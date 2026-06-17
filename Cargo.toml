@@ -69,6 +69,7 @@ windows-sys = { version = "0.52", features = [
     "Win32_UI_WindowsAndMessaging",  # SendMessageTimeout, WM_SETTINGCHANGE, HWND_BROADCAST
     "Win32_System_Registry",         # RegOpenKeyExW, RegSetValueExW (HKCU\Environment)
     "Win32_Storage_FileSystem",      # stop-flag presence check
+    "Win32_System_SystemInformation", # GetComputerNameExW (statusline host)
 ] }
 
 # ─── cargo-binstall metadata (consumed by WSL `cargo binstall claude-smart`) ──

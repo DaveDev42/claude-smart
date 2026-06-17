@@ -125,7 +125,7 @@ pub fn hkcu_setenv(_profile: &str, dir: &str) -> std::io::Result<()> {
     use windows_sys::Win32::{
         Foundation::HWND,
         System::Registry::{
-            RegCloseKey, RegOpenKeyExW, RegSetValueExW, HKEY_CURRENT_USER, KEY_SET_VALUE,
+            HKEY, RegCloseKey, RegOpenKeyExW, RegSetValueExW, HKEY_CURRENT_USER, KEY_SET_VALUE,
             REG_SZ,
         },
         UI::WindowsAndMessaging::{
@@ -142,7 +142,8 @@ pub fn hkcu_setenv(_profile: &str, dir: &str) -> std::io::Result<()> {
     let env_str: Vec<u16> = "Environment\0".encode_utf16().collect();
 
     // 1. Open HKCU\Environment with KEY_SET_VALUE.
-    let mut hkey = std::ptr::null_mut();
+    // HKEY in windows-sys 0.52 is an isize handle (not a raw pointer).
+    let mut hkey: HKEY = 0;
     let open_result = unsafe {
         RegOpenKeyExW(
             HKEY_CURRENT_USER,
