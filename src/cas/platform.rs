@@ -21,6 +21,13 @@
 //!   propagation mechanism exists; the shell-only guard (`~/.zshenv`) is
 //!   sufficient. `apply_global` is a no-op.
 //!
+//! # Soft-failure contract
+//!
+//! Both `launchctl_setenv` and `hkcu_setenv` treat failure as *soft*: a missing
+//! binary, a permission error, or a locked registry key logs a warning to stderr
+//! but does **not** prevent the live-shell export from succeeding. This mirrors
+//! the zsh `… 2>/dev/null` suppression on line 135 of `claude-as.zsh`.
+//!
 //! # Spec reference
 //! `docs/superpowers/specs/2026-06-17-csm-rust-port-design.md` §2 "cas -g",
 //! §3 "`cas --eval` shell-export shim", §5 #3 "cas live-shell env export"
@@ -49,31 +56,45 @@ fn apply_global_impl(profile: &str, dir: &str) -> std::io::Result<()> {
 /// Invoke `/bin/launchctl setenv CLAUDE_CONFIG_DIR <dir>` to propagate the
 /// new config dir to the launchd `gui/<uid>` domain.
 ///
-/// Failure is soft — we print a warning to stderr but do **not** return an
-/// error, mirroring the zsh `… 2>/dev/null` suppression. The live-shell
-/// export still succeeds even if launchctl is unavailable (e.g. CI / a
-/// container / a sandboxed test environment).
+/// This updates the `gui/<uid>` launchd domain so GUI apps (Dock, Spotlight,
+/// non-login shells spawned by launchd) inherit the new `CLAUDE_CONFIG_DIR`
+/// immediately — without requiring a re-login.
 ///
-/// # Status (Phase 0)
-/// Body is `unimplemented!()` — the signature, linkage, and soft-error
-/// contract are final; the exec call will be filled in during Phase 11
-/// (implementation order §6).
+/// Mirrors the zsh `cas -g` path (claude-as.zsh line 135):
+/// ```zsh
+/// [[ "$OSTYPE" == darwin* ]] && /bin/launchctl setenv CLAUDE_CONFIG_DIR "$dir" 2>/dev/null
+/// ```
+///
+/// Failure is **soft** — we print a warning to stderr but do NOT return an
+/// error, matching the `2>/dev/null` suppression in the zsh source. The
+/// live-shell export still succeeds even if launchctl is unavailable (e.g. CI
+/// / a container / a sandboxed test environment).
 #[cfg(target_os = "macos")]
-pub fn launchctl_setenv(profile: &str, dir: &str) -> std::io::Result<()> {
-    // Phase 0: signature is locked; body deferred.
-    // Final implementation will be approximately:
-    //
-    //   std::process::Command::new("/bin/launchctl")
-    //       .args(["setenv", "CLAUDE_CONFIG_DIR", dir])
-    //       .status()
-    //       .ok(); // soft — ignore failure
-    //   Ok(())
-    //
-    let _ = (profile, dir); // suppress unused warnings in Phase 0
-    unimplemented!(
-        "cas: launchctl_setenv not yet implemented (Phase 11); \
-         will exec /bin/launchctl setenv CLAUDE_CONFIG_DIR '{dir}'"
-    )
+pub fn launchctl_setenv(_profile: &str, dir: &str) -> std::io::Result<()> {
+    use std::process::Command;
+
+    // `/bin/launchctl setenv CLAUDE_CONFIG_DIR <dir>`
+    // Matches the zsh line exactly: the env var name is hardcoded, the value
+    // is the resolved config-dir path.
+    let status = Command::new("/bin/launchctl")
+        .args(["setenv", "CLAUDE_CONFIG_DIR", dir])
+        .status();
+
+    match status {
+        Ok(s) if s.success() => {}
+        Ok(s) => {
+            // Non-zero exit from launchctl: warn but don't abort (mirrors 2>/dev/null).
+            eprintln!(
+                "cas: launchctl setenv exited with {s} — GUI apps may not see the new profile until re-login"
+            );
+        }
+        Err(e) => {
+            // launchctl not found or not executable: warn but don't abort.
+            eprintln!("cas: launchctl setenv failed: {e} — GUI apps may not see the new profile");
+        }
+    }
+
+    Ok(())
 }
 
 // ─── Windows ─────────────────────────────────────────────────────────────────
@@ -92,35 +113,87 @@ fn apply_global_impl(profile: &str, dir: &str) -> std::io::Result<()> {
 /// - `SendMessageTimeoutW(HWND_BROADCAST, WM_SETTINGCHANGE, 0, "Environment", …)`
 ///   for the broadcast
 ///
-/// # Status (Phase 0)
-/// Body is `unimplemented!()` — the signature, imports, and raw-API strategy
-/// are final; the Win32 calls will be filled in during Phase 13 (Windows
-/// supervisor, the last phase per §6).
+/// Failure is soft — we print a warning to stderr but do NOT return an error.
+///
+/// # Status (Phase 4 — Windows supervisor)
+/// The registry write and `SendMessageTimeout` broadcast are implemented here
+/// as stubs that log a warning. The full Win32 implementation will be added
+/// during the Windows supervisor phase (Phase 13 per §6 of the scaffold spec).
+/// On POSIX this code is not compiled.
 #[cfg(windows)]
-pub fn hkcu_setenv(profile: &str, dir: &str) -> std::io::Result<()> {
-    // Phase 0: signature is locked; body deferred.
-    //
-    // Final implementation sketch (windows-sys 0.52):
-    //
-    //   use windows_sys::Win32::{
-    //       System::Registry::{RegOpenKeyExW, RegSetValueExW, HKEY_CURRENT_USER, KEY_SET_VALUE},
-    //       UI::WindowsAndMessaging::{
-    //           SendMessageTimeoutW, HWND_BROADCAST, WM_SETTINGCHANGE,
-    //           SMTO_ABORTIFHUNG,
-    //       },
-    //       Foundation::HWND,
-    //   };
-    //   // 1. Open HKCU\Environment with KEY_SET_VALUE.
-    //   // 2. RegSetValueExW → REG_EXPAND_SZ or REG_SZ.
-    //   // 3. SendMessageTimeoutW(HWND_BROADCAST, WM_SETTINGCHANGE, 0,
-    //   //        "Environment" as wide ptr, SMTO_ABORTIFHUNG, 5000, ptr::null_mut()).
-    //   Ok(())
-    //
-    let _ = (profile, dir); // suppress unused warnings in Phase 0
-    unimplemented!(
-        "cas: hkcu_setenv not yet implemented (Phase 13); \
-         will write HKCU\\Environment\\CLAUDE_CONFIG_DIR and broadcast WM_SETTINGCHANGE"
-    )
+pub fn hkcu_setenv(_profile: &str, dir: &str) -> std::io::Result<()> {
+    use windows_sys::Win32::{
+        Foundation::HWND,
+        System::Registry::{
+            RegCloseKey, RegOpenKeyExW, RegSetValueExW, HKEY_CURRENT_USER, KEY_SET_VALUE,
+            REG_SZ,
+        },
+        UI::WindowsAndMessaging::{
+            SendMessageTimeoutW, HWND_BROADCAST, SMTO_ABORTIFHUNG, WM_SETTINGCHANGE,
+        },
+    };
+
+    // Convert the dir string to a null-terminated UTF-16 for Win32 APIs.
+    let dir_wide: Vec<u16> = dir.encode_utf16().chain(std::iter::once(0)).collect();
+
+    // Convert the registry key path to wide.
+    let key_path: Vec<u16> = "Environment\0".encode_utf16().collect();
+    let value_name: Vec<u16> = "CLAUDE_CONFIG_DIR\0".encode_utf16().collect();
+    let env_str: Vec<u16> = "Environment\0".encode_utf16().collect();
+
+    // 1. Open HKCU\Environment with KEY_SET_VALUE.
+    let mut hkey = std::ptr::null_mut();
+    let open_result = unsafe {
+        RegOpenKeyExW(
+            HKEY_CURRENT_USER,
+            key_path.as_ptr(),
+            0,
+            KEY_SET_VALUE,
+            &mut hkey,
+        )
+    };
+
+    if open_result != 0 {
+        eprintln!("cas: RegOpenKeyExW failed (0x{open_result:08X}) — HKCU\\Environment not updated");
+        return Ok(()); // soft failure
+    }
+
+    // 2. Write CLAUDE_CONFIG_DIR as REG_SZ.
+    let set_result = unsafe {
+        RegSetValueExW(
+            hkey,
+            value_name.as_ptr(),
+            0,
+            REG_SZ,
+            dir_wide.as_ptr() as *const u8,
+            (dir_wide.len() * 2) as u32,
+        )
+    };
+
+    unsafe { RegCloseKey(hkey) };
+
+    if set_result != 0 {
+        eprintln!("cas: RegSetValueExW failed (0x{set_result:08X}) — HKCU\\Environment\\CLAUDE_CONFIG_DIR not updated");
+        return Ok(()); // soft failure
+    }
+
+    // 3. Broadcast WM_SETTINGCHANGE "Environment" so Explorer and new
+    //    console windows inherit the change (matching the pwsh pattern used
+    //    by HKCU env writes elsewhere in windows/powershell-profile/).
+    let mut result: usize = 0;
+    unsafe {
+        SendMessageTimeoutW(
+            HWND_BROADCAST as HWND,
+            WM_SETTINGCHANGE,
+            0,
+            env_str.as_ptr() as isize,
+            SMTO_ABORTIFHUNG,
+            5000,
+            &mut result,
+        );
+    }
+
+    Ok(())
 }
 
 // ─── Other POSIX (Linux / WSL) ────────────────────────────────────────────────
@@ -130,4 +203,38 @@ fn apply_global_impl(_profile: &str, _dir: &str) -> std::io::Result<()> {
     // Linux / WSL: no persistent non-shell env propagation mechanism.
     // The ~/.zshenv guard is the sole floor; no additional side-effect needed.
     Ok(())
+}
+
+// ─── tests ────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `apply_global` must not panic or return hard errors on the current
+    /// platform. On macOS CI, launchctl may fail (sandbox) — that's OK.
+    /// On Linux/WSL, it is a no-op.
+    #[test]
+    fn apply_global_does_not_panic() {
+        // Soft failure only — never panics or returns hard error on POSIX.
+        let result = apply_global("personal", "/tmp/.claude.personal");
+        assert!(result.is_ok(), "apply_global must not return hard error: {:?}", result);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn launchctl_setenv_does_not_panic_with_valid_args() {
+        // In a sandboxed CI environment launchctl may fail — that's the soft
+        // failure we're testing: it should log a warning, not panic or return Err.
+        let result = launchctl_setenv("personal", "/tmp/.claude.personal");
+        assert!(result.is_ok(), "launchctl_setenv should soft-fail, not hard-fail: {:?}", result);
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    #[test]
+    fn linux_apply_global_is_noop() {
+        // On Linux/WSL the function must succeed (no-op).
+        let result = apply_global("personal", "/tmp/.claude.personal");
+        assert!(result.is_ok());
+    }
 }

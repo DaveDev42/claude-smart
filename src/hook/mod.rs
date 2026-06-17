@@ -46,27 +46,46 @@ pub fn run(owner_dir: &Path) -> anyhow::Result<()> {
     };
 
     // Classify the hook event and determine whether a limit-switch is warranted.
+    // classify() reproduces the full limit-switch.sh.j2 flow including kill-switches,
+    // reason gate, detection tiers, managed-session gate, cooldown, and hop guard.
     let decision = detect::classify(&input, owner_dir)?;
 
     match decision {
         detect::Decision::Skip => {
-            // Nothing to do (kill-switch, cooldown, reason gate, etc.)
+            // Nothing to do — a kill-switch, cooldown, marker, or no-limit result.
         }
+
         detect::Decision::NotifyOnly { ref message } => {
-            // Reason gate: user-quit events → notify only, no relaunch.
-            notify::emit_osc777(message)?;
-            notify::append_log(&sid, message, owner_dir)?;
+            // Notify-only: user-quit + limited, no-target, detect-only mode, or
+            // unmanaged session. Emit OSC 777 notify on stdout.
+            // Log goes to the smart_dir limit-switch.log.
+            let log_msg = format!("notify-only sid={} msg={}", &sid[..sid.len().min(8)], message);
+            notify::emit_osc777(message).unwrap_or(()); // best-effort stdout
+            let _ = notify::append_log(&sid, &log_msg, owner_dir); // best-effort log
         }
+
         detect::Decision::LimitSwitch {
             ref message,
             ref target_profile,
             ref handoff,
+            ref cwd,
+            born,
         } => {
             // Full limit-switch commit sequence (§4b ordering):
-            // 1–5 handled by stop::commit_and_stop (sentinel write precedes stop signal)
-            notify::emit_osc777(message)?;
-            notify::append_log(&sid, message, owner_dir)?;
-            stop::commit_and_stop(&sid, target_profile, handoff, owner_dir)?;
+            // notify first (stdout before any mutation), then commit_and_stop.
+            notify::emit_osc777(message).unwrap_or(());
+
+            let log_msg = format!(
+                "limit-switch sid={} to={} cwd={} hop={}",
+                &sid[..sid.len().min(8)],
+                target_profile,
+                cwd,
+                born,
+            );
+            let _ = notify::append_log(&sid, &log_msg, owner_dir);
+
+            stop::commit_and_stop(sid.as_str(), target_profile, handoff, cwd, born, owner_dir)
+                .with_context(|| format!("commit_and_stop failed for session {sid}"))?;
         }
     }
 

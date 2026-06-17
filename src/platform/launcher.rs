@@ -16,9 +16,13 @@ pub struct ChildHandle {
 
 /// One foreground execution of `claude`.  Impls MUST:
 ///   1. Inherit the caller's tty for stdin/stdout/stderr (never pipe).
-///   2. Return only when the child exits.
-///   3. Leave the terminal usable for the relaunch loop afterward.
-///   4. Write `<sid>.pid` before returning to the relaunch loop.
+///   2. Write `<sid>.pid` (`"<pid> <born>"`) **immediately after spawn, before
+///      blocking in wait** — the limit-switch hook fires while claude is still
+///      alive and reads this file to stamp the relaunch sentinel's `born`. If we
+///      wrote it only after the child exits, the hook would find no pidfile.
+///   3. Return only when the child exits.
+///   4. Leave the terminal usable for the relaunch loop afterward.
+///   5. Remove `<sid>.pid` is the relaunch loop's job, not the launcher's.
 ///
 /// The `env` map contains child-only environment overrides (e.g.
 /// `CLAUDE_CONFIG_DIR`).  Impls merge these into the inherited environment
@@ -26,6 +30,7 @@ pub struct ChildHandle {
 pub trait Launcher {
     fn run_foreground(
         &self,
+        sid: &str,
         cli: &[OsString],
         env: &HashMap<OsString, OsString>, // child-only overrides
     ) -> io::Result<(ExitStatus, ChildHandle)>;

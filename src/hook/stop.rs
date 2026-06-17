@@ -47,37 +47,51 @@ pub struct RelaunchSentinel {
 /// `sid`            — session UUID string.
 /// `target_profile` — profile name to switch to (stored in the sentinel).
 /// `handoff`        — handoff prompt string forwarded to the resumed session.
-/// `owner_dir`      — CLAUDE_CONFIG_DIR of the owning profile (for cwd resolution).
+/// `cwd`            — working directory from the hook input (not owner_dir).
+/// `born`           — born epoch read from the PID file by classify().
+/// `_owner_dir`     — CLAUDE_CONFIG_DIR of the owning profile (reserved for future use).
+///
+/// The commit ordering (§4b, mirrors `limit-switch.sh.j2` lines 384–425):
+///   1. merge-sidecar hop
+///   2. write .relaunch sentinel (atomic tmp+rename)
+///   3. noclobber-create .switched marker
+///   4. re-stamp .last-switch
+///   5. stop signal LAST (POSIX SIGTERM / Windows .stop flag)
 pub fn commit_and_stop(
     sid: &str,
     target_profile: &str,
     handoff: &str,
-    owner_dir: &Path,
+    cwd: &str,
+    born: i64,
+    _owner_dir: &Path,
 ) -> anyhow::Result<()> {
     use crate::paths;
 
     // ── Step 1: read current hop from sidecar, compute next_hop ──────────────
+    // Shell: limit-switch.sh.j2 lines 394-395
     let current_hop = read_sidecar_hop(sid);
     let next_hop = current_hop + 1;
 
     // Merge next_hop back into the sidecar (merge-not-clobber: preserve other fields).
+    // Shell: `"$HELPER" merge-sidecar "$session_id" hop "$next_hop"`
     merge_sidecar_hop(sid, next_hop)?;
 
     // ── Step 2: write .relaunch sentinel (atomic) ─────────────────────────────
-    let cwd = owner_dir
-        .to_str()
-        .unwrap_or(".")
-        .to_string();
-
-    let born = read_pid_born(sid).unwrap_or(0);
+    // Shell: `"$HELPER" write-relaunch ...` (limit-switch.sh.j2 lines 403-406)
+    // born is passed from classify() (already read from the pidfile there).
+    let actual_born = if born != 0 {
+        born
+    } else {
+        read_pid_born(sid).unwrap_or(0)
+    };
 
     let sentinel = RelaunchSentinel {
         session_id: sid.to_string(),
         target_profile: target_profile.to_string(),
-        cwd,
+        cwd: cwd.to_string(),
         handoff: handoff.to_string(),
         hop: next_hop,
-        born,
+        born: actual_born,
     };
 
     write_relaunch_sentinel(sid, &sentinel)?;
@@ -207,11 +221,16 @@ fn stop_managed_process(sid: &str) -> anyhow::Result<()> {
 
 // ─── platform stop implementations ───────────────────────────────────────────
 
+/// Public wrapper for detect.rs to call without reimplementing the check.
 /// Returns true if `pid` is a live process whose exe basename ends with "claude" or "node"
 /// (case-insensitive; `.exe` stripped on Windows).
 ///
 /// Uses targeted `sysinfo` refresh (never a full sweep) on Windows/Linux,
 /// and `ps -o comm=` on macOS (POSIX-only path).
+pub fn check_is_live_claude_or_node(pid: u32) -> bool {
+    platform_is_live_claude_or_node(pid)
+}
+
 fn is_live_claude_or_node(pid: u32) -> bool {
     platform_is_live_claude_or_node(pid)
 }
