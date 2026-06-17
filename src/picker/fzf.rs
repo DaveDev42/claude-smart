@@ -76,10 +76,60 @@ pub fn fzf_available() -> bool {
 ///   or fzf exited with any non-zero code that does not represent a valid
 ///   selection).
 ///
-/// **Phase 0 stub** — body is `unimplemented!()`.
+/// fzf exit code for "no match / user cancelled" (Escape).
+const FZF_EXIT_NO_MATCH: i32 = 1;
+/// fzf exit code for "interrupted" (Ctrl-C / Ctrl-G).
+const FZF_EXIT_INTERRUPTED: i32 = 130;
+
 pub fn run_fzf(rows: &[String], opts: &FzfOpts) -> Option<String> {
-    let _ = (rows, opts); // suppress unused-variable warnings while unimplemented
-    unimplemented!("run_fzf: pipe rows to fzf, recover col1 from selected line")
+    use std::io::Write;
+
+    if rows.is_empty() {
+        return None;
+    }
+
+    let mut cmd = Command::new("fzf");
+    cmd.arg("--prompt").arg(&opts.prompt)
+        .arg("--with-nth").arg(&opts.with_nth)
+        .arg("--delimiter").arg(&opts.delimiter)
+        .arg("--height").arg(&opts.height);
+    for extra in &opts.extra_args {
+        cmd.arg(extra);
+    }
+    // fzf reads candidates from stdin and writes the chosen line to stdout; its
+    // TUI is drawn on /dev/tty, so piping stdin/stdout does not hide the UI.
+    cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::inherit());
+
+    let mut child = cmd.spawn().ok()?;
+
+    // Feed the rows. fzf may close stdin early (selection made before all rows
+    // are read) → a BrokenPipe write is expected and must not abort.
+    if let Some(mut stdin) = child.stdin.take() {
+        let payload = rows.join("\n");
+        let _ = stdin.write_all(payload.as_bytes());
+        let _ = stdin.write_all(b"\n");
+        // drop closes the pipe → fzf sees EOF
+    }
+
+    let output = child.wait_with_output().ok()?;
+    // Only exit 0 is a real selection; Escape (1), Ctrl-C (130), and any other
+    // non-zero / signal exit all mean "no selection".
+    if output.status.code() != Some(0) {
+        debug_assert!(matches!(
+            output.status.code(),
+            None | Some(FZF_EXIT_NO_MATCH) | Some(FZF_EXIT_INTERRUPTED) | Some(_)
+        ));
+        return None;
+    }
+
+    let selected = String::from_utf8_lossy(&output.stdout);
+    let line = selected.lines().next()?; // first (only, with --no-multi) line
+    if line.is_empty() {
+        return None;
+    }
+    // Recover col1 = the hidden recovery key (split on the configured delimiter).
+    let delim = opts.delimiter.chars().next().unwrap_or('\t');
+    Some(line.split(delim).next().unwrap_or(line).to_string())
 }
 
 // ─── tests ────────────────────────────────────────────────────────────────────

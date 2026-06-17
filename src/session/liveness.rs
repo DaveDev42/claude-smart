@@ -44,13 +44,20 @@ use crate::paths;
 ///
 /// Never panics.
 pub fn sid_live(sid: &str) -> bool {
-    // Phase 0: types and wiring are final; implementation is Phase 7.
-    // The `_pid_path` binding exists so callers can see the paths usage pattern.
-    let _pid_path = paths::pid_file(sid);
-    unimplemented!(
-        "sid_live: read <sid>.pid → parse (pid, born) → platform proc-check \
-         (Phase 7 — see platform/proc_check.rs PosixProcCheck / SysinfoProcCheck)"
-    )
+    use crate::platform::proc_check::ProcCheck;
+
+    let content = match std::fs::read_to_string(paths::pid_file(sid)) {
+        Ok(c) => c,
+        Err(_) => return false, // pidfile absent → not live
+    };
+    let (pid, _born) = match parse_pid_file(&content) {
+        Some(p) => p,
+        None => return false, // unparseable → not live
+    };
+    // Delegate the PID→comm check to the compile-time platform impl
+    // (PosixProcCheck on unix, SysinfoProcCheck on Windows). `born` is read
+    // for the relaunch loop's stricter born-match guard, not here.
+    crate::platform::PlatformProcCheck::is_live_claude_or_node(pid)
 }
 
 /// Parse the two-token PID-file content `"<pid> <born>"`.

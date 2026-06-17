@@ -85,7 +85,13 @@ impl AccountRow {
             format_stale_age(age_secs)
         });
 
-        let display = render_display(data, stale_annotation.as_deref());
+        // The display column (col2, shown via --with-nth=2..) MUST lead with the
+        // profile name — col1 is hidden for recovery, so without this the user
+        // could not tell which account each row is. Matches the spec §4a example
+        // (`personal   session 3%   …`). Left-pad to a fixed width so the usage
+        // columns line up across rows.
+        let usage = render_display(data, stale_annotation.as_deref());
+        let display = format!("{:<10} {usage}", profile);
 
         AccountRow {
             profile: profile.to_string(),
@@ -94,7 +100,7 @@ impl AccountRow {
     }
 }
 
-/// Render the display portion (col2+) for a profile row.
+/// Render the usage portion (everything after the profile-name column) for a row.
 ///
 /// Spec §4a rendering rules:
 /// - error present → `[error: <string>]  (stale Nm ago)`
@@ -182,17 +188,20 @@ impl AccountPicker {
     /// - `Some(profile_name)` — user selected a profile.
     /// - `None` — empty/cancelled selection OR fzf unavailable (degraded).
     ///
-    /// **Phase 0 stub.** The fzf invocation is `unimplemented!()`.
+    /// When `fzf_available()` is false → stderr warning + `None` (degrade).
+    /// Escape / Ctrl-C / empty selection → `None`. Otherwise the chosen profile.
     pub fn pick(&self) -> Option<String> {
+        if self.rows.is_empty() {
+            return None;
+        }
         if !fzf_available() {
             eprintln!(
                 "csm: hub usage fetch failed and fzf not available — keeping current profile"
             );
             return None;
         }
-        unimplemented!(
-            "AccountPicker::pick: build fzf rows, invoke run_fzf, map col1 → profile name"
-        )
+        let lines = self.build_fzf_input();
+        crate::picker::fzf::run_fzf(&lines, &Self::fzf_opts())
     }
 
     /// Build the TSV lines to pipe to fzf.
@@ -338,6 +347,35 @@ mod tests {
         assert_eq!(row.profile, "personal");
         // Display should contain the stale annotation (approximately 5m ago).
         assert!(row.display.contains("stale"), "got: {}", row.display);
+        // …and MUST lead with the profile name (col1 is hidden via --with-nth=2..,
+        // so the name only appears to the user if it is in the display column).
+        assert!(
+            row.display.starts_with("personal"),
+            "display must start with profile name, got: {}",
+            row.display
+        );
+        assert!(row.display.contains("session 10%"), "got: {}", row.display);
+    }
+
+    #[test]
+    fn build_display_leads_with_profile_name_even_on_error() {
+        let data = StaleProfileData {
+            session_pct: None,
+            week_all_pct: None,
+            resets: None,
+            error: Some("no credentials".to_string()),
+        };
+        let row = AccountRow::build("work", &data, None);
+        assert!(
+            row.display.starts_with("work"),
+            "got: {}",
+            row.display
+        );
+        assert!(row.display.contains("[error: no credentials]"), "got: {}", row.display);
+        // col1 (recovery key) is the bare profile name, no padding.
+        assert_eq!(row.profile, "work");
+        let tsv = row.to_tsv();
+        assert_eq!(tsv.split('\t').next().unwrap(), "work");
     }
 
     #[test]

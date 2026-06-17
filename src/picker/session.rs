@@ -136,9 +136,29 @@ impl SessionPicker {
 
     /// Run the picker and return the user's selection.
     ///
-    /// **Phase 0 stub.** The fzf invocation logic is `unimplemented!()`.
-    pub fn pick(&self) -> Option<PickedSession> {
-        unimplemented!("SessionPicker::pick: build fzf rows, invoke run_fzf, map sentinel → PickedSession")
+    /// - Empty `rows` → `PickedSession::Fresh` (no picker shown).
+    /// - fzf unavailable → `None` (caller degrades to newest-free-sid / fresh).
+    /// - Escape / Ctrl-C / empty selection → `None`.
+    /// - `__NEW__` → `Fresh`, `__CONTINUE__` → `Continue`, UUID → `Resume(uuid)`.
+    pub fn pick(&self, newest_live_label: Option<&str>) -> Option<PickedSession> {
+        if self.rows.is_empty() {
+            return Some(PickedSession::Fresh);
+        }
+        if !crate::picker::fzf::fzf_available() {
+            return None;
+        }
+        let lines = self.build_fzf_input(newest_live_label);
+        let col1 = crate::picker::fzf::run_fzf(&lines, &Self::fzf_opts())?;
+        Some(Self::resolve(&col1))
+    }
+
+    /// Map a recovered col1 (sentinel constant or UUID) to a `PickedSession`.
+    pub fn resolve(col1: &str) -> PickedSession {
+        match col1 {
+            SENTINEL_NEW => PickedSession::Fresh,
+            SENTINEL_CONTINUE => PickedSession::Continue,
+            uuid => PickedSession::Resume(uuid.to_string()),
+        }
     }
 
     /// Build the TSV lines to pipe to fzf, including sentinel rows at the top.
