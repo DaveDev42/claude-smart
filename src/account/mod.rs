@@ -17,7 +17,7 @@ pub mod scoring;
 
 pub use profiles::ProfileMap;
 
-use crate::usage::{self, FetchError, UsageData};
+use crate::usage::{self, UsageData};
 use scoring::{ScoringError, ScoringResult};
 
 /// Choose the best profile to switch to.

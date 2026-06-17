@@ -40,7 +40,7 @@
 //! 9. Managed-session gate: check .pid file.
 //! 10. Cooldown gate (noclobber .last-switch).
 //! 11. Hop guard.
-//! → Decision::LimitSwitch { target_profile, handoff, cwd, born }.
+//!     → Decision::LimitSwitch { target_profile, handoff, cwd, born }.
 
 use std::path::Path;
 
@@ -179,7 +179,7 @@ pub fn parse_stdin() -> anyhow::Result<HookInput> {
 /// 9. Managed-session gate (.pid file)
 /// 10. Machine-wide cooldown (noclobber .last-switch)
 /// 11. Hop guard
-/// → LimitSwitch
+///     → LimitSwitch
 pub fn classify(input: &HookInput, owner_dir: &Path) -> anyhow::Result<Decision> {
     use crate::paths;
 
@@ -270,7 +270,7 @@ pub fn classify(input: &HookInput, owner_dir: &Path) -> anyhow::Result<Decision>
         if !detect_path.exists() {
             let _ = paths::smart_dir(); // ensure dir exists
             let _ = write_noclobber_epoch(&detect_path);
-            let _ = prune_detected_markers();
+            prune_detected_markers();
             let profile_name = owner_dir_to_profile_name(owner_dir);
             let body = format!(
                 "[{profile_name}] hit {limited_msg} — you quit, so not relaunching; next csm will pick a healthy account"
@@ -293,7 +293,7 @@ pub fn classify(input: &HookInput, owner_dir: &Path) -> anyhow::Result<Decision>
             if !detect_path.exists() {
                 let _ = paths::smart_dir();
                 let _ = write_noclobber_epoch(&detect_path);
-                let _ = prune_detected_markers();
+                prune_detected_markers();
                 let body = format!(
                     "[{current_profile}] hit {limited_msg} — no account with headroom to switch to"
                 );
@@ -314,7 +314,7 @@ pub fn classify(input: &HookInput, owner_dir: &Path) -> anyhow::Result<Decision>
         if !detect_path.exists() {
             let _ = paths::smart_dir();
             let _ = write_noclobber_epoch(&detect_path);
-            let _ = prune_detected_markers();
+            prune_detected_markers();
             let sid_short = sid.get(..8).unwrap_or(sid);
             let body = format!(
                 "[{current_profile}] hit {limited_msg} → switch to [{target_profile}] (auto-relaunch OFF; csm --profile {target_profile} --resume {sid_short})"
@@ -332,7 +332,7 @@ pub fn classify(input: &HookInput, owner_dir: &Path) -> anyhow::Result<Decision>
         if !detect_path.exists() {
             let _ = paths::smart_dir();
             let _ = write_noclobber_epoch(&detect_path);
-            let _ = prune_detected_markers();
+            prune_detected_markers();
             let sid_short = sid.get(..8).unwrap_or(sid);
             let body = format!(
                 "[{current_profile}] hit {limited_msg} → switch to [{target_profile}] by hand (csm --profile {target_profile} --resume {sid_short})"
@@ -737,19 +737,11 @@ fn is_live_claude_or_node(pid: u32) -> bool {
 
 /// Read the `hop` field from `<sid>.json` sidecar.
 /// Returns 0 on missing/corrupt sidecar. Tolerates both String and Number (§6 compat).
+/// Delegates to the single `Sidecar::hop_int` SSOT (was triplicated).
 fn read_sidecar_hop(sid: &str) -> i64 {
-    use crate::paths;
-    let Ok(content) = std::fs::read_to_string(paths::sidecar(sid)) else {
-        return 0;
-    };
-    let Ok(val) = serde_json::from_str::<serde_json::Value>(&content) else {
-        return 0;
-    };
-    match val.get("hop") {
-        Some(serde_json::Value::String(s)) => s.parse::<i64>().unwrap_or(0),
-        Some(serde_json::Value::Number(n)) => n.as_i64().unwrap_or(0),
-        _ => 0,
-    }
+    crate::sidecar::read_sidecar(&crate::paths::sidecar(sid))
+        .map(|s| s.hop_int())
+        .unwrap_or(0)
 }
 
 /// Build the handoff prompt string.
@@ -762,9 +754,9 @@ fn read_sidecar_hop(sid: &str) -> i64 {
 ///   - unset → "resume"
 ///   - empty ("") → disabled (return empty string)
 ///   - set to a value → that value
-/// BUT the Korean handoff from the shell is the DEFAULT WHEN TRIGGERING A SWITCH.
-/// We use the Korean string as the contextual handoff and CLAUDE_SMART_RESUME_PROMPT
-/// as an override (empty = suppress).
+///     BUT the Korean handoff from the shell is the DEFAULT WHEN TRIGGERING A SWITCH.
+///     We use the Korean string as the contextual handoff and CLAUDE_SMART_RESUME_PROMPT
+///     as an override (empty = suppress).
 pub(crate) fn build_handoff(
     sid_short: &str,
     current_profile: &str,

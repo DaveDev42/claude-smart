@@ -11,7 +11,7 @@
 pub mod model;
 mod transport;
 
-pub use model::{ProfileUsage, UsageData, UsageSection};
+pub use model::UsageData;
 pub use transport::fetch;
 
 /// Errors that can occur when fetching usage data from the hub.
@@ -21,12 +21,6 @@ pub use transport::fetch;
 /// current profile silently (non-interactive / hook contexts).
 #[derive(Debug, thiserror::Error)]
 pub enum FetchError {
-    /// The positive TTL cache file is fresh; this arm is never returned to
-    /// external callers but is used internally to short-circuit the network
-    /// path.  Exposed as a variant so transport.rs can return it.
-    #[error("cache is fresh (internal fast-return)")]
-    CacheFresh,
-
     /// The negative-cooldown file (`$SMART_DIR/.usage-fetch-failed`) is recent
     /// (< 120 s); treat identically to a live fetch failure.
     #[error("negative cache active — hub confirmed down within cooldown window")]

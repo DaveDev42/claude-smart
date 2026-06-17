@@ -53,6 +53,10 @@ impl SessionRow {
     }
 
     /// Parse a TSV line produced by [`to_tsv`].  Returns `None` on malformed input.
+    /// The symmetric complement of `to_tsv`; kept for any future TSV-based session
+    /// IPC/cache reader (no production consumer reads the 5-column form yet — the
+    /// scan index uses its own 4-column parser).
+    #[allow(dead_code)]
     pub fn from_tsv(line: &str) -> Option<Self> {
         let mut cols = line.splitn(5, '\t');
         let sid = cols.next()?.to_owned();

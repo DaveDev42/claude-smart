@@ -91,8 +91,8 @@ pub fn resolve_alias(name: &str) -> Result<String, AliasError> {
     // Check staleness.
     let stale = is_index_stale(&titles_path, ttl);
 
-    // Try a lookup.
-    let sid = lookup_alias(name, &titles_path);
+    // Try a lookup. I/O errors (other than a missing index) propagate as Io.
+    let sid = lookup_alias(name, &titles_path)?;
 
     match sid {
         Some(found) => {
@@ -114,7 +114,7 @@ pub fn resolve_alias(name: &str) -> Result<String, AliasError> {
                 // Rebuild synchronously and retry once.
                 // Mirrors: `if [ "$stale" = true ]; then reindex_titles; _lookup_alias "$alias"; fi`
                 reindex_titles();
-                match lookup_alias(name, &titles_path) {
+                match lookup_alias(name, &titles_path)? {
                     Some(found) => Ok(found),
                     None => Err(AliasError::NotFound { alias: name.to_owned() }),
                 }
@@ -166,8 +166,19 @@ pub fn looks_like_uuid(s: &str) -> bool {
 /// ```awk
 /// awk -F'\t' -v a="$1" '$1==a && $3+0>=m+0 {m=$3; s=$2} END{if(s)print s}'
 /// ```
-fn lookup_alias(alias: &str, titles_path: &PathBuf) -> Option<String> {
-    let content = fs::read_to_string(titles_path).ok()?;
+fn lookup_alias(alias: &str, titles_path: &PathBuf) -> Result<Option<String>, AliasError> {
+    let content = match fs::read_to_string(titles_path) {
+        Ok(c) => c,
+        // A missing index is a normal "no match" (the caller may reindex and retry);
+        // any other I/O error (permissions, etc.) must NOT masquerade as NotFound.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => {
+            return Err(AliasError::Io {
+                path: titles_path.clone(),
+                source: e,
+            })
+        }
+    };
     let mut best_mtime: i64 = -1;
     let mut best_sid: Option<String> = None;
 
@@ -185,7 +196,7 @@ fn lookup_alias(alias: &str, titles_path: &PathBuf) -> Option<String> {
             best_sid = Some(sid.to_owned());
         }
     }
-    best_sid
+    Ok(best_sid)
 }
 
 // ─── titles index rebuild ─────────────────────────────────────────────────────
@@ -260,9 +271,9 @@ pub fn reindex_titles() {
         content.push_str(&format!("{}\t{}\t{}\n", row.title, row.sid, row.mtime));
     }
     if fs::write(&tmp_path, &content).is_ok() {
-        let _ = fs::rename(&tmp_path, &titles_path).or_else(|_| {
+        let _ = fs::rename(&tmp_path, &titles_path).map_err(|_| {
             let _ = fs::remove_file(&tmp_path);
-            Err(())
+            
         });
     }
 }
@@ -499,7 +510,7 @@ mod tests {
             "My Project\taaaaaaaa-0000-0000-0000-000000000001\t1000\n\
              Other Title\tbbbbbbbb-0000-0000-0000-000000000002\t2000\n"
         ).unwrap();
-        let result = lookup_alias("My Project", &titles_path);
+        let result = lookup_alias("My Project", &titles_path).expect("io");
         assert_eq!(result.unwrap(), "aaaaaaaa-0000-0000-0000-000000000001");
     }
 
@@ -513,7 +524,7 @@ mod tests {
              Same Title\tnew-sid-0000-0000-0000-000000000002\t999\n"
         ).unwrap();
         // Mirrors awk `>= m` accumulator — higher mtime wins.
-        let result = lookup_alias("Same Title", &titles_path);
+        let result = lookup_alias("Same Title", &titles_path).expect("io");
         assert_eq!(result.unwrap(), "new-sid-0000-0000-0000-000000000002");
     }
 
@@ -524,7 +535,7 @@ mod tests {
         fs::write(&titles_path,
             "Known Title\taaaaaaaa-0000-0000-0000-000000000001\t1000\n"
         ).unwrap();
-        let result = lookup_alias("Unknown Title", &titles_path);
+        let result = lookup_alias("Unknown Title", &titles_path).expect("io");
         assert!(result.is_none());
     }
 
@@ -537,9 +548,9 @@ mod tests {
             "# comment line\n\
              Real Title\tcccccccc-0000-0000-0000-000000000001\t500\n"
         ).unwrap();
-        let result = lookup_alias("# comment line", &titles_path);
+        let result = lookup_alias("# comment line", &titles_path).expect("io");
         assert!(result.is_none(), "comment lines must not match");
-        let result2 = lookup_alias("Real Title", &titles_path);
+        let result2 = lookup_alias("Real Title", &titles_path).expect("io");
         assert_eq!(result2.unwrap(), "cccccccc-0000-0000-0000-000000000001");
     }
 
@@ -552,7 +563,7 @@ mod tests {
              Valid Title\tdddddddd-0000-0000-0000-000000000001\t500\n\
              \n"
         ).unwrap();
-        let result = lookup_alias("Valid Title", &titles_path);
+        let result = lookup_alias("Valid Title", &titles_path).expect("io");
         assert_eq!(result.unwrap(), "dddddddd-0000-0000-0000-000000000001");
     }
 
@@ -560,7 +571,7 @@ mod tests {
     fn lookup_alias_missing_file_returns_none() {
         let tmp = TempDir::new().unwrap();
         let titles_path = tmp.path().join("nonexistent-titles.tsv");
-        let result = lookup_alias("anything", &titles_path);
+        let result = lookup_alias("anything", &titles_path).expect("io");
         assert!(result.is_none());
     }
 
@@ -672,11 +683,11 @@ mod tests {
         fs::write(&titles_path, &content).unwrap();
 
         // Verify lookup.
-        let found = lookup_alias("Rust Port Design", &titles_path);
+        let found = lookup_alias("Rust Port Design", &titles_path).expect("io");
         assert_eq!(found.unwrap(), sid);
 
         // Unknown alias.
-        let missing = lookup_alias("Nonexistent Title", &titles_path);
+        let missing = lookup_alias("Nonexistent Title", &titles_path).expect("io");
         assert!(missing.is_none());
     }
 

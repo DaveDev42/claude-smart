@@ -17,4 +17,4 @@ pub mod fzf;
 pub mod session;
 
 pub use account::AccountPicker;
-pub use session::SessionPicker;
+// SessionPicker is imported directly via `picker::session::SessionPicker`.

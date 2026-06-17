@@ -234,7 +234,12 @@ pub struct LaunchSpec {
     pub session_id: String,
     /// Absolute path to the `CLAUDE_CONFIG_DIR` for this launch.
     pub profile_dir: std::path::PathBuf,
-    /// Working directory to start claude in.
+    /// The cold-launch working directory. Carried for completeness/diagnostics;
+    /// the relaunch loop never re-applies it because every hop runs inside the
+    /// same supervisor process, so claude naturally inherits the original cwd
+    /// (hops change only the profile, not the directory). `main` uses cwd directly
+    /// for session scanning before building the spec.
+    #[allow(dead_code)]
     pub cwd: std::path::PathBuf,
     /// Full CLI to pass to claude (everything after `csm run [csm-flags]`).
     pub cli: Vec<OsString>,

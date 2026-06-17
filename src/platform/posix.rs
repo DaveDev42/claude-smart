@@ -35,6 +35,7 @@ fn claude_bin() -> OsString {
 // ─── PosixLauncher ────────────────────────────────────────────────────────────
 
 /// POSIX foreground supervisor.  See module-level doc for the full protocol.
+#[derive(Default)]
 pub struct PosixLauncher;
 
 impl Launcher for PosixLauncher {

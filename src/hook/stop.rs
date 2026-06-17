@@ -24,23 +24,10 @@ use std::path::Path;
 
 use anyhow::Context as _;
 
-/// Relaunch sentinel written atomically before the stop signal.
-///
-/// Legacy zsh wrote `hop` as a JSON **number** in `.relaunch`; the Rust binary
-/// continues this convention (i64, not a string) so a partially-upgraded machine
-/// can still read the sentinel with its old reader.
-#[derive(Debug, serde::Serialize, serde::Deserialize)]
-pub struct RelaunchSentinel {
-    pub session_id: String,
-    pub target_profile: String,
-    pub cwd: String,
-    pub handoff: String,
-    /// hop is a JSON number (not a string) — see §6 read-compat matrix.
-    pub hop: i64,
-    /// born epoch (seconds since UNIX_EPOCH) from the owning supervisor's `.pid` file.
-    /// The supervisor rejects sentinels with `born < launch_born` (stale-sentinel guard).
-    pub born: i64,
-}
+/// The relaunch sentinel format is owned by `platform::relaunch` (the supervisor's
+/// reader lives there too). Re-export it so the hook writes the EXACT same wire
+/// format the supervisor reads — a single SSOT prevents silent field/format drift.
+pub use crate::platform::relaunch::RelaunchSentinel;
 
 /// Execute the full commit sequence and then stop the managed process.
 ///
@@ -94,7 +81,7 @@ pub fn commit_and_stop(
         born: actual_born,
     };
 
-    write_relaunch_sentinel(sid, &sentinel)?;
+    crate::platform::relaunch::write_relaunch(&paths::relaunch(sid), &sentinel)?;
 
     // ── Step 3: noclobber .switched marker ───────────────────────────────────
     let switched_path = paths::switched(sid);
@@ -115,37 +102,16 @@ pub fn commit_and_stop(
     Ok(())
 }
 
-// ─── sentinel write ───────────────────────────────────────────────────────────
-
-/// Write the relaunch sentinel atomically (tmp+rename, same filesystem).
-fn write_relaunch_sentinel(sid: &str, sentinel: &RelaunchSentinel) -> anyhow::Result<()> {
-    use crate::paths;
-
-    let dest = paths::relaunch(sid);
-    let tmp = dest.with_extension("relaunch.tmp");
-    let json = serde_json::to_string(sentinel).context("failed to serialize relaunch sentinel")?;
-    std::fs::write(&tmp, &json).context("failed to write relaunch sentinel tmp")?;
-    std::fs::rename(&tmp, &dest).context("failed to rename relaunch sentinel into place")?;
-    Ok(())
-}
-
 // ─── sidecar hop helpers ─────────────────────────────────────────────────────
 
 /// Read the `hop` field from `<sid>.json`, tolerating both String and Number forms.
 /// Returns 0 on missing/corrupt sidecar (§6 compat: old zsh wrote hop as a JSON string).
+/// Delegates to the single `Sidecar::hop_int` SSOT so the String/Number tolerance
+/// rule lives in exactly one place (was triplicated across stop.rs/detect.rs/sidecar).
 fn read_sidecar_hop(sid: &str) -> i64 {
-    use crate::paths;
-    let Ok(content) = std::fs::read_to_string(paths::sidecar(sid)) else {
-        return 0;
-    };
-    let Ok(val) = serde_json::from_str::<serde_json::Value>(&content) else {
-        return 0;
-    };
-    match val.get("hop") {
-        Some(serde_json::Value::String(s)) => s.parse::<i64>().unwrap_or(0),
-        Some(serde_json::Value::Number(n)) => n.as_i64().unwrap_or(0),
-        _ => 0,
-    }
+    crate::sidecar::read_sidecar(&crate::paths::sidecar(sid))
+        .map(|s| s.hop_int())
+        .unwrap_or(0)
 }
 
 /// Merge `next_hop` into `<sid>.json` without clobbering other fields.

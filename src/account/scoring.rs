@@ -203,7 +203,7 @@ pub fn pick_best(
             // Equal pct → soonest reset epoch wins (shell lines 957–960).
             // A known epoch beats unknown; a smaller epoch (sooner) beats a larger.
             let new_wins = match (epoch, best_epoch) {
-                (Some(e), None) => true,           // known beats unknown
+                (Some(_), None) => true,           // known beats unknown
                 (Some(e), Some(be)) => e < be,     // smaller (sooner) wins
                 _ => false,                        // unknown doesn't beat known or equal unknown
             };
@@ -233,6 +233,10 @@ pub fn pick_best(
 ///
 /// Absent `session.pct` is encoded as [`ABSENT_SESSION_PCT`] (-1) (spec §2,
 /// shell `current-usage` lines 730–753).
+///
+/// Test-isolation helper: the production scorer inlines `data.current_usage`;
+/// this named wrapper lets unit tests assert the §2 encoding independently.
+#[allow(dead_code)]
 pub fn current_usage_pcts(data: &UsageData, profile: &str) -> Option<(i64, i64)> {
     data.current_usage(profile)
 }
@@ -245,6 +249,8 @@ pub fn current_usage_pcts(data: &UsageData, profile: &str) -> Option<(i64, i64)>
 /// - `week_all.pct >= SATURATION_PCT` (env-overridable).
 ///
 /// Used by tests to assert individual exclusion conditions independently.
+/// Test-isolation helper: the production scorer inlines the same three checks.
+#[allow(dead_code)]
 pub fn is_excluded(data: &UsageData, profile: &str) -> bool {
     let lim = limit_pct();
     let sat = saturation_pct();

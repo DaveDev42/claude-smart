@@ -35,6 +35,8 @@ pub fn is_claude_or_node_name(base: &str) -> bool {
 /// This impl is available on any platform where `sysinfo` is compiled in (all
 /// targets), but the `platform/mod.rs` dispatch wires it only for Windows-native.
 /// On Linux it is available as an alternative to `PosixProcCheck` if needed.
+/// (Dead on unix builds where `PosixProcCheck` is wired; live on Windows-native.)
+#[cfg_attr(unix, allow(dead_code))]
 pub struct SysinfoProcCheck;
 
 impl ProcCheck for SysinfoProcCheck {

@@ -14,7 +14,7 @@
 //!    - `ai-title` (last `{"type":"ai-title","aiTitle":"..."}` in the byte window),
 //!    - fall back to `last-prompt` (last `{"type":"last-prompt","lastPrompt":"..."}`)
 //!    - fall back to first user message text.
-//!    `mode` = last `permissionMode` seen across `"permission-mode"` or `"user"` records.
+//!      `mode` = last `permissionMode` seen across `"permission-mode"` or `"user"` records.
 //! 4. **Dedup by sid** — newest `mtime` wins (`>=` — not `>`).
 //! 5. **Output** — `Vec<SessionRow>` sorted newest-first.
 //!
@@ -74,11 +74,10 @@ pub fn scan_sessions(cwd: &Path) -> Vec<SessionRow> {
         if let Ok(entries) = fs::read_dir(dir) {
             for entry in entries.flatten() {
                 let p = entry.path();
-                if p.extension().and_then(|e| e.to_str()) == Some("jsonl") {
-                    if p.is_file() {
+                if p.extension().and_then(|e| e.to_str()) == Some("jsonl")
+                    && p.is_file() {
                         all_transcripts.push(p);
                     }
-                }
             }
         }
     }
@@ -148,7 +147,7 @@ pub fn scan_sessions(cwd: &Path) -> Vec<SessionRow> {
         .collect();
 
     // Sort newest-first by mtime (stable for deterministic ordering on ties).
-    rows.sort_by(|a, b| b.mtime.cmp(&a.mtime));
+    rows.sort_by_key(|b| std::cmp::Reverse(b.mtime));
     rows
 }
 
@@ -353,9 +352,8 @@ pub(crate) fn write_scan_index(
     // Write to a tmp file then atomically rename.
     let tmp_path = index_path.with_extension(format!("tmp{}", std::process::id()));
     fs::write(&tmp_path, &content)?;
-    fs::rename(&tmp_path, index_path).map_err(|e| {
+    fs::rename(&tmp_path, index_path).inspect_err(|_| {
         let _ = fs::remove_file(&tmp_path);
-        e
     })
 }
 

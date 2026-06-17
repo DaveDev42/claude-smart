@@ -87,6 +87,7 @@ unsafe extern "system" fn console_ctrl_handler(ctrl_type: u32) -> BOOL {
 }
 
 /// Windows console-control supervisor.  See module-level doc for the protocol.
+#[derive(Default)]
 pub struct WindowsLauncher;
 
 impl Launcher for WindowsLauncher {

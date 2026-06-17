@@ -11,7 +11,7 @@ mod statusline;
 mod usage;
 
 use std::ffi::OsString;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::Context as _;
 use uuid::Uuid;
@@ -46,6 +46,24 @@ fn main() -> anyhow::Result<()> {
         rest = &args[1..];
     } else if args.len() >= 2 {
         let candidate = args[1].to_string_lossy();
+        // Top-level `--version`/`-V` and `--help`/`-h` belong to csm itself, not to
+        // claude. (To pass these through to claude, use `csm run -- --version`.)
+        // Intercept only when they are the very first token so `csm run --help`
+        // routing into cmd_run's own usage still works.
+        match candidate.as_ref() {
+            "--version" | "-V" => {
+                println!("csm {}", env!("CARGO_PKG_VERSION"));
+                return Ok(());
+            }
+            "--help" | "-h" => {
+                println!("csm {} — claude-smart launcher\n", env!("CARGO_PKG_VERSION"));
+                println!("usage: csm <run|hook|cas|pick-account|scan|current-usage|sidecar|statusline|completions|newuuid>");
+                println!("       csm [claude-flags...]        (bare = implicit `csm run`)");
+                println!("       csm run [csm-flags] [-- claude-passthru...]");
+                return Ok(());
+            }
+            _ => {}
+        }
         match candidate.as_ref() {
             "run"
             | "hook"
@@ -112,7 +130,7 @@ fn main() -> anyhow::Result<()> {
 ///   - interactive (isatty(0) && isatty(1))
 ///   - proactive pick context (not `--profile` / not `--no-pick`)
 ///   - `pick_account` returned `Err(FetchFailed)`
-///   NOT when hook / `--profile` / `--no-pick` / non-interactive.
+///     NOT when hook / `--profile` / `--no-pick` / non-interactive.
 fn cmd_run(args: &[OsString]) -> anyhow::Result<()> {
     use cli::parser::{parse, ResumeArg};
     use platform::relaunch::LaunchSpec;
@@ -311,7 +329,7 @@ fn derive_current_profile_name(profiles: &account::ProfileMap) -> String {
         .file_name()
         .and_then(|n| n.to_str())
         .map(|n| n.strip_prefix(".claude.").unwrap_or(n).to_owned())
-        .unwrap_or_else(|| cas::default_profile())
+        .unwrap_or_else(cas::default_profile)
 }
 
 /// Proactive account pick with hub-down picker fallback (spec §4a).
@@ -366,11 +384,11 @@ fn proactive_pick_profile(
 /// Non-interactive → silent fail-safe to current profile.
 fn hub_down_pick(
     profiles: &account::ProfileMap,
-    current_dir: &PathBuf,
+    current_dir: &Path,
 ) -> anyhow::Result<PathBuf> {
     // TTY gate: isatty(0) && isatty(1) — matches zsh `[[ -t 0 && -t 1 ]]`.
     if !is_interactive() {
-        return Ok(current_dir.clone());
+        return Ok(current_dir.to_path_buf());
     }
 
     let rows = build_account_rows(profiles);
@@ -382,7 +400,7 @@ fn hub_down_pick(
                 .context("csm: hub-down picker — selected profile not in map")?;
             Ok(PathBuf::from(dir))
         }
-        None => Ok(current_dir.clone()),
+        None => Ok(current_dir.to_path_buf()),
     }
 }
 
@@ -880,25 +898,6 @@ fn cmd_completions(args: &[OsString]) -> anyhow::Result<()> {
 
 // ─── PlatformLauncher Default impl ────────────────────────────────────────────
 
-// `PlatformLauncher` is a type alias to `PosixLauncher` (unix) or
-// `WindowsLauncher` (Windows).  Both are unit structs with no fields.
-// We provide a `Default` impl here so `cmd_run` can use `PlatformLauncher {}`.
-// If the parallel implementer adds fields to the launcher, this impl must be
-// updated.
-
-#[cfg(unix)]
-impl Default for platform::posix::PosixLauncher {
-    fn default() -> Self {
-        platform::posix::PosixLauncher {}
-    }
-}
-
-#[cfg(windows)]
-impl Default for platform::windows::WindowsLauncher {
-    fn default() -> Self {
-        platform::windows::WindowsLauncher {}
-    }
-}
 
 // ─── tests ────────────────────────────────────────────────────────────────────
 

@@ -145,7 +145,7 @@ fn do_network_fetch() -> Result<UsageData, FetchError> {
     // Shell lines 699–708: `out="$(timeout $SSH_DEADLINE ssh … 'cat "$HOME/claude-code-usage/cache/usage-limits.json"')"`.
     #[cfg(unix)]
     {
-        return ssh_fetch();
+        ssh_fetch()
     }
 
     // Windows: HTTP is the only transport.
@@ -517,6 +517,8 @@ fn write_positive_cache(data: &UsageData) -> Result<(), FetchError> {
 
 /// Return the age of `path` in seconds (wall clock now − mtime).
 /// Returns `Err(FetchError::Io)` if the metadata cannot be read.
+/// Test-only: production paths call `file_age_secs_from_meta` to avoid a second `stat`.
+#[cfg(test)]
 fn file_age_secs(path: &std::path::Path) -> Result<u64, FetchError> {
     let meta = std::fs::metadata(path)?;
     Ok(file_age_secs_from_meta(&meta))

@@ -104,8 +104,11 @@ impl Sidecar {
         }
     }
 
-    /// Return a `Value::Number` representation of the given hop count, suitable
-    /// for writing into a new sidecar.
+    /// Return a `Value::Number` representation of the given hop count.
+    /// Test-only constructor: production hop writes use the legacy JSON **string**
+    /// form (`jq --arg` compat, see `merge_sidecar_hop`), so this Number form is
+    /// only used to build `Sidecar` fixtures in unit tests.
+    #[cfg(test)]
     pub fn hop_value(n: i64) -> serde_json::Value {
         serde_json::Value::Number(serde_json::Number::from(n))
     }

@@ -10,6 +10,10 @@ use std::process::ExitStatus;
 /// compare a stored `born` value against the current pidfile to confirm they are
 /// looking at the same incarnation of the process and not a recycled PID.
 pub struct ChildHandle {
+    /// PID of the spawned child. Already written to `<sid>.pid` at spawn time,
+    /// so the relaunch loop reads `born` (not `pid`) from the handle; kept for
+    /// diagnostics and any future clobber-guard cross-check.
+    #[allow(dead_code)]
     pub pid: u32,
     pub born: i64,
 }

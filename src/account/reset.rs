@@ -174,11 +174,11 @@ fn is_bare_time(s: &str) -> bool {
     if let Some(colon_pos) = digits_part.find(':') {
         let hour = &digits_part[..colon_pos];
         let min = &digits_part[colon_pos + 1..];
-        hour.len() >= 1 && hour.len() <= 2 && hour.chars().all(|c| c.is_ascii_digit())
+        !hour.is_empty() && hour.len() <= 2 && hour.chars().all(|c| c.is_ascii_digit())
             && min.len() == 2 && min.chars().all(|c| c.is_ascii_digit())
     } else {
         // No colon — must be 1 or 2 digits
-        digits_part.len() >= 1 && digits_part.len() <= 2 && digits_part.chars().all(|c| c.is_ascii_digit())
+        !digits_part.is_empty() && digits_part.len() <= 2 && digits_part.chars().all(|c| c.is_ascii_digit())
     }
 }
 

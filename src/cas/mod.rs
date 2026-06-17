@@ -139,22 +139,6 @@ impl Shell {
         }
     }
 
-    /// Emit a shell snippet that prints an informational `msg` to stdout.
-    ///
-    /// Used for `Op::Status` progress messages (not eval-able; the shim should
-    /// NOT eval this path).
-    pub fn info_snippet(&self, msg: &str) -> String {
-        match self {
-            Shell::Zsh => {
-                let escaped = msg.replace('\'', "'\\''");
-                format!("printf '%s\\n' '{escaped}'")
-            }
-            Shell::Pwsh => {
-                let escaped = msg.replace('\'', "''");
-                format!("Write-Host '{escaped}'")
-            }
-        }
-    }
 }
 
 // ─── default state-file path ─────────────────────────────────────────────────
@@ -446,7 +430,14 @@ fn print_status(_shell: Shell, profiles: &ProfileMap) -> anyhow::Result<()> {
     };
 
     println!("current shell:  {current_name} ({shell_state})");
-    println!("global default: {default} (~/.config/claude-as/default)");
+    // Show the RESOLVED config dir of the default profile (not a hardcoded path),
+    // so the user can see where the default actually points — falls back to the
+    // pointer-file location when the dir can't be resolved.
+    if default_dir.is_empty() {
+        println!("global default: {default} (~/.config/claude-as/default)");
+    } else {
+        println!("global default: {default} ({default_dir})");
+    }
     println!("available:");
 
     if profiles.is_empty() {
@@ -792,7 +783,7 @@ mod tests {
     #[test]
     fn parse_args_switch_personal() {
         let args = ["--eval", "--shell", "zsh", "--", "personal"];
-        let (shell, op) = parse_cas_args(&args).unwrap();
+        let (shell, op) = parse_cas_args_for_test(&args).unwrap();
         assert_eq!(shell, Shell::Zsh);
         assert_eq!(op, Op::Switch { profile: "personal".to_owned() });
     }
@@ -800,7 +791,7 @@ mod tests {
     #[test]
     fn parse_args_switch_work() {
         let args = ["--eval", "--shell", "zsh", "--", "work"];
-        let (shell, op) = parse_cas_args(&args).unwrap();
+        let (shell, op) = parse_cas_args_for_test(&args).unwrap();
         assert_eq!(shell, Shell::Zsh);
         assert_eq!(op, Op::Switch { profile: "work".to_owned() });
     }
@@ -808,7 +799,7 @@ mod tests {
     #[test]
     fn parse_args_switch_pwsh() {
         let args = ["--eval", "--shell", "pwsh", "--", "personal"];
-        let (shell, op) = parse_cas_args(&args).unwrap();
+        let (shell, op) = parse_cas_args_for_test(&args).unwrap();
         assert_eq!(shell, Shell::Pwsh);
         assert_eq!(op, Op::Switch { profile: "personal".to_owned() });
     }
@@ -816,7 +807,7 @@ mod tests {
     #[test]
     fn parse_args_minus() {
         let args = ["--eval", "--shell", "zsh", "--", "-"];
-        let (shell, op) = parse_cas_args(&args).unwrap();
+        let (shell, op) = parse_cas_args_for_test(&args).unwrap();
         assert_eq!(shell, Shell::Zsh);
         assert_eq!(op, Op::Minus);
     }
@@ -824,7 +815,7 @@ mod tests {
     #[test]
     fn parse_args_global() {
         let args = ["--eval", "--shell", "zsh", "--", "-g", "personal"];
-        let (shell, op) = parse_cas_args(&args).unwrap();
+        let (shell, op) = parse_cas_args_for_test(&args).unwrap();
         assert_eq!(shell, Shell::Zsh);
         assert_eq!(op, Op::Global { profile: "personal".to_owned() });
     }
@@ -832,7 +823,7 @@ mod tests {
     #[test]
     fn parse_args_global_long_form() {
         let args = ["--eval", "--shell", "zsh", "--", "--global", "work"];
-        let (shell, op) = parse_cas_args(&args).unwrap();
+        let (shell, op) = parse_cas_args_for_test(&args).unwrap();
         assert_eq!(shell, Shell::Zsh);
         assert_eq!(op, Op::Global { profile: "work".to_owned() });
     }
@@ -840,7 +831,7 @@ mod tests {
     #[test]
     fn parse_args_resync() {
         let args = ["--eval", "--shell", "zsh", "--", "resync"];
-        let (shell, op) = parse_cas_args(&args).unwrap();
+        let (shell, op) = parse_cas_args_for_test(&args).unwrap();
         assert_eq!(shell, Shell::Zsh);
         assert_eq!(op, Op::Resync);
     }
@@ -848,7 +839,7 @@ mod tests {
     #[test]
     fn parse_args_status() {
         let args = ["--eval", "--shell", "zsh", "--", "status"];
-        let (shell, op) = parse_cas_args(&args).unwrap();
+        let (shell, op) = parse_cas_args_for_test(&args).unwrap();
         assert_eq!(shell, Shell::Zsh);
         assert_eq!(op, Op::Status { print_current: false });
     }
@@ -856,7 +847,7 @@ mod tests {
     #[test]
     fn parse_args_status_print_current() {
         let args = ["--eval", "--shell", "zsh", "--", "status", "--print-current"];
-        let (shell, op) = parse_cas_args(&args).unwrap();
+        let (shell, op) = parse_cas_args_for_test(&args).unwrap();
         assert_eq!(shell, Shell::Zsh);
         assert_eq!(op, Op::Status { print_current: true });
     }
@@ -865,7 +856,7 @@ mod tests {
     fn parse_args_no_shell_defaults_to_zsh() {
         // When --shell is absent (bare call), default to zsh.
         let args = ["--eval", "--", "personal"];
-        let (shell, op) = parse_cas_args(&args).unwrap();
+        let (shell, op) = parse_cas_args_for_test(&args).unwrap();
         assert_eq!(shell, Shell::Zsh);
         assert_eq!(op, Op::Switch { profile: "personal".to_owned() });
     }
@@ -874,39 +865,29 @@ mod tests {
     fn parse_args_no_args_is_status() {
         // Bare `csm cas` (no --shell, no --) → status.
         let args: [&str; 0] = [];
-        let (_, op) = parse_cas_args(&args).unwrap();
+        let (_, op) = parse_cas_args_for_test(&args).unwrap();
         assert_eq!(op, Op::Status { print_current: false });
     }
 
     #[test]
     fn parse_args_global_missing_profile_errors() {
         let args = ["--eval", "--shell", "zsh", "--", "-g"];
-        let result = parse_cas_args(&args);
+        let result = parse_cas_args_for_test(&args);
         assert!(result.is_err(), "expected error for -g without profile");
     }
 }
 
-// ─── parse_cas_args (public for testing) ─────────────────────────────────────
+// ─── test-only grammar fixture ────────────────────────────────────────────────
+//
+// The production cas argument parser is `parse_cas_flags` + `parse_cas_op` in
+// `main.rs` and is the SSOT. The function below is a TEST-ONLY fixture that
+// mirrors the grammar so the 12 unit tests below can exercise the (Shell, Op)
+// outcome combinations without needing access to main.rs's private functions.
+// It is gated `#[cfg(test)]` so it never appears in release builds and does
+// not produce a dead-code warning.
 
-/// Parse the argument slice for `csm cas`.
-///
-/// This is the hand-rolled parser used by `cmd_cas` in `main.rs`. It is
-/// `pub(crate)` so tests in this module can call it directly.
-///
-/// Argument forms (everything after `csm cas`):
-///
-/// ```text
-/// [--eval] [--shell {zsh|bash|pwsh}] [--] <profile>
-/// [--eval] [--shell {zsh|bash|pwsh}] [--] -
-/// [--eval] [--shell {zsh|bash|pwsh}] [--] -g <profile>
-/// [--eval] [--shell {zsh|bash|pwsh}] [--] --global <profile>
-/// [--eval] [--shell {zsh|bash|pwsh}] [--] resync
-/// [--eval] [--shell {zsh|bash|pwsh}] [--] status [--print-current]
-/// [--eval] [--shell {zsh|bash|pwsh}] [--]           ← bare → Status
-/// ```
-///
-/// Returns `(Shell, Op)`.
-pub(crate) fn parse_cas_args<S: AsRef<str>>(args: &[S]) -> anyhow::Result<(Shell, Op)> {
+#[cfg(test)]
+fn parse_cas_args_for_test<S: AsRef<str>>(args: &[S]) -> anyhow::Result<(Shell, Op)> {
     let mut shell = Shell::Zsh; // default
     let mut i = 0;
     let n = args.len();
@@ -916,8 +897,6 @@ pub(crate) fn parse_cas_args<S: AsRef<str>>(args: &[S]) -> anyhow::Result<(Shell
         let a = args[i].as_ref();
         match a {
             "--eval" => {
-                // Consumed; eval mode is the only mode — this flag is a no-op
-                // marker that signals "the shim is calling us". We accept it.
                 i += 1;
             }
             "--shell" => {
@@ -932,12 +911,10 @@ pub(crate) fn parse_cas_args<S: AsRef<str>>(args: &[S]) -> anyhow::Result<(Shell
                 i += 1;
             }
             "--" => {
-                // End of csm-level flags; everything after is the user command.
                 i += 1;
                 break;
             }
             _ => {
-                // No `--` separator — the rest are user args directly.
                 break;
             }
         }
@@ -945,7 +922,6 @@ pub(crate) fn parse_cas_args<S: AsRef<str>>(args: &[S]) -> anyhow::Result<(Shell
 
     // Parse the user command (after `--` or the last csm flag).
     if i >= n {
-        // No user args → bare `cas` → status display.
         return Ok((shell, Op::Status { print_current: false }));
     }
 
@@ -973,7 +949,6 @@ pub(crate) fn parse_cas_args<S: AsRef<str>>(args: &[S]) -> anyhow::Result<(Shell
         }
 
         profile => {
-            // Any other argument is treated as a profile name.
             Ok((shell, Op::Switch { profile: profile.to_owned() }))
         }
     }

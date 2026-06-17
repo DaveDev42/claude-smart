@@ -119,14 +119,8 @@ fn render_display(data: &StaleProfileData, stale: Option<&str>) -> String {
     // Build the usage part from whatever sections are available.
     let mut parts = Vec::new();
 
-    match data.session_pct {
-        Some(pct) => parts.push(format!("session {pct}%")),
-        None => {}
-    }
-    match data.week_all_pct {
-        Some(pct) => parts.push(format!("week {pct}%")),
-        None => {}
-    }
+    if let Some(pct) = data.session_pct { parts.push(format!("session {pct}%")) }
+    if let Some(pct) = data.week_all_pct { parts.push(format!("week {pct}%")) }
     if let Some(ref resets) = data.resets {
         parts.push(format!("resets {resets}"));
     }

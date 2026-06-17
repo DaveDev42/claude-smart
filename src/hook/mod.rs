@@ -24,8 +24,6 @@ use std::path::Path;
 
 use anyhow::Context as _;
 
-pub use detect::HookInput;
-
 /// Entry point for `csm hook [--owner <profile_dir>]`.
 ///
 /// `owner_dir` is the profile directory (value of CLAUDE_CONFIG_DIR for the hook's

@@ -100,9 +100,15 @@ pub fn format_segment(host: String, personal: bool) -> String {
                 .file_name()
                 .map(|n| n.to_string_lossy().into_owned())
                 .unwrap_or_default();
-            match base.strip_prefix(".claude.") {
-                Some(label) => format!("{label}@{host}"),
-                None => host,
+            // Only a `.claude.<profile>` dir gets a profile label; any other dir
+            // shows the bare host. `strip_claude_prefix` returns the input unchanged
+            // when the prefix is absent, so detect that case to preserve the
+            // label-only-for-managed-profiles behavior.
+            let label = strip_claude_prefix(&base);
+            if label != base {
+                format!("{label}@{host}")
+            } else {
+                host
             }
         }
     }
@@ -117,6 +123,11 @@ pub fn format_segment(host: String, personal: bool) -> String {
 /// - Take `basename($CLAUDE_CONFIG_DIR)`.
 /// - If the basename starts with `.claude.`, strip that prefix.
 /// - Otherwise return the raw basename.
+///
+/// Tested helper; `format_segment` is the live statusline path. Reserved for a
+/// future profile-name display (e.g. `csm cas` status) that wants the raw label
+/// without the `@host` suffix.
+#[allow(dead_code)]
 pub fn current_profile() -> Result<String> {
     let dir = std::env::var_os("CLAUDE_CONFIG_DIR");
     match dir {
@@ -159,7 +170,7 @@ pub fn strip_claude_prefix(s: &str) -> &str {
 /// Mirrors:
 /// - sh:   `host=$(hostname -s); host="${host#Dave-}"`  (case-sensitive strip)
 /// - ps1:  `$host = [Environment]::MachineName; if ($host -like 'Dave-*') { … }`
-///         (`-like` is case-insensitive on Windows — `DAVE-WINDOWS` → `WINDOWS`)
+///   (`-like` is case-insensitive on Windows — `DAVE-WINDOWS` → `WINDOWS`)
 pub fn short_hostname() -> Result<String> {
     let raw = hostname()?;
     Ok(strip_dave_prefix(raw))
