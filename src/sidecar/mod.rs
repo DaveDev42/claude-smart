@@ -255,6 +255,10 @@ fn is_empty_patch(p: &Sidecar) -> bool {
 }
 
 /// Atomic write: serialize `sidecar` to `<path>.tmp`, then rename to `path`.
+///
+/// Mirrors the shell's `printf '%s' "$existing" | jq ... > "$tmp" && mv -f "$tmp" "$f" || rm -f "$tmp"`:
+/// on any failure after the tmp is created, the tmp is cleaned up so a failed write
+/// never leaves a stale partial file at `<path>.tmp`.
 fn write_atomic(path: &Path, sidecar: &Sidecar) -> Result<(), SidecarError> {
     // Ensure the parent directory exists.
     if let Some(parent) = path.parent() {
@@ -262,10 +266,17 @@ fn write_atomic(path: &Path, sidecar: &Sidecar) -> Result<(), SidecarError> {
     }
 
     let tmp = path.with_extension("json.tmp");
-    let json = serde_json::to_string_pretty(sidecar)?;
-    std::fs::write(&tmp, json)?;
-    std::fs::rename(&tmp, path)?;
-    Ok(())
+    let json = serde_json::to_string(sidecar)?;
+    // If any step after this fails, clean up the tmp (best-effort).
+    let result = (|| -> Result<(), SidecarError> {
+        std::fs::write(&tmp, &json)?;
+        std::fs::rename(&tmp, path)?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result
 }
 
 // ─── tests ────────────────────────────────────────────────────────────────────
@@ -639,5 +650,157 @@ mod tests {
         let s2 = read_sidecar(&path).unwrap();
         assert!(s2.extra.contains_key("unknownFutureKey"),
             "unknown future key should survive write_sidecar round-trip");
+    }
+
+    #[test]
+    fn write_atomic_uses_tmp_then_renames() {
+        // Verify atomic write: after write_sidecar the .json.tmp file is gone
+        // and the .json file has valid content. During the write, the tmp is at
+        // `<path>.tmp` on the same filesystem (same dir), so rename is atomic.
+        let dir = TempDir::new().unwrap();
+        let path = tmp_sidecar(&dir, "atomic.json");
+        let tmp_path = dir.path().join("atomic.json.tmp");
+
+        let s = Sidecar {
+            session_id: Some("atomic-test".to_owned()),
+            hop: Some(Sidecar::hop_value(1)),
+            ..Default::default()
+        };
+        write_sidecar(&path, &s).unwrap();
+
+        // Tmp must be gone after a successful write.
+        assert!(!tmp_path.exists(), ".json.tmp must be cleaned up after rename");
+        // The canonical file must be readable.
+        let read_back = read_sidecar(&path).unwrap();
+        assert_eq!(read_back.session_id.as_deref(), Some("atomic-test"));
+        assert_eq!(read_back.hop_int(), 1);
+    }
+
+    #[test]
+    fn write_sidecar_compact_json() {
+        // Shell writes compact single-line JSON (jq -c); Rust must match so the
+        // on-disk format is consistent with legacy zsh-written sidecars.
+        let dir = TempDir::new().unwrap();
+        let path = tmp_sidecar(&dir, "compact.json");
+        let s = Sidecar {
+            session_id: Some("sid".to_owned()),
+            effort: Some("max".to_owned()),
+            ..Default::default()
+        };
+        write_sidecar(&path, &s).unwrap();
+        let raw = std::fs::read_to_string(&path).unwrap();
+        // Must not contain newlines (compact, not pretty-printed).
+        assert!(!raw.contains('\n'), "sidecar JSON must be compact (no newlines); got: {raw}");
+    }
+
+    #[test]
+    fn merge_sidecar_noop_when_all_none() {
+        // merge_sidecar with a fully-None patch must not touch the file at all
+        // (no mtime change, no I/O). This is the "no-op on empty value" contract
+        // from the shell's: `[ -z "$value" ] && return 0`.
+        let dir = TempDir::new().unwrap();
+        let path = tmp_sidecar(&dir, "sid.json");
+        write_sidecar(
+            &path,
+            &Sidecar {
+                session_id: Some("existing".to_owned()),
+                effort: Some("high".to_owned()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let mtime_before = std::fs::metadata(&path).and_then(|m| m.modified()).unwrap();
+        merge_sidecar(&path, &Sidecar::default()).unwrap();
+        let mtime_after = std::fs::metadata(&path).and_then(|m| m.modified()).unwrap();
+        assert_eq!(mtime_before, mtime_after, "no-op merge must not modify file mtime");
+    }
+
+    #[test]
+    fn hop_preserved_across_write_and_merge_chain() {
+        // Simulate the real limit-switch sequence:
+        // 1. hook writes hop=1 via merge_sidecar,
+        // 2. resumed claude-smart calls write_sidecar to record new mode/effort
+        //    (WITHOUT a hop field),
+        // 3. hop must still be 1 after step 2.
+        let dir = TempDir::new().unwrap();
+        let path = tmp_sidecar(&dir, "sid.json");
+
+        // Step 0: initial sidecar with mode.
+        write_sidecar(
+            &path,
+            &Sidecar {
+                session_id: Some("sid".to_owned()),
+                permission_mode: Some("default".to_owned()),
+                ..Default::default()
+            },
+        ).unwrap();
+
+        // Step 1: hook increments hop to 1 via merge.
+        merge_sidecar(
+            &path,
+            &Sidecar {
+                hop: Some(Sidecar::hop_value(1)),
+                ..Default::default()
+            },
+        ).unwrap();
+        assert_eq!(read_sidecar(&path).unwrap().hop_int(), 1);
+
+        // Step 2: wrapper writes updated mode WITHOUT a hop field.
+        write_sidecar(
+            &path,
+            &Sidecar {
+                permission_mode: Some("bypassPermissions".to_owned()),
+                effort: Some("max".to_owned()),
+                ..Default::default()
+            },
+        ).unwrap();
+
+        let result = read_sidecar(&path).unwrap();
+        assert_eq!(result.hop_int(), 1, "hop must survive write_sidecar without hop field");
+        assert_eq!(result.permission_mode.as_deref(), Some("bypassPermissions"));
+        assert_eq!(result.effort.as_deref(), Some("max"));
+    }
+
+    #[test]
+    fn sidecar_flags_no_default_effort_injection() {
+        // On resume: no effort flag is emitted if effort is absent from sidecar.
+        // The spec says "no default-effort injection — floor lives in settings.json".
+        let s = Sidecar {
+            permission_mode: Some("acceptEdits".to_owned()),
+            // effort intentionally absent
+            model: Some("claude-opus-4-5".to_owned()),
+            ..Default::default()
+        };
+        let flags = s.sidecar_flags();
+        // Should have --permission-mode + value + --model + value = 4 items, no --effort.
+        assert_eq!(flags.len(), 4);
+        let flag_strs: Vec<String> = flags.iter()
+            .map(|f| f.to_string_lossy().into_owned())
+            .collect();
+        assert!(!flag_strs.contains(&"--effort".to_owned()), "--effort must not appear if absent from sidecar");
+    }
+
+    #[test]
+    fn write_sidecar_corrupt_existing_starts_fresh() {
+        // If the existing sidecar is corrupt, write_sidecar must treat it as {}
+        // (not propagate garbage). This mirrors the shell's:
+        //   `printf '%s' "$existing" | "$JQ" -e . >/dev/null 2>&1 || existing="{}"`
+        let dir = TempDir::new().unwrap();
+        let path = tmp_sidecar(&dir, "sid.json");
+        std::fs::write(&path, b"{{corrupt{{").unwrap();
+
+        let patch = Sidecar {
+            session_id: Some("new-sid".to_owned()),
+            effort: Some("low".to_owned()),
+            ..Default::default()
+        };
+        write_sidecar(&path, &patch).unwrap();
+
+        let result = read_sidecar(&path).unwrap();
+        assert_eq!(result.session_id.as_deref(), Some("new-sid"));
+        assert_eq!(result.effort.as_deref(), Some("low"));
+        // No garbage from the corrupt original.
+        assert!(result.extra.is_empty(), "corrupt original must not leak into new sidecar");
     }
 }

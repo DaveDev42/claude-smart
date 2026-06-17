@@ -15,4 +15,4 @@ pub mod parser;
 
 // Re-export the primary types so callers can write `crate::cli::ParsedArgs`
 // without knowing the sub-module layout.
-pub use parser::{Flags, ParsedArgs};
+pub use parser::{Flags, ParsedArgs, ResumeArg};

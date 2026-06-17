@@ -17,17 +17,30 @@
 //! ```text
 //! <title_alias>\t<sid>\t<mtime_epoch>
 //! ```
-//! Lines starting with `#` are comments and are ignored.
+//! Lines starting with `#` are comments and are ignored.  Blank lines are
+//! ignored.
 //!
-//! Lookup is **case-insensitive**, first-match wins (file is written
-//! newest-first by mtime, so the most recent match is returned).
+//! Lookup is **exact-match** on the title column (shell `_lookup_alias` uses
+//! `awk -v a="$1" '$1==a`).  When multiple rows share the same title, the
+//! row with the highest `mtime` wins (matching `_lookup_alias`'s
+//! `>= m` awk accumulator).
 //!
-//! ## Phase 0
+//! ## Lazy incremental index maintenance (mirrors `resolve_alias`, lines 459–492)
 //!
-//! The body of `resolve_alias` is `unimplemented!()` — the `titles.tsv` writer
-//! lives in `session/scan.rs` (Phase 5).  The signature and error type are final.
+//! - **No index yet** → build synchronously (first use pays once).
+//! - **Index stale** (older than TTL, default 300 s) and alias **found** →
+//!   answer from the current index immediately, refresh in the background.
+//! - **Index stale** and alias **not found** → rebuild synchronously, retry
+//!   once (the alias may be a just-applied `/title` the index predates).
+//! - **Index fresh** and alias **not found** → hard `Err(AliasError::NotFound)`.
+//!
+//! The background refresh is fire-and-forget (`std::thread::spawn`), matching
+//! the shell's `( reindex_titles >/dev/null 2>&1 & )`.
 
 use crate::paths;
+use std::fs;
+use std::path::PathBuf;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 
 /// Errors from alias resolution.
@@ -40,36 +53,77 @@ pub enum AliasError {
     /// `titles.tsv` could not be read (I/O error).
     #[error("failed to read titles.tsv at {path}: {source}")]
     Io {
-        path: std::path::PathBuf,
+        path: PathBuf,
         #[source]
         source: std::io::Error,
     },
 }
 
+/// Default titles index TTL in seconds (matches `CLAUDE_TITLE_INDEX_TTL:-300`).
+const DEFAULT_TITLE_INDEX_TTL: u64 = 300;
+
 /// Resolve a session title alias to a canonical UUID `sid`.
 ///
 /// If `name` is already UUID-shaped (36-char, hyphen-delimited hex), it is
 /// returned as-is without touching the file.  Otherwise `titles.tsv` is
-/// searched case-insensitively, and the **first** matching `sid` is returned.
+/// searched for an exact match on the title column; the row with the highest
+/// `mtime` wins.
 ///
 /// Returns `Err(AliasError::NotFound)` when no match is found — this is a hard
-/// error; the caller must not silently start a fresh session.
+/// error; the caller must not silently start a fresh session (spec N6).
 ///
-/// ## Phase 0
-///
-/// Body is `unimplemented!()`.  Signature and error type are final.
+/// Mirrors `resolve_alias` in `claude-smart-helper.sh.j2` (lines 459–492).
 pub fn resolve_alias(name: &str) -> Result<String, AliasError> {
     // Fast path: already a UUID — no file I/O needed.
     if looks_like_uuid(name) {
         return Ok(name.to_owned());
     }
 
-    // Slow path: look up in titles.tsv.
-    let _titles_path = paths::titles_tsv();
-    unimplemented!(
-        "resolve_alias: read titles.tsv, case-insensitive match on title column, \
-         return first sid; hard error on miss (Phase 5 — spec N6)"
-    )
+    let titles_path = paths::titles_tsv();
+    let ttl = read_ttl_from_env();
+
+    // No index yet → build synchronously (first use pays once).
+    // Mirrors: `[ -f "$TITLES_INDEX" ] || reindex_titles`
+    if !titles_path.exists() {
+        reindex_titles();
+    }
+
+    // Check staleness.
+    let stale = is_index_stale(&titles_path, ttl);
+
+    // Try a lookup.
+    let sid = lookup_alias(name, &titles_path);
+
+    match sid {
+        Some(found) => {
+            // Hit: answer from the current index immediately.
+            // If stale, refresh in the background so the NEXT call sees fresh data.
+            // Mirrors: `if [ -n "$sid" ]; then [ "$stale" = true ] && ( reindex_titles & )`
+            if stale {
+                let tp = titles_path.clone();
+                std::thread::spawn(move || {
+                    let _ = tp; // keep path alive in the thread
+                    reindex_titles();
+                });
+            }
+            Ok(found)
+        }
+        None => {
+            if stale {
+                // Miss on stale index → the alias may be a just-applied title.
+                // Rebuild synchronously and retry once.
+                // Mirrors: `if [ "$stale" = true ]; then reindex_titles; _lookup_alias "$alias"; fi`
+                reindex_titles();
+                match lookup_alias(name, &titles_path) {
+                    Some(found) => Ok(found),
+                    None => Err(AliasError::NotFound { alias: name.to_owned() }),
+                }
+            } else {
+                // Miss on fresh index → genuine unknown alias.
+                Err(AliasError::NotFound { alias: name.to_owned() })
+            }
+        }
+    }
 }
 
 /// Return `true` if `s` looks like a UUID — 36 characters in the
@@ -80,8 +134,6 @@ pub fn resolve_alias(name: &str) -> Result<String, AliasError> {
 /// 18, 23 are hyphens and all other characters are ASCII hex digits.  A real
 /// UUID parser would be stricter; for the alias-bypass check this is sufficient
 /// and allocation-free.
-///
-/// This function is **always fully implemented** (pure, trivial).
 pub fn looks_like_uuid(s: &str) -> bool {
     let b = s.as_bytes();
     if b.len() != 36 {
@@ -94,7 +146,7 @@ pub fn looks_like_uuid(s: &str) -> bool {
     // All other positions must be ASCII hex digits.
     for (i, &c) in b.iter().enumerate() {
         if i == 8 || i == 13 || i == 18 || i == 23 {
-            continue; // already checked above
+            continue;
         }
         if !c.is_ascii_hexdigit() {
             return false;
@@ -103,13 +155,285 @@ pub fn looks_like_uuid(s: &str) -> bool {
     true
 }
 
+// ─── titles.tsv lookup ────────────────────────────────────────────────────────
+
+/// Look up an exact-match alias in `titles.tsv`.
+///
+/// `titles.tsv` format: `<title>\t<sid>\t<mtime>` per line.
+/// Returns the `sid` of the row with the highest `mtime` whose title == `alias`.
+///
+/// Mirrors `_lookup_alias` (helper lines 453–457):
+/// ```awk
+/// awk -F'\t' -v a="$1" '$1==a && $3+0>=m+0 {m=$3; s=$2} END{if(s)print s}'
+/// ```
+fn lookup_alias(alias: &str, titles_path: &PathBuf) -> Option<String> {
+    let content = fs::read_to_string(titles_path).ok()?;
+    let mut best_mtime: i64 = -1;
+    let mut best_sid: Option<String> = None;
+
+    for line in content.lines() {
+        if line.starts_with('#') || line.is_empty() {
+            continue;
+        }
+        let mut cols = line.splitn(3, '\t');
+        let title = cols.next().unwrap_or("");
+        let sid = cols.next().unwrap_or("");
+        let mtime: i64 = cols.next().unwrap_or("0").trim().parse().unwrap_or(0);
+
+        if title == alias && !sid.is_empty() && mtime >= best_mtime {
+            best_mtime = mtime;
+            best_sid = Some(sid.to_owned());
+        }
+    }
+    best_sid
+}
+
+// ─── titles index rebuild ─────────────────────────────────────────────────────
+
+/// (Re)build the session-name index (`titles.tsv`).
+///
+/// Incremental: with an existing index we only rescan transcripts newer than it
+/// (`find -newer` semantics via mtime comparison).  A missing index does a full
+/// scan of all transcripts.  Atomic temp+rename so a concurrent resolve never
+/// reads a half-written file.  Best-effort — any failure leaves the old index.
+///
+/// Mirrors `reindex_titles` in `claude-smart-helper.sh.j2` (lines 409–444).
+///
+/// Title extraction: last `"custom-title"` or `"agent-name"` record per
+/// transcript, matching the jq:
+/// ```
+/// select(.type=="custom-title" or .type=="agent-name") | (.customTitle // .agentName // empty)
+/// ```
+pub fn reindex_titles() {
+    let projects_dir = paths::session_base_dir();
+    if !projects_dir.is_dir() {
+        return;
+    }
+    let _ = paths::smart_dir(); // lazy-create smart_dir
+    let titles_path = paths::titles_tsv();
+
+    // Determine incremental cutoff: mtime of the existing index, or 0 for full scan.
+    let since_epoch: i64 = if titles_path.exists() {
+        file_mtime_epoch(&titles_path).unwrap_or(0)
+    } else {
+        0
+    };
+
+    // Load existing rows to carry forward.
+    let mut existing_rows: Vec<TitleRow> = if titles_path.exists() {
+        read_titles_tsv(&titles_path)
+    } else {
+        Vec::new()
+    };
+
+    // Collect transcripts to rescan.
+    let stale = collect_transcripts_newer_than(&projects_dir, since_epoch);
+
+    if stale.is_empty() && !existing_rows.is_empty() {
+        return; // nothing changed
+    }
+
+    // Extract titles from stale transcripts and append.
+    for tp in &stale {
+        let sid = match tp.file_stem().and_then(|s| s.to_str()) {
+            Some(s) if !s.is_empty() => s.to_owned(),
+            _ => continue,
+        };
+        let mtime = file_mtime_epoch(tp).unwrap_or(0);
+        if let Some(title) = extract_last_title(tp) {
+            existing_rows.push(TitleRow { title, sid, mtime });
+        }
+    }
+
+    // Dedup by sid keeping the newest-mtime row.
+    // Mirrors the awk: `{ if (!($2 in m) || $3+0 >= m[$2]+0) { m[$2]=$3; row[$2]=$0 } }`
+    let deduped = dedup_title_rows_by_sid(existing_rows);
+
+    // Atomic write.
+    let tmp_path = {
+        let mut p = titles_path.clone();
+        p.set_extension(format!("tmp{}", std::process::id()));
+        p
+    };
+    let mut content = String::new();
+    for row in &deduped {
+        content.push_str(&format!("{}\t{}\t{}\n", row.title, row.sid, row.mtime));
+    }
+    if fs::write(&tmp_path, &content).is_ok() {
+        let _ = fs::rename(&tmp_path, &titles_path).or_else(|_| {
+            let _ = fs::remove_file(&tmp_path);
+            Err(())
+        });
+    }
+}
+
+/// Collect all `.jsonl` transcripts under `projects_dir` (recursively into
+/// subdirs) that have an mtime > `since_epoch`.  When `since_epoch == 0`,
+/// collect those that contain a title record (mirrors the `grep -rls` path).
+fn collect_transcripts_newer_than(projects_dir: &std::path::Path, since_epoch: i64) -> Vec<PathBuf> {
+    let mut result = Vec::new();
+    let entries = match fs::read_dir(projects_dir) {
+        Ok(e) => e,
+        Err(_) => return result,
+    };
+    // The projects_dir contains one subdir per encoded cwd; each subdir
+    // contains the actual .jsonl transcript files.
+    for entry in entries.flatten() {
+        let subdir = entry.path();
+        if !subdir.is_dir() {
+            continue;
+        }
+        let sub_entries = match fs::read_dir(&subdir) {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        for sub_entry in sub_entries.flatten() {
+            let p = sub_entry.path();
+            if p.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+                continue;
+            }
+            if !p.is_file() {
+                continue;
+            }
+            let mt = file_mtime_epoch(&p).unwrap_or(0);
+            if since_epoch == 0 || mt > since_epoch {
+                result.push(p);
+            }
+        }
+    }
+    result
+}
+
+/// Extract the final title from a transcript.
+///
+/// Returns the last `customTitle` or `agentName` value from a `"custom-title"`
+/// or `"agent-name"` record.  Mirrors `_title_of` (helper lines 401–403).
+fn extract_last_title(path: &PathBuf) -> Option<String> {
+    let content = fs::read_to_string(path).ok()?;
+    let mut last_title: Option<String> = None;
+    for line in content.lines() {
+        if line.is_empty() {
+            continue;
+        }
+        let v: serde_json::Value = match serde_json::from_str(line) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let obj = match v.as_object() {
+            Some(o) => o,
+            None => continue,
+        };
+        let record_type = obj.get("type").and_then(|t| t.as_str()).unwrap_or("");
+        if record_type == "custom-title" || record_type == "agent-name" {
+            let title = obj
+                .get("customTitle")
+                .or_else(|| obj.get("agentName"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            if !title.is_empty() {
+                last_title = Some(title.to_owned());
+            }
+        }
+    }
+    last_title
+}
+
+// ─── titles row type ─────────────────────────────────────────────────────────
+
+struct TitleRow {
+    title: String,
+    sid: String,
+    mtime: i64,
+}
+
+/// Read `titles.tsv` into a `Vec<TitleRow>`.
+fn read_titles_tsv(path: &PathBuf) -> Vec<TitleRow> {
+    let content = match fs::read_to_string(path) {
+        Ok(c) => c,
+        Err(_) => return Vec::new(),
+    };
+    content
+        .lines()
+        .filter(|l| !l.starts_with('#') && !l.is_empty())
+        .filter_map(|line| {
+            let mut cols = line.splitn(3, '\t');
+            let title = cols.next()?.to_owned();
+            let sid = cols.next()?.to_owned();
+            let mtime: i64 = cols.next()?.trim().parse().unwrap_or(0);
+            Some(TitleRow { title, sid, mtime })
+        })
+        .collect()
+}
+
+/// Dedup `TitleRow`s by sid keeping the highest-mtime row.
+/// Mirrors: `{ if (!($2 in m) || $3+0 >= m[$2]+0) { m[$2]=$3; row[$2]=$0 } }`
+fn dedup_title_rows_by_sid(rows: Vec<TitleRow>) -> Vec<TitleRow> {
+    use std::collections::HashMap;
+    let mut map: HashMap<String, usize> = HashMap::new();
+    let mut out: Vec<TitleRow> = Vec::new();
+    for row in rows {
+        match map.get(&row.sid) {
+            None => {
+                map.insert(row.sid.clone(), out.len());
+                out.push(row);
+            }
+            Some(&idx) => {
+                if row.mtime >= out[idx].mtime {
+                    out[idx] = row;
+                }
+            }
+        }
+    }
+    out
+}
+
+// ─── staleness check ─────────────────────────────────────────────────────────
+
+/// Return the TTL from `CLAUDE_TITLE_INDEX_TTL` env var, or the default 300 s.
+fn read_ttl_from_env() -> u64 {
+    std::env::var("CLAUDE_TITLE_INDEX_TTL")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(DEFAULT_TITLE_INDEX_TTL)
+}
+
+/// Return `true` if `titles.tsv` is older than `ttl` seconds (or missing).
+///
+/// Mirrors the staleness check in `resolve_alias` (helper lines 468–473):
+/// ```bash
+/// imtime="$(stat -f %m "$TITLES_INDEX")"
+/// age=$(( now - imtime ))
+/// [ "$age" -gt "$ttl" ] && stale=true
+/// ```
+fn is_index_stale(titles_path: &PathBuf, ttl: u64) -> bool {
+    let mtime = match file_mtime_epoch(titles_path) {
+        Some(m) => m,
+        None => return true, // absent → stale
+    };
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or(Duration::ZERO)
+        .as_secs() as i64;
+    let age = now - mtime;
+    age > ttl as i64
+}
+
+/// Return the mtime of `path` as a Unix epoch in seconds.
+fn file_mtime_epoch(path: &PathBuf) -> Option<i64> {
+    let mt = fs::metadata(path).ok()?.modified().ok()?;
+    let dur = mt.duration_since(UNIX_EPOCH).unwrap_or(Duration::ZERO);
+    Some(dur.as_secs() as i64)
+}
+
 // ─── tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use tempfile::TempDir;
 
-    // looks_like_uuid is REAL — full test coverage.
+    // ─── looks_like_uuid ─────────────────────────────────────────────────────
 
     #[test]
     fn uuid_recognised() {
@@ -129,19 +453,16 @@ mod tests {
 
     #[test]
     fn non_uuid_rejected_by_missing_hyphens() {
-        // All hyphens replaced with 'x'
         assert!(!looks_like_uuid("01234567x89abxcdefx0123x456789abcdef"));
     }
 
     #[test]
     fn non_uuid_rejected_by_non_hex_in_non_hyphen_position() {
-        // Replace one hex digit with 'g' (not hex)
         assert!(!looks_like_uuid("g1234567-89ab-cdef-0123-456789abcdef"));
     }
 
     #[test]
     fn non_uuid_rejected_when_hyphen_at_wrong_position() {
-        // Move a hyphen one position left
         assert!(!looks_like_uuid("0123456-789ab-cdef-0123-456789abcdef"));
     }
 
@@ -152,7 +473,8 @@ mod tests {
         assert!(!looks_like_uuid("some conversation about cats"));
     }
 
-    // resolve_alias fast-path (UUID pass-through) is testable without titles.tsv.
+    // ─── resolve_alias fast path ─────────────────────────────────────────────
+
     #[test]
     fn resolve_alias_passthrough_for_uuid() {
         let uuid = "01234567-89ab-cdef-0123-456789abcdef";
@@ -160,7 +482,238 @@ mod tests {
         assert_eq!(result, uuid);
     }
 
-    // The non-UUID (alias lookup) path is unimplemented in Phase 0 — it would
-    // panic.  We verify that by checking the UUID fast-path works and leave the
-    // slow path for Phase 5.
+    #[test]
+    fn resolve_alias_passthrough_uppercase_uuid() {
+        let uuid = "AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE";
+        let result = resolve_alias(uuid).expect("uppercase UUID should pass through");
+        assert_eq!(result, uuid);
+    }
+
+    // ─── lookup_alias ────────────────────────────────────────────────────────
+
+    #[test]
+    fn lookup_alias_finds_exact_match() {
+        let tmp = TempDir::new().unwrap();
+        let titles_path = tmp.path().join("titles.tsv");
+        fs::write(&titles_path,
+            "My Project\taaaaaaaa-0000-0000-0000-000000000001\t1000\n\
+             Other Title\tbbbbbbbb-0000-0000-0000-000000000002\t2000\n"
+        ).unwrap();
+        let result = lookup_alias("My Project", &titles_path);
+        assert_eq!(result.unwrap(), "aaaaaaaa-0000-0000-0000-000000000001");
+    }
+
+    #[test]
+    fn lookup_alias_returns_newest_mtime_on_duplicate_title() {
+        let tmp = TempDir::new().unwrap();
+        let titles_path = tmp.path().join("titles.tsv");
+        // Same title appears twice; the row with higher mtime should win.
+        fs::write(&titles_path,
+            "Same Title\told-sid-0000-0000-0000-000000000001\t100\n\
+             Same Title\tnew-sid-0000-0000-0000-000000000002\t999\n"
+        ).unwrap();
+        // Mirrors awk `>= m` accumulator — higher mtime wins.
+        let result = lookup_alias("Same Title", &titles_path);
+        assert_eq!(result.unwrap(), "new-sid-0000-0000-0000-000000000002");
+    }
+
+    #[test]
+    fn lookup_alias_not_found_returns_none() {
+        let tmp = TempDir::new().unwrap();
+        let titles_path = tmp.path().join("titles.tsv");
+        fs::write(&titles_path,
+            "Known Title\taaaaaaaa-0000-0000-0000-000000000001\t1000\n"
+        ).unwrap();
+        let result = lookup_alias("Unknown Title", &titles_path);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn lookup_alias_ignores_comment_lines() {
+        let tmp = TempDir::new().unwrap();
+        let titles_path = tmp.path().join("titles.tsv");
+        // Comment line must not be treated as a row.
+        fs::write(&titles_path,
+            "# comment line\n\
+             Real Title\tcccccccc-0000-0000-0000-000000000001\t500\n"
+        ).unwrap();
+        let result = lookup_alias("# comment line", &titles_path);
+        assert!(result.is_none(), "comment lines must not match");
+        let result2 = lookup_alias("Real Title", &titles_path);
+        assert_eq!(result2.unwrap(), "cccccccc-0000-0000-0000-000000000001");
+    }
+
+    #[test]
+    fn lookup_alias_ignores_blank_lines() {
+        let tmp = TempDir::new().unwrap();
+        let titles_path = tmp.path().join("titles.tsv");
+        fs::write(&titles_path,
+            "\n\
+             Valid Title\tdddddddd-0000-0000-0000-000000000001\t500\n\
+             \n"
+        ).unwrap();
+        let result = lookup_alias("Valid Title", &titles_path);
+        assert_eq!(result.unwrap(), "dddddddd-0000-0000-0000-000000000001");
+    }
+
+    #[test]
+    fn lookup_alias_missing_file_returns_none() {
+        let tmp = TempDir::new().unwrap();
+        let titles_path = tmp.path().join("nonexistent-titles.tsv");
+        let result = lookup_alias("anything", &titles_path);
+        assert!(result.is_none());
+    }
+
+    // ─── extract_last_title ───────────────────────────────────────────────────
+
+    #[test]
+    fn extract_last_title_from_custom_title_record() {
+        let tmp = TempDir::new().unwrap();
+        let tp = tmp.path().join("test.jsonl");
+        fs::write(&tp,
+            r#"{"type":"user","message":{"content":"hello"}}"#.to_owned() + "\n" +
+            r#"{"type":"custom-title","customTitle":"My Custom Title"}"# + "\n"
+        ).unwrap();
+        assert_eq!(extract_last_title(&tp).unwrap(), "My Custom Title");
+    }
+
+    #[test]
+    fn extract_last_title_from_agent_name_record() {
+        let tmp = TempDir::new().unwrap();
+        let tp = tmp.path().join("test.jsonl");
+        fs::write(&tp,
+            r#"{"type":"agent-name","agentName":"My Agent"}"#.to_owned() + "\n"
+        ).unwrap();
+        assert_eq!(extract_last_title(&tp).unwrap(), "My Agent");
+    }
+
+    #[test]
+    fn extract_last_title_takes_last_occurrence() {
+        let tmp = TempDir::new().unwrap();
+        let tp = tmp.path().join("test.jsonl");
+        fs::write(&tp,
+            r#"{"type":"custom-title","customTitle":"First Title"}"#.to_owned() + "\n" +
+            r#"{"type":"custom-title","customTitle":"Final Title"}"# + "\n"
+        ).unwrap();
+        assert_eq!(extract_last_title(&tp).unwrap(), "Final Title");
+    }
+
+    #[test]
+    fn extract_last_title_no_title_record_returns_none() {
+        let tmp = TempDir::new().unwrap();
+        let tp = tmp.path().join("test.jsonl");
+        fs::write(&tp,
+            r#"{"type":"user","message":{"content":"hello"}}"#.to_owned() + "\n"
+        ).unwrap();
+        assert!(extract_last_title(&tp).is_none());
+    }
+
+    #[test]
+    fn extract_last_title_custom_title_wins_over_agent_name() {
+        // custom-title after agent-name: last record wins.
+        let tmp = TempDir::new().unwrap();
+        let tp = tmp.path().join("test.jsonl");
+        fs::write(&tp,
+            r#"{"type":"agent-name","agentName":"Agent"}"#.to_owned() + "\n" +
+            r#"{"type":"custom-title","customTitle":"Custom"}"# + "\n"
+        ).unwrap();
+        assert_eq!(extract_last_title(&tp).unwrap(), "Custom");
+    }
+
+    // ─── dedup_title_rows_by_sid ──────────────────────────────────────────────
+
+    #[test]
+    fn dedup_title_rows_keeps_newest_mtime() {
+        let rows = vec![
+            TitleRow { title: "Old Title".to_owned(), sid: "aaa".to_owned(), mtime: 100 },
+            TitleRow { title: "New Title".to_owned(), sid: "aaa".to_owned(), mtime: 200 },
+        ];
+        let deduped = dedup_title_rows_by_sid(rows);
+        assert_eq!(deduped.len(), 1);
+        assert_eq!(deduped[0].title, "New Title");
+        assert_eq!(deduped[0].mtime, 200);
+    }
+
+    #[test]
+    fn dedup_title_rows_equal_mtime_second_wins() {
+        let rows = vec![
+            TitleRow { title: "First".to_owned(), sid: "bbb".to_owned(), mtime: 100 },
+            TitleRow { title: "Second".to_owned(), sid: "bbb".to_owned(), mtime: 100 },
+        ];
+        let deduped = dedup_title_rows_by_sid(rows);
+        assert_eq!(deduped.len(), 1);
+        assert_eq!(deduped[0].title, "Second"); // >= wins
+    }
+
+    // ─── reindex_titles + lookup round-trip ───────────────────────────────────
+
+    #[test]
+    fn reindex_and_lookup_end_to_end() {
+        // This test creates a fake projects dir with transcripts that have
+        // title records, runs reindex_titles, and verifies lookup works.
+        // We cannot override paths::session_base_dir() / paths::titles_tsv()
+        // directly, so we test the sub-functions instead.
+
+        let tmp = TempDir::new().unwrap();
+        let titles_path = tmp.path().join("titles.tsv");
+        let sid = "ffffffff-0000-0000-0000-000000000001";
+
+        // Simulate reindex writing a row.
+        let row = TitleRow {
+            title: "Rust Port Design".to_owned(),
+            sid: sid.to_owned(),
+            mtime: 1_718_000_000,
+        };
+        let deduped = dedup_title_rows_by_sid(vec![row]);
+        let mut content = String::new();
+        for r in &deduped {
+            content.push_str(&format!("{}\t{}\t{}\n", r.title, r.sid, r.mtime));
+        }
+        fs::write(&titles_path, &content).unwrap();
+
+        // Verify lookup.
+        let found = lookup_alias("Rust Port Design", &titles_path);
+        assert_eq!(found.unwrap(), sid);
+
+        // Unknown alias.
+        let missing = lookup_alias("Nonexistent Title", &titles_path);
+        assert!(missing.is_none());
+    }
+
+    // ─── AliasError variants ─────────────────────────────────────────────────
+
+    #[test]
+    fn alias_error_not_found_message_contains_alias() {
+        let err = AliasError::NotFound { alias: "my-session".to_owned() };
+        let msg = err.to_string();
+        assert!(msg.contains("my-session"), "error message should contain the alias: {msg}");
+    }
+
+    #[test]
+    fn alias_error_io_message_contains_path() {
+        let err = AliasError::Io {
+            path: std::path::PathBuf::from("/some/path/titles.tsv"),
+            source: std::io::Error::new(std::io::ErrorKind::NotFound, "not found"),
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("titles.tsv"), "error message should contain path: {msg}");
+    }
+
+    // ─── is_index_stale ───────────────────────────────────────────────────────
+
+    #[test]
+    fn is_index_stale_for_missing_file() {
+        let tmp = TempDir::new().unwrap();
+        let missing = tmp.path().join("no-such-file.tsv");
+        assert!(is_index_stale(&missing, 300), "missing file should be considered stale");
+    }
+
+    #[test]
+    fn is_index_stale_for_freshly_written_file() {
+        let tmp = TempDir::new().unwrap();
+        let p = tmp.path().join("fresh.tsv");
+        fs::write(&p, "content\n").unwrap();
+        // A freshly created file should NOT be stale with a 300 s TTL.
+        assert!(!is_index_stale(&p, 300), "freshly written file should not be stale");
+    }
 }
