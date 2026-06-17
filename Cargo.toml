@@ -1,0 +1,89 @@
+[package]
+name         = "claude-smart"
+version      = "0.1.0"
+edition      = "2021"
+rust-version = "1.88"
+default-run  = "csm"
+description  = "Cross-platform Claude Code smart session manager"
+license      = "MIT OR Apache-2.0"
+repository   = "https://github.com/DaveDev42/claude-smart"
+homepage     = "https://github.com/DaveDev42/claude-smart"
+keywords     = ["claude", "ai", "cli", "session"]
+categories   = ["command-line-utilities"]
+readme       = "README.md"
+
+[[bin]]
+name = "csm"
+path = "src/main.rs"
+
+# ─── core, always present ────────────────────────────────────────────────────
+[dependencies]
+# serde model: sidecar/<sid>.json, .relaunch sentinel, .usage-cache.json,
+# profiles.json, hook stdin contract, scan index storage
+serde      = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# completions ONLY (csm completions {zsh|bash|pwsh}); never touches csm's own argv
+clap          = { version = "4", features = ["derive", "env"] }
+clap_complete = "4"
+
+# human timestamps (MM-DD HH:MM), reset-epoch parse ("Jun 4 at 9pm (Asia/Seoul)"),
+# stale-age for the hub-down picker
+chrono    = { version = "0.4", features = ["serde"] }
+chrono-tz = "0.9"   # IANA zone table for resets_to_epoch (~3 MB binary overhead, acceptable)
+
+uuid = { version = "1", features = ["v4"] }   # newuuid: lowercase UUID v4
+dirs = "5"                                     # cross-platform ~/ resolution for Paths
+
+# liveness + comm check (replaces POSIX `ps -o comm=` on Linux + the Windows task walk).
+# Only TARGETED refresh_process(Pid) — never a full sweep on the hot Stop path.
+sysinfo = { version = "0.30", default-features = false }  # no "process" feature in 0.30; process APIs always present
+
+anyhow    = "1"   # bin error propagation
+thiserror = "1"   # library-style errors in session/account/usage (UsageError, FetchError, SidecarError…)
+
+# ─── HTTP transport (usage fetch HTTP-first path, all 4 machines) ─────────────
+# rustls-tls (not native-tls): native-tls drags in system OpenSSL on Linux, which
+# breaks cross-compile + adds a build-time libssl dep on the WSL target; rustls is
+# pure-Rust and builds cleanly on all 4 targets (darwin/linux/windows-msvc). The hub
+# endpoint is plain HTTP over Tailscale Serve, so TLS trust-store nuance is moot here.
+[dependencies.reqwest]
+version          = "0.12"
+default-features = false
+features         = ["json", "blocking", "rustls-tls"]
+
+# ─── POSIX-only ──────────────────────────────────────────────────────────────
+# tcsetpgrp/setpgid (foreground supervisor), kill() (hook SIGTERM), isatty (TTY gate)
+[target.'cfg(unix)'.dependencies]
+nix = { version = "0.29", features = ["hostname", "process", "signal", "term", "fs"] }
+
+# ─── Windows-only ────────────────────────────────────────────────────────────
+# GenerateConsoleCtrlEvent, SetConsoleCtrlHandler, WaitFor*Object, CreateProcess
+# (CREATE_NEW_PROCESS_GROUP), TerminateProcess, SendMessageTimeout+WM_SETTINGCHANGE
+# (cas -g HKCU\Environment broadcast)
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.52", features = [
+    "Win32_System_Threading",        # CreateProcess*, WaitForSingleObject, TerminateProcess, OpenProcess
+    "Win32_System_Console",          # GenerateConsoleCtrlEvent, SetConsoleCtrlHandler
+    "Win32_Foundation",              # BOOL, HANDLE, HWND, LRESULT
+    "Win32_UI_WindowsAndMessaging",  # SendMessageTimeout, WM_SETTINGCHANGE, HWND_BROADCAST
+    "Win32_System_Registry",         # RegOpenKeyExW, RegSetValueExW (HKCU\Environment)
+    "Win32_Storage_FileSystem",      # stop-flag presence check
+] }
+
+# ─── cargo-binstall metadata (consumed by WSL `cargo binstall claude-smart`) ──
+# { repo } / { version } / { target } / { archive-suffix } / { binary-ext } are
+# substituted at install time. Archive names MUST match the release packaging steps.
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/csm-{ target }{ archive-suffix }"
+bin-dir = "csm{ binary-ext }"
+pkg-fmt = "tgz"
+
+[package.metadata.binstall.overrides.x86_64-pc-windows-msvc]
+pkg-fmt = "zip"
+
+[package.metadata.binstall.overrides.aarch64-pc-windows-msvc]
+pkg-fmt = "zip"
+
+[dev-dependencies]
+tempfile = "3"
