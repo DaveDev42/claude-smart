@@ -84,16 +84,25 @@ pub enum CompletionsSubcmd {
         owner: Option<String>,
     },
 
-    /// Claude-as profile switcher (binary half; shim evals the output).
+    /// Claude-as profile switcher + registry manager (binary half; shim evals
+    /// the eval-class output, calls management verbs directly).
+    ///
+    /// Eval-class ops (after `--`, with `--eval --shell`): `<profile>`, `-`,
+    /// `-g <profile>`, `resync`, `status`.
+    /// Management verbs (direct, no `--eval`): `list`, `add <name> [<dir>]`,
+    /// `set <name> <dir>`, `remove|rm <name>`, `use <name>`.
     #[command(name = "cas")]
     Cas {
-        /// Emit the eval-able export line (required for shim integration).
+        /// Emit the eval-able export line (required for profile switching).
         #[arg(long)]
         eval: bool,
         /// Shell dialect for the export line (zsh|bash|pwsh).
         #[arg(long, value_name = "SHELL")]
         shell: Option<String>,
-        /// Operation and its arguments (after `--`).
+        /// Print the resolved default CLAUDE_CONFIG_DIR and exit (floor SSOT).
+        #[arg(long)]
+        print_default_dir: bool,
+        /// Operation and its arguments (after `--`, or a management verb).
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         op_args: Vec<String>,
     },

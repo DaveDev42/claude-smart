@@ -302,7 +302,7 @@ fn consume_required_value(
 /// Build a `Vec<OsString>` from string slices — test helper.
 #[cfg(test)]
 fn os_args(ss: &[&str]) -> Vec<OsString> {
-    ss.iter().map(|s| OsString::from(s)).collect()
+    ss.iter().map(OsString::from).collect()
 }
 
 // ─── tests ────────────────────────────────────────────────────────────────────

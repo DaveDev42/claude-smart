@@ -904,7 +904,7 @@ pub(crate) fn now_epoch() -> i64 {
 
 #[cfg(test)]
 thread_local! {
-    static TEST_NOW: std::cell::RefCell<i64> = std::cell::RefCell::new(1_718_000_000);
+    static TEST_NOW: std::cell::RefCell<i64> = const { std::cell::RefCell::new(1_718_000_000) };
 }
 
 #[cfg(test)]

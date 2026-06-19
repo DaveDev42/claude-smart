@@ -332,8 +332,8 @@ mod tests {
 
     #[test]
     fn constants_are_sane() {
-        assert!(LIMIT_PCT > SATURATION_PCT, "LIMIT_PCT must be > SATURATION_PCT");
-        assert!(ABSENT_SESSION_PCT < 0, "absent sentinel must be negative");
+        const { assert!(LIMIT_PCT > SATURATION_PCT, "LIMIT_PCT must be > SATURATION_PCT") };
+        const { assert!(ABSENT_SESSION_PCT < 0, "absent sentinel must be negative") };
     }
 
     // ─── basic pick ──────────────────────────────────────────────────────────

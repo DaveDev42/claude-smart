@@ -152,7 +152,7 @@ fn cmd_run(args: &[OsString]) -> anyhow::Result<()> {
         PathBuf::from(dir)
     } else if flags.no_pick {
         // `--no-pick` — keep current profile without scoring.
-        current_profile_dir()
+        current_profile_dir(&profiles)
     } else {
         // Proactive pick (include_current=true — no-op switch if already best).
         proactive_pick_profile(&current_profile_name, &profiles, flags.pick_account)?
@@ -301,24 +301,21 @@ fn resolve_profile_dir(profile: &str, profiles: &account::ProfileMap) -> anyhow:
 }
 
 /// Return the current profile dir from `$CLAUDE_CONFIG_DIR`, or the default
-/// derived from `~/.config/claude-as/default`.
-fn current_profile_dir() -> PathBuf {
+/// resolved from the registry (`~/.config/claude-as/{profiles.json,default}`).
+fn current_profile_dir(profiles: &account::ProfileMap) -> PathBuf {
     if let Ok(dir) = std::env::var("CLAUDE_CONFIG_DIR") {
         if !dir.is_empty() {
             return PathBuf::from(dir);
         }
     }
-    let default = cas::default_profile();
-    dirs::home_dir()
-        .map(|h| h.join(format!(".claude.{default}")))
-        .unwrap_or_else(|| PathBuf::from(format!(".claude.{default}")))
+    profiles.default_dir()
 }
 
 /// Derive the current profile name from `$CLAUDE_CONFIG_DIR` + ProfileMap.
 fn derive_current_profile_name(profiles: &account::ProfileMap) -> String {
     let dir = std::env::var("CLAUDE_CONFIG_DIR").unwrap_or_default();
     if dir.is_empty() {
-        return cas::default_profile();
+        return profiles.default_name();
     }
     // Try to reverse-lookup the dir in the profiles map.
     if let Some((name, _)) = profiles.iter().find(|(_, d)| *d == dir.as_str()) {
@@ -329,7 +326,7 @@ fn derive_current_profile_name(profiles: &account::ProfileMap) -> String {
         .file_name()
         .and_then(|n| n.to_str())
         .map(|n| n.strip_prefix(".claude.").unwrap_or(n).to_owned())
-        .unwrap_or_else(cas::default_profile)
+        .unwrap_or_else(|| profiles.default_name())
 }
 
 /// Proactive account pick with hub-down picker fallback (spec §4a).
@@ -348,7 +345,7 @@ fn proactive_pick_profile(
 ) -> anyhow::Result<PathBuf> {
     use account::scoring::ScoringError;
 
-    let current_dir = current_profile_dir();
+    let current_dir = current_profile_dir(profiles);
 
     // No ProfileMap (toss / first-boot) — skip all picking.
     if profiles.is_empty() {
@@ -592,12 +589,15 @@ fn is_interactive() -> bool {
 /// when `--owner` is absent (non-interactive / missing shim).
 fn cmd_hook(args: &[OsString]) -> anyhow::Result<()> {
     let owner_dir: PathBuf = parse_owner_flag(args)
-        .or_else(|| std::env::var("CLAUDE_CONFIG_DIR").ok().map(PathBuf::from))
+        .or_else(|| {
+            std::env::var("CLAUDE_CONFIG_DIR")
+                .ok()
+                .filter(|d| !d.is_empty())
+                .map(PathBuf::from)
+        })
         .unwrap_or_else(|| {
-            let default = cas::default_profile();
-            dirs::home_dir()
-                .map(|h| h.join(format!(".claude.{default}")))
-                .unwrap_or_else(|| PathBuf::from(format!(".claude.{default}")))
+            // Last resort (no --owner, no $CLAUDE_CONFIG_DIR): the registry default.
+            account::ProfileMap::load().unwrap_or_default().default_dir()
         });
 
     hook::run(&owner_dir)
@@ -633,22 +633,47 @@ fn parse_owner_flag(args: &[OsString]) -> Option<PathBuf> {
 fn cmd_cas(args: &[OsString]) -> anyhow::Result<()> {
     use cas::{Op, Shell};
 
-    let (eval_mode, shell_opt, op_args) = parse_cas_flags(args)?;
+    let parsed = parse_cas_flags(args)?;
+
+    // `--print-default-dir`: print the resolved default CLAUDE_CONFIG_DIR and
+    // return. Used by the shell/launchd floors as the single SSOT for dir
+    // derivation (no `--shell`, no eval). Takes precedence over op parsing.
+    if parsed.print_default_dir {
+        let profiles = account::ProfileMap::load().unwrap_or_default();
+        println!("{}", profiles.default_dir().to_string_lossy());
+        return Ok(());
+    }
+
+    let eval_mode = parsed.eval_mode;
+    let op = parse_cas_op(&parsed.op_args)?;
+
+    // Registry-management ops are non-eval (the shim calls `csm cas <verb>`
+    // directly). They mutate profiles.json / the default state file and print
+    // human output — not an eval-able line.
+    if matches!(
+        op,
+        Op::List | Op::Add { .. } | Op::Set { .. } | Op::Remove { .. } | Op::SetDefault { .. }
+    ) {
+        if eval_mode {
+            anyhow::bail!("csm cas: management verbs ({op:?}) must not be wrapped in --eval");
+        }
+        let mut profiles =
+            account::ProfileMap::load().context("csm cas: failed to load profiles.json")?;
+        return cas::manage_emit(&op, &mut profiles);
+    }
 
     let shell = if eval_mode {
-        let s = shell_opt
+        let s = parsed
+            .shell
             .as_deref()
             .ok_or_else(|| anyhow::anyhow!("csm cas: --eval requires --shell <zsh|pwsh>"))?;
-        Shell::parse(s)
-            .ok_or_else(|| anyhow::anyhow!("csm cas: unknown --shell value {s:?}"))?
+        Shell::parse(s).ok_or_else(|| anyhow::anyhow!("csm cas: unknown --shell value {s:?}"))?
     } else {
         Shell::Zsh // informational status path
     };
 
-    let op = parse_cas_op(&op_args)?;
-
     if !eval_mode {
-        // Without --eval only Op::Status is allowed (informational).
+        // Without --eval only Op::Status is allowed among the eval-class ops.
         if !matches!(op, Op::Status { .. }) {
             anyhow::bail!("csm cas: --eval flag is required for profile switching");
         }
@@ -658,43 +683,52 @@ fn cmd_cas(args: &[OsString]) -> anyhow::Result<()> {
     cas::eval_emit(shell, &op, &profiles)
 }
 
-/// Parse `--eval`, `--shell`, and `--` sections from `csm cas` arguments.
-///
-/// Returns `(eval_mode, Option<shell_str>, op_args_after_double_dash)`.
-fn parse_cas_flags(args: &[OsString]) -> anyhow::Result<(bool, Option<String>, Vec<String>)> {
-    let mut eval_mode = false;
-    let mut shell: Option<String> = None;
-    let mut op_args: Vec<String> = Vec::new();
+/// Parsed `csm cas` flags.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct CasFlags {
+    eval_mode: bool,
+    shell: Option<String>,
+    op_args: Vec<String>,
+    /// `--print-default-dir`: print the resolved default dir and exit (floor SSOT).
+    print_default_dir: bool,
+}
+
+/// Parse `--eval`, `--shell`, `--print-default-dir`, and `--` sections from
+/// `csm cas` arguments.
+fn parse_cas_flags(args: &[OsString]) -> anyhow::Result<CasFlags> {
+    let mut f = CasFlags::default();
     let mut past_double_dash = false;
     let mut iter = args.iter().peekable();
 
     while let Some(arg) = iter.next() {
         if past_double_dash {
-            op_args.push(arg.to_string_lossy().into_owned());
+            f.op_args.push(arg.to_string_lossy().into_owned());
             continue;
         }
         let s = arg.to_string_lossy();
         if s == "--" {
             past_double_dash = true;
         } else if s == "--eval" {
-            eval_mode = true;
+            f.eval_mode = true;
+        } else if s == "--print-default-dir" {
+            f.print_default_dir = true;
         } else if s == "--shell" {
             if let Some(next) = iter.next() {
-                shell = Some(next.to_string_lossy().into_owned());
+                f.shell = Some(next.to_string_lossy().into_owned());
             }
         } else if let Some(val) = s.strip_prefix("--shell=") {
-            shell = Some(val.to_owned());
+            f.shell = Some(val.to_owned());
         } else {
             // Positional arg before `--`: treat as start of op args.
-            op_args.push(s.into_owned());
+            f.op_args.push(s.into_owned());
             for remaining in iter.by_ref() {
-                op_args.push(remaining.to_string_lossy().into_owned());
+                f.op_args.push(remaining.to_string_lossy().into_owned());
             }
             break;
         }
     }
 
-    Ok((eval_mode, shell, op_args))
+    Ok(f)
 }
 
 /// Parse the CAS operation from the op-args slice.
@@ -716,6 +750,40 @@ fn parse_cas_op(op_args: &[String]) -> anyhow::Result<cas::Op> {
                 .cloned()
                 .ok_or_else(|| anyhow::anyhow!("csm cas: -g/--global requires a profile argument"))?;
             Ok(Op::Global { profile })
+        }
+        // ── registry management verbs (reserved words; routed to manage_emit) ──
+        Some("list") => Ok(Op::List),
+        Some("add") => {
+            let name = op_args
+                .get(1)
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("csm cas add: requires a profile name"))?;
+            Ok(Op::Add { name, dir: op_args.get(2).cloned() })
+        }
+        Some("set") => {
+            let name = op_args
+                .get(1)
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("csm cas set: requires <name> <dir>"))?;
+            let dir = op_args
+                .get(2)
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("csm cas set: requires <name> <dir>"))?;
+            Ok(Op::Set { name, dir })
+        }
+        Some("remove") | Some("rm") => {
+            let name = op_args
+                .get(1)
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("csm cas remove: requires a profile name"))?;
+            Ok(Op::Remove { name })
+        }
+        Some("use") => {
+            let name = op_args
+                .get(1)
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("csm cas use: requires a profile name"))?;
+            Ok(Op::SetDefault { name })
         }
         Some(profile) => Ok(Op::Switch { profile: profile.to_owned() }),
     }
@@ -1132,34 +1200,44 @@ mod tests {
     #[test]
     fn parse_cas_flags_eval_shell_double_dash() {
         let args = argv(&["--eval", "--shell", "zsh", "--", "personal"]);
-        let (eval, shell, op_args) = parse_cas_flags(&args).unwrap();
-        assert!(eval);
-        assert_eq!(shell.as_deref(), Some("zsh"));
-        assert_eq!(op_args, vec!["personal"]);
+        let f = parse_cas_flags(&args).unwrap();
+        assert!(f.eval_mode);
+        assert_eq!(f.shell.as_deref(), Some("zsh"));
+        assert_eq!(f.op_args, vec!["personal"]);
+        assert!(!f.print_default_dir);
     }
 
     #[test]
     fn parse_cas_flags_equals_form_shell() {
         let args = argv(&["--eval", "--shell=pwsh", "--", "work"]);
-        let (eval, shell, op_args) = parse_cas_flags(&args).unwrap();
-        assert!(eval);
-        assert_eq!(shell.as_deref(), Some("pwsh"));
-        assert_eq!(op_args, vec!["work"]);
+        let f = parse_cas_flags(&args).unwrap();
+        assert!(f.eval_mode);
+        assert_eq!(f.shell.as_deref(), Some("pwsh"));
+        assert_eq!(f.op_args, vec!["work"]);
     }
 
     #[test]
     fn parse_cas_flags_no_eval_mode() {
         let args = argv(&["status"]);
-        let (eval, _shell, op_args) = parse_cas_flags(&args).unwrap();
-        assert!(!eval);
-        assert_eq!(op_args, vec!["status"]);
+        let f = parse_cas_flags(&args).unwrap();
+        assert!(!f.eval_mode);
+        assert_eq!(f.op_args, vec!["status"]);
     }
 
     #[test]
     fn parse_cas_flags_global_op() {
         let args = argv(&["--eval", "--shell", "zsh", "--", "-g", "personal"]);
-        let (_eval, _shell, op_args) = parse_cas_flags(&args).unwrap();
-        assert_eq!(op_args, vec!["-g", "personal"]);
+        let f = parse_cas_flags(&args).unwrap();
+        assert_eq!(f.op_args, vec!["-g", "personal"]);
+    }
+
+    #[test]
+    fn parse_cas_flags_print_default_dir() {
+        let args = argv(&["--print-default-dir"]);
+        let f = parse_cas_flags(&args).unwrap();
+        assert!(f.print_default_dir);
+        assert!(!f.eval_mode);
+        assert!(f.op_args.is_empty());
     }
 
     // ── parse_cas_op ──────────────────────────────────────────────────────────
@@ -1211,6 +1289,46 @@ mod tests {
         let op =
             parse_cas_op(&["--global".to_owned(), "personal".to_owned()]).unwrap();
         assert!(matches!(op, cas::Op::Global { profile } if profile == "personal"));
+    }
+
+    // ── parse_cas_op: registry management verbs ───────────────────────────────
+
+    #[test]
+    fn parse_cas_op_list() {
+        assert!(matches!(parse_cas_op(&["list".to_owned()]).unwrap(), cas::Op::List));
+    }
+
+    #[test]
+    fn parse_cas_op_add_with_and_without_dir() {
+        let op = parse_cas_op(&["add".to_owned(), "work".to_owned()]).unwrap();
+        assert!(matches!(op, cas::Op::Add { ref name, dir: None } if name == "work"));
+        let op = parse_cas_op(&["add".to_owned(), "work".to_owned(), "/d".to_owned()]).unwrap();
+        assert!(matches!(op, cas::Op::Add { ref name, dir: Some(ref d) } if name == "work" && d == "/d"));
+        // missing name → err
+        assert!(parse_cas_op(&["add".to_owned()]).is_err());
+    }
+
+    #[test]
+    fn parse_cas_op_set_requires_name_and_dir() {
+        let op = parse_cas_op(&["set".to_owned(), "w".to_owned(), "/d".to_owned()]).unwrap();
+        assert!(matches!(op, cas::Op::Set { ref name, ref dir } if name == "w" && dir == "/d"));
+        assert!(parse_cas_op(&["set".to_owned(), "w".to_owned()]).is_err());
+    }
+
+    #[test]
+    fn parse_cas_op_remove_and_rm_alias() {
+        let op = parse_cas_op(&["remove".to_owned(), "w".to_owned()]).unwrap();
+        assert!(matches!(op, cas::Op::Remove { ref name } if name == "w"));
+        let op = parse_cas_op(&["rm".to_owned(), "w".to_owned()]).unwrap();
+        assert!(matches!(op, cas::Op::Remove { ref name } if name == "w"));
+        assert!(parse_cas_op(&["remove".to_owned()]).is_err());
+    }
+
+    #[test]
+    fn parse_cas_op_use_sets_default() {
+        let op = parse_cas_op(&["use".to_owned(), "w".to_owned()]).unwrap();
+        assert!(matches!(op, cas::Op::SetDefault { ref name } if name == "w"));
+        assert!(parse_cas_op(&["use".to_owned()]).is_err());
     }
 
     // ── parse_sidecar_kv_args ─────────────────────────────────────────────────

@@ -652,7 +652,7 @@ mod tests {
                 .expect("could not format touch timestamp via date -r or date -d");
 
             let status = std::process::Command::new("touch")
-                .args(["-t", &ts, &path.to_string_lossy().to_string()])
+                .args(["-t", &ts, path.to_string_lossy().as_ref()])
                 .status()
                 .expect("touch -t invocation failed");
             assert!(status.success(), "touch -t exited with failure for ts={ts}");
@@ -1102,7 +1102,7 @@ mod tests {
         let age = file_age_secs(&f).unwrap();
         // Allow ±5s for any scheduling jitter.
         assert!(
-            age >= 65 && age <= 80,
+            (65..=80).contains(&age),
             "file aged 70s should report age ≈ 70s, got {age}"
         );
     }
