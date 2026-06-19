@@ -1139,9 +1139,18 @@ fn cmd_completions(args: &[OsString]) -> anyhow::Result<()> {
         .map(|a| a.to_string_lossy().into_owned())
         .unwrap_or_default();
 
-    let shell: Shell = shell_str.parse().map_err(|_| {
+    // Accept `pwsh` as an alias for clap's `powershell` token — both csm's
+    // `--help` and the shim contract speak of `pwsh`, so the completions verb
+    // must too. (`clap_complete::Shell::from_str` only knows `powershell`.)
+    let normalized = if shell_str.eq_ignore_ascii_case("pwsh") {
+        "powershell".to_owned()
+    } else {
+        shell_str.clone()
+    };
+
+    let shell: Shell = normalized.parse().map_err(|_| {
         anyhow::anyhow!(
-            "csm completions: unknown shell {shell_str:?} — use zsh, bash, or powershell"
+            "csm completions: unknown shell {shell_str:?} — use zsh, bash, pwsh, or powershell"
         )
     })?;
 
@@ -1188,8 +1197,8 @@ mod tests {
         if args.len() >= 2 {
             let candidate = args[1].to_string_lossy();
             match candidate.as_ref() {
-                "run" | "hook" | "cas" | "pick-account" | "scan" | "current-usage"
-                | "sidecar" | "statusline" | "completions" | "newuuid" => {
+                "run" | "hook" | "profiles" | "usage" | "cas" | "pick-account" | "scan"
+                | "current-usage" | "sidecar" | "statusline" | "completions" | "newuuid" => {
                     return (
                         Box::leak(candidate.into_owned().into_boxed_str()),
                         args.len() - 2,
@@ -1224,6 +1233,34 @@ mod tests {
         let a = argv(&["csm", "pick-account", "personal", "--include-current"]);
         let (cmd, _) = dispatch_subcommand(&a);
         assert_eq!(cmd, "pick-account");
+    }
+
+    #[test]
+    fn dispatch_explicit_profiles() {
+        let a = argv(&["csm", "profiles", "list"]);
+        let (cmd, rest_len) = dispatch_subcommand(&a);
+        assert_eq!(cmd, "profiles");
+        assert_eq!(rest_len, 1);
+    }
+
+    #[test]
+    fn dispatch_explicit_usage() {
+        let a = argv(&["csm", "usage", "--json"]);
+        let (cmd, rest_len) = dispatch_subcommand(&a);
+        assert_eq!(cmd, "usage");
+        assert_eq!(rest_len, 1);
+    }
+
+    /// A word that is NOT a reserved csm subcommand falls through to `run`
+    /// (→ forwarded to claude). This is the collision-avoidance contract: any
+    /// claude subcommand (mcp/doctor/update/…) is forwarded, never hijacked.
+    #[test]
+    fn dispatch_claude_subcommands_fall_through_to_run() {
+        for w in ["mcp", "doctor", "update", "agents", "auth", "plugin", "project"] {
+            let a = argv(&["csm", w, "--some-flag"]);
+            let (cmd, _) = dispatch_subcommand(&a);
+            assert_eq!(cmd, "run", "`csm {w}` must fall through to run (forward to claude)");
+        }
     }
 
     #[test]
