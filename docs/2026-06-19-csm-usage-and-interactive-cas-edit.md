@@ -117,16 +117,48 @@ ProfileMap, Action) -> Outcome` core (unit-tested with scripted Action sequences
 - `cli/completions.rs`: add `usage` subcommand + `edit` to the cas verb doc.
 - `tests/no_private_names.rs` continues to gate both new modules.
 
-## 4. Follow-on simplification (owner's observation — NOT this cycle)
+## 4. Follow-on simplification — dependency map + deployment gate
 
-As csm absorbs metering + registry editing, dave-environment can retire:
-- `shared/claude/claude-smart-helper.sh.j2` (the legacy zsh usage-fetch helper —
-  csm's `fetch()` + `usage`/`current-usage` supersede it).
-- Per-profile collect/keepalive shell glue once `csm usage --json` can feed the
-  dashboard directly. The hub-side **collection** (`shared/claude-code-usage/`,
-  ccusage-rs) stays — that's the data SOURCE; only the client-side shell glue
-  collapses. Tracked separately; needs its own audit + migration so the live
-  dashboard never loses a data point. Listed here so it isn't forgotten.
+**Status (2026-06-19, audited):** the simplification is **deployment-gated, not
+code-gated.** The csm binary already supersedes the shell helper's usage/registry
+logic (`csm usage`, `csm current-usage`, `csm profiles`, plus the 5-layer
+`fetch()` resilience ladder — offline degrade verified via `usage --no-fetch`
+stale-cache E2E). BUT on all 4 dave-environment machines `csm` is still the zsh
+`claude-smart` **shell-function alias** — the Rust binary is NOT installed by any
+package manager (no Brewfile / cargo-binstall / winget entry). So the shell helper
+is STILL the live hot path. **Retiring it now would break account picking + limit
+detection on every personal session.** Nothing in dave-environment is safe to
+retire this session.
+
+The retirement IS the deployment, and it lands as the binary's companion commits:
+1. `macos/homebrew/Brewfile.j2`: `brew "davedev42/tap/claude-smart"`.
+2. `wsl/packages/vars.yml`: `claude-smart` in the cargo-binstall list.
+3. `windows/claude-smart/playbook.yml`: install `csm.exe` (model on
+   `windows/git-worktree-manager/`).
+4. `shared/claude/playbook.yml`: replace the `Deploy claude-smart-helper.sh` +
+   `Deploy limit-switch.sh` tasks with `state: absent` cleanups; collapse the
+   deploy-time `usage_http_default_url` baking (the binary reads `CLAUDE_USAGE_URL`
+   from settings.json env at runtime — already wired).
+5. Replace `shared/zsh/claude-smart.zsh` (~690 lines) + the Windows-native LITE
+   pwsh `claude-smart` function (~80 lines) with the ~15-line `csm run` shims.
+
+**Gated on:** (a) a tagged `claude-smart` release + Homebrew tap formula
+(release-please CI path), (b) the Windows 2 BLOCKING manual checks (dave-env #13).
+Until then, the shell implementation is authoritative.
+
+**Must NOT touch (hub-side DATA SOURCE):** `shared/claude-code-usage/` (the Bun
+server, collect script, parse-usage.py, `com.dave.claude-code-usage.server` plist
+incl. its `CLAUDE_CONFIG_DIR` floor) and `shared/grafana/`. csm is a *consumer* of
+`/cc-usage/api/data/limits`, not its producer. The per-profile keepalive /
+collect-limits-local client agents were already retired (marker
+`.retired-contributing-v1`).
+
+**Residual hardcoding to clear AT cutover (not before):**
+`shared/claude/limit-switch.sh.j2:168–178` (P1/P2 name↔dir vars → `csm hook
+--owner <dir>` reads profiles.json); `shared/zsh/claude-smart.zsh:680`
+(completion-only `(personal work)`). The `zshenv.j2` / `claude-config-dir-
+setenv.sh.j2` `=personal` fallbacks are intentional pre-csm bootstrap guards —
+keep.
 
 ## 5. Tests
 
