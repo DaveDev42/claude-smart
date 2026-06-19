@@ -248,13 +248,6 @@ pub struct LaunchSpec {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write;
-
-    fn write_tmp(content: &str) -> tempfile::NamedTempFile {
-        let mut f = tempfile::NamedTempFile::new().expect("tempfile");
-        f.write_all(content.as_bytes()).expect("write");
-        f
-    }
 
     #[test]
     fn roundtrip_sentinel() {

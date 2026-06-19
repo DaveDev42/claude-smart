@@ -11,6 +11,11 @@ homepage     = "https://github.com/DaveDev42/claude-smart"
 keywords     = ["claude", "ai", "cli", "session"]
 categories   = ["command-line-utilities"]
 readme       = "README.md"
+# Keep the published crate tarball free of internal runbooks and CI config.
+# docs/ holds machine-specific operator notes (private hostnames, the
+# dave-environment provisioning repo); .github/ is release plumbing. Neither
+# belongs in the registry artifact. (src/ test fixtures still ship — inert.)
+exclude      = ["docs/", ".github/", "IN_PROGRESS.md"]
 
 [[bin]]
 name = "csm"

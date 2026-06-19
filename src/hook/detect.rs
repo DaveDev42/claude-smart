@@ -918,6 +918,11 @@ pub(crate) fn set_test_now(epoch: i64) {
 mod tests {
     use super::*;
     use std::path::Path;
+    use std::sync::Mutex;
+
+    /// Serializes tests that mutate the process-global `CLAUDE_SMART_RESUME_PROMPT`
+    /// env var, so they don't clobber each other under the default parallel runner.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     // ── HookInput serde tests ──────────────────────────────────────────────────
 
@@ -1302,6 +1307,7 @@ mod tests {
 
     #[test]
     fn build_handoff_default_korean() {
+        let _g = ENV_LOCK.lock().unwrap();
         // Remove any env override
         let prev = std::env::var("CLAUDE_SMART_RESUME_PROMPT");
         std::env::remove_var("CLAUDE_SMART_RESUME_PROMPT");
@@ -1319,6 +1325,7 @@ mod tests {
 
     #[test]
     fn build_handoff_empty_suppresses() {
+        let _g = ENV_LOCK.lock().unwrap();
         let prev = std::env::var("CLAUDE_SMART_RESUME_PROMPT");
         std::env::set_var("CLAUDE_SMART_RESUME_PROMPT", "");
         let h = build_handoff("01234567", "personal", "work", 1);
@@ -1332,6 +1339,7 @@ mod tests {
 
     #[test]
     fn build_handoff_custom_override() {
+        let _g = ENV_LOCK.lock().unwrap();
         let prev = std::env::var("CLAUDE_SMART_RESUME_PROMPT");
         std::env::set_var("CLAUDE_SMART_RESUME_PROMPT", "custom prompt here");
         let h = build_handoff("01234567", "personal", "work", 1);

@@ -108,7 +108,8 @@ pub fn profiles_json() -> PathBuf {
         .join("profiles.json")
 }
 
-/// Hub-local usage limits cache (Workstation fast path).
+/// Hub-local usage limits cache (read directly when this machine IS the hub —
+/// the `CLAUDE_HUB_HOSTNAME` fast path).
 /// `$HOME/claude-code-usage/cache/usage-limits.json`
 pub fn hub_local_cache() -> PathBuf {
     dirs::home_dir()

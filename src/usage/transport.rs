@@ -5,9 +5,10 @@
 //!
 //! Reproduces `fetch_usage()` in `claude-smart-helper.sh.j2` lines 655–728.
 //!
-//! 1. **Hub-local fast path** (`hostname == "workstation"` → read
-//!    `paths::hub_local_cache()` directly, skip all network).
-//!    Shell lines 657–662: `if printf '%s' "$host" | grep -qi '^workstation$'; then cat "$USAGE_CACHE"; return 0`
+//! 1. **Hub-local fast path** (`hostname == $CLAUDE_HUB_HOSTNAME` → read
+//!    `paths::hub_local_cache()` directly, skip all network). Disabled when the
+//!    env var is unset/empty.
+//!    Shell lines 657–662: `if printf '%s' "$host" | grep -qi "^$USAGE_HUB$"; then cat "$USAGE_CACHE"; return 0`
 //!
 //! 2. **Positive TTL check**: if `paths::usage_cache()` exists and mtime age <
 //!    `POSITIVE_TTL_SECS` (60 s, env `CLAUDE_USAGE_TTL`) → parse + return.
@@ -56,15 +57,15 @@ const DEFAULT_HTTP_TIMEOUT_SECS: u64 = 2;
 #[cfg(unix)]
 const DEFAULT_SSH_DEADLINE_SECS: u64 = 3;
 
-/// Default hub usage URL.
-/// Shell: `USAGE_URL="${CLAUDE_USAGE_URL-{{ usage_http_default_url }}}"`.
-/// Note the `-` (not `:-`): set-but-empty disables HTTP entirely.
-const DEFAULT_HUB_USAGE_URL: &str =
-    "http://workstation.example-tnet.ts.net/cc-usage/api/data/limits";
-
-/// Hub hostname (short, case-insensitive match).
-/// Shell: `USAGE_HUB="workstation"`.
-const HUB_HOSTNAME: &str = "workstation";
+/// Default hub usage URL. Empty = HTTP disabled unless `CLAUDE_USAGE_URL` is set.
+///
+/// The hub endpoint is site-specific infrastructure, so the binary ships **no**
+/// compiled-in URL. Deployments that run a usage hub inject the real endpoint via
+/// the `CLAUDE_USAGE_URL` env var (e.g. an Ansible-templated `settings.json`).
+/// Shell: `USAGE_URL="${CLAUDE_USAGE_URL-}"`.
+/// Note the `-` (not `:-`): set-but-empty disables HTTP entirely; unset falls
+/// back to this empty default, which `resolve_usage_url()` also treats as "off".
+const DEFAULT_HUB_USAGE_URL: &str = "";
 
 // ─── public entry-point ───────────────────────────────────────────────────────
 
@@ -157,31 +158,49 @@ fn do_network_fetch() -> Result<UsageData, FetchError> {
 
 /// Resolve the usage URL from the environment.
 ///
-/// Shell: `USAGE_URL="${CLAUDE_USAGE_URL-{{ usage_http_default_url }}}"`.
-/// The `-` (not `:-`) means: if `CLAUDE_USAGE_URL` is set but empty, use
-/// empty (which disables HTTP); if unset, use the default. Returns `None`
-/// when HTTP is disabled (empty URL).
+/// Shell: `USAGE_URL="${CLAUDE_USAGE_URL-}"`.
+/// The `-` (not `:-`) means: if `CLAUDE_USAGE_URL` is set but empty, use empty;
+/// if unset, fall back to `DEFAULT_HUB_USAGE_URL` (also empty). Either way an
+/// empty result yields `None` — HTTP is disabled unless a non-empty URL is set.
 fn resolve_usage_url() -> Option<String> {
-    match std::env::var("CLAUDE_USAGE_URL") {
-        Ok(val) => {
-            if val.is_empty() {
-                None // set-but-empty = HTTP disabled
-            } else {
-                Some(val)
-            }
-        }
-        Err(_) => Some(DEFAULT_HUB_USAGE_URL.to_owned()), // unset = use default
+    let url = match std::env::var("CLAUDE_USAGE_URL") {
+        Ok(val) => val,                            // set (possibly empty)
+        Err(_) => DEFAULT_HUB_USAGE_URL.to_owned(), // unset = default (empty)
+    };
+    if url.is_empty() {
+        None // empty = HTTP disabled
+    } else {
+        Some(url)
     }
 }
 
 // ─── hub-local fast path ─────────────────────────────────────────────────────
 
-/// True when running on Workstation itself (the hub machine).
+/// The configured hub hostname (short name), or `None` when unset/empty.
 ///
-/// Shell lines 657–659: `host="$(hostname -s …)"; if printf '%s' "$host" | grep -qi '^workstation$'`
-/// Case-insensitive match (`Workstation` or `workstation`).
+/// The hub machine is site-specific, so the binary ships no compiled-in name.
+/// Deployments that run a usage hub set `CLAUDE_HUB_HOSTNAME` (e.g. via an
+/// Ansible-templated `settings.json`); when unset, both the hub-local fast path
+/// and the SSH fallback are disabled — the correct behaviour for any machine
+/// that is not itself the hub.
+/// Shell: `USAGE_HUB="${CLAUDE_HUB_HOSTNAME-}"`.
+pub fn hub_hostname() -> Option<String> {
+    std::env::var("CLAUDE_HUB_HOSTNAME")
+        .ok()
+        .map(|h| h.trim().to_ascii_lowercase())
+        .filter(|h| !h.is_empty())
+}
+
+/// True when this machine **is** the configured hub (read its cache directly,
+/// skip all network). Always false when `CLAUDE_HUB_HOSTNAME` is unset/empty.
+///
+/// Shell lines 657–659: `host="$(hostname -s …)"; if printf '%s' "$host" | grep -qi "^$USAGE_HUB$"`
+/// Case-insensitive match.
 fn is_hub_local() -> bool {
-    short_hostname().to_ascii_lowercase() == HUB_HOSTNAME
+    match hub_hostname() {
+        Some(hub) => short_hostname().to_ascii_lowercase() == hub,
+        None => false,
+    }
 }
 
 /// Read the hub's own `usage-limits.json` (no network needed).
@@ -400,6 +419,11 @@ fn ssh_fetch() -> Result<UsageData, FetchError> {
     use std::process::{Command, Stdio};
     use std::time::{Duration, Instant};
 
+    // No configured hub → no SSH fallback. (External machines that are not part
+    // of a hub deployment never set CLAUDE_HUB_HOSTNAME, so we must not attempt
+    // to ssh to an arbitrary host name.)
+    let hub = hub_hostname().ok_or_else(|| FetchError::Ssh("no hub hostname configured".into()))?;
+
     // Ensure ~/.ssh exists (shell: `mkdir -p "$HOME/.ssh" 2>/dev/null`).
     if let Some(home) = dirs::home_dir() {
         let _ = std::fs::create_dir_all(home.join(".ssh"));
@@ -430,7 +454,7 @@ fn ssh_fetch() -> Result<UsageData, FetchError> {
             "-o", "ControlMaster=auto",
             "-o", &format!("ControlPath={control_path_str}"),
             "-o", "ControlPersist=300",
-            HUB_HOSTNAME,   // short MagicDNS name (ssh_config FQDN pin handles resolution)
+            hub.as_str(),   // short MagicDNS name (ssh_config FQDN pin handles resolution)
             remote_cmd,
         ])
         .stdout(Stdio::piped())
@@ -918,13 +942,15 @@ mod tests {
     // prevent parallel interference with each other.
 
     #[test]
-    fn resolve_usage_url_uses_default_when_env_unset() {
+    fn resolve_usage_url_disabled_when_env_unset() {
+        // The binary ships no compiled-in hub URL, so an unset CLAUDE_USAGE_URL
+        // means HTTP is disabled (None) — identical to set-but-empty.
         let _guard = ENV_LOCK.lock().unwrap();
         let saved = std::env::var("CLAUDE_USAGE_URL").ok();
         std::env::remove_var("CLAUDE_USAGE_URL");
 
         let url = resolve_usage_url();
-        assert_eq!(url.as_deref(), Some(DEFAULT_HUB_USAGE_URL));
+        assert!(url.is_none(), "unset CLAUDE_USAGE_URL should disable HTTP (no compiled default)");
 
         match saved {
             Some(v) => std::env::set_var("CLAUDE_USAGE_URL", v),
@@ -972,8 +998,26 @@ mod tests {
     }
 
     #[test]
-    fn hub_hostname_const_is_lowercase() {
-        assert_eq!(HUB_HOSTNAME, HUB_HOSTNAME.to_ascii_lowercase());
+    fn hub_hostname_env_contract() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let saved = std::env::var("CLAUDE_HUB_HOSTNAME").ok();
+
+        // Unset → None (no compiled-in hub name → fast path + SSH disabled).
+        std::env::remove_var("CLAUDE_HUB_HOSTNAME");
+        assert!(hub_hostname().is_none(), "unset → None");
+
+        // Set-but-empty / whitespace → None.
+        std::env::set_var("CLAUDE_HUB_HOSTNAME", "  ");
+        assert!(hub_hostname().is_none(), "blank → None");
+
+        // Set → trimmed + lowercased.
+        std::env::set_var("CLAUDE_HUB_HOSTNAME", " Some-Hub ");
+        assert_eq!(hub_hostname().as_deref(), Some("some-hub"));
+
+        match saved {
+            Some(v) => std::env::set_var("CLAUDE_HUB_HOSTNAME", v),
+            None => std::env::remove_var("CLAUDE_HUB_HOSTNAME"),
+        }
     }
 
     // ── positive_ttl_secs / negative_cooldown_secs env overrides ─────────────

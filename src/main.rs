@@ -414,8 +414,8 @@ fn build_account_rows(
     let cache_path = paths::usage_cache();
     let (cache_mtime, cache_json) = load_stale_cache(&cache_path);
 
-    // Hub-local fallback (Workstation fast path — N11).
-    let (cache_mtime, cache_json) = if cache_json.is_none() && is_hub_macmini() {
+    // Hub-local fallback: when running ON the configured hub, read its own cache.
+    let (cache_mtime, cache_json) = if cache_json.is_none() && is_hub_local_machine() {
         load_stale_cache(&paths::hub_local_cache())
     } else {
         (cache_mtime, cache_json)
@@ -551,11 +551,17 @@ fn parse_cache_sections(
     (profiles, errors)
 }
 
-/// `true` when running on Workstation (hub-local N11 reconciliation).
-fn is_hub_macmini() -> bool {
-    statusline::hostname()
-        .map(|h| h.eq_ignore_ascii_case("workstation"))
-        .unwrap_or(false)
+/// `true` when this machine **is** the configured usage hub (hub-local
+/// reconciliation: read the hub's own cache directly). Driven by the same
+/// `CLAUDE_HUB_HOSTNAME` env contract as `usage::transport::is_hub_local`, so
+/// no machine name is compiled into the binary. Always false when unset/empty.
+fn is_hub_local_machine() -> bool {
+    match usage::hub_hostname() {
+        Some(hub) => statusline::hostname()
+            .map(|h| h.eq_ignore_ascii_case(&hub))
+            .unwrap_or(false),
+        None => false,
+    }
 }
 
 /// `true` when both stdin and stdout are terminals — mirrors zsh `[[ -t 0 && -t 1 ]]`.

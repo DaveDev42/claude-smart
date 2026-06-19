@@ -1042,7 +1042,6 @@ mod tests {
     fn session_dirs_for_deduplicates_same_path() {
         // A path with no dots produces identical current+legacy encodings.
         // The result should contain at most one entry for that dir.
-        let tmp = TempDir::new().unwrap();
         // We can only test the dedup logic indirectly via encode_cwd.
         let (cur, leg) = paths::encode_cwd(Path::new("/tmp/noproject"));
         // Both encodings must be identical (no dots in path).

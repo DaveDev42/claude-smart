@@ -12,7 +12,7 @@ pub mod model;
 mod transport;
 
 pub use model::UsageData;
-pub use transport::fetch;
+pub use transport::{fetch, hub_hostname};
 
 /// Errors that can occur when fetching usage data from the hub.
 ///
