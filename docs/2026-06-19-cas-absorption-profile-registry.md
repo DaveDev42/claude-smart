@@ -138,9 +138,26 @@ intent); `cas use` sets floor (no drift) but omits export; atomic `save` tmp mus
 be same-dir; toss `cas add` is explicit-user-only.
 
 Migration (never break live mid-rollout, each step revertible):
-1. Ship binary first (allowlist removal + verbs + `--print-default-dir`); install
+1. ✅ Ship binary first (allowlist removal + verbs + `--print-default-dir`); install
    on all 4. Backward-compatible: no profiles.json → synth == today.
-2. Author profiles.json + default via Ansible (behavior-preserving; dirs match synth).
-   Verify `csm cas list` + `--print-default-dir` on each.
-3. Swap shims + de-hardcode floors (depend on step 1+2).
-4. New shells pick up shims; running sessions keep captured paths.
+   DONE: crate commit `972d7c3` (feat(cas): csm가 CAS 기능을 완전 흡수). 515+1
+   tests, clippy 0, leak-guard `no_private_names.rs` green, E2E lifecycle proven.
+   `cargo package` verify-builds the isolated tarball clean; docs/ + .github/
+   excluded. crates.io publish gate is OPEN (leak remediated + verified) — the
+   first publish is the owner's local `cargo publish` (no static token).
+2. ✅ Author profiles.json + default via Ansible (behavior-preserving; dirs match synth).
+   DONE: dave-environment commit `e42a85a`. POSIX copy + win-self win_copy render
+   profiles.json (sorted, no community.general dep) + force:no default seed; SSOT
+   claude_profiles/claude_default_profile in inventory/group_vars/all.yml. Verified
+   via `--check --diff` on Acme-Laptop: writes the exact sorted JSON. hub env
+   contract (CLAUDE_USAGE_URL + CLAUDE_HUB_HOSTNAME) injected in settings*.json.j2.
+3. ✅ Swap shims + de-hardcode floors (depend on step 1+2).
+   DONE (same commit `e42a85a`): zsh + pwsh CAS bodies → csm dispatchers (no
+   profile names/dirs); zshenv.j2 + claude-config-dir-setenv.sh.j2 floors →
+   `csm cas --print-default-dir` with injection-safe fallback; cleanup-claude-home.yml
+   loops claude_profiles.keys(). zsh dispatcher E2E-proven against the real binary;
+   pwsh validated structurally (Windows-native runtime = owner BLOCKING check).
+4. ⏳ New shells pick up shims; running sessions keep captured paths.
+   PENDING: run `ansible-playbook playbook.yml` on each of the 4 machines, then
+   `exec zsh` (POSIX) / new pwsh window (Windows). Windows-native 2 BLOCKING
+   manual checks (dave-environment task #13) still gate the gw_ai_command flip.
