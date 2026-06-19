@@ -401,18 +401,18 @@ pub fn manage_emit(op: &Op, profiles: &mut ProfileMap) -> anyhow::Result<()> {
         Op::Add { name, dir } => {
             if !ProfileMap::is_valid_name(name) {
                 anyhow::bail!(
-                    "cas add: invalid profile name '{name}' (allowed: letters, digits, . _ -)"
+                    "add: invalid profile name '{name}' (allowed: letters, digits, . _ -)"
                 );
             }
             if profiles.contains(name) {
                 anyhow::bail!(
-                    "cas add: profile '{name}' already exists ({}). Use `cas set` to change its dir.",
+                    "add: profile '{name}' already exists ({}). Use `csm profiles set {name} <dir>` to change its dir.",
                     profiles.get(name).unwrap_or("")
                 );
             }
             let dir = resolve_new_dir(name, dir.as_deref());
             std::fs::create_dir_all(&dir)
-                .map_err(|e| anyhow::anyhow!("cas add: cannot create dir '{dir}': {e}"))?;
+                .map_err(|e| anyhow::anyhow!("add: cannot create dir '{dir}': {e}"))?;
             profiles.insert(name.clone(), dir.clone());
             profiles.save()?;
             eprintln!("added profile '{name}' → {dir}");
@@ -421,14 +421,14 @@ pub fn manage_emit(op: &Op, profiles: &mut ProfileMap) -> anyhow::Result<()> {
         Op::Set { name, dir } => {
             if !ProfileMap::is_valid_name(name) {
                 anyhow::bail!(
-                    "cas set: invalid profile name '{name}' (allowed: letters, digits, . _ -)"
+                    "set: invalid profile name '{name}' (allowed: letters, digits, . _ -)"
                 );
             }
             if dir.is_empty() {
-                anyhow::bail!("cas set: <dir> is required");
+                anyhow::bail!("set: <dir> is required");
             }
             std::fs::create_dir_all(dir)
-                .map_err(|e| anyhow::anyhow!("cas set: cannot create dir '{dir}': {e}"))?;
+                .map_err(|e| anyhow::anyhow!("set: cannot create dir '{dir}': {e}"))?;
             let prev = profiles.insert(name.clone(), dir.clone());
             profiles.save()?;
             match prev {
@@ -440,7 +440,7 @@ pub fn manage_emit(op: &Op, profiles: &mut ProfileMap) -> anyhow::Result<()> {
         Op::Remove { name } => {
             if !profiles.contains(name) {
                 anyhow::bail!(
-                    "cas remove: no such profile '{name}' — configured: {}",
+                    "remove: no such profile '{name}' — configured: {}",
                     profiles.names_sorted().join(", ")
                 );
             }

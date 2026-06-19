@@ -799,32 +799,32 @@ fn parse_cas_op(op_args: &[String]) -> anyhow::Result<cas::Op> {
             let name = op_args
                 .get(1)
                 .cloned()
-                .ok_or_else(|| anyhow::anyhow!("csm cas add: requires a profile name"))?;
+                .ok_or_else(|| anyhow::anyhow!("add: requires a profile name (`csm profiles add <name> [<dir>]`)"))?;
             Ok(Op::Add { name, dir: op_args.get(2).cloned() })
         }
         Some("set") => {
             let name = op_args
                 .get(1)
                 .cloned()
-                .ok_or_else(|| anyhow::anyhow!("csm cas set: requires <name> <dir>"))?;
+                .ok_or_else(|| anyhow::anyhow!("set: requires <name> <dir> (`csm profiles set <name> <dir>`)"))?;
             let dir = op_args
                 .get(2)
                 .cloned()
-                .ok_or_else(|| anyhow::anyhow!("csm cas set: requires <name> <dir>"))?;
+                .ok_or_else(|| anyhow::anyhow!("set: requires <name> <dir> (`csm profiles set <name> <dir>`)"))?;
             Ok(Op::Set { name, dir })
         }
         Some("remove") | Some("rm") => {
             let name = op_args
                 .get(1)
                 .cloned()
-                .ok_or_else(|| anyhow::anyhow!("csm cas remove: requires a profile name"))?;
+                .ok_or_else(|| anyhow::anyhow!("remove: requires a profile name (`csm profiles rm <name>`)"))?;
             Ok(Op::Remove { name })
         }
         Some("use") => {
             let name = op_args
                 .get(1)
                 .cloned()
-                .ok_or_else(|| anyhow::anyhow!("csm cas use: requires a profile name"))?;
+                .ok_or_else(|| anyhow::anyhow!("use: requires a profile name (`csm profiles use <name>`)"))?;
             Ok(Op::SetDefault { name })
         }
         Some("edit") => Ok(Op::Edit),
