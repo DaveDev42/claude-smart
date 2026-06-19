@@ -90,7 +90,7 @@ pub enum CompletionsSubcmd {
     /// Eval-class ops (after `--`, with `--eval --shell`): `<profile>`, `-`,
     /// `-g <profile>`, `resync`, `status`.
     /// Management verbs (direct, no `--eval`): `list`, `add <name> [<dir>]`,
-    /// `set <name> <dir>`, `remove|rm <name>`, `use <name>`.
+    /// `set <name> <dir>`, `remove|rm <name>`, `use <name>`, `edit`.
     #[command(name = "cas")]
     Cas {
         /// Emit the eval-able export line (required for profile switching).
@@ -105,6 +105,24 @@ pub enum CompletionsSubcmd {
         /// Operation and its arguments (after `--`, or a management verb).
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         op_args: Vec<String>,
+    },
+
+    /// Profile registry (human-facing noun-verb front over the cas handlers).
+    #[command(name = "profiles")]
+    Profiles {
+        #[command(subcommand)]
+        verb: Option<ProfilesVerb>,
+    },
+
+    /// Multi-profile usage table (registry ∪ hub), offline-aware.
+    #[command(name = "usage")]
+    Usage {
+        /// Emit the joined registry∪hub view as JSON.
+        #[arg(long)]
+        json: bool,
+        /// Read only the local cache (no network).
+        #[arg(long)]
+        no_fetch: bool,
     },
 
     /// Pick the best account to launch under.
@@ -162,6 +180,51 @@ pub enum CompletionsSubcmd {
     /// Print a fresh lowercase UUID v4 (used as --session-id on cold launch).
     #[command(name = "newuuid")]
     Newuuid,
+}
+
+/// `csm profiles <verb>` — registry management verbs.
+#[derive(clap::Subcommand)]
+pub enum ProfilesVerb {
+    /// List configured profiles (current/default marked).
+    #[command(name = "list")]
+    List,
+    /// Register a new profile (dir defaults to ~/.claude.<name>).
+    #[command(name = "add")]
+    Add {
+        /// Profile name.
+        name: String,
+        /// Config dir (optional; defaults to ~/.claude.<name>).
+        dir: Option<String>,
+    },
+    /// Register/overwrite a profile's config dir.
+    #[command(name = "set")]
+    Set {
+        /// Profile name.
+        name: String,
+        /// Config dir.
+        dir: String,
+    },
+    /// Unregister a profile (refused if it is the default).
+    #[command(name = "rm", alias = "remove")]
+    Rm {
+        /// Profile name.
+        name: String,
+    },
+    /// Set the machine default profile (state file + platform floor).
+    #[command(name = "use")]
+    Use {
+        /// Profile name.
+        name: String,
+    },
+    /// Interactive editor (TTY).
+    #[command(name = "edit")]
+    Edit,
+    /// Print a profile's config dir (default profile when omitted).
+    #[command(name = "dir")]
+    Dir {
+        /// Profile name (default profile when omitted).
+        name: Option<String>,
+    },
 }
 
 // ─── generate ─────────────────────────────────────────────────────────────────
@@ -249,8 +312,8 @@ mod tests {
         let out = String::from_utf8_lossy(&buf);
         // All subcommands from the dispatch table.
         for sub in &[
-            "run", "hook", "cas", "pick-account", "scan", "current-usage",
-            "sidecar", "statusline", "completions", "newuuid",
+            "run", "hook", "profiles", "usage", "cas", "pick-account", "scan",
+            "current-usage", "sidecar", "statusline", "completions", "newuuid",
         ] {
             assert!(
                 out.contains(sub),

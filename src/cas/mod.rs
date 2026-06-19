@@ -46,6 +46,7 @@ use std::path::PathBuf;
 
 use crate::account::profiles::ProfileMap;
 
+pub mod edit;
 pub mod platform;
 
 // ─── Op ──────────────────────────────────────────────────────────────────────
@@ -102,6 +103,10 @@ pub enum Op {
     /// `cas use <name>` — set the global default (state file + platform floor),
     /// without emitting a per-shell export. The scriptable analogue of `-g`.
     SetDefault { name: String },
+
+    /// `csm profiles edit` — interactive registry editor (TTY-gated menu loop).
+    /// Non-eval; routed to `manage_emit`.
+    Edit,
 }
 
 // ─── Shell ───────────────────────────────────────────────────────────────────
@@ -368,7 +373,12 @@ pub fn eval_emit(shell: Shell, op: &Op, profiles: &ProfileMap) -> anyhow::Result
         // Registry-management ops are handled by `manage_emit`, not the eval
         // path. `cmd_cas` routes them away from here; this arm only guards the
         // type system (and surfaces a clear error if routing ever regresses).
-        Op::List | Op::Add { .. } | Op::Set { .. } | Op::Remove { .. } | Op::SetDefault { .. } => {
+        Op::List
+        | Op::Add { .. }
+        | Op::Set { .. }
+        | Op::Remove { .. }
+        | Op::SetDefault { .. }
+        | Op::Edit => {
             anyhow::bail!("internal: {op:?} is a management op — route to manage_emit");
         }
     }
@@ -437,7 +447,8 @@ pub fn manage_emit(op: &Op, profiles: &mut ProfileMap) -> anyhow::Result<()> {
             // Refuse to orphan the global default (the dir on disk is retained).
             if profiles.default_name() == *name {
                 anyhow::bail!(
-                    "cas remove: '{name}' is the global default — run `cas use <other>` first"
+                    "remove: '{name}' is the global default — set the default elsewhere first \
+                     (`csm profiles use <other>`)"
                 );
             }
             let dir = profiles.remove(name).unwrap_or_default();
@@ -456,6 +467,12 @@ pub fn manage_emit(op: &Op, profiles: &mut ProfileMap) -> anyhow::Result<()> {
             }
             eprintln!("global default → {name} ({dir})");
             eprintln!("(new shells + GUI/launchd follow this; your current shell keeps its profile until you run `cas {name}` or open a new shell)");
+        }
+
+        Op::Edit => {
+            // Interactive editor — loads/saves the registry through the same
+            // `profiles` map (the caller passes it mutable so writes persist).
+            edit::run_interactive(profiles)?;
         }
 
         // Switch/Global/Resync/Minus/Status are handled by `eval_emit`; routing

@@ -191,6 +191,25 @@ pub fn hub_hostname() -> Option<String> {
         .filter(|h| !h.is_empty())
 }
 
+/// True when usage metering is configured for this machine — either we ARE the
+/// hub (`CLAUDE_HUB_HOSTNAME` matches this host) or a non-empty `CLAUDE_USAGE_URL`
+/// is set. When this is `false`, [`fetch`] can never succeed; `csm usage` uses
+/// this to print a "metering disabled" message instead of a transient error.
+///
+/// This is the env-opt-in gate: an external user (or a toss machine) with
+/// neither variable set gets a clean "disabled" path, not a fetch failure.
+pub fn is_configured() -> bool {
+    is_hub_local() || resolve_usage_url().is_some()
+}
+
+/// Age in seconds of the positive usage cache file (`.usage-cache.json`), or
+/// `None` when the cache is absent/unreadable. `csm usage` uses this to render
+/// the "⚠ hub data is Nm old" stale header when serving cached data offline.
+pub fn cache_age_secs() -> Option<u64> {
+    let meta = std::fs::metadata(paths::usage_cache()).ok()?;
+    Some(file_age_secs_from_meta(&meta))
+}
+
 /// True when this machine **is** the configured hub (read its cache directly,
 /// skip all network). Always false when `CLAUDE_HUB_HOSTNAME` is unset/empty.
 ///

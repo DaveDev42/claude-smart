@@ -56,10 +56,7 @@ fn main() -> anyhow::Result<()> {
                 return Ok(());
             }
             "--help" | "-h" => {
-                println!("csm {} — claude-smart launcher\n", env!("CARGO_PKG_VERSION"));
-                println!("usage: csm <run|hook|cas|pick-account|scan|current-usage|sidecar|statusline|completions|newuuid>");
-                println!("       csm [claude-flags...]        (bare = implicit `csm run`)");
-                println!("       csm run [csm-flags] [-- claude-passthru...]");
+                print_help();
                 return Ok(());
             }
             _ => {}
@@ -67,6 +64,8 @@ fn main() -> anyhow::Result<()> {
         match candidate.as_ref() {
             "run"
             | "hook"
+            | "profiles"
+            | "usage"
             | "cas"
             | "pick-account"
             | "scan"
@@ -93,6 +92,8 @@ fn main() -> anyhow::Result<()> {
     match subcommand {
         "run" => cmd_run(rest),
         "hook" => cmd_hook(rest),
+        "profiles" => cmd_profiles(rest),
+        "usage" => cmd_usage(rest),
         "cas" => cmd_cas(rest),
         "pick-account" => cmd_pick_account(rest),
         "scan" => cmd_scan(rest),
@@ -106,10 +107,46 @@ fn main() -> anyhow::Result<()> {
         }
         other => {
             eprintln!("csm: unknown subcommand: {other}");
-            eprintln!("usage: csm <run|hook|cas|pick-account|scan|current-usage|sidecar|statusline|completions|newuuid>");
+            eprintln!("run `csm --help` for the full surface");
             std::process::exit(1);
         }
     }
+}
+
+/// Print the top-level `csm --help` surface (noun-verb).
+///
+/// The reserved subcommand words are DELIBERATELY disjoint from `claude`'s
+/// subcommand set (agents/auth/auto-mode/doctor/install/mcp/plugin/project/
+/// setup-token/ultrareview/update). Any first token NOT listed here falls
+/// through to an implicit `csm run` → forwarded verbatim to `claude`, so
+/// `csm mcp …`, `csm doctor`, etc. reach claude untouched.
+fn print_help() {
+    let v = env!("CARGO_PKG_VERSION");
+    println!("csm {v} — claude-smart launcher\n");
+    println!("USAGE");
+    println!("  csm [claude-args...]                 bare = smart launch (implicit `csm run`)");
+    println!("  csm run [csm-flags] [-- claude...]   smart launcher (session + account + relaunch)");
+    println!("  csm <subcommand> ...\n");
+    println!("PROFILES (registry — ~/.config/claude-as/profiles.json)");
+    println!("  csm profiles [list]                  list configured profiles");
+    println!("  csm profiles add  <name> [<dir>]     register (dir default ~/.claude.<name>)");
+    println!("  csm profiles set  <name> <dir>       register/overwrite a profile dir");
+    println!("  csm profiles rm   <name>             unregister (refused if it is the default)");
+    println!("  csm profiles use  <name>             set machine default + floor");
+    println!("  csm profiles edit                    interactive editor (TTY)");
+    println!("  csm profiles dir  [<name>]           print a profile's dir (default if omitted)\n");
+    println!("USAGE METERING");
+    println!("  csm usage [--json] [--no-fetch]      multi-profile usage table (offline-aware)\n");
+    println!("OTHER");
+    println!("  csm pick-account [<cur>] [--include-current]   scoring → winner profile");
+    println!("  csm scan [<cwd>]                     session TSV for the picker");
+    println!("  csm sidecar {{read|write|merge|flags}} <sid> [k=v...]");
+    println!("  csm statusline                       `<profile>@<host>` for the shell prompt");
+    println!("  csm completions {{zsh|bash|pwsh}}      shell completions");
+    println!("  csm newuuid                          fresh lowercase UUID v4");
+    println!("  csm cas ...                          eval-class shim contract (machine interface)\n");
+    println!("Words not listed above forward to `claude` (e.g. `csm mcp`, `csm doctor`).");
+    println!("To pass a csm-reserved flag to claude, use `csm run -- <args>`.");
 }
 
 // ─── run ──────────────────────────────────────────────────────────────────────
@@ -652,7 +689,12 @@ fn cmd_cas(args: &[OsString]) -> anyhow::Result<()> {
     // human output — not an eval-able line.
     if matches!(
         op,
-        Op::List | Op::Add { .. } | Op::Set { .. } | Op::Remove { .. } | Op::SetDefault { .. }
+        Op::List
+            | Op::Add { .. }
+            | Op::Set { .. }
+            | Op::Remove { .. }
+            | Op::SetDefault { .. }
+            | Op::Edit
     ) {
         if eval_mode {
             anyhow::bail!("csm cas: management verbs ({op:?}) must not be wrapped in --eval");
@@ -785,8 +827,145 @@ fn parse_cas_op(op_args: &[String]) -> anyhow::Result<cas::Op> {
                 .ok_or_else(|| anyhow::anyhow!("csm cas use: requires a profile name"))?;
             Ok(Op::SetDefault { name })
         }
+        Some("edit") => Ok(Op::Edit),
         Some(profile) => Ok(Op::Switch { profile: profile.to_owned() }),
     }
+}
+
+// ─── profiles ────────────────────────────────────────────────────────────────
+
+/// `csm profiles <verb> ...` — the human-facing registry noun.
+///
+/// A thin noun-verb front over the SAME `cas::Op` handlers the `cas` management
+/// verbs use (no duplicate registry logic). Verbs:
+///   list | add <name> [<dir>] | set <name> <dir> | rm|remove <name>
+///   use <name> | edit | dir [<name>]
+///
+/// Bare `csm profiles` ≡ `csm profiles list`. `dir` is a profiles-only
+/// convenience (prints a profile's config dir; default profile when omitted).
+fn cmd_profiles(args: &[OsString]) -> anyhow::Result<()> {
+    use cas::Op;
+
+    let verb = args.first().map(|a| a.to_string_lossy().into_owned());
+    let rest: Vec<String> = args
+        .iter()
+        .skip(1)
+        .map(|a| a.to_string_lossy().into_owned())
+        .collect();
+
+    // `dir` is profiles-only (not a cas Op): print a profile's resolved dir.
+    if verb.as_deref() == Some("dir") {
+        let profiles =
+            account::ProfileMap::load().context("csm profiles: failed to load profiles.json")?;
+        let dir = match rest.first() {
+            Some(name) => profiles.get(name).map(str::to_owned).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "csm profiles dir: unknown profile '{name}' — configured: {}",
+                    profiles.names_sorted().join(", ")
+                )
+            })?,
+            None => profiles.default_dir().to_string_lossy().into_owned(),
+        };
+        println!("{dir}");
+        return Ok(());
+    }
+
+    // Map the verb to a cas::Op. Bare/`list` → List; everything else reuses the
+    // exact same parser the `cas` verbs use (so behavior cannot diverge).
+    let op = match verb.as_deref() {
+        None | Some("list") => Op::List,
+        Some("edit") => Op::Edit,
+        Some(v @ ("add" | "set" | "remove" | "rm" | "use")) => {
+            // Rebuild the op-args vec in the shape parse_cas_op expects.
+            let mut op_args = Vec::with_capacity(1 + rest.len());
+            op_args.push(v.to_owned());
+            op_args.extend(rest.iter().cloned());
+            parse_cas_op(&op_args)?
+        }
+        Some(other) => {
+            anyhow::bail!(
+                "csm profiles: unknown verb '{other}' \
+                 (expected list|add|set|rm|use|edit|dir)"
+            );
+        }
+    };
+
+    let mut profiles =
+        account::ProfileMap::load().context("csm profiles: failed to load profiles.json")?;
+    cas::manage_emit(&op, &mut profiles)
+}
+
+// ─── usage ───────────────────────────────────────────────────────────────────
+
+/// `csm usage [--json] [--no-fetch]`
+///
+/// Multi-profile usage table joining the registry with the hub's usage blob.
+/// Offline-aware: serves the stale positive cache with an age header when the
+/// hub is unreachable; prints a "disabled" message (registry still shown) when
+/// metering env is unset. `--no-fetch` reads only the cache (never touches the
+/// network) for fast scripted reads.
+fn cmd_usage(args: &[OsString]) -> anyhow::Result<()> {
+    use usage::report;
+
+    let mut json = false;
+    let mut no_fetch = false;
+    for a in args {
+        match a.to_string_lossy().as_ref() {
+            "--json" => json = true,
+            "--no-fetch" => no_fetch = true,
+            "-h" | "--help" => {
+                println!("usage: csm usage [--json] [--no-fetch]");
+                println!("  --json      emit the joined registry∪hub view as JSON");
+                println!("  --no-fetch  read only the local cache (no network)");
+                return Ok(());
+            }
+            other => anyhow::bail!("csm usage: unknown flag '{other}' (try --json | --no-fetch)"),
+        }
+    }
+
+    let profiles =
+        account::ProfileMap::load().context("csm usage: failed to load profiles.json")?;
+    let configured = usage::is_configured();
+
+    // Resolve usage data + freshness. `--no-fetch` reads the cache directly;
+    // otherwise fetch() runs the full resilience ladder (which itself prefers
+    // a fresh cache before any network).
+    let (data, stale_secs) = if !configured {
+        (None, None)
+    } else if no_fetch {
+        let age = usage::cache_age_secs();
+        (read_usage_cache(), age)
+    } else {
+        match usage::fetch() {
+            Ok(d) => {
+                // fetch() may have served a cached blob; surface its age so an
+                // offline serve is labeled stale. Hub-local serves are fresh
+                // (age ~0), so the stale header self-suppresses below 60s.
+                (Some(d), usage::cache_age_secs())
+            }
+            Err(_) => {
+                // Hub unreachable — degrade to the last-known cache, if any.
+                (read_usage_cache(), usage::cache_age_secs())
+            }
+        }
+    };
+
+    let rpt = report::build_report(&profiles, data.as_ref(), configured, stale_secs);
+
+    if json {
+        println!("{}", report::render_json(&rpt)?);
+    } else {
+        print!("{}", report::render_table(&rpt));
+    }
+    Ok(())
+}
+
+/// Read the positive usage cache file directly (no network, no TTL gate). Used
+/// by `--no-fetch` and the offline-degrade path. Returns `None` when absent or
+/// unparseable.
+fn read_usage_cache() -> Option<usage::UsageData> {
+    let raw = std::fs::read_to_string(paths::usage_cache()).ok()?;
+    serde_json::from_str(&raw).ok()
 }
 
 // ─── pick-account ──────────────────────────────────────────────────────────────

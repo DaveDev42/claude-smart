@@ -9,10 +9,11 @@
 //! `fetch()` entry-point.
 
 pub mod model;
+pub mod report;
 mod transport;
 
 pub use model::UsageData;
-pub use transport::{fetch, hub_hostname};
+pub use transport::{cache_age_secs, fetch, hub_hostname, is_configured};
 
 /// Errors that can occur when fetching usage data from the hub.
 ///
