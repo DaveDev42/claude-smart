@@ -132,9 +132,35 @@ jobs:
           download-url: https://github.com/DaveDev42/claude-smart/releases/download/${{ needs.resolve-release.outputs.tag_name }}/csm-aarch64-apple-darwin.tar.gz
           tap-token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
 
-  # publish-crate: intentionally removed.
-  # The first crates.io publish of `claude-smart` is done locally with `cargo publish`
-  # (interactive crates.io login), because Trusted Publishing cannot be configured until
-  # the crate already exists. Once the crate exists and Trusted Publishing is registered
-  # in the crates.io UI (DaveDev42/claude-smart, workflow release-please.yml), re-add an
-  # OIDC `publish-crate` job using rust-lang/crates-io-auth-action@v1 (no static token).
+  # crates.io publish via Trusted Publishing (OIDC — no static token).
+  # Registered in the crates.io UI: DaveDev42/claude-smart, repo owner DaveDev42,
+  # workflow `release-please.yml`, no environment. The action exchanges the job's
+  # OIDC id-token for a short-lived crates.io token at runtime.
+  # `cargo publish` is not idempotent, so guard on whether this exact version is
+  # already on the index (re-runs / workflow_dispatch of an old tag would 409).
+  publish-crate:
+    needs: [resolve-release, build]
+    if: ${{ !cancelled() && needs.resolve-release.result == 'success' && needs.build.result == 'success' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Authenticate to crates.io (Trusted Publishing)
+        uses: rust-lang/crates-io-auth-action@v1
+        id: auth
+      - name: Publish if this version is new
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+        run: |
+          ver="$(cargo metadata --no-deps --format-version 1 \
+            | python3 -c 'import sys,json;print(json.load(sys.stdin)["packages"][0]["version"])')"
+          echo "Cargo.toml version: $ver"
+          if cargo search claude-smart | grep -q "^claude-smart = \"$ver\""; then
+            echo "claude-smart $ver already on crates.io — skipping publish."
+          else
+            cargo publish
+          fi

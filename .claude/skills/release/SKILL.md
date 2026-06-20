@@ -58,23 +58,33 @@ release PR. There is usually nothing to hand-edit.
    Confirm the GitHub release published with all 4 assets + `SHA256SUMS.txt`, and
    that the tap formula bumped.
 
-## crates.io (NOT in CI — important)
+## crates.io (now in CI via Trusted Publishing)
 
-There is intentionally **no `publish-crate` job**. Reason: Trusted Publishing
-can't be set up until the crate already exists on crates.io.
+The crate **is published** (`claude-smart` first went up as `0.1.1`, local
+`cargo publish`). CI now carries a `publish-crate` job that authenticates via
+**Trusted Publishing** (OIDC `id-token`, `rust-lang/crates-io-auth-action@v1` →
+short-lived token, no static `CARGO_REGISTRY_TOKEN`). It runs after `build`
+succeeds on a release and is version-guarded — if the Cargo.toml version is
+already on the index it **skips** (so `workflow_dispatch` of an old tag won't 409).
 
-- **First-ever publish** is done LOCALLY by the user (interactive crates.io login;
-  no static token in CI or this session):
-  ```sh
-  cargo publish --dry-run    # verify the tarball builds in isolation (safe to run)
-  cargo publish              # USER runs this after `cargo login` — needs their token
-  ```
-  Verify hygiene first: `cargo package --list` must show NO `docs/`, `.github/`,
-  or `IN_PROGRESS.md` (the `Cargo.toml` `exclude`), and `README.md` + `src/` only.
-- **After** the crate exists: register Trusted Publishing in the crates.io UI
-  (`DaveDev42/claude-smart`, workflow `release-please.yml`) and re-add an OIDC
-  `publish-crate` job using `rust-lang/crates-io-auth-action@v1` (no static token).
-  The removed-job note is at the bottom of `release-please.yml`.
+So for a normal release you do **nothing** for crates.io — merging the release PR
+bumps the version and the job publishes it. Just confirm afterward that the new
+version appears on crates.io.
+
+Manual publish is the fallback only (token issue, CI down, or a version CI
+skipped). When doing it by hand, verify hygiene first:
+```sh
+cargo package --list   # must show LICENSE + README.md + src/; NO docs/ .github/
+                       # IN_PROGRESS.md CLAUDE.md .claude/ (the Cargo.toml exclude)
+cargo publish --dry-run   # isolated build, safe
+cargo publish             # needs `cargo login` token; via `rustup run stable cargo …`
+                          # if the cargo shim mis-parses the subcommand
+```
+
+> One-time setup already done: Trusted Publishing is registered in the crates.io
+> UI (owner `DaveDev42`, repo `claude-smart`, workflow `release-please.yml`, no
+> environment). If the publisher config is ever removed, re-add it there or the
+> OIDC exchange fails.
 
 ## Don't
 
