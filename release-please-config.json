@@ -6,7 +6,7 @@
       "include-component-in-tag": false,
       "draft": true,
       "bump-major-pre-major": false,
-      "bump-minor-pre-major": false,
+      "bump-minor-pre-major": true,
       "bump-patch-for-minor-pre-major": true,
       "extra-files": [
         { "type": "toml", "path": "Cargo.lock",
