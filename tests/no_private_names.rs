@@ -13,13 +13,19 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-/// Substrings that must never appear in shipped (non-test) source.
-const FORBIDDEN: &[&str] = &[
-    "example-tnet",      // tailnet suffix
-    "workstation",   // hub hostname (lowercase)
-    "Workstation",   // hub hostname (display)
-    "user", // personal email local-part
-];
+/// Substrings that must never appear in shipped (non-test) source. Most are
+/// written as plain literals; the personal-email local-part is assembled at
+/// runtime (see `forbidden()`) so the guard can grep for it without the full
+/// address sitting in this public file verbatim.
+fn forbidden() -> Vec<String> {
+    vec![
+        "example-tnet".to_string(),    // tailnet suffix
+        "workstation".to_string(), // hub hostname (lowercase)
+        "Workstation".to_string(), // hub hostname (display)
+        // personal email local-part, split so it isn't a searchable literal here
+        format!("{}{}", "helloworld", "4625"),
+    ]
+}
 
 /// Profile-name allowlist leak: these must not appear as string literals in
 /// non-test production logic (they are valid only as test fixtures + the
@@ -67,11 +73,12 @@ fn no_private_identifiers_in_shipped_source() {
     );
 
     let mut violations: Vec<String> = Vec::new();
+    let forbidden = forbidden();
 
     for file in &files {
         let src = fs::read_to_string(file).expect("read source");
         for (lineno, line) in production_lines(&src) {
-            for needle in FORBIDDEN {
+            for needle in &forbidden {
                 if line.contains(needle) {
                     violations.push(format!(
                         "{}:{}: forbidden identifier {:?}",
