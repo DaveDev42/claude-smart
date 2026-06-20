@@ -24,7 +24,7 @@ use std::process::{Command, ExitStatus};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::launcher::{ChildHandle, Launcher};
-use super::proc_check::{ProcCheck, is_claude_or_node_name};
+use super::proc_check::{is_claude_or_node_name, ProcCheck};
 
 /// The binary `csm run` launches. Overridable via `CLAUDE_SMART_CLAUDE_BIN`
 /// for tests / non-standard installs (matches the shell's `$CLAUDE_BIN`).
@@ -47,8 +47,8 @@ impl Launcher for PosixLauncher {
     ) -> io::Result<(ExitStatus, ChildHandle)> {
         use std::os::unix::io::AsFd;
 
-        use nix::sys::signal::{SaFlags, SigAction, SigHandler, SigSet, Signal, sigaction};
-        use nix::unistd::{Pid, setpgid, tcgetpgrp, tcsetpgrp};
+        use nix::sys::signal::{sigaction, SaFlags, SigAction, SigHandler, SigSet, Signal};
+        use nix::unistd::{setpgid, tcgetpgrp, tcsetpgrp, Pid};
 
         let born = SystemTime::now()
             .duration_since(UNIX_EPOCH)

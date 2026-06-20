@@ -69,7 +69,10 @@ pub fn resets_to_epoch(resets: &str) -> Result<DateTime<Utc>, ResetParseError> {
 /// This function is `pub` so that calling modules (e.g. `scoring`) can
 /// call it with a real `Utc::now()` without going through the thin wrapper.
 /// Tests inject a fixed instant for determinism.
-pub fn resets_to_epoch_at(resets: &str, now: DateTime<Utc>) -> Result<DateTime<Utc>, ResetParseError> {
+pub fn resets_to_epoch_at(
+    resets: &str,
+    now: DateTime<Utc>,
+) -> Result<DateTime<Utc>, ResetParseError> {
     let s = resets.trim();
     if s.is_empty() {
         return Err(ResetParseError::Empty);
@@ -123,16 +126,16 @@ pub fn resets_to_epoch_at(resets: &str, now: DateTime<Utc>) -> Result<DateTime<U
     // After our normalisation the body is `"<Mon> <DD> <H>:<MM>(am|pm)"`.
     // We try the current year first, then the next year if the result is in the past.
     let year = now_in_tz.year();
-    let dt = parse_body_with_year(&body, year, tz)
-        .ok_or_else(|| ResetParseError::UnrecognisedFormat(format!("{} (from {:?})", body, resets)))?;
+    let dt = parse_body_with_year(&body, year, tz).ok_or_else(|| {
+        ResetParseError::UnrecognisedFormat(format!("{} (from {:?})", body, resets))
+    })?;
 
     // ── Step 7: next-year rollover ────────────────────────────────────────────
     //
     // Shell: `[ "$epoch" -lt "$now" ] && epoch="$(date -j -f '%Y %b %d %I:%M%p' "$((y+1)) $s" ...)"`
     let dt_utc = dt.with_timezone(&Utc);
     if dt_utc < now {
-        let dt_next = parse_body_with_year(&body, year + 1, tz)
-            .ok_or(ResetParseError::Overflow)?;
+        let dt_next = parse_body_with_year(&body, year + 1, tz).ok_or(ResetParseError::Overflow)?;
         return Ok(dt_next.with_timezone(&Utc));
     }
 
@@ -151,7 +154,9 @@ fn extract_tz(s: &str) -> Result<(&str, Tz), ResetParseError> {
         let body = s[..paren_start].trim();
         let rest = &s[paren_start + 2..]; // skip " ("
         let tz_str = rest.trim_end_matches(')').trim();
-        let tz: Tz = tz_str.parse().map_err(|_| ResetParseError::UnknownTimezone(tz_str.to_string()))?;
+        let tz: Tz = tz_str
+            .parse()
+            .map_err(|_| ResetParseError::UnknownTimezone(tz_str.to_string()))?;
         Ok((body, tz))
     } else {
         // No parenthesised suffix — treat as UTC.
@@ -165,7 +170,10 @@ fn extract_tz(s: &str) -> Result<(&str, Tz), ResetParseError> {
 fn is_bare_time(s: &str) -> bool {
     let s_lower = s.to_lowercase();
     // Must end with "am" or "pm"
-    let (digits_part, _ampm) = if let Some(stem) = s_lower.strip_suffix("am").or_else(|| s_lower.strip_suffix("pm")) {
+    let (digits_part, _ampm) = if let Some(stem) = s_lower
+        .strip_suffix("am")
+        .or_else(|| s_lower.strip_suffix("pm"))
+    {
         (stem, ())
     } else {
         return false;
@@ -174,11 +182,16 @@ fn is_bare_time(s: &str) -> bool {
     if let Some(colon_pos) = digits_part.find(':') {
         let hour = &digits_part[..colon_pos];
         let min = &digits_part[colon_pos + 1..];
-        !hour.is_empty() && hour.len() <= 2 && hour.chars().all(|c| c.is_ascii_digit())
-            && min.len() == 2 && min.chars().all(|c| c.is_ascii_digit())
+        !hour.is_empty()
+            && hour.len() <= 2
+            && hour.chars().all(|c| c.is_ascii_digit())
+            && min.len() == 2
+            && min.chars().all(|c| c.is_ascii_digit())
     } else {
         // No colon — must be 1 or 2 digits
-        !digits_part.is_empty() && digits_part.len() <= 2 && digits_part.chars().all(|c| c.is_ascii_digit())
+        !digits_part.is_empty()
+            && digits_part.len() <= 2
+            && digits_part.chars().all(|c| c.is_ascii_digit())
     }
 }
 
@@ -353,9 +366,9 @@ fn parse_12h_time(s: &str) -> Option<NaiveTime> {
     // 12am → 0, 1am → 1, …, 11am → 11
     // 12pm → 12, 1pm → 13, …, 11pm → 23
     let hour_24 = match (is_pm, hour) {
-        (false, 12) => 0,   // 12am = midnight
+        (false, 12) => 0, // 12am = midnight
         (false, h) => h,
-        (true, 12) => 12,   // 12pm = noon
+        (true, 12) => 12, // 12pm = noon
         (true, h) => h + 12,
     };
 
@@ -633,8 +646,18 @@ mod tests {
     #[test]
     fn parse_month_all_names() {
         let expected = [
-            ("jan", 1u32), ("feb", 2), ("mar", 3), ("apr", 4), ("may", 5), ("jun", 6),
-            ("jul", 7), ("aug", 8), ("sep", 9), ("oct", 10), ("nov", 11), ("dec", 12),
+            ("jan", 1u32),
+            ("feb", 2),
+            ("mar", 3),
+            ("apr", 4),
+            ("may", 5),
+            ("jun", 6),
+            ("jul", 7),
+            ("aug", 8),
+            ("sep", 9),
+            ("oct", 10),
+            ("nov", 11),
+            ("dec", 12),
         ];
         for (name, num) in expected {
             assert_eq!(parse_month(name), Some(num), "month={name}");

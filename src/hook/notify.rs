@@ -196,7 +196,10 @@ mod tests {
                 );
             }
         }
-        assert!(body.contains("\\;"), "escaped semicolons should use \\;: {body}");
+        assert!(
+            body.contains("\\;"),
+            "escaped semicolons should use \\;: {body}"
+        );
     }
 
     /// build_osc777_json does not panic on an empty message.
@@ -225,7 +228,9 @@ mod tests {
         assert!(line.contains("action=switched"), "line: {line}");
         // Timestamp is YYYY-MM-DD HH:MM:SS
         assert!(
-            line.chars().take(10).all(|c| c.is_ascii_digit() || c == '-'),
+            line.chars()
+                .take(10)
+                .all(|c| c.is_ascii_digit() || c == '-'),
             "timestamp format unexpected: {line}"
         );
     }
@@ -275,9 +280,14 @@ mod tests {
         let body = "[personal] hit session 99% → switching to [work] (hop 1)";
         let json = build_osc777_json("limit detected", body);
         let val: serde_json::Value = serde_json::from_str(&json).unwrap();
-        let seq = val["terminalSequence"].as_str().expect("terminalSequence must be a string");
+        let seq = val["terminalSequence"]
+            .as_str()
+            .expect("terminalSequence must be a string");
         // CC reads this string and writes it verbatim to the PTY.
-        assert!(seq.starts_with("\x1b]777;"), "must start with ESC]777;: {seq:?}");
+        assert!(
+            seq.starts_with("\x1b]777;"),
+            "must start with ESC]777;: {seq:?}"
+        );
         // The body content (with escaped semicolons) must be present.
         assert!(seq.contains("personal"), "body content missing: {seq}");
         assert!(seq.contains("work"), "body content missing: {seq}");

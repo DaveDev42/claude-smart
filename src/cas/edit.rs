@@ -50,7 +50,10 @@ pub enum Outcome {
     /// The registry was mutated and should be persisted. `msg` is user-facing.
     /// `set_default` carries a profile name when the default-NAME state file
     /// must also be (re)written to it (rename-follows-default / set-default).
-    Changed { msg: String, set_default: Option<String> },
+    Changed {
+        msg: String,
+        set_default: Option<String>,
+    },
     /// Nothing changed; `msg` explains why (no-op or a recoverable user error).
     NoChange { msg: String },
     /// The user asked to quit.
@@ -98,18 +101,27 @@ pub fn apply_edit_action(profiles: &mut ProfileMap, action: Action) -> Outcome {
 
         Action::EditDir { name, dir } => {
             if !profiles.contains(&name) {
-                return Outcome::NoChange { msg: format!("no such profile '{name}'") };
+                return Outcome::NoChange {
+                    msg: format!("no such profile '{name}'"),
+                };
             }
             if dir.trim().is_empty() {
-                return Outcome::NoChange { msg: "dir cannot be empty".to_owned() };
+                return Outcome::NoChange {
+                    msg: "dir cannot be empty".to_owned(),
+                };
             }
             profiles.insert(name.clone(), dir.clone());
-            Outcome::Changed { msg: format!("'{name}' → {dir}"), set_default: None }
+            Outcome::Changed {
+                msg: format!("'{name}' → {dir}"),
+                set_default: None,
+            }
         }
 
         Action::Rename { from, to } => {
             if !profiles.contains(&from) {
-                return Outcome::NoChange { msg: format!("no such profile '{from}'") };
+                return Outcome::NoChange {
+                    msg: format!("no such profile '{from}'"),
+                };
             }
             if !ProfileMap::is_valid_name(&to) {
                 return Outcome::NoChange {
@@ -117,7 +129,9 @@ pub fn apply_edit_action(profiles: &mut ProfileMap, action: Action) -> Outcome {
                 };
             }
             if from == to {
-                return Outcome::NoChange { msg: "name unchanged".to_owned() };
+                return Outcome::NoChange {
+                    msg: "name unchanged".to_owned(),
+                };
             }
             if profiles.contains(&to) {
                 return Outcome::NoChange {
@@ -137,7 +151,9 @@ pub fn apply_edit_action(profiles: &mut ProfileMap, action: Action) -> Outcome {
 
         Action::Delete { name } => {
             if !profiles.contains(&name) {
-                return Outcome::NoChange { msg: format!("no such profile '{name}'") };
+                return Outcome::NoChange {
+                    msg: format!("no such profile '{name}'"),
+                };
             }
             if profiles.default_name() == name {
                 return Outcome::NoChange {
@@ -155,7 +171,9 @@ pub fn apply_edit_action(profiles: &mut ProfileMap, action: Action) -> Outcome {
             // Populated map requires membership (empty/synth never reaches the
             // interactive editor — the TTY menu lists only existing profiles).
             if !profiles.contains(&name) {
-                return Outcome::NoChange { msg: format!("no such profile '{name}'") };
+                return Outcome::NoChange {
+                    msg: format!("no such profile '{name}'"),
+                };
             }
             Outcome::Changed {
                 msg: format!("global default → {name}"),
@@ -330,7 +348,11 @@ fn render_menu(profiles: &ProfileMap) {
     println!(
         "csm profiles edit — {} profile(s), default: {}",
         names.len(),
-        if default.is_empty() { "(none)" } else { &default }
+        if default.is_empty() {
+            "(none)"
+        } else {
+            &default
+        }
     );
     let current = std::env::var("CLAUDE_CONFIG_DIR").unwrap_or_default();
     for (i, name) in names.iter().enumerate() {
@@ -393,18 +415,33 @@ mod tests {
     #[test]
     fn add_valid_inserts() {
         let mut p = registry(&[]);
-        let out = apply_edit_action(&mut p, Action::Add {
-            name: "work".into(),
-            dir: Some("/tmp/.claude.work".into()),
-        });
-        assert!(matches!(out, Outcome::Changed { set_default: None, .. }));
+        let out = apply_edit_action(
+            &mut p,
+            Action::Add {
+                name: "work".into(),
+                dir: Some("/tmp/.claude.work".into()),
+            },
+        );
+        assert!(matches!(
+            out,
+            Outcome::Changed {
+                set_default: None,
+                ..
+            }
+        ));
         assert_eq!(p.get("work"), Some("/tmp/.claude.work"));
     }
 
     #[test]
     fn add_blank_dir_synthesizes() {
         let mut p = registry(&[]);
-        let out = apply_edit_action(&mut p, Action::Add { name: "work".into(), dir: None });
+        let out = apply_edit_action(
+            &mut p,
+            Action::Add {
+                name: "work".into(),
+                dir: None,
+            },
+        );
         assert!(matches!(out, Outcome::Changed { .. }));
         assert!(p.get("work").unwrap().ends_with(".claude.work"));
     }
@@ -412,7 +449,13 @@ mod tests {
     #[test]
     fn add_duplicate_rejected() {
         let mut p = registry(&[("work", "/tmp/work")]);
-        let out = apply_edit_action(&mut p, Action::Add { name: "work".into(), dir: None });
+        let out = apply_edit_action(
+            &mut p,
+            Action::Add {
+                name: "work".into(),
+                dir: None,
+            },
+        );
         assert!(matches!(out, Outcome::NoChange { .. }));
         // unchanged
         assert_eq!(p.get("work"), Some("/tmp/work"));
@@ -421,7 +464,13 @@ mod tests {
     #[test]
     fn add_invalid_name_rejected() {
         let mut p = registry(&[]);
-        let out = apply_edit_action(&mut p, Action::Add { name: "has space".into(), dir: None });
+        let out = apply_edit_action(
+            &mut p,
+            Action::Add {
+                name: "has space".into(),
+                dir: None,
+            },
+        );
         assert!(matches!(out, Outcome::NoChange { .. }));
         assert!(p.is_empty());
     }
@@ -429,10 +478,13 @@ mod tests {
     #[test]
     fn edit_dir_changes_existing() {
         let mut p = registry(&[("work", "/old")]);
-        let out = apply_edit_action(&mut p, Action::EditDir {
-            name: "work".into(),
-            dir: "/new".into(),
-        });
+        let out = apply_edit_action(
+            &mut p,
+            Action::EditDir {
+                name: "work".into(),
+                dir: "/new".into(),
+            },
+        );
         assert!(matches!(out, Outcome::Changed { .. }));
         assert_eq!(p.get("work"), Some("/new"));
     }
@@ -440,14 +492,26 @@ mod tests {
     #[test]
     fn edit_dir_missing_profile_no_change() {
         let mut p = registry(&[]);
-        let out = apply_edit_action(&mut p, Action::EditDir { name: "x".into(), dir: "/d".into() });
+        let out = apply_edit_action(
+            &mut p,
+            Action::EditDir {
+                name: "x".into(),
+                dir: "/d".into(),
+            },
+        );
         assert!(matches!(out, Outcome::NoChange { .. }));
     }
 
     #[test]
     fn edit_dir_empty_rejected() {
         let mut p = registry(&[("work", "/old")]);
-        let out = apply_edit_action(&mut p, Action::EditDir { name: "work".into(), dir: "  ".into() });
+        let out = apply_edit_action(
+            &mut p,
+            Action::EditDir {
+                name: "work".into(),
+                dir: "  ".into(),
+            },
+        );
         assert!(matches!(out, Outcome::NoChange { .. }));
         assert_eq!(p.get("work"), Some("/old"));
     }
@@ -459,7 +523,13 @@ mod tests {
         // — keeps this test about dir-movement, not default-following (covered
         // separately in rename_default_follows).
         let mut p = registry(&[("work", "/w"), ("keep", "/k")]);
-        let out = apply_edit_action(&mut p, Action::Rename { from: "work".into(), to: "job".into() });
+        let out = apply_edit_action(
+            &mut p,
+            Action::Rename {
+                from: "work".into(),
+                to: "job".into(),
+            },
+        );
         // The dir moved and the source name is gone, regardless of whether the
         // global default happened to point at "work" in this environment.
         assert!(matches!(out, Outcome::Changed { .. }));
@@ -471,7 +541,13 @@ mod tests {
     #[test]
     fn rename_target_exists_rejected() {
         let mut p = registry(&[("work", "/w"), ("job", "/j")]);
-        let out = apply_edit_action(&mut p, Action::Rename { from: "work".into(), to: "job".into() });
+        let out = apply_edit_action(
+            &mut p,
+            Action::Rename {
+                from: "work".into(),
+                to: "job".into(),
+            },
+        );
         assert!(matches!(out, Outcome::NoChange { .. }));
         // both intact
         assert_eq!(p.get("work"), Some("/w"));
@@ -481,7 +557,13 @@ mod tests {
     #[test]
     fn rename_invalid_target_rejected() {
         let mut p = registry(&[("work", "/w")]);
-        let out = apply_edit_action(&mut p, Action::Rename { from: "work".into(), to: "a/b".into() });
+        let out = apply_edit_action(
+            &mut p,
+            Action::Rename {
+                from: "work".into(),
+                to: "a/b".into(),
+            },
+        );
         assert!(matches!(out, Outcome::NoChange { .. }));
         assert!(p.contains("work"));
     }
@@ -491,10 +573,20 @@ mod tests {
         // A single-profile map: default_name() resolves to "work" (preferred).
         let mut p = registry(&[("work", "/w")]);
         assert_eq!(p.default_name(), "work");
-        let out = apply_edit_action(&mut p, Action::Rename { from: "work".into(), to: "job".into() });
+        let out = apply_edit_action(
+            &mut p,
+            Action::Rename {
+                from: "work".into(),
+                to: "job".into(),
+            },
+        );
         match out {
             Outcome::Changed { set_default, .. } => {
-                assert_eq!(set_default.as_deref(), Some("job"), "default must follow rename");
+                assert_eq!(
+                    set_default.as_deref(),
+                    Some("job"),
+                    "default must follow rename"
+                );
             }
             other => panic!("expected Changed, got {other:?}"),
         }
@@ -522,7 +614,12 @@ mod tests {
     #[test]
     fn delete_missing_no_change() {
         let mut p = registry(&[("a", "/a")]);
-        let out = apply_edit_action(&mut p, Action::Delete { name: "nope".into() });
+        let out = apply_edit_action(
+            &mut p,
+            Action::Delete {
+                name: "nope".into(),
+            },
+        );
         assert!(matches!(out, Outcome::NoChange { .. }));
     }
 
@@ -539,7 +636,12 @@ mod tests {
     #[test]
     fn set_default_missing_no_change() {
         let mut p = registry(&[("a", "/a")]);
-        let out = apply_edit_action(&mut p, Action::SetDefault { name: "ghost".into() });
+        let out = apply_edit_action(
+            &mut p,
+            Action::SetDefault {
+                name: "ghost".into(),
+            },
+        );
         assert!(matches!(out, Outcome::NoChange { .. }));
     }
 
@@ -555,20 +657,45 @@ mod tests {
     fn scripted_lifecycle() {
         let mut p = registry(&[]);
         assert!(matches!(
-            apply_edit_action(&mut p, Action::Add { name: "alpha".into(), dir: Some("/a".into()) }),
+            apply_edit_action(
+                &mut p,
+                Action::Add {
+                    name: "alpha".into(),
+                    dir: Some("/a".into())
+                }
+            ),
             Outcome::Changed { .. }
         ));
         assert!(matches!(
-            apply_edit_action(&mut p, Action::Add { name: "beta".into(), dir: Some("/b".into()) }),
+            apply_edit_action(
+                &mut p,
+                Action::Add {
+                    name: "beta".into(),
+                    dir: Some("/b".into())
+                }
+            ),
             Outcome::Changed { .. }
         ));
         // set-default beta
-        match apply_edit_action(&mut p, Action::SetDefault { name: "beta".into() }) {
-            Outcome::Changed { set_default, .. } => assert_eq!(set_default.as_deref(), Some("beta")),
+        match apply_edit_action(
+            &mut p,
+            Action::SetDefault {
+                name: "beta".into(),
+            },
+        ) {
+            Outcome::Changed { set_default, .. } => {
+                assert_eq!(set_default.as_deref(), Some("beta"))
+            }
             o => panic!("{o:?}"),
         }
         // rename alpha (non-default) → gamma; default does NOT follow.
-        match apply_edit_action(&mut p, Action::Rename { from: "alpha".into(), to: "gamma".into() }) {
+        match apply_edit_action(
+            &mut p,
+            Action::Rename {
+                from: "alpha".into(),
+                to: "gamma".into(),
+            },
+        ) {
             // NOTE: default_name() here reads the real state file, which in a
             // test env is unlikely to be "alpha"; assert structurally instead.
             Outcome::Changed { .. } => {}

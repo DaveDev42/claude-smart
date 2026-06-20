@@ -94,7 +94,9 @@ pub fn titles_tsv() -> PathBuf {
 /// (rust-port spec §line 447); no Rust caller reads it today.
 #[allow(dead_code)]
 pub fn legacy_helper_sh() -> PathBuf {
-    smart_dir_no_create().join("bin").join("claude-smart-helper.sh")
+    smart_dir_no_create()
+        .join("bin")
+        .join("claude-smart-helper.sh")
 }
 
 /// `~/.config/claude-as/profiles.json` — cross-platform profile→dir map.
@@ -194,10 +196,7 @@ mod tests {
             cur, expected_current,
             "current encoding mismatch for {raw:?}"
         );
-        assert_eq!(
-            leg, expected_legacy,
-            "legacy encoding mismatch for {raw:?}"
-        );
+        assert_eq!(leg, expected_legacy, "legacy encoding mismatch for {raw:?}");
     }
 
     #[test]
@@ -227,11 +226,7 @@ mod tests {
     #[test]
     fn encode_cwd_no_dots() {
         // A path with no dots → current == legacy
-        check(
-            "/tmp/myproject",
-            "-tmp-myproject",
-            "-tmp-myproject",
-        );
+        check("/tmp/myproject", "-tmp-myproject", "-tmp-myproject");
     }
 
     #[test]
@@ -253,7 +248,10 @@ mod tests {
     fn encode_cwd_current_legacy_differ_when_dots_present() {
         let (cur, leg) = encode_cwd(Path::new("/foo/bar.baz"));
         // current replaces the dot
-        assert!(cur.contains("bar-baz"), "current should replace dots: {cur}");
+        assert!(
+            cur.contains("bar-baz"),
+            "current should replace dots: {cur}"
+        );
         // legacy preserves the dot
         assert!(leg.contains("bar.baz"), "legacy should keep dots: {leg}");
     }
@@ -273,15 +271,24 @@ mod tests {
             s.contains(".claude.shared"),
             "smart_dir should be under .claude.shared, got: {s}"
         );
-        assert!(s.ends_with("smart"), "smart_dir should end with 'smart', got: {s}");
+        assert!(
+            s.ends_with("smart"),
+            "smart_dir should end with 'smart', got: {s}"
+        );
     }
 
     #[test]
     fn profiles_json_is_under_config() {
         let p = profiles_json();
         let s = p.to_string_lossy();
-        assert!(s.contains(".config"), "profiles_json not under .config: {s}");
-        assert!(s.contains("claude-as"), "profiles_json not under claude-as: {s}");
+        assert!(
+            s.contains(".config"),
+            "profiles_json not under .config: {s}"
+        );
+        assert!(
+            s.contains("claude-as"),
+            "profiles_json not under claude-as: {s}"
+        );
     }
 
     #[test]

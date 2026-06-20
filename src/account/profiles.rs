@@ -185,10 +185,7 @@ mod tests {
 
     #[test]
     fn single_profile_roundtrip() {
-        let pm = parse_profiles(
-            r#"{"personal": "/Users/example/.claude.personal"}"#,
-        )
-        .unwrap();
+        let pm = parse_profiles(r#"{"personal": "/Users/example/.claude.personal"}"#).unwrap();
         assert!(!pm.is_empty());
         assert_eq!(pm.get("personal"), Some("/Users/example/.claude.personal"));
         assert_eq!(pm.get("work"), None);
@@ -205,10 +202,7 @@ mod tests {
 
     #[test]
     fn iter_yields_all_entries() {
-        let pm = parse_profiles(
-            r#"{"personal": "/a", "work": "/b"}"#,
-        )
-        .unwrap();
+        let pm = parse_profiles(r#"{"personal": "/a", "work": "/b"}"#).unwrap();
         let mut pairs: Vec<(&str, &str)> = pm.iter().collect();
         pairs.sort_unstable();
         assert_eq!(pairs, vec![("work", "/b"), ("personal", "/a")]);
@@ -339,7 +333,10 @@ mod tests {
         // Sorted keys + trailing newline on disk.
         let raw = std::fs::read_to_string(&path).unwrap();
         assert!(raw.ends_with('\n'));
-        assert!(raw.find("alpha").unwrap() < raw.find("zeta").unwrap(), "keys not sorted: {raw}");
+        assert!(
+            raw.find("alpha").unwrap() < raw.find("zeta").unwrap(),
+            "keys not sorted: {raw}"
+        );
 
         // Roundtrip.
         let reloaded = parse_profiles(&raw).unwrap();

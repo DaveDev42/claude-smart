@@ -15,10 +15,10 @@ use std::path::{Path, PathBuf};
 
 /// Substrings that must never appear in shipped (non-test) source.
 const FORBIDDEN: &[&str] = &[
-    "example-tnet",       // tailnet suffix
-    "workstation",    // hub hostname (lowercase)
-    "Workstation",    // hub hostname (display)
-    "user",  // personal email local-part
+    "example-tnet",      // tailnet suffix
+    "workstation",   // hub hostname (lowercase)
+    "Workstation",   // hub hostname (display)
+    "user", // personal email local-part
 ];
 
 /// Profile-name allowlist leak: these must not appear as string literals in
@@ -60,7 +60,11 @@ fn no_private_identifiers_in_shipped_source() {
     let src_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
     let mut files = Vec::new();
     collect_rs(&src_dir, &mut files);
-    assert!(!files.is_empty(), "no .rs files found under {}", src_dir.display());
+    assert!(
+        !files.is_empty(),
+        "no .rs files found under {}",
+        src_dir.display()
+    );
 
     let mut violations: Vec<String> = Vec::new();
 

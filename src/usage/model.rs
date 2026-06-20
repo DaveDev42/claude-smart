@@ -223,9 +223,13 @@ mod tests {
     #[test]
     fn deserialize_minimal_json_no_errors_key() {
         // The `errors` key is absent when all profiles succeeded.
-        let json = r#"{"profiles": {"personal": {"session": {"pct": 10}, "week_all": {"pct": 20}}}}"#;
+        let json =
+            r#"{"profiles": {"personal": {"session": {"pct": 10}, "week_all": {"pct": 20}}}}"#;
         let data: UsageData = serde_json::from_str(json).expect("minimal JSON");
-        assert!(data.errors.is_none(), "errors should be None when key absent");
+        assert!(
+            data.errors.is_none(),
+            "errors should be None when key absent"
+        );
         let p = data.profiles.get("personal").expect("personal");
         assert!(p.week_sonnet.is_none());
     }
@@ -276,8 +280,7 @@ mod tests {
 
     #[test]
     fn roundtrip_serialize_deserialize() {
-        let data: UsageData =
-            serde_json::from_str(SAMPLE_CACHE_JSON).expect("initial parse");
+        let data: UsageData = serde_json::from_str(SAMPLE_CACHE_JSON).expect("initial parse");
         let serialized = serde_json::to_string(&data).expect("serialize");
         let data2: UsageData = serde_json::from_str(&serialized).expect("re-parse");
 

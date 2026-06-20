@@ -446,7 +446,10 @@ mod tests {
         assert_eq!(by("personal").session_pct, Some(12));
         assert_eq!(by("work").status, Status::NearLimit); // week_all=96 ≥ 95
         assert_eq!(by("work").status, Status::Errored);
-        assert_eq!(by("work").error.as_deref(), Some("HTTP 401: no credentials"));
+        assert_eq!(
+            by("work").error.as_deref(),
+            Some("HTTP 401: no credentials")
+        );
     }
 
     #[test]
@@ -471,7 +474,10 @@ mod tests {
         let names: Vec<&str> = report.rows.iter().map(|r| r.name.as_str()).collect();
         let ghost_idx = names.iter().position(|n| *n == "ghost").unwrap();
         let personal_idx = names.iter().position(|n| *n == "personal").unwrap();
-        assert!(ghost_idx > personal_idx, "unregistered must sort after registered: {names:?}");
+        assert!(
+            ghost_idx > personal_idx,
+            "unregistered must sort after registered: {names:?}"
+        );
         // And the rendered name carries the tag.
         let table = render_table(&report);
         assert!(table.contains("ghost (unreg)"), "table:\n{table}");
@@ -496,7 +502,10 @@ mod tests {
         assert_eq!(report.rows.len(), 2);
         assert!(report.rows.iter().all(|r| r.status == Status::NoData));
         let table = render_table(&report);
-        assert!(table.contains("usage metering unavailable"), "table:\n{table}");
+        assert!(
+            table.contains("usage metering unavailable"),
+            "table:\n{table}"
+        );
     }
 
     #[test]
@@ -505,7 +514,10 @@ mod tests {
         let report = build_report(&reg, None, /*configured=*/ false, None);
         let table = render_table(&report);
         assert!(table.contains("usage metering disabled"), "table:\n{table}");
-        assert!(table.contains("personal"), "registry must still render: {table}");
+        assert!(
+            table.contains("personal"),
+            "registry must still render: {table}"
+        );
         // Disabled never claims the hub is "unavailable" (that's a different state).
         assert!(!table.contains("unavailable"), "table:\n{table}");
     }
@@ -524,7 +536,10 @@ mod tests {
         let u = sample_usage();
         // Fresh (5s): no stale header.
         let fresh = render_table(&build_report(&reg, Some(&u), true, Some(5)));
-        assert!(!fresh.contains("hub data is"), "fresh should not warn: {fresh}");
+        assert!(
+            !fresh.contains("hub data is"),
+            "fresh should not warn: {fresh}"
+        );
         // Old (7m): stale header present.
         let stale = render_table(&build_report(&reg, Some(&u), true, Some(420)));
         assert!(stale.contains("hub data is 7m old"), "stale:\n{stale}");
@@ -550,15 +565,32 @@ mod tests {
         assert_eq!(v["stale_secs"], serde_json::json!(30));
         assert_eq!(v["captured_at"], serde_json::json!("2026-06-19T07:00:00Z"));
         // BTreeMap → keys sorted: work before ghost before personal.
-        let keys: Vec<&str> = v["profiles"].as_object().unwrap().keys().map(String::as_str).collect();
+        let keys: Vec<&str> = v["profiles"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
         let mut sorted = keys.clone();
         sorted.sort_unstable();
         assert_eq!(keys, sorted, "json profile keys must be sorted: {keys:?}");
         // Status serializes snake_case.
-        assert_eq!(v["profiles"]["work"]["status"], serde_json::json!("near_limit"));
-        assert_eq!(v["profiles"]["personal"]["session_pct"], serde_json::json!(12));
-        assert_eq!(v["profiles"]["work"]["status"], serde_json::json!("errored"));
-        assert_eq!(v["profiles"]["work"]["error"], serde_json::json!("HTTP 401: no credentials"));
+        assert_eq!(
+            v["profiles"]["work"]["status"],
+            serde_json::json!("near_limit")
+        );
+        assert_eq!(
+            v["profiles"]["personal"]["session_pct"],
+            serde_json::json!(12)
+        );
+        assert_eq!(
+            v["profiles"]["work"]["status"],
+            serde_json::json!("errored")
+        );
+        assert_eq!(
+            v["profiles"]["work"]["error"],
+            serde_json::json!("HTTP 401: no credentials")
+        );
     }
 
     #[test]

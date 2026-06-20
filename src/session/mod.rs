@@ -64,7 +64,13 @@ impl SessionRow {
         let human_ts = cols.next()?.to_owned();
         let mode = cols.next()?.to_owned();
         let label = cols.next()?.to_owned();
-        Some(SessionRow { sid, mtime, human_ts, mode, label })
+        Some(SessionRow {
+            sid,
+            mtime,
+            human_ts,
+            mode,
+            label,
+        })
     }
 }
 
@@ -88,11 +94,11 @@ mod tests {
     #[test]
     fn session_row_tsv_roundtrip() {
         let row = SessionRow {
-            sid:      "01234567-89ab-cdef-0123-456789abcdef".to_owned(),
-            mtime:    1_718_000_000,
+            sid: "01234567-89ab-cdef-0123-456789abcdef".to_owned(),
+            mtime: 1_718_000_000,
             human_ts: "06-10 14:32".to_owned(),
-            mode:     "default".to_owned(),
-            label:    "Some conversation label".to_owned(),
+            mode: "default".to_owned(),
+            label: "Some conversation label".to_owned(),
         };
         let tsv = row.to_tsv();
         let parsed = SessionRow::from_tsv(&tsv).expect("round-trip should succeed");
@@ -102,11 +108,11 @@ mod tests {
     #[test]
     fn session_row_tsv_roundtrip_empty_mode() {
         let row = SessionRow {
-            sid:      "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee".to_owned(),
-            mtime:    0,
+            sid: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee".to_owned(),
+            mtime: 0,
             human_ts: "01-01 00:00".to_owned(),
-            mode:     String::new(),
-            label:    "label with\ttab in it? no — label is last col so tab OK".to_owned(),
+            mode: String::new(),
+            label: "label with\ttab in it? no — label is last col so tab OK".to_owned(),
         };
         let tsv = row.to_tsv();
         let parsed = SessionRow::from_tsv(&tsv).expect("round-trip should succeed");

@@ -134,10 +134,7 @@ pub const LIMIT_PCT: i64 = 99;
 /// Shell source: limit-switch.sh.j2 lines 159-161:
 ///   `case "$reason" in clear|logout|prompt_input_exit|exit) user_quit=1 ;; esac`
 pub fn is_user_quit_reason(reason: &str) -> bool {
-    matches!(
-        reason,
-        "clear" | "logout" | "prompt_input_exit" | "exit"
-    )
+    matches!(reason, "clear" | "logout" | "prompt_input_exit" | "exit")
 }
 
 // ─── public API ───────────────────────────────────────────────────────────────
@@ -283,7 +280,8 @@ pub fn classify(input: &HookInput, owner_dir: &Path) -> anyhow::Result<Decision>
     // ── 6. Pick target profile (exclude current, reactive hook mode) ──────────
     // Shell: limit-switch.sh.j2 lines 267-285
     let current_profile = owner_dir_to_profile_name(owner_dir);
-    let target_result = crate::account::pick_account(&current_profile, /*include_current=*/false);
+    let target_result =
+        crate::account::pick_account(&current_profile, /*include_current=*/ false);
     let target_profile = match target_result {
         Ok(Some(name)) => name,
         Ok(None) | Err(_) => {
@@ -307,8 +305,8 @@ pub fn classify(input: &HookInput, owner_dir: &Path) -> anyhow::Result<Decision>
     // Shell: limit-switch.sh.j2 lines 298-308
     // Default is "1" (relaunch enabled). Explicit =0 → notify-only.
     // MUST run before any state mutation — does NOT claim .switched or cooldown.
-    let relaunch_env = std::env::var("CLAUDE_AUTO_SWITCH_RELAUNCH")
-        .unwrap_or_else(|_| "1".to_string());
+    let relaunch_env =
+        std::env::var("CLAUDE_AUTO_SWITCH_RELAUNCH").unwrap_or_else(|_| "1".to_string());
     if relaunch_env != "1" {
         let detect_path = paths::detected(sid);
         if !detect_path.exists() {
@@ -462,10 +460,7 @@ pub(crate) fn limit_in_tail_impl(
 ) -> Option<String> {
     let content = std::fs::read_to_string(path).ok()?;
     // Shell: `tail -n "$n" "$tp"` — take last n non-empty lines.
-    let lines: Vec<&str> = content
-        .lines()
-        .filter(|l| !l.trim().is_empty())
-        .collect();
+    let lines: Vec<&str> = content.lines().filter(|l| !l.trim().is_empty()).collect();
     let tail: &[&str] = if lines.len() > n {
         &lines[lines.len() - n..]
     } else {
@@ -551,7 +546,12 @@ fn detect_malformed_in_tail(input: &HookInput) -> Option<String> {
         return None;
     }
     let now_secs = now_epoch();
-    malformed_in_tail_impl(path, MALFORMED_TAIL_RECORDS, MALFORMED_RECENCY_SECS, now_secs)
+    malformed_in_tail_impl(
+        path,
+        MALFORMED_TAIL_RECORDS,
+        MALFORMED_RECENCY_SECS,
+        now_secs,
+    )
 }
 
 /// Core logic for malformed-in-tail scanning.
@@ -563,10 +563,7 @@ pub(crate) fn malformed_in_tail_impl(
     now_secs: i64,
 ) -> Option<String> {
     let content = std::fs::read_to_string(path).ok()?;
-    let lines: Vec<&str> = content
-        .lines()
-        .filter(|l| !l.trim().is_empty())
-        .collect();
+    let lines: Vec<&str> = content.lines().filter(|l| !l.trim().is_empty()).collect();
     let tail: &[&str] = if lines.len() > n {
         &lines[lines.len() - n..]
     } else {
@@ -708,10 +705,7 @@ fn extract_timestamp_epoch(v: &serde_json::Value) -> i64 {
 ///      `/Users/example/.claude.work` → `"work"`
 ///      (unknown dir) → use the last segment as-is
 pub(crate) fn owner_dir_to_profile_name(owner_dir: &Path) -> String {
-    let seg = owner_dir
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("");
+    let seg = owner_dir.file_name().and_then(|n| n.to_str()).unwrap_or("");
     // Strip leading `.claude.` prefix if present
     if let Some(stripped) = seg.strip_prefix(".claude.") {
         stripped.to_string()
@@ -1074,8 +1068,8 @@ mod tests {
     /// Tier-1 detects a fresh limit banner in the transcript tail.
     #[test]
     fn limit_in_tail_detects_fresh_banner() {
-        use tempfile::NamedTempFile;
         use std::io::Write;
+        use tempfile::NamedTempFile;
 
         let base_now: i64 = 1_718_000_000;
         set_test_now(base_now);
@@ -1093,8 +1087,8 @@ mod tests {
     /// Tier-1 does NOT trigger on a stale limit banner (outside the window).
     #[test]
     fn limit_in_tail_skips_stale_banner() {
-        use tempfile::NamedTempFile;
         use std::io::Write;
+        use tempfile::NamedTempFile;
 
         let base_now: i64 = 1_718_000_000;
         let banner = "You've hit your session limit · resets 9pm (Asia/Seoul)";
@@ -1111,8 +1105,8 @@ mod tests {
     /// Tier-1 does NOT trigger on a non-error record.
     #[test]
     fn limit_in_tail_skips_non_error_record() {
-        use tempfile::NamedTempFile;
         use std::io::Write;
+        use tempfile::NamedTempFile;
 
         let base_now: i64 = 1_718_000_000;
         let banner = "You've hit your session limit · resets 9pm (Asia/Seoul)";
@@ -1129,8 +1123,8 @@ mod tests {
     /// Tier-1 does NOT trigger when text doesn't match the limit pattern.
     #[test]
     fn limit_in_tail_skips_wrong_text() {
-        use tempfile::NamedTempFile;
         use std::io::Write;
+        use tempfile::NamedTempFile;
 
         let base_now: i64 = 1_718_000_000;
         let line = make_transcript_line(true, "Server overloaded, try again later", -100, base_now);
@@ -1145,8 +1139,8 @@ mod tests {
     /// Tier-1: only the last N lines are checked.
     #[test]
     fn limit_in_tail_only_last_n_records() {
-        use tempfile::NamedTempFile;
         use std::io::Write;
+        use tempfile::NamedTempFile;
 
         let base_now: i64 = 1_718_000_000;
         let mut f = NamedTempFile::new().unwrap();
@@ -1174,7 +1168,10 @@ mod tests {
         // Total: 16 lines. Banner is at index 12 (0-based), within the last 4+1=4 records
         // of the tail-12 scan. Should be detected.
         let result = limit_in_tail_impl(f.path(), 12, 900, base_now);
-        assert!(result.is_some(), "banner within last 12 should be detected: {result:?}");
+        assert!(
+            result.is_some(),
+            "banner within last 12 should be detected: {result:?}"
+        );
     }
 
     // ── malformed_in_tail_impl tests ───────────────────────────────────────────
@@ -1204,8 +1201,8 @@ mod tests {
     /// malformed-in-tail detects a fresh malformed tool-call record.
     #[test]
     fn malformed_in_tail_detects_fresh_hit() {
-        use tempfile::NamedTempFile;
         use std::io::Write;
+        use tempfile::NamedTempFile;
 
         let base_now: i64 = 1_718_000_000;
         let line = make_malformed_record(-60, base_now); // 60 s ago, within 180 s
@@ -1220,8 +1217,8 @@ mod tests {
     /// malformed-in-tail does NOT trigger when the record has a tool_use block.
     #[test]
     fn malformed_in_tail_skips_when_has_tool_use_block() {
-        use tempfile::NamedTempFile;
         use std::io::Write;
+        use tempfile::NamedTempFile;
 
         let base_now: i64 = 1_718_000_000;
         let epoch = base_now - 60;
@@ -1247,14 +1244,17 @@ mod tests {
         writeln!(f, "{line}").unwrap();
 
         let result = malformed_in_tail_impl(f.path(), 8, 180, base_now);
-        assert!(result.is_none(), "should not trigger when tool_use block present");
+        assert!(
+            result.is_none(),
+            "should not trigger when tool_use block present"
+        );
     }
 
     /// malformed-in-tail does NOT trigger when text doesn't end with </invoke>.
     #[test]
     fn malformed_in_tail_skips_without_close_invoke() {
-        use tempfile::NamedTempFile;
         use std::io::Write;
+        use tempfile::NamedTempFile;
 
         let base_now: i64 = 1_718_000_000;
         let epoch = base_now - 60;
@@ -1279,7 +1279,10 @@ mod tests {
         writeln!(f, "{line}").unwrap();
 
         let result = malformed_in_tail_impl(f.path(), 8, 180, base_now);
-        assert!(result.is_none(), "should not trigger without </invoke> at end");
+        assert!(
+            result.is_none(),
+            "should not trigger without </invoke> at end"
+        );
     }
 
     // ── owner_dir_to_profile_name tests ───────────────────────────────────────
@@ -1314,7 +1317,10 @@ mod tests {
         let h = build_handoff("01234567", "personal", "work", 1);
         // Should contain Korean text
         assert!(h.contains("01234567"), "should contain sid_short: {h}");
-        assert!(h.contains("personal"), "should contain current profile: {h}");
+        assert!(
+            h.contains("personal"),
+            "should contain current profile: {h}"
+        );
         assert!(h.contains("work"), "should contain target profile: {h}");
         assert!(h.contains("hop 1"), "should contain hop: {h}");
         // Restore
@@ -1423,7 +1429,10 @@ mod tests {
         let epoch = extract_timestamp_epoch(&v);
         assert!(epoch > 0, "should parse ISO-8601 timestamp");
         // 2024-01-10T12:00:00Z = 1704888000 (approximately)
-        assert!(epoch > 1_700_000_000 && epoch < 1_800_000_000, "epoch out of expected range: {epoch}");
+        assert!(
+            epoch > 1_700_000_000 && epoch < 1_800_000_000,
+            "epoch out of expected range: {epoch}"
+        );
     }
 
     #[test]

@@ -47,7 +47,9 @@ use thiserror::Error;
 #[derive(Debug, Error)]
 pub enum AliasError {
     /// The alias was not found in `titles.tsv`.  This is a hard error per spec N6.
-    #[error("unknown session alias {alias:?} — not found in titles.tsv (use a UUID or a known title)")]
+    #[error(
+        "unknown session alias {alias:?} — not found in titles.tsv (use a UUID or a known title)"
+    )]
     NotFound { alias: String },
 
     /// `titles.tsv` could not be read (I/O error).
@@ -116,11 +118,15 @@ pub fn resolve_alias(name: &str) -> Result<String, AliasError> {
                 reindex_titles();
                 match lookup_alias(name, &titles_path)? {
                     Some(found) => Ok(found),
-                    None => Err(AliasError::NotFound { alias: name.to_owned() }),
+                    None => Err(AliasError::NotFound {
+                        alias: name.to_owned(),
+                    }),
                 }
             } else {
                 // Miss on fresh index → genuine unknown alias.
-                Err(AliasError::NotFound { alias: name.to_owned() })
+                Err(AliasError::NotFound {
+                    alias: name.to_owned(),
+                })
             }
         }
     }
@@ -273,7 +279,6 @@ pub fn reindex_titles() {
     if fs::write(&tmp_path, &content).is_ok() {
         let _ = fs::rename(&tmp_path, &titles_path).map_err(|_| {
             let _ = fs::remove_file(&tmp_path);
-            
         });
     }
 }
@@ -281,7 +286,10 @@ pub fn reindex_titles() {
 /// Collect all `.jsonl` transcripts under `projects_dir` (recursively into
 /// subdirs) that have an mtime > `since_epoch`.  When `since_epoch == 0`,
 /// collect those that contain a title record (mirrors the `grep -rls` path).
-fn collect_transcripts_newer_than(projects_dir: &std::path::Path, since_epoch: i64) -> Vec<PathBuf> {
+fn collect_transcripts_newer_than(
+    projects_dir: &std::path::Path,
+    since_epoch: i64,
+) -> Vec<PathBuf> {
     let mut result = Vec::new();
     let entries = match fs::read_dir(projects_dir) {
         Ok(e) => e,
@@ -506,10 +514,12 @@ mod tests {
     fn lookup_alias_finds_exact_match() {
         let tmp = TempDir::new().unwrap();
         let titles_path = tmp.path().join("titles.tsv");
-        fs::write(&titles_path,
+        fs::write(
+            &titles_path,
             "My Project\taaaaaaaa-0000-0000-0000-000000000001\t1000\n\
-             Other Title\tbbbbbbbb-0000-0000-0000-000000000002\t2000\n"
-        ).unwrap();
+             Other Title\tbbbbbbbb-0000-0000-0000-000000000002\t2000\n",
+        )
+        .unwrap();
         let result = lookup_alias("My Project", &titles_path).expect("io");
         assert_eq!(result.unwrap(), "aaaaaaaa-0000-0000-0000-000000000001");
     }
@@ -519,10 +529,12 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let titles_path = tmp.path().join("titles.tsv");
         // Same title appears twice; the row with higher mtime should win.
-        fs::write(&titles_path,
+        fs::write(
+            &titles_path,
             "Same Title\told-sid-0000-0000-0000-000000000001\t100\n\
-             Same Title\tnew-sid-0000-0000-0000-000000000002\t999\n"
-        ).unwrap();
+             Same Title\tnew-sid-0000-0000-0000-000000000002\t999\n",
+        )
+        .unwrap();
         // Mirrors awk `>= m` accumulator — higher mtime wins.
         let result = lookup_alias("Same Title", &titles_path).expect("io");
         assert_eq!(result.unwrap(), "new-sid-0000-0000-0000-000000000002");
@@ -532,9 +544,11 @@ mod tests {
     fn lookup_alias_not_found_returns_none() {
         let tmp = TempDir::new().unwrap();
         let titles_path = tmp.path().join("titles.tsv");
-        fs::write(&titles_path,
-            "Known Title\taaaaaaaa-0000-0000-0000-000000000001\t1000\n"
-        ).unwrap();
+        fs::write(
+            &titles_path,
+            "Known Title\taaaaaaaa-0000-0000-0000-000000000001\t1000\n",
+        )
+        .unwrap();
         let result = lookup_alias("Unknown Title", &titles_path).expect("io");
         assert!(result.is_none());
     }
@@ -544,10 +558,12 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let titles_path = tmp.path().join("titles.tsv");
         // Comment line must not be treated as a row.
-        fs::write(&titles_path,
+        fs::write(
+            &titles_path,
             "# comment line\n\
-             Real Title\tcccccccc-0000-0000-0000-000000000001\t500\n"
-        ).unwrap();
+             Real Title\tcccccccc-0000-0000-0000-000000000001\t500\n",
+        )
+        .unwrap();
         let result = lookup_alias("# comment line", &titles_path).expect("io");
         assert!(result.is_none(), "comment lines must not match");
         let result2 = lookup_alias("Real Title", &titles_path).expect("io");
@@ -558,11 +574,13 @@ mod tests {
     fn lookup_alias_ignores_blank_lines() {
         let tmp = TempDir::new().unwrap();
         let titles_path = tmp.path().join("titles.tsv");
-        fs::write(&titles_path,
+        fs::write(
+            &titles_path,
             "\n\
              Valid Title\tdddddddd-0000-0000-0000-000000000001\t500\n\
-             \n"
-        ).unwrap();
+             \n",
+        )
+        .unwrap();
         let result = lookup_alias("Valid Title", &titles_path).expect("io");
         assert_eq!(result.unwrap(), "dddddddd-0000-0000-0000-000000000001");
     }
@@ -581,10 +599,14 @@ mod tests {
     fn extract_last_title_from_custom_title_record() {
         let tmp = TempDir::new().unwrap();
         let tp = tmp.path().join("test.jsonl");
-        fs::write(&tp,
-            r#"{"type":"user","message":{"content":"hello"}}"#.to_owned() + "\n" +
-            r#"{"type":"custom-title","customTitle":"My Custom Title"}"# + "\n"
-        ).unwrap();
+        fs::write(
+            &tp,
+            r#"{"type":"user","message":{"content":"hello"}}"#.to_owned()
+                + "\n"
+                + r#"{"type":"custom-title","customTitle":"My Custom Title"}"#
+                + "\n",
+        )
+        .unwrap();
         assert_eq!(extract_last_title(&tp).unwrap(), "My Custom Title");
     }
 
@@ -592,9 +614,11 @@ mod tests {
     fn extract_last_title_from_agent_name_record() {
         let tmp = TempDir::new().unwrap();
         let tp = tmp.path().join("test.jsonl");
-        fs::write(&tp,
-            r#"{"type":"agent-name","agentName":"My Agent"}"#.to_owned() + "\n"
-        ).unwrap();
+        fs::write(
+            &tp,
+            r#"{"type":"agent-name","agentName":"My Agent"}"#.to_owned() + "\n",
+        )
+        .unwrap();
         assert_eq!(extract_last_title(&tp).unwrap(), "My Agent");
     }
 
@@ -602,10 +626,14 @@ mod tests {
     fn extract_last_title_takes_last_occurrence() {
         let tmp = TempDir::new().unwrap();
         let tp = tmp.path().join("test.jsonl");
-        fs::write(&tp,
-            r#"{"type":"custom-title","customTitle":"First Title"}"#.to_owned() + "\n" +
-            r#"{"type":"custom-title","customTitle":"Final Title"}"# + "\n"
-        ).unwrap();
+        fs::write(
+            &tp,
+            r#"{"type":"custom-title","customTitle":"First Title"}"#.to_owned()
+                + "\n"
+                + r#"{"type":"custom-title","customTitle":"Final Title"}"#
+                + "\n",
+        )
+        .unwrap();
         assert_eq!(extract_last_title(&tp).unwrap(), "Final Title");
     }
 
@@ -613,9 +641,11 @@ mod tests {
     fn extract_last_title_no_title_record_returns_none() {
         let tmp = TempDir::new().unwrap();
         let tp = tmp.path().join("test.jsonl");
-        fs::write(&tp,
-            r#"{"type":"user","message":{"content":"hello"}}"#.to_owned() + "\n"
-        ).unwrap();
+        fs::write(
+            &tp,
+            r#"{"type":"user","message":{"content":"hello"}}"#.to_owned() + "\n",
+        )
+        .unwrap();
         assert!(extract_last_title(&tp).is_none());
     }
 
@@ -624,10 +654,14 @@ mod tests {
         // custom-title after agent-name: last record wins.
         let tmp = TempDir::new().unwrap();
         let tp = tmp.path().join("test.jsonl");
-        fs::write(&tp,
-            r#"{"type":"agent-name","agentName":"Agent"}"#.to_owned() + "\n" +
-            r#"{"type":"custom-title","customTitle":"Custom"}"# + "\n"
-        ).unwrap();
+        fs::write(
+            &tp,
+            r#"{"type":"agent-name","agentName":"Agent"}"#.to_owned()
+                + "\n"
+                + r#"{"type":"custom-title","customTitle":"Custom"}"#
+                + "\n",
+        )
+        .unwrap();
         assert_eq!(extract_last_title(&tp).unwrap(), "Custom");
     }
 
@@ -636,8 +670,16 @@ mod tests {
     #[test]
     fn dedup_title_rows_keeps_newest_mtime() {
         let rows = vec![
-            TitleRow { title: "Old Title".to_owned(), sid: "aaa".to_owned(), mtime: 100 },
-            TitleRow { title: "New Title".to_owned(), sid: "aaa".to_owned(), mtime: 200 },
+            TitleRow {
+                title: "Old Title".to_owned(),
+                sid: "aaa".to_owned(),
+                mtime: 100,
+            },
+            TitleRow {
+                title: "New Title".to_owned(),
+                sid: "aaa".to_owned(),
+                mtime: 200,
+            },
         ];
         let deduped = dedup_title_rows_by_sid(rows);
         assert_eq!(deduped.len(), 1);
@@ -648,8 +690,16 @@ mod tests {
     #[test]
     fn dedup_title_rows_equal_mtime_second_wins() {
         let rows = vec![
-            TitleRow { title: "First".to_owned(), sid: "bbb".to_owned(), mtime: 100 },
-            TitleRow { title: "Second".to_owned(), sid: "bbb".to_owned(), mtime: 100 },
+            TitleRow {
+                title: "First".to_owned(),
+                sid: "bbb".to_owned(),
+                mtime: 100,
+            },
+            TitleRow {
+                title: "Second".to_owned(),
+                sid: "bbb".to_owned(),
+                mtime: 100,
+            },
         ];
         let deduped = dedup_title_rows_by_sid(rows);
         assert_eq!(deduped.len(), 1);
@@ -695,9 +745,14 @@ mod tests {
 
     #[test]
     fn alias_error_not_found_message_contains_alias() {
-        let err = AliasError::NotFound { alias: "my-session".to_owned() };
+        let err = AliasError::NotFound {
+            alias: "my-session".to_owned(),
+        };
         let msg = err.to_string();
-        assert!(msg.contains("my-session"), "error message should contain the alias: {msg}");
+        assert!(
+            msg.contains("my-session"),
+            "error message should contain the alias: {msg}"
+        );
     }
 
     #[test]
@@ -707,7 +762,10 @@ mod tests {
             source: std::io::Error::new(std::io::ErrorKind::NotFound, "not found"),
         };
         let msg = err.to_string();
-        assert!(msg.contains("titles.tsv"), "error message should contain path: {msg}");
+        assert!(
+            msg.contains("titles.tsv"),
+            "error message should contain path: {msg}"
+        );
     }
 
     // ─── is_index_stale ───────────────────────────────────────────────────────
@@ -716,7 +774,10 @@ mod tests {
     fn is_index_stale_for_missing_file() {
         let tmp = TempDir::new().unwrap();
         let missing = tmp.path().join("no-such-file.tsv");
-        assert!(is_index_stale(&missing, 300), "missing file should be considered stale");
+        assert!(
+            is_index_stale(&missing, 300),
+            "missing file should be considered stale"
+        );
     }
 
     #[test]
@@ -725,6 +786,9 @@ mod tests {
         let p = tmp.path().join("fresh.tsv");
         fs::write(&p, "content\n").unwrap();
         // A freshly created file should NOT be stale with a 300 s TTL.
-        assert!(!is_index_stale(&p, 300), "freshly written file should not be stale");
+        assert!(
+            !is_index_stale(&p, 300),
+            "freshly written file should not be stale"
+        );
     }
 }

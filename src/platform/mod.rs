@@ -1,7 +1,7 @@
 pub mod launcher;
+pub mod pid;
 pub mod proc_check;
 pub mod relaunch;
-pub mod pid;
 
 #[cfg(unix)]
 pub mod posix;

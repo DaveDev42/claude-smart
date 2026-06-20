@@ -57,7 +57,11 @@ pub fn run(owner_dir: &Path) -> anyhow::Result<()> {
             // Notify-only: user-quit + limited, no-target, detect-only mode, or
             // unmanaged session. Emit OSC 777 notify on stdout.
             // Log goes to the smart_dir limit-switch.log.
-            let log_msg = format!("notify-only sid={} msg={}", &sid[..sid.len().min(8)], message);
+            let log_msg = format!(
+                "notify-only sid={} msg={}",
+                &sid[..sid.len().min(8)],
+                message
+            );
             notify::emit_osc777(message).unwrap_or(()); // best-effort stdout
             let _ = notify::append_log(&sid, &log_msg, owner_dir); // best-effort log
         }

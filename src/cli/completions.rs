@@ -265,7 +265,10 @@ mod tests {
     fn generate_powershell_completions_is_non_empty() {
         let mut buf = Vec::new();
         generate(Shell::PowerShell, &mut buf);
-        assert!(!buf.is_empty(), "powershell completions should not be empty");
+        assert!(
+            !buf.is_empty(),
+            "powershell completions should not be empty"
+        );
     }
 
     // ── completions include known subcommand names ────────────────────────────
@@ -312,8 +315,18 @@ mod tests {
         let out = String::from_utf8_lossy(&buf);
         // All subcommands from the dispatch table.
         for sub in &[
-            "run", "hook", "profiles", "usage", "cas", "pick-account", "scan",
-            "current-usage", "sidecar", "statusline", "completions", "newuuid",
+            "run",
+            "hook",
+            "profiles",
+            "usage",
+            "cas",
+            "pick-account",
+            "scan",
+            "current-usage",
+            "sidecar",
+            "statusline",
+            "completions",
+            "newuuid",
         ] {
             assert!(
                 out.contains(sub),
@@ -330,6 +343,9 @@ mod tests {
         let mut buf2 = Vec::new();
         generate(Shell::Zsh, &mut buf1);
         generate(Shell::Zsh, &mut buf2);
-        assert_eq!(buf1, buf2, "repeated generate calls must produce identical output");
+        assert_eq!(
+            buf1, buf2,
+            "repeated generate calls must produce identical output"
+        );
     }
 }

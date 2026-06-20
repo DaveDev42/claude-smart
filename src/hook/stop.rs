@@ -289,11 +289,7 @@ fn write_noclobber(path: &Path, content: &str) -> anyhow::Result<()> {
     use std::io::Write as _;
 
     // `create_new(true)` fails with AlreadyExists if the file exists — noclobber.
-    match OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(path)
-    {
+    match OpenOptions::new().write(true).create_new(true).open(path) {
         Ok(mut f) => {
             f.write_all(content.as_bytes())?;
         }

@@ -392,17 +392,24 @@ mod tests {
         let r = parse(&os_args(&["-r", "01234567-89ab-cdef-0123-456789abcdef"]));
         assert_eq!(
             r.flags.resume,
-            Some(ResumeArg::Id("01234567-89ab-cdef-0123-456789abcdef".to_owned()))
+            Some(ResumeArg::Id(
+                "01234567-89ab-cdef-0123-456789abcdef".to_owned()
+            ))
         );
         assert!(r.passthru.is_empty());
     }
 
     #[test]
     fn parse_resume_long_with_uuid() {
-        let r = parse(&os_args(&["--resume", "01234567-89ab-cdef-0123-456789abcdef"]));
+        let r = parse(&os_args(&[
+            "--resume",
+            "01234567-89ab-cdef-0123-456789abcdef",
+        ]));
         assert_eq!(
             r.flags.resume,
-            Some(ResumeArg::Id("01234567-89ab-cdef-0123-456789abcdef".to_owned()))
+            Some(ResumeArg::Id(
+                "01234567-89ab-cdef-0123-456789abcdef".to_owned()
+            ))
         );
         assert!(r.passthru.is_empty());
     }
@@ -427,7 +434,9 @@ mod tests {
         let r = parse(&os_args(&["--resume=01234567-89ab-cdef-0123-456789abcdef"]));
         assert_eq!(
             r.flags.resume,
-            Some(ResumeArg::Id("01234567-89ab-cdef-0123-456789abcdef".to_owned()))
+            Some(ResumeArg::Id(
+                "01234567-89ab-cdef-0123-456789abcdef".to_owned()
+            ))
         );
     }
 
@@ -493,7 +502,10 @@ mod tests {
     #[test]
     fn parse_permission_mode_space() {
         let r = parse(&os_args(&["--permission-mode", "bypassPermissions"]));
-        assert_eq!(r.flags.permission_mode.as_deref(), Some("bypassPermissions"));
+        assert_eq!(
+            r.flags.permission_mode.as_deref(),
+            Some("bypassPermissions")
+        );
         assert!(r.passthru.is_empty());
     }
 
@@ -513,7 +525,10 @@ mod tests {
 
     #[test]
     fn parse_session_id_space() {
-        let r = parse(&os_args(&["--session-id", "aaaabbbb-cccc-dddd-eeee-ffffaaaabbbb"]));
+        let r = parse(&os_args(&[
+            "--session-id",
+            "aaaabbbb-cccc-dddd-eeee-ffffaaaabbbb",
+        ]));
         assert_eq!(
             r.flags.session_id.as_deref(),
             Some("aaaabbbb-cccc-dddd-eeee-ffffaaaabbbb")
@@ -555,7 +570,9 @@ mod tests {
 
     #[test]
     fn parse_session_id_equals() {
-        let r = parse(&os_args(&["--session-id=aaaabbbb-cccc-dddd-eeee-ffffaaaabbbb"]));
+        let r = parse(&os_args(&[
+            "--session-id=aaaabbbb-cccc-dddd-eeee-ffffaaaabbbb",
+        ]));
         assert_eq!(
             r.flags.session_id.as_deref(),
             Some("aaaabbbb-cccc-dddd-eeee-ffffaaaabbbb")
@@ -694,9 +711,16 @@ mod tests {
     fn passthru_preserves_interleaving_with_csm_flags() {
         // csm flags and passthru can be interleaved (zsh's case statement does
         // exactly this — each unrecognised arg lands in passthru independently)
-        let r = parse(&os_args(&["--dangerously-skip-permissions", "-n", "my prompt"]));
+        let r = parse(&os_args(&[
+            "--dangerously-skip-permissions",
+            "-n",
+            "my prompt",
+        ]));
         assert!(r.flags.new);
-        assert_eq!(r.passthru, os_args(&["--dangerously-skip-permissions", "my prompt"]));
+        assert_eq!(
+            r.passthru,
+            os_args(&["--dangerously-skip-permissions", "my prompt"])
+        );
     }
 
     // ══════════════════════════════════════════════════════════════════════════
@@ -795,7 +819,9 @@ mod tests {
         ]));
         assert_eq!(
             r.flags.resume,
-            Some(ResumeArg::Id("aaaabbbb-cccc-dddd-eeee-ffffaaaabbbb".to_owned()))
+            Some(ResumeArg::Id(
+                "aaaabbbb-cccc-dddd-eeee-ffffaaaabbbb".to_owned()
+            ))
         );
         assert_eq!(r.passthru, os_args(&["my follow-up"]));
     }
@@ -813,10 +839,15 @@ mod tests {
     #[test]
     fn resume_equals_form_does_not_need_next_token() {
         // `--resume=<id>` is self-contained — no peeking at the next token
-        let r = parse(&os_args(&["--resume=aaaabbbb-cccc-dddd-eeee-ffffaaaabbbb", "-n"]));
+        let r = parse(&os_args(&[
+            "--resume=aaaabbbb-cccc-dddd-eeee-ffffaaaabbbb",
+            "-n",
+        ]));
         assert_eq!(
             r.flags.resume,
-            Some(ResumeArg::Id("aaaabbbb-cccc-dddd-eeee-ffffaaaabbbb".to_owned()))
+            Some(ResumeArg::Id(
+                "aaaabbbb-cccc-dddd-eeee-ffffaaaabbbb".to_owned()
+            ))
         );
         // `-n` is still consumed correctly after the equals-form resume
         assert!(r.flags.new);
@@ -839,10 +870,7 @@ mod tests {
         // Interleaved: unknown flag, then csm flag, then unknown flag
         let r = parse(&os_args(&["--output-format=json", "--new", "--print"]));
         assert!(r.flags.new);
-        assert_eq!(
-            r.passthru,
-            os_args(&["--output-format=json", "--print"])
-        );
+        assert_eq!(r.passthru, os_args(&["--output-format=json", "--print"]));
     }
 
     /// The auto-resume handoff prompt `"resume"` is a plain positional arg.
@@ -856,7 +884,9 @@ mod tests {
         ]));
         assert_eq!(
             r.flags.resume,
-            Some(ResumeArg::Id("aaaabbbb-cccc-dddd-eeee-ffffaaaabbbb".to_owned()))
+            Some(ResumeArg::Id(
+                "aaaabbbb-cccc-dddd-eeee-ffffaaaabbbb".to_owned()
+            ))
         );
         assert_eq!(r.passthru, os_args(&["resume"]));
     }

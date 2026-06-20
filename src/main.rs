@@ -62,18 +62,8 @@ fn main() -> anyhow::Result<()> {
             _ => {}
         }
         match candidate.as_ref() {
-            "run"
-            | "hook"
-            | "profiles"
-            | "usage"
-            | "cas"
-            | "pick-account"
-            | "scan"
-            | "current-usage"
-            | "sidecar"
-            | "statusline"
-            | "completions"
-            | "newuuid" => {
+            "run" | "hook" | "profiles" | "usage" | "cas" | "pick-account" | "scan"
+            | "current-usage" | "sidecar" | "statusline" | "completions" | "newuuid" => {
                 subcommand = Box::leak(candidate.into_owned().into_boxed_str());
                 rest = &args[2..];
             }
@@ -125,7 +115,9 @@ fn print_help() {
     println!("csm {v} — claude-smart launcher\n");
     println!("USAGE");
     println!("  csm [claude-args...]                 bare = smart launch (implicit `csm run`)");
-    println!("  csm run [csm-flags] [-- claude...]   smart launcher (session + account + relaunch)");
+    println!(
+        "  csm run [csm-flags] [-- claude...]   smart launcher (session + account + relaunch)"
+    );
     println!("  csm <subcommand> ...\n");
     println!("PROFILES (registry — ~/.config/claude-as/profiles.json)");
     println!("  csm profiles [list]                  list configured profiles");
@@ -144,7 +136,9 @@ fn print_help() {
     println!("  csm statusline                       `<profile>@<host>` for the shell prompt");
     println!("  csm completions {{zsh|bash|pwsh}}      shell completions");
     println!("  csm newuuid                          fresh lowercase UUID v4");
-    println!("  csm cas ...                          eval-class shim contract (machine interface)\n");
+    println!(
+        "  csm cas ...                          eval-class shim contract (machine interface)\n"
+    );
     println!("Words not listed above forward to `claude` (e.g. `csm mcp`, `csm doctor`).");
     println!("To pass a csm-reserved flag to claude, use `csm run -- <args>`.");
 }
@@ -205,8 +199,9 @@ fn cmd_run(args: &[OsString]) -> anyhow::Result<()> {
                 if looks_like_uuid(raw) {
                     raw.clone()
                 } else {
-                    session::resolve_alias(raw)
-                        .with_context(|| format!("csm: --resume alias resolution failed for {raw:?}"))?
+                    session::resolve_alias(raw).with_context(|| {
+                        format!("csm: --resume alias resolution failed for {raw:?}")
+                    })?
                 }
             }
             ResumeArg::Picker => resolve_session_via_picker(&cwd)?,
@@ -271,12 +266,12 @@ fn resolve_session_via_picker(cwd: &std::path::Path) -> anyhow::Result<String> {
     let picker_rows: Vec<PickerRow> = rows
         .iter()
         .map(|r| PickerRow {
-            sid:      r.sid.clone(),
-            mtime:    r.mtime as u64,
+            sid: r.sid.clone(),
+            mtime: r.mtime as u64,
             human_ts: r.human_ts.clone(),
-            mode:     r.mode.clone(),
-            label:    r.label.clone(),
-            is_live:  session::sid_live(&r.sid),
+            mode: r.mode.clone(),
+            label: r.label.clone(),
+            is_live: session::sid_live(&r.sid),
         })
         .collect();
 
@@ -285,9 +280,7 @@ fn resolve_session_via_picker(cwd: &std::path::Path) -> anyhow::Result<String> {
 
     match sp.pick(newest_live_label) {
         None | Some(PickedSession::Fresh) => Ok(newuuid()),
-        Some(PickedSession::Continue) => {
-            Ok(newest_free_sid(cwd)?.unwrap_or_else(newuuid))
-        }
+        Some(PickedSession::Continue) => Ok(newest_free_sid(cwd)?.unwrap_or_else(newuuid)),
         Some(PickedSession::Resume(sid)) => Ok(sid),
     }
 }
@@ -298,10 +291,8 @@ fn resolve_session_via_picker(cwd: &std::path::Path) -> anyhow::Result<String> {
 ///   2+ free sessions → open picker
 fn resolve_session_default(cwd: &std::path::Path) -> anyhow::Result<String> {
     let rows = session::scan(cwd);
-    let free: Vec<&session::SessionRow> = rows
-        .iter()
-        .filter(|r| !session::sid_live(&r.sid))
-        .collect();
+    let free: Vec<&session::SessionRow> =
+        rows.iter().filter(|r| !session::sid_live(&r.sid)).collect();
 
     match free.len() {
         0 => Ok(newuuid()),
@@ -329,8 +320,8 @@ fn resolve_profile_dir(profile: &str, profiles: &account::ProfileMap) -> anyhow:
         return Ok(dir.to_owned());
     }
     // Fallback: synthesise conventional `~/.claude.<profile>` path.
-    let home = dirs::home_dir()
-        .ok_or_else(|| anyhow::anyhow!("csm: cannot determine HOME directory"))?;
+    let home =
+        dirs::home_dir().ok_or_else(|| anyhow::anyhow!("csm: cannot determine HOME directory"))?;
     Ok(home
         .join(format!(".claude.{profile}"))
         .to_string_lossy()
@@ -416,10 +407,7 @@ fn proactive_pick_profile(
 ///
 /// Interactive + fetch-miss → open fzf account picker with stale usage data.
 /// Non-interactive → silent fail-safe to current profile.
-fn hub_down_pick(
-    profiles: &account::ProfileMap,
-    current_dir: &Path,
-) -> anyhow::Result<PathBuf> {
+fn hub_down_pick(profiles: &account::ProfileMap, current_dir: &Path) -> anyhow::Result<PathBuf> {
     // TTY gate: isatty(0) && isatty(1) — matches zsh `[[ -t 0 && -t 1 ]]`.
     if !is_interactive() {
         return Ok(current_dir.to_path_buf());
@@ -439,9 +427,7 @@ fn hub_down_pick(
 }
 
 /// Build `AccountRow` list for the hub-down picker.
-fn build_account_rows(
-    profiles: &account::ProfileMap,
-) -> Vec<picker::account::AccountRow> {
+fn build_account_rows(profiles: &account::ProfileMap) -> Vec<picker::account::AccountRow> {
     use picker::account::{AccountRow, StaleProfileData};
 
     // Try the smart-dir cache first.
@@ -509,9 +495,7 @@ struct CacheProfileEntry {
 }
 
 /// Load a usage cache JSON file; returns `(Option<mtime_secs>, Option<Value>)`.
-fn load_stale_cache(
-    path: &std::path::Path,
-) -> (Option<u64>, Option<serde_json::Value>) {
+fn load_stale_cache(path: &std::path::Path) -> (Option<u64>, Option<serde_json::Value>) {
     let mtime = std::fs::metadata(path)
         .ok()
         .and_then(|m| m.modified().ok())
@@ -536,8 +520,7 @@ fn parse_cache_sections(
 ) {
     let mut profiles: std::collections::HashMap<String, CacheProfileEntry> =
         std::collections::HashMap::new();
-    let mut errors: std::collections::HashMap<String, String> =
-        std::collections::HashMap::new();
+    let mut errors: std::collections::HashMap<String, String> = std::collections::HashMap::new();
 
     let v = match json {
         Some(v) => v,
@@ -634,7 +617,9 @@ fn cmd_hook(args: &[OsString]) -> anyhow::Result<()> {
         })
         .unwrap_or_else(|| {
             // Last resort (no --owner, no $CLAUDE_CONFIG_DIR): the registry default.
-            account::ProfileMap::load().unwrap_or_default().default_dir()
+            account::ProfileMap::load()
+                .unwrap_or_default()
+                .default_dir()
         });
 
     hook::run(&owner_dir)
@@ -787,48 +772,47 @@ fn parse_cas_op(op_args: &[String]) -> anyhow::Result<cas::Op> {
         Some("-") => Ok(Op::Minus),
         Some("resync") => Ok(Op::Resync),
         Some("-g") | Some("--global") => {
-            let profile = op_args
-                .get(1)
-                .cloned()
-                .ok_or_else(|| anyhow::anyhow!("csm cas: -g/--global requires a profile argument"))?;
+            let profile = op_args.get(1).cloned().ok_or_else(|| {
+                anyhow::anyhow!("csm cas: -g/--global requires a profile argument")
+            })?;
             Ok(Op::Global { profile })
         }
         // ── registry management verbs (reserved words; routed to manage_emit) ──
         Some("list") => Ok(Op::List),
         Some("add") => {
-            let name = op_args
-                .get(1)
-                .cloned()
-                .ok_or_else(|| anyhow::anyhow!("add: requires a profile name (`csm profiles add <name> [<dir>]`)"))?;
-            Ok(Op::Add { name, dir: op_args.get(2).cloned() })
+            let name = op_args.get(1).cloned().ok_or_else(|| {
+                anyhow::anyhow!("add: requires a profile name (`csm profiles add <name> [<dir>]`)")
+            })?;
+            Ok(Op::Add {
+                name,
+                dir: op_args.get(2).cloned(),
+            })
         }
         Some("set") => {
-            let name = op_args
-                .get(1)
-                .cloned()
-                .ok_or_else(|| anyhow::anyhow!("set: requires <name> <dir> (`csm profiles set <name> <dir>`)"))?;
-            let dir = op_args
-                .get(2)
-                .cloned()
-                .ok_or_else(|| anyhow::anyhow!("set: requires <name> <dir> (`csm profiles set <name> <dir>`)"))?;
+            let name = op_args.get(1).cloned().ok_or_else(|| {
+                anyhow::anyhow!("set: requires <name> <dir> (`csm profiles set <name> <dir>`)")
+            })?;
+            let dir = op_args.get(2).cloned().ok_or_else(|| {
+                anyhow::anyhow!("set: requires <name> <dir> (`csm profiles set <name> <dir>`)")
+            })?;
             Ok(Op::Set { name, dir })
         }
         Some("remove") | Some("rm") => {
-            let name = op_args
-                .get(1)
-                .cloned()
-                .ok_or_else(|| anyhow::anyhow!("remove: requires a profile name (`csm profiles rm <name>`)"))?;
+            let name = op_args.get(1).cloned().ok_or_else(|| {
+                anyhow::anyhow!("remove: requires a profile name (`csm profiles rm <name>`)")
+            })?;
             Ok(Op::Remove { name })
         }
         Some("use") => {
-            let name = op_args
-                .get(1)
-                .cloned()
-                .ok_or_else(|| anyhow::anyhow!("use: requires a profile name (`csm profiles use <name>`)"))?;
+            let name = op_args.get(1).cloned().ok_or_else(|| {
+                anyhow::anyhow!("use: requires a profile name (`csm profiles use <name>`)")
+            })?;
             Ok(Op::SetDefault { name })
         }
         Some("edit") => Ok(Op::Edit),
-        Some(profile) => Ok(Op::Switch { profile: profile.to_owned() }),
+        Some(profile) => Ok(Op::Switch {
+            profile: profile.to_owned(),
+        }),
     }
 }
 
@@ -1041,7 +1025,9 @@ fn cmd_sidecar(args: &[OsString]) -> anyhow::Result<()> {
     let op = args
         .first()
         .map(|a| a.to_string_lossy().into_owned())
-        .ok_or_else(|| anyhow::anyhow!("csm sidecar: operation required (read|write|merge|flags)"))?;
+        .ok_or_else(|| {
+            anyhow::anyhow!("csm sidecar: operation required (read|write|merge|flags)")
+        })?;
     let sid = args
         .get(1)
         .map(|a| a.to_string_lossy().into_owned())
@@ -1080,9 +1066,9 @@ fn cmd_sidecar(args: &[OsString]) -> anyhow::Result<()> {
                 }
             }
         }
-        other => anyhow::bail!(
-            "csm sidecar: unknown operation {other:?} — use read|write|merge|flags"
-        ),
+        other => {
+            anyhow::bail!("csm sidecar: unknown operation {other:?} — use read|write|merge|flags")
+        }
     }
     Ok(())
 }
@@ -1100,21 +1086,17 @@ fn parse_sidecar_kv_args(args: &[OsString]) -> anyhow::Result<sidecar::Sidecar> 
             .ok_or_else(|| anyhow::anyhow!("csm sidecar: expected key=value, got {s:?}"))?;
         match key {
             "session_id" | "sessionId" => patch.session_id = Some(value.to_owned()),
-            "permission_mode" | "permissionMode" => {
-                patch.permission_mode = Some(value.to_owned())
-            }
+            "permission_mode" | "permissionMode" => patch.permission_mode = Some(value.to_owned()),
             "effort" => patch.effort = Some(value.to_owned()),
             "model" => patch.model = Some(value.to_owned()),
             "cwd" => patch.cwd = Some(value.to_owned()),
             "profile" => patch.profile = Some(value.to_owned()),
             "hop" => {
-                let n: i64 = value
-                    .parse()
-                    .with_context(|| format!("csm sidecar: hop must be an integer, got {value:?}"))?;
+                let n: i64 = value.parse().with_context(|| {
+                    format!("csm sidecar: hop must be an integer, got {value:?}")
+                })?;
                 // Store as a JSON Number (the canonical Rust-binary form; §6 compat).
-                patch.hop = Some(serde_json::Value::Number(
-                    serde_json::Number::from(n),
-                ));
+                patch.hop = Some(serde_json::Value::Number(serde_json::Number::from(n)));
             }
             other => anyhow::bail!("csm sidecar: unknown key {other:?}"),
         }
@@ -1159,7 +1141,6 @@ fn cmd_completions(args: &[OsString]) -> anyhow::Result<()> {
 }
 
 // ─── PlatformLauncher Default impl ────────────────────────────────────────────
-
 
 // ─── tests ────────────────────────────────────────────────────────────────────
 
@@ -1256,10 +1237,15 @@ mod tests {
     /// claude subcommand (mcp/doctor/update/…) is forwarded, never hijacked.
     #[test]
     fn dispatch_claude_subcommands_fall_through_to_run() {
-        for w in ["mcp", "doctor", "update", "agents", "auth", "plugin", "project"] {
+        for w in [
+            "mcp", "doctor", "update", "agents", "auth", "plugin", "project",
+        ] {
             let a = argv(&["csm", w, "--some-flag"]);
             let (cmd, _) = dispatch_subcommand(&a);
-            assert_eq!(cmd, "run", "`csm {w}` must fall through to run (forward to claude)");
+            assert_eq!(
+                cmd, "run",
+                "`csm {w}` must fall through to run (forward to claude)"
+            );
         }
     }
 
@@ -1485,25 +1471,39 @@ mod tests {
     #[test]
     fn parse_cas_op_status_no_args() {
         let op = parse_cas_op(&[]).unwrap();
-        assert!(matches!(op, cas::Op::Status { print_current: false }));
+        assert!(matches!(
+            op,
+            cas::Op::Status {
+                print_current: false
+            }
+        ));
     }
 
     #[test]
     fn parse_cas_op_status_explicit() {
         let op = parse_cas_op(&["status".to_owned()]).unwrap();
-        assert!(matches!(op, cas::Op::Status { print_current: false }));
+        assert!(matches!(
+            op,
+            cas::Op::Status {
+                print_current: false
+            }
+        ));
     }
 
     #[test]
     fn parse_cas_op_status_print_current() {
         let op = parse_cas_op(&["status".to_owned(), "--print-current".to_owned()]).unwrap();
-        assert!(matches!(op, cas::Op::Status { print_current: true }));
+        assert!(matches!(
+            op,
+            cas::Op::Status {
+                print_current: true
+            }
+        ));
     }
 
     #[test]
     fn parse_cas_op_global_long_form() {
-        let op =
-            parse_cas_op(&["--global".to_owned(), "personal".to_owned()]).unwrap();
+        let op = parse_cas_op(&["--global".to_owned(), "personal".to_owned()]).unwrap();
         assert!(matches!(op, cas::Op::Global { profile } if profile == "personal"));
     }
 
@@ -1511,7 +1511,10 @@ mod tests {
 
     #[test]
     fn parse_cas_op_list() {
-        assert!(matches!(parse_cas_op(&["list".to_owned()]).unwrap(), cas::Op::List));
+        assert!(matches!(
+            parse_cas_op(&["list".to_owned()]).unwrap(),
+            cas::Op::List
+        ));
     }
 
     #[test]
@@ -1519,7 +1522,9 @@ mod tests {
         let op = parse_cas_op(&["add".to_owned(), "work".to_owned()]).unwrap();
         assert!(matches!(op, cas::Op::Add { ref name, dir: None } if name == "work"));
         let op = parse_cas_op(&["add".to_owned(), "work".to_owned(), "/d".to_owned()]).unwrap();
-        assert!(matches!(op, cas::Op::Add { ref name, dir: Some(ref d) } if name == "work" && d == "/d"));
+        assert!(
+            matches!(op, cas::Op::Add { ref name, dir: Some(ref d) } if name == "work" && d == "/d")
+        );
         // missing name → err
         assert!(parse_cas_op(&["add".to_owned()]).is_err());
     }
@@ -1553,10 +1558,7 @@ mod tests {
     fn parse_sidecar_kv_permission_mode() {
         let args = argv(&["permission_mode=bypassPermissions"]);
         let patch = parse_sidecar_kv_args(&args).unwrap();
-        assert_eq!(
-            patch.permission_mode.as_deref(),
-            Some("bypassPermissions")
-        );
+        assert_eq!(patch.permission_mode.as_deref(), Some("bypassPermissions"));
     }
 
     #[test]

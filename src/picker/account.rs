@@ -24,7 +24,7 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::picker::fzf::{FzfOpts, fzf_available};
+use crate::picker::fzf::{fzf_available, FzfOpts};
 
 // ─── types ────────────────────────────────────────────────────────────────────
 
@@ -71,11 +71,7 @@ impl AccountRow {
     /// work    [error: no credentials]                      (stale 4m ago)
     /// personal   (no usage data)
     /// ```
-    pub fn build(
-        profile: &str,
-        data: &StaleProfileData,
-        cache_mtime_secs: Option<u64>,
-    ) -> Self {
+    pub fn build(profile: &str, data: &StaleProfileData, cache_mtime_secs: Option<u64>) -> Self {
         let stale_annotation = cache_mtime_secs.map(|mtime| {
             let now = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -108,9 +104,7 @@ impl AccountRow {
 ///   no-data; but stale annotation is still appended if we have a cache mtime)
 /// - otherwise: `session <N>%   week <N>%   resets <str>   (stale Nm ago)`
 fn render_display(data: &StaleProfileData, stale: Option<&str>) -> String {
-    let stale_suffix = stale
-        .map(|s| format!("   ({s})"))
-        .unwrap_or_default();
+    let stale_suffix = stale.map(|s| format!("   ({s})")).unwrap_or_default();
 
     if let Some(ref err) = data.error {
         return format!("[error: {err}]{stale_suffix}");
@@ -119,8 +113,12 @@ fn render_display(data: &StaleProfileData, stale: Option<&str>) -> String {
     // Build the usage part from whatever sections are available.
     let mut parts = Vec::new();
 
-    if let Some(pct) = data.session_pct { parts.push(format!("session {pct}%")) }
-    if let Some(pct) = data.week_all_pct { parts.push(format!("week {pct}%")) }
+    if let Some(pct) = data.session_pct {
+        parts.push(format!("session {pct}%"))
+    }
+    if let Some(pct) = data.week_all_pct {
+        parts.push(format!("week {pct}%"))
+    }
     if let Some(ref resets) = data.resets {
         parts.push(format!("resets {resets}"));
     }
@@ -360,12 +358,12 @@ mod tests {
             error: Some("no credentials".to_string()),
         };
         let row = AccountRow::build("work", &data, None);
+        assert!(row.display.starts_with("work"), "got: {}", row.display);
         assert!(
-            row.display.starts_with("work"),
+            row.display.contains("[error: no credentials]"),
             "got: {}",
             row.display
         );
-        assert!(row.display.contains("[error: no credentials]"), "got: {}", row.display);
         // col1 (recovery key) is the bare profile name, no padding.
         assert_eq!(row.profile, "work");
         let tsv = row.to_tsv();

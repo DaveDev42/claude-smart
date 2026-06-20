@@ -287,7 +287,10 @@ mod tests {
         let picker = SessionPicker::new(rows);
         let lines = picker.build_fzf_input(None);
         assert_eq!(lines.len(), 4);
-        let sids: Vec<&str> = lines.iter().map(|l| l.split('\t').next().unwrap()).collect();
+        let sids: Vec<&str> = lines
+            .iter()
+            .map(|l| l.split('\t').next().unwrap())
+            .collect();
         assert_eq!(sids[0], SENTINEL_NEW);
         assert_eq!(sids[1], SENTINEL_CONTINUE);
         assert_eq!(sids[2], "aaa");

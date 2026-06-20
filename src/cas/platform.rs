@@ -125,7 +125,7 @@ pub fn hkcu_setenv(_profile: &str, dir: &str) -> std::io::Result<()> {
     use windows_sys::Win32::{
         Foundation::HWND,
         System::Registry::{
-            HKEY, RegCloseKey, RegOpenKeyExW, RegSetValueExW, HKEY_CURRENT_USER, KEY_SET_VALUE,
+            RegCloseKey, RegOpenKeyExW, RegSetValueExW, HKEY, HKEY_CURRENT_USER, KEY_SET_VALUE,
             REG_SZ,
         },
         UI::WindowsAndMessaging::{
@@ -155,7 +155,9 @@ pub fn hkcu_setenv(_profile: &str, dir: &str) -> std::io::Result<()> {
     };
 
     if open_result != 0 {
-        eprintln!("cas: RegOpenKeyExW failed (0x{open_result:08X}) — HKCU\\Environment not updated");
+        eprintln!(
+            "cas: RegOpenKeyExW failed (0x{open_result:08X}) — HKCU\\Environment not updated"
+        );
         return Ok(()); // soft failure
     }
 
@@ -219,7 +221,11 @@ mod tests {
     fn apply_global_does_not_panic() {
         // Soft failure only — never panics or returns hard error on POSIX.
         let result = apply_global("personal", "/tmp/.claude.personal");
-        assert!(result.is_ok(), "apply_global must not return hard error: {:?}", result);
+        assert!(
+            result.is_ok(),
+            "apply_global must not return hard error: {:?}",
+            result
+        );
     }
 
     #[cfg(target_os = "macos")]
@@ -228,7 +234,11 @@ mod tests {
         // In a sandboxed CI environment launchctl may fail — that's the soft
         // failure we're testing: it should log a warning, not panic or return Err.
         let result = launchctl_setenv("personal", "/tmp/.claude.personal");
-        assert!(result.is_ok(), "launchctl_setenv should soft-fail, not hard-fail: {:?}", result);
+        assert!(
+            result.is_ok(),
+            "launchctl_setenv should soft-fail, not hard-fail: {:?}",
+            result
+        );
     }
 
     #[cfg(all(unix, not(target_os = "macos")))]

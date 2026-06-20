@@ -164,7 +164,6 @@ impl Shell {
             }
         }
     }
-
 }
 
 // ─── default state-file path ─────────────────────────────────────────────────
@@ -507,19 +506,19 @@ fn resolve_profile(profile: &str, profiles: &ProfileMap) -> anyhow::Result<Strin
         // Toss machine or pre-ansible boot: synthesize the conventional path.
         let home = dirs::home_dir()
             .ok_or_else(|| anyhow::anyhow!("cas: cannot determine HOME directory"))?;
-        return Ok(home.join(format!(".claude.{profile}")).to_string_lossy().into_owned());
+        return Ok(home
+            .join(format!(".claude.{profile}"))
+            .to_string_lossy()
+            .into_owned());
     }
-    profiles
-        .get(profile)
-        .map(str::to_owned)
-        .ok_or_else(|| {
-            let available: Vec<&str> = profiles.names_sorted();
-            anyhow::anyhow!(
-                "cas: unknown profile '{}' — available: {}",
-                profile,
-                available.join(", ")
-            )
-        })
+    profiles.get(profile).map(str::to_owned).ok_or_else(|| {
+        let available: Vec<&str> = profiles.names_sorted();
+        anyhow::anyhow!(
+            "cas: unknown profile '{}' — available: {}",
+            profile,
+            available.join(", ")
+        )
+    })
 }
 
 /// Print informational status (no eval output). Mirrors the zsh `cas` with no
@@ -579,9 +578,9 @@ fn print_status(_shell: Shell, profiles: &ProfileMap) -> anyhow::Result<()> {
             let is_current = dir == current_dir.as_str();
             let is_default = name == default.as_str();
             let mark = match (is_current, is_default) {
-                (true,  true)  => "*d",
-                (true,  false) => "* ",
-                (false, true)  => " d",
+                (true, true) => "*d",
+                (true, false) => "* ",
+                (false, true) => " d",
                 (false, false) => "  ",
             };
             println!("  {mark} {name:<12} {dir}");
@@ -637,7 +636,12 @@ fn parse_cas_args_for_test<S: AsRef<str>>(args: &[S]) -> anyhow::Result<(Shell, 
 
     // Parse the user command (after `--` or the last csm flag).
     if i >= n {
-        return Ok((shell, Op::Status { print_current: false }));
+        return Ok((
+            shell,
+            Op::Status {
+                print_current: false,
+            },
+        ));
     }
 
     let cmd = args[i].as_ref();
@@ -660,9 +664,12 @@ fn parse_cas_args_for_test<S: AsRef<str>>(args: &[S]) -> anyhow::Result<(Shell, 
             Ok((shell, Op::Global { profile }))
         }
 
-        profile => {
-            Ok((shell, Op::Switch { profile: profile.to_owned() }))
-        }
+        profile => Ok((
+            shell,
+            Op::Switch {
+                profile: profile.to_owned(),
+            },
+        )),
     }
 }
 
@@ -780,13 +787,19 @@ mod tests {
     #[test]
     fn shell_zsh_export_line() {
         let line = Shell::Zsh.export_line("/Users/example/.claude.personal");
-        assert_eq!(line, "export CLAUDE_CONFIG_DIR='/Users/example/.claude.personal'");
+        assert_eq!(
+            line,
+            "export CLAUDE_CONFIG_DIR='/Users/example/.claude.personal'"
+        );
     }
 
     #[test]
     fn shell_pwsh_export_line() {
         let line = Shell::Pwsh.export_line(r"C:\Users\example\.claude.personal");
-        assert_eq!(line, r"$env:CLAUDE_CONFIG_DIR = 'C:\Users\example\.claude.personal'");
+        assert_eq!(
+            line,
+            r"$env:CLAUDE_CONFIG_DIR = 'C:\Users\example\.claude.personal'"
+        );
     }
 
     #[test]
@@ -814,7 +827,10 @@ mod tests {
 
     #[test]
     fn resolve_new_dir_explicit_wins() {
-        assert_eq!(resolve_new_dir("work", Some("/custom/work")), "/custom/work");
+        assert_eq!(
+            resolve_new_dir("work", Some("/custom/work")),
+            "/custom/work"
+        );
     }
 
     #[test]
@@ -863,12 +879,20 @@ mod tests {
 
     #[test]
     fn op_variants_constructible() {
-        let _ = Op::Switch { profile: "personal".to_owned() };
+        let _ = Op::Switch {
+            profile: "personal".to_owned(),
+        };
         let _ = Op::Minus;
-        let _ = Op::Global { profile: "work".to_owned() };
+        let _ = Op::Global {
+            profile: "work".to_owned(),
+        };
         let _ = Op::Resync;
-        let _ = Op::Status { print_current: false };
-        let _ = Op::Status { print_current: true };
+        let _ = Op::Status {
+            print_current: false,
+        };
+        let _ = Op::Status {
+            print_current: true,
+        };
     }
 
     // ── resolve_profile tests ─────────────────────────────────────────────────
@@ -893,8 +917,14 @@ mod tests {
         let result = resolve_profile("hacker", &profiles);
         assert!(result.is_err());
         let msg = result.unwrap_err().to_string();
-        assert!(msg.contains("unknown profile"), "expected 'unknown profile' in: {msg}");
-        assert!(msg.contains("personal"), "expected available profiles in: {msg}");
+        assert!(
+            msg.contains("unknown profile"),
+            "expected 'unknown profile' in: {msg}"
+        );
+        assert!(
+            msg.contains("personal"),
+            "expected available profiles in: {msg}"
+        );
     }
 
     #[test]
@@ -1015,7 +1045,10 @@ mod tests {
         let msg = result.unwrap_err().to_string();
         assert!(msg.contains("unknown profile"), "got: {msg}");
         assert!(msg.contains("configured:"), "got: {msg}");
-        assert!(msg.contains("personal") && msg.contains("work"), "got: {msg}");
+        assert!(
+            msg.contains("personal") && msg.contains("work"),
+            "got: {msg}"
+        );
     }
 
     #[test]
@@ -1035,7 +1068,12 @@ mod tests {
         let args = ["--eval", "--shell", "zsh", "--", "personal"];
         let (shell, op) = parse_cas_args_for_test(&args).unwrap();
         assert_eq!(shell, Shell::Zsh);
-        assert_eq!(op, Op::Switch { profile: "personal".to_owned() });
+        assert_eq!(
+            op,
+            Op::Switch {
+                profile: "personal".to_owned()
+            }
+        );
     }
 
     #[test]
@@ -1043,7 +1081,12 @@ mod tests {
         let args = ["--eval", "--shell", "zsh", "--", "work"];
         let (shell, op) = parse_cas_args_for_test(&args).unwrap();
         assert_eq!(shell, Shell::Zsh);
-        assert_eq!(op, Op::Switch { profile: "work".to_owned() });
+        assert_eq!(
+            op,
+            Op::Switch {
+                profile: "work".to_owned()
+            }
+        );
     }
 
     #[test]
@@ -1051,7 +1094,12 @@ mod tests {
         let args = ["--eval", "--shell", "pwsh", "--", "personal"];
         let (shell, op) = parse_cas_args_for_test(&args).unwrap();
         assert_eq!(shell, Shell::Pwsh);
-        assert_eq!(op, Op::Switch { profile: "personal".to_owned() });
+        assert_eq!(
+            op,
+            Op::Switch {
+                profile: "personal".to_owned()
+            }
+        );
     }
 
     #[test]
@@ -1067,7 +1115,12 @@ mod tests {
         let args = ["--eval", "--shell", "zsh", "--", "-g", "personal"];
         let (shell, op) = parse_cas_args_for_test(&args).unwrap();
         assert_eq!(shell, Shell::Zsh);
-        assert_eq!(op, Op::Global { profile: "personal".to_owned() });
+        assert_eq!(
+            op,
+            Op::Global {
+                profile: "personal".to_owned()
+            }
+        );
     }
 
     #[test]
@@ -1075,7 +1128,12 @@ mod tests {
         let args = ["--eval", "--shell", "zsh", "--", "--global", "work"];
         let (shell, op) = parse_cas_args_for_test(&args).unwrap();
         assert_eq!(shell, Shell::Zsh);
-        assert_eq!(op, Op::Global { profile: "work".to_owned() });
+        assert_eq!(
+            op,
+            Op::Global {
+                profile: "work".to_owned()
+            }
+        );
     }
 
     #[test]
@@ -1091,15 +1149,32 @@ mod tests {
         let args = ["--eval", "--shell", "zsh", "--", "status"];
         let (shell, op) = parse_cas_args_for_test(&args).unwrap();
         assert_eq!(shell, Shell::Zsh);
-        assert_eq!(op, Op::Status { print_current: false });
+        assert_eq!(
+            op,
+            Op::Status {
+                print_current: false
+            }
+        );
     }
 
     #[test]
     fn parse_args_status_print_current() {
-        let args = ["--eval", "--shell", "zsh", "--", "status", "--print-current"];
+        let args = [
+            "--eval",
+            "--shell",
+            "zsh",
+            "--",
+            "status",
+            "--print-current",
+        ];
         let (shell, op) = parse_cas_args_for_test(&args).unwrap();
         assert_eq!(shell, Shell::Zsh);
-        assert_eq!(op, Op::Status { print_current: true });
+        assert_eq!(
+            op,
+            Op::Status {
+                print_current: true
+            }
+        );
     }
 
     #[test]
@@ -1108,7 +1183,12 @@ mod tests {
         let args = ["--eval", "--", "personal"];
         let (shell, op) = parse_cas_args_for_test(&args).unwrap();
         assert_eq!(shell, Shell::Zsh);
-        assert_eq!(op, Op::Switch { profile: "personal".to_owned() });
+        assert_eq!(
+            op,
+            Op::Switch {
+                profile: "personal".to_owned()
+            }
+        );
     }
 
     #[test]
@@ -1116,7 +1196,12 @@ mod tests {
         // Bare `csm cas` (no --shell, no --) → status.
         let args: [&str; 0] = [];
         let (_, op) = parse_cas_args_for_test(&args).unwrap();
-        assert_eq!(op, Op::Status { print_current: false });
+        assert_eq!(
+            op,
+            Op::Status {
+                print_current: false
+            }
+        );
     }
 
     #[test]

@@ -74,10 +74,9 @@ pub fn scan_sessions(cwd: &Path) -> Vec<SessionRow> {
         if let Ok(entries) = fs::read_dir(dir) {
             for entry in entries.flatten() {
                 let p = entry.path();
-                if p.extension().and_then(|e| e.to_str()) == Some("jsonl")
-                    && p.is_file() {
-                        all_transcripts.push(p);
-                    }
+                if p.extension().and_then(|e| e.to_str()) == Some("jsonl") && p.is_file() {
+                    all_transcripts.push(p);
+                }
             }
         }
     }
@@ -333,7 +332,13 @@ fn parse_index_row(line: &str) -> Option<SessionRow> {
     let mode = cols.next()?.to_owned();
     let label = cols.next()?.to_owned();
     let human_ts = format_human_ts(mtime);
-    Some(SessionRow { sid, mtime, human_ts, mode, label })
+    Some(SessionRow {
+        sid,
+        mtime,
+        human_ts,
+        mode,
+        label,
+    })
 }
 
 /// Write the index atomically (tmp + rename), matching `reindex_scan_dir`'s
@@ -346,7 +351,10 @@ pub(crate) fn write_scan_index(
     // Build the full content.
     let mut content = format!("{}{}\n", INDEX_HEADER_PREFIX, refresh_start);
     for row in rows {
-        content.push_str(&format!("{}\t{}\t{}\t{}\n", row.sid, row.mtime, row.mode, row.label));
+        content.push_str(&format!(
+            "{}\t{}\t{}\t{}\n",
+            row.sid, row.mtime, row.mode, row.label
+        ));
     }
 
     // Write to a tmp file then atomically rename.
@@ -460,10 +468,7 @@ pub(crate) fn extract_label_and_mode(transcript_path: &Path) -> (String, String)
 
     // Label priority: ai-title → last-prompt → first user message.
     // Mirrors jq: `if $title != "" then $title elif $last != "" then $last else $first end`
-    let raw_label = ai_title
-        .or(last_prompt)
-        .or(first_user)
-        .unwrap_or_default();
+    let raw_label = ai_title.or(last_prompt).or(first_user).unwrap_or_default();
 
     // Truncate to 80 chars (char boundary, not byte boundary).
     let label = truncate_to_chars(&raw_label, 80);
@@ -496,10 +501,18 @@ fn extract_user_text(obj: &serde_json::Map<String, Value>) -> Option<String> {
                 .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
                 .collect();
             let joined = text.join(" ");
-            if joined.is_empty() { None } else { Some(joined) }
+            if joined.is_empty() {
+                None
+            } else {
+                Some(joined)
+            }
         }
         Value::String(s) => {
-            if s.is_empty() { None } else { Some(s.clone()) }
+            if s.is_empty() {
+                None
+            } else {
+                Some(s.clone())
+            }
         }
         _ => None,
     }
@@ -734,10 +747,11 @@ mod tests {
     fn extract_mode_from_perm_mode_record() {
         let tmp = TempDir::new().unwrap();
         let sid = "aaaaaaaa-0000-0000-0000-000000000001";
-        write_transcript(tmp.path(), sid, &[
-            &user_record("hello"),
-            &perm_mode_record("plan"),
-        ]);
+        write_transcript(
+            tmp.path(),
+            sid,
+            &[&user_record("hello"), &perm_mode_record("plan")],
+        );
         let tp = tmp.path().join(format!("{sid}.jsonl"));
         let (mode, _label) = extract_label_and_mode(&tp);
         assert_eq!(mode, "plan");
@@ -747,10 +761,14 @@ mod tests {
     fn extract_mode_from_user_record_with_permission_mode() {
         let tmp = TempDir::new().unwrap();
         let sid = "aaaaaaaa-0000-0000-0000-000000000002";
-        write_transcript(tmp.path(), sid, &[
-            &user_record("initial"),
-            &user_with_mode_record("later message", "acceptEdits"),
-        ]);
+        write_transcript(
+            tmp.path(),
+            sid,
+            &[
+                &user_record("initial"),
+                &user_with_mode_record("later message", "acceptEdits"),
+            ],
+        );
         let tp = tmp.path().join(format!("{sid}.jsonl"));
         let (mode, _) = extract_label_and_mode(&tp);
         assert_eq!(mode, "acceptEdits");
@@ -760,9 +778,7 @@ mod tests {
     fn extract_mode_missing_returns_question_mark() {
         let tmp = TempDir::new().unwrap();
         let sid = "aaaaaaaa-0000-0000-0000-000000000003";
-        write_transcript(tmp.path(), sid, &[
-            &user_record("no mode here"),
-        ]);
+        write_transcript(tmp.path(), sid, &[&user_record("no mode here")]);
         let tp = tmp.path().join(format!("{sid}.jsonl"));
         let (mode, _) = extract_label_and_mode(&tp);
         assert_eq!(mode, "?");
@@ -772,11 +788,15 @@ mod tests {
     fn label_ai_title_wins() {
         let tmp = TempDir::new().unwrap();
         let sid = "aaaaaaaa-0000-0000-0000-000000000004";
-        write_transcript(tmp.path(), sid, &[
-            &user_record("first user prompt"),
-            &last_prompt_record("last prompt text"),
-            &ai_title_record("The AI Title"),
-        ]);
+        write_transcript(
+            tmp.path(),
+            sid,
+            &[
+                &user_record("first user prompt"),
+                &last_prompt_record("last prompt text"),
+                &ai_title_record("The AI Title"),
+            ],
+        );
         let tp = tmp.path().join(format!("{sid}.jsonl"));
         let (_mode, label) = extract_label_and_mode(&tp);
         assert_eq!(label, "The AI Title");
@@ -786,10 +806,14 @@ mod tests {
     fn label_last_prompt_fallback_when_no_ai_title() {
         let tmp = TempDir::new().unwrap();
         let sid = "aaaaaaaa-0000-0000-0000-000000000005";
-        write_transcript(tmp.path(), sid, &[
-            &user_record("first user prompt"),
-            &last_prompt_record("last prompt fallback"),
-        ]);
+        write_transcript(
+            tmp.path(),
+            sid,
+            &[
+                &user_record("first user prompt"),
+                &last_prompt_record("last prompt fallback"),
+            ],
+        );
         let tp = tmp.path().join(format!("{sid}.jsonl"));
         let (_mode, label) = extract_label_and_mode(&tp);
         assert_eq!(label, "last prompt fallback");
@@ -799,10 +823,14 @@ mod tests {
     fn label_first_user_fallback_when_no_title_or_last_prompt() {
         let tmp = TempDir::new().unwrap();
         let sid = "aaaaaaaa-0000-0000-0000-000000000006";
-        write_transcript(tmp.path(), sid, &[
-            &user_record("the very first message"),
-            &user_record("a second message"),
-        ]);
+        write_transcript(
+            tmp.path(),
+            sid,
+            &[
+                &user_record("the very first message"),
+                &user_record("a second message"),
+            ],
+        );
         let tp = tmp.path().join(format!("{sid}.jsonl"));
         let (_mode, label) = extract_label_and_mode(&tp);
         assert_eq!(label, "the very first message");
@@ -813,9 +841,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let sid = "aaaaaaaa-0000-0000-0000-000000000007";
         let long_title = "A".repeat(120);
-        write_transcript(tmp.path(), sid, &[
-            &ai_title_record(&long_title),
-        ]);
+        write_transcript(tmp.path(), sid, &[&ai_title_record(&long_title)]);
         let tp = tmp.path().join(format!("{sid}.jsonl"));
         let (_mode, label) = extract_label_and_mode(&tp);
         assert_eq!(label.chars().count(), 80);
@@ -835,11 +861,15 @@ mod tests {
     fn extract_ignores_malformed_json_lines() {
         let tmp = TempDir::new().unwrap();
         let sid = "aaaaaaaa-0000-0000-0000-000000000009";
-        write_transcript(tmp.path(), sid, &[
-            r#"not-json{"bad":"line"}"#,
-            &user_record("real message"),
-            r#"{"incomplete"#, // truncated — fromjson? drops it
-        ]);
+        write_transcript(
+            tmp.path(),
+            sid,
+            &[
+                r#"not-json{"bad":"line"}"#,
+                &user_record("real message"),
+                r#"{"incomplete"#, // truncated — fromjson? drops it
+            ],
+        );
         let tp = tmp.path().join(format!("{sid}.jsonl"));
         // Should not panic and should still find the user message.
         let (_mode, label) = extract_label_and_mode(&tp);
@@ -851,10 +881,14 @@ mod tests {
         // The jq picks `last` for ai-title (the final occurrence in the window).
         let tmp = TempDir::new().unwrap();
         let sid = "aaaaaaaa-0000-0000-0000-00000000000a";
-        write_transcript(tmp.path(), sid, &[
-            &ai_title_record("First Title"),
-            &ai_title_record("Updated Title"),
-        ]);
+        write_transcript(
+            tmp.path(),
+            sid,
+            &[
+                &ai_title_record("First Title"),
+                &ai_title_record("Updated Title"),
+            ],
+        );
         let tp = tmp.path().join(format!("{sid}.jsonl"));
         let (_mode, label) = extract_label_and_mode(&tp);
         assert_eq!(label, "Updated Title");
@@ -989,10 +1023,11 @@ mod tests {
         // so instead we exercise the sub-functions directly.
 
         let sid = "cccccccc-0000-0000-0000-000000000001";
-        write_transcript(&project_dir, sid, &[
-            &user_record("hello world"),
-            &perm_mode_record("plan"),
-        ]);
+        write_transcript(
+            &project_dir,
+            sid,
+            &[&user_record("hello world"), &perm_mode_record("plan")],
+        );
 
         // extract_index_row works on the transcript.
         let tp = project_dir.join(format!("{sid}.jsonl"));
@@ -1020,10 +1055,15 @@ mod tests {
         let tp2 = tmp.path().join(format!("{sid2}.jsonl"));
 
         fs::write(&tp1, format!("{}\n", user_record("first session message"))).unwrap();
-        fs::write(&tp2, format!("{}\n{}\n",
-            user_record("second session message"),
-            ai_title_record("My AI Title"),
-        )).unwrap();
+        fs::write(
+            &tp2,
+            format!(
+                "{}\n{}\n",
+                user_record("second session message"),
+                ai_title_record("My AI Title"),
+            ),
+        )
+        .unwrap();
 
         // Use a small sleep alternative: just set mtime indirectly via write order.
         // Test extract + build rows + sort.
@@ -1045,7 +1085,10 @@ mod tests {
         // We can only test the dedup logic indirectly via encode_cwd.
         let (cur, leg) = paths::encode_cwd(Path::new("/tmp/noproject"));
         // Both encodings must be identical (no dots in path).
-        assert_eq!(cur, leg, "expected identical encodings for path without dots");
+        assert_eq!(
+            cur, leg,
+            "expected identical encodings for path without dots"
+        );
     }
 
     // ─── last permissionMode wins (tail of file) ──────────────────────────────
@@ -1054,11 +1097,15 @@ mod tests {
     fn last_permission_mode_wins() {
         let tmp = TempDir::new().unwrap();
         let sid = "eeeeeeee-0000-0000-0000-000000000001";
-        write_transcript(tmp.path(), sid, &[
-            &perm_mode_record("default"),
-            &perm_mode_record("plan"),
-            &perm_mode_record("acceptEdits"),
-        ]);
+        write_transcript(
+            tmp.path(),
+            sid,
+            &[
+                &perm_mode_record("default"),
+                &perm_mode_record("plan"),
+                &perm_mode_record("acceptEdits"),
+            ],
+        );
         let tp = tmp.path().join(format!("{sid}.jsonl"));
         let (mode, _) = extract_label_and_mode(&tp);
         // "acceptEdits" is the LAST occurrence.
@@ -1079,7 +1126,10 @@ mod tests {
     #[test]
     fn transcript_sid_extracts_stem() {
         let p = Path::new("/foo/bar/01234567-89ab-cdef-0123-456789abcdef.jsonl");
-        assert_eq!(transcript_sid(p).unwrap(), "01234567-89ab-cdef-0123-456789abcdef");
+        assert_eq!(
+            transcript_sid(p).unwrap(),
+            "01234567-89ab-cdef-0123-456789abcdef"
+        );
     }
 
     #[test]

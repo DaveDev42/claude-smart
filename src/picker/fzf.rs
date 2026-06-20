@@ -89,16 +89,22 @@ pub fn run_fzf(rows: &[String], opts: &FzfOpts) -> Option<String> {
     }
 
     let mut cmd = Command::new("fzf");
-    cmd.arg("--prompt").arg(&opts.prompt)
-        .arg("--with-nth").arg(&opts.with_nth)
-        .arg("--delimiter").arg(&opts.delimiter)
-        .arg("--height").arg(&opts.height);
+    cmd.arg("--prompt")
+        .arg(&opts.prompt)
+        .arg("--with-nth")
+        .arg(&opts.with_nth)
+        .arg("--delimiter")
+        .arg(&opts.delimiter)
+        .arg("--height")
+        .arg(&opts.height);
     for extra in &opts.extra_args {
         cmd.arg(extra);
     }
     // fzf reads candidates from stdin and writes the chosen line to stdout; its
     // TUI is drawn on /dev/tty, so piping stdin/stdout does not hide the UI.
-    cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::inherit());
+    cmd.stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit());
 
     let mut child = cmd.spawn().ok()?;
 
@@ -146,7 +152,10 @@ mod tests {
     fn fzf_available_is_stable() {
         let a = fzf_available();
         let b = fzf_available();
-        assert_eq!(a, b, "fzf_available() must be deterministic within one process");
+        assert_eq!(
+            a, b,
+            "fzf_available() must be deterministic within one process"
+        );
     }
 
     /// When fzf is not available, `fzf_available()` returns `false` (not panic).

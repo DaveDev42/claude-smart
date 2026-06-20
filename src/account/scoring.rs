@@ -96,11 +96,7 @@ pub type ScoringResult = Result<Option<String>, ScoringError>;
 ///
 /// # Shell source
 /// `pick_account` in `claude-smart-helper.sh.j2` lines 883–971.
-pub fn pick_best(
-    data: &UsageData,
-    current_profile: &str,
-    include_current: bool,
-) -> ScoringResult {
+pub fn pick_best(data: &UsageData, current_profile: &str, include_current: bool) -> ScoringResult {
     let lim = limit_pct();
     let sat = saturation_pct();
 
@@ -203,9 +199,9 @@ pub fn pick_best(
             // Equal pct → soonest reset epoch wins (shell lines 957–960).
             // A known epoch beats unknown; a smaller epoch (sooner) beats a larger.
             let new_wins = match (epoch, best_epoch) {
-                (Some(_), None) => true,           // known beats unknown
-                (Some(e), Some(be)) => e < be,     // smaller (sooner) wins
-                _ => false,                        // unknown doesn't beat known or equal unknown
+                (Some(_), None) => true,       // known beats unknown
+                (Some(e), Some(be)) => e < be, // smaller (sooner) wins
+                _ => false,                    // unknown doesn't beat known or equal unknown
             };
             if new_wins {
                 best_name = Some(c.name);
@@ -332,7 +328,12 @@ mod tests {
 
     #[test]
     fn constants_are_sane() {
-        const { assert!(LIMIT_PCT > SATURATION_PCT, "LIMIT_PCT must be > SATURATION_PCT") };
+        const {
+            assert!(
+                LIMIT_PCT > SATURATION_PCT,
+                "LIMIT_PCT must be > SATURATION_PCT"
+            )
+        };
         const { assert!(ABSENT_SESSION_PCT < 0, "absent sentinel must be negative") };
     }
 
@@ -344,15 +345,9 @@ mod tests {
     fn one_saturated_one_healthy_picks_healthy() {
         let mut profiles = HashMap::new();
         // "saturated" has week_pct = 96 (>= SATURATION_PCT=95) → excluded
-        profiles.insert(
-            "saturated".to_string(),
-            make_profile(Some(10), 96, None),
-        );
+        profiles.insert("saturated".to_string(), make_profile(Some(10), 96, None));
         // "healthy" has week_pct = 60 → viable
-        profiles.insert(
-            "healthy".to_string(),
-            make_profile(Some(5), 60, None),
-        );
+        profiles.insert("healthy".to_string(), make_profile(Some(5), 60, None));
         let data = make_data(profiles);
         let result = pick_best(&data, "other", false).unwrap();
         assert_eq!(result.as_deref(), Some("healthy"));
@@ -419,7 +414,10 @@ mod tests {
         profiles.insert("current".to_string(), make_profile(Some(10), 70, None));
         let data = make_data(profiles);
         let result = pick_best(&data, "current", true).unwrap();
-        assert_eq!(result, None, "winner == current with include_current=true must be None");
+        assert_eq!(
+            result, None,
+            "winner == current with include_current=true must be None"
+        );
     }
 
     /// include_current=true: if winner is NOT current, return that winner.
@@ -442,7 +440,11 @@ mod tests {
         profiles.insert("alt".to_string(), make_profile(Some(5), 40, None));
         let data = make_data(profiles);
         let result = pick_best(&data, "current", false).unwrap();
-        assert_eq!(result.as_deref(), Some("alt"), "reactive mode must not return current");
+        assert_eq!(
+            result.as_deref(),
+            Some("alt"),
+            "reactive mode must not return current"
+        );
     }
 
     // ─── all-saturated ────────────────────────────────────────────────────────
@@ -479,10 +481,17 @@ mod tests {
         profiles.insert("errored".to_string(), make_profile(Some(5), 80, None));
         profiles.insert("healthy".to_string(), make_profile(Some(5), 50, None));
         let mut errors = HashMap::new();
-        errors.insert("errored".to_string(), "HTTP 401: no credentials".to_string());
+        errors.insert(
+            "errored".to_string(),
+            "HTTP 401: no credentials".to_string(),
+        );
         let data = make_data_with_errors(profiles, errors);
         let result = pick_best(&data, "", false).unwrap();
-        assert_eq!(result.as_deref(), Some("healthy"), "errored profile must be excluded");
+        assert_eq!(
+            result.as_deref(),
+            Some("healthy"),
+            "errored profile must be excluded"
+        );
     }
 
     /// All profiles errored → AllSaturated.

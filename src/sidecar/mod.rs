@@ -40,7 +40,7 @@ pub enum SidecarError {
 /// existing values. Unknown fields are preserved via `flatten` so future
 /// additions survive a round-trip through an older binary.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]   // sessionId, permissionMode, etc.
+#[serde(rename_all = "camelCase")] // sessionId, permissionMode, etc.
 pub struct Sidecar {
     /// The Claude session UUID, e.g. `01234567-89ab-cdef-0123-456789abcdef`.
     #[serde(rename = "sessionId", skip_serializing_if = "Option::is_none")]
@@ -390,8 +390,14 @@ mod tests {
             ..Default::default()
         };
         let json = serde_json::to_string(&s).expect("serialize");
-        assert!(json.contains("\"sessionId\""), "missing sessionId in: {json}");
-        assert!(json.contains("\"permissionMode\""), "missing permissionMode in: {json}");
+        assert!(
+            json.contains("\"sessionId\""),
+            "missing sessionId in: {json}"
+        );
+        assert!(
+            json.contains("\"permissionMode\""),
+            "missing permissionMode in: {json}"
+        );
         assert!(json.contains("\"effort\""), "missing effort in: {json}");
         assert!(json.contains("\"model\""), "missing model in: {json}");
         assert!(json.contains("\"cwd\""), "missing cwd in: {json}");
@@ -541,7 +547,11 @@ mod tests {
 
         // Hop must still be 2.
         let result = read_sidecar(&path).unwrap();
-        assert_eq!(result.hop_int(), 2, "hop should be preserved when not in patch");
+        assert_eq!(
+            result.hop_int(),
+            2,
+            "hop should be preserved when not in patch"
+        );
         assert_eq!(result.permission_mode.as_deref(), Some("default"));
     }
 
@@ -588,19 +598,18 @@ mod tests {
         )
         .unwrap();
 
-        let mtime_before = std::fs::metadata(&path)
-            .and_then(|m| m.modified())
-            .unwrap();
+        let mtime_before = std::fs::metadata(&path).and_then(|m| m.modified()).unwrap();
 
         // Merge empty patch — should be a no-op (no file write).
         merge_sidecar(&path, &Sidecar::default()).unwrap();
 
-        let mtime_after = std::fs::metadata(&path)
-            .and_then(|m| m.modified())
-            .unwrap();
+        let mtime_after = std::fs::metadata(&path).and_then(|m| m.modified()).unwrap();
 
         // mtime must not change (no write happened).
-        assert_eq!(mtime_before, mtime_after, "empty merge should not touch the file");
+        assert_eq!(
+            mtime_before, mtime_after,
+            "empty merge should not touch the file"
+        );
     }
 
     #[test]
@@ -651,8 +660,10 @@ mod tests {
         // Write it back and confirm the key is still there.
         write_sidecar(&path, &Sidecar::default()).unwrap();
         let s2 = read_sidecar(&path).unwrap();
-        assert!(s2.extra.contains_key("unknownFutureKey"),
-            "unknown future key should survive write_sidecar round-trip");
+        assert!(
+            s2.extra.contains_key("unknownFutureKey"),
+            "unknown future key should survive write_sidecar round-trip"
+        );
     }
 
     #[test]
@@ -672,7 +683,10 @@ mod tests {
         write_sidecar(&path, &s).unwrap();
 
         // Tmp must be gone after a successful write.
-        assert!(!tmp_path.exists(), ".json.tmp must be cleaned up after rename");
+        assert!(
+            !tmp_path.exists(),
+            ".json.tmp must be cleaned up after rename"
+        );
         // The canonical file must be readable.
         let read_back = read_sidecar(&path).unwrap();
         assert_eq!(read_back.session_id.as_deref(), Some("atomic-test"));
@@ -693,7 +707,10 @@ mod tests {
         write_sidecar(&path, &s).unwrap();
         let raw = std::fs::read_to_string(&path).unwrap();
         // Must not contain newlines (compact, not pretty-printed).
-        assert!(!raw.contains('\n'), "sidecar JSON must be compact (no newlines); got: {raw}");
+        assert!(
+            !raw.contains('\n'),
+            "sidecar JSON must be compact (no newlines); got: {raw}"
+        );
     }
 
     #[test]
@@ -716,7 +733,10 @@ mod tests {
         let mtime_before = std::fs::metadata(&path).and_then(|m| m.modified()).unwrap();
         merge_sidecar(&path, &Sidecar::default()).unwrap();
         let mtime_after = std::fs::metadata(&path).and_then(|m| m.modified()).unwrap();
-        assert_eq!(mtime_before, mtime_after, "no-op merge must not modify file mtime");
+        assert_eq!(
+            mtime_before, mtime_after,
+            "no-op merge must not modify file mtime"
+        );
     }
 
     #[test]
@@ -737,7 +757,8 @@ mod tests {
                 permission_mode: Some("default".to_owned()),
                 ..Default::default()
             },
-        ).unwrap();
+        )
+        .unwrap();
 
         // Step 1: hook increments hop to 1 via merge.
         merge_sidecar(
@@ -746,7 +767,8 @@ mod tests {
                 hop: Some(Sidecar::hop_value(1)),
                 ..Default::default()
             },
-        ).unwrap();
+        )
+        .unwrap();
         assert_eq!(read_sidecar(&path).unwrap().hop_int(), 1);
 
         // Step 2: wrapper writes updated mode WITHOUT a hop field.
@@ -757,10 +779,15 @@ mod tests {
                 effort: Some("max".to_owned()),
                 ..Default::default()
             },
-        ).unwrap();
+        )
+        .unwrap();
 
         let result = read_sidecar(&path).unwrap();
-        assert_eq!(result.hop_int(), 1, "hop must survive write_sidecar without hop field");
+        assert_eq!(
+            result.hop_int(),
+            1,
+            "hop must survive write_sidecar without hop field"
+        );
         assert_eq!(result.permission_mode.as_deref(), Some("bypassPermissions"));
         assert_eq!(result.effort.as_deref(), Some("max"));
     }
@@ -778,10 +805,14 @@ mod tests {
         let flags = s.sidecar_flags();
         // Should have --permission-mode + value + --model + value = 4 items, no --effort.
         assert_eq!(flags.len(), 4);
-        let flag_strs: Vec<String> = flags.iter()
+        let flag_strs: Vec<String> = flags
+            .iter()
             .map(|f| f.to_string_lossy().into_owned())
             .collect();
-        assert!(!flag_strs.contains(&"--effort".to_owned()), "--effort must not appear if absent from sidecar");
+        assert!(
+            !flag_strs.contains(&"--effort".to_owned()),
+            "--effort must not appear if absent from sidecar"
+        );
     }
 
     #[test]
@@ -804,6 +835,9 @@ mod tests {
         assert_eq!(result.session_id.as_deref(), Some("new-sid"));
         assert_eq!(result.effort.as_deref(), Some("low"));
         // No garbage from the corrupt original.
-        assert!(result.extra.is_empty(), "corrupt original must not leak into new sidecar");
+        assert!(
+            result.extra.is_empty(),
+            "corrupt original must not leak into new sidecar"
+        );
     }
 }

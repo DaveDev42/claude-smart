@@ -86,24 +86,22 @@ mod tests {
 
     #[test]
     fn parse_pid_file_basic() {
-        let (pid, born) = parse_pid_file("12345 1718000000\n")
-            .expect("should parse pid+born");
+        let (pid, born) = parse_pid_file("12345 1718000000\n").expect("should parse pid+born");
         assert_eq!(pid, 12345);
         assert_eq!(born, 1_718_000_000);
     }
 
     #[test]
     fn parse_pid_file_no_trailing_newline() {
-        let (pid, born) = parse_pid_file("99 42")
-            .expect("no newline is fine");
+        let (pid, born) = parse_pid_file("99 42").expect("no newline is fine");
         assert_eq!(pid, 99);
         assert_eq!(born, 42);
     }
 
     #[test]
     fn parse_pid_file_extra_whitespace() {
-        let (pid, born) = parse_pid_file("  1000  9999999999  ")
-            .expect("leading/trailing whitespace is fine");
+        let (pid, born) =
+            parse_pid_file("  1000  9999999999  ").expect("leading/trailing whitespace is fine");
         assert_eq!(pid, 1000);
         assert_eq!(born, 9_999_999_999);
     }
@@ -111,8 +109,8 @@ mod tests {
     #[test]
     fn parse_pid_file_extra_tokens_ignored() {
         // Forward-compat: future versions may append more fields.
-        let (pid, born) = parse_pid_file("1 2 extra tokens here")
-            .expect("extra tokens are ignored");
+        let (pid, born) =
+            parse_pid_file("1 2 extra tokens here").expect("extra tokens are ignored");
         assert_eq!(pid, 1);
         assert_eq!(born, 2);
     }

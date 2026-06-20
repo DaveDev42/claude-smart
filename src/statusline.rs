@@ -216,9 +216,7 @@ fn hostname_impl() -> Result<String> {
 #[cfg(windows)]
 fn hostname_impl() -> Result<String> {
     use std::os::windows::ffi::OsStringExt;
-    use windows_sys::Win32::System::SystemInformation::{
-        ComputerNameNetBIOS, GetComputerNameExW,
-    };
+    use windows_sys::Win32::System::SystemInformation::{ComputerNameNetBIOS, GetComputerNameExW};
 
     // First call: pass null + &mut size to obtain required buffer length.
     let mut size: u32 = 0;
@@ -226,9 +224,7 @@ fn hostname_impl() -> Result<String> {
     unsafe { GetComputerNameExW(ComputerNameNetBIOS, std::ptr::null_mut(), &mut size) };
 
     let mut buf: Vec<u16> = vec![0u16; size as usize];
-    let ok = unsafe {
-        GetComputerNameExW(ComputerNameNetBIOS, buf.as_mut_ptr(), &mut size)
-    };
+    let ok = unsafe { GetComputerNameExW(ComputerNameNetBIOS, buf.as_mut_ptr(), &mut size) };
     if ok == 0 {
         anyhow::bail!("GetComputerNameExW failed");
     }
@@ -340,28 +336,19 @@ mod tests {
     #[test]
     fn leaf_personal_path() {
         // /home/you/.claude.personal  →  basename ".claude.personal"  →  "personal"
-        assert_eq!(
-            profile_with_dir("/home/you/.claude.personal"),
-            "personal"
-        );
+        assert_eq!(profile_with_dir("/home/you/.claude.personal"), "personal");
     }
 
     #[test]
     fn leaf_work_path() {
         // /home/you/.claude.work  →  basename ".claude.work"  →  "work"
-        assert_eq!(
-            profile_with_dir("/home/you/.claude.work"),
-            "work"
-        );
+        assert_eq!(profile_with_dir("/home/you/.claude.work"), "work");
     }
 
     #[test]
     fn leaf_macos_style_path() {
         // /Users/example/.claude.personal  →  "personal"
-        assert_eq!(
-            profile_with_dir("/Users/example/.claude.personal"),
-            "personal"
-        );
+        assert_eq!(profile_with_dir("/Users/example/.claude.personal"), "personal");
     }
 
     #[test]
@@ -373,10 +360,7 @@ mod tests {
     #[test]
     fn leaf_trailing_slash_stripped() {
         // std::path::Path normalises trailing slashes; basename is still correct.
-        assert_eq!(
-            profile_with_dir("/home/you/.claude.personal/"),
-            "personal"
-        );
+        assert_eq!(profile_with_dir("/home/you/.claude.personal/"), "personal");
     }
 
     #[test]
@@ -507,8 +491,10 @@ mod tests {
     #[test]
     fn short_hostname_no_domain_suffix() {
         let h = short_hostname().unwrap();
-        assert!(!h.contains('.') || h.starts_with('.'),
-            "short hostname should have no interior FQDN dot: {h}");
+        assert!(
+            !h.contains('.') || h.starts_with('.'),
+            "short hostname should have no interior FQDN dot: {h}"
+        );
     }
 
     #[test]
@@ -519,8 +505,10 @@ mod tests {
         // Only check if the raw hostname actually had the prefix.
         let raw = hostname().unwrap();
         if raw.len() > 5 && raw[..5].eq_ignore_ascii_case("Dave-") {
-            assert!(!h.starts_with("Dave-") && !h.starts_with("dave-"),
-                "Dave- prefix not stripped: {h}");
+            assert!(
+                !h.starts_with("Dave-") && !h.starts_with("dave-"),
+                "Dave- prefix not stripped: {h}"
+            );
         }
     }
 

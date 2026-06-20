@@ -159,9 +159,7 @@ pub fn run_relaunch_loop(
 
         // Hop cap: bound the number of automatic profile switches per chain.
         if sentinel.hop > MAX_HOPS {
-            eprintln!(
-                "csm: limit-switch hop cap ({MAX_HOPS}) reached — not relaunching again"
-            );
+            eprintln!("csm: limit-switch hop cap ({MAX_HOPS}) reached — not relaunching again");
             let _ = std::fs::remove_file(&pid_path);
             return exit_with(status);
         }
@@ -290,7 +288,8 @@ mod tests {
     fn hop_is_number_not_string() {
         // Contrast with sidecar where hop is a JSON STRING.
         // Here hop must deserialize from a JSON number.
-        let json = r#"{"session_id":"x","target_profile":"p","cwd":"/","handoff":"","hop":1,"born":0}"#;
+        let json =
+            r#"{"session_id":"x","target_profile":"p","cwd":"/","handoff":"","hop":1,"born":0}"#;
         let s: RelaunchSentinel = serde_json::from_str(json).unwrap();
         assert_eq!(s.hop, 1_i64);
     }
@@ -316,7 +315,9 @@ mod tests {
             born: 1_718_100_000,
         };
         write_relaunch(&path, &sentinel).unwrap();
-        let back = read_relaunch(&path).unwrap().expect("should exist after write");
+        let back = read_relaunch(&path)
+            .unwrap()
+            .expect("should exist after write");
         assert_eq!(back.session_id, sentinel.session_id);
         assert_eq!(back.born, sentinel.born);
         assert_eq!(back.hop, sentinel.hop);

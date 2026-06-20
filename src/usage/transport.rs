@@ -164,7 +164,7 @@ fn do_network_fetch() -> Result<UsageData, FetchError> {
 /// empty result yields `None` — HTTP is disabled unless a non-empty URL is set.
 fn resolve_usage_url() -> Option<String> {
     let url = match std::env::var("CLAUDE_USAGE_URL") {
-        Ok(val) => val,                            // set (possibly empty)
+        Ok(val) => val,                             // set (possibly empty)
         Err(_) => DEFAULT_HUB_USAGE_URL.to_owned(), // unset = default (empty)
     };
     if url.is_empty() {
@@ -468,12 +468,17 @@ fn ssh_fetch() -> Result<UsageData, FetchError> {
     let start = Instant::now();
     let mut child = Command::new("ssh")
         .args([
-            "-o", "BatchMode=yes",
-            "-o", "ConnectTimeout=4",
-            "-o", "ControlMaster=auto",
-            "-o", &format!("ControlPath={control_path_str}"),
-            "-o", "ControlPersist=300",
-            hub.as_str(),   // short MagicDNS name (ssh_config FQDN pin handles resolution)
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "ConnectTimeout=4",
+            "-o",
+            "ControlMaster=auto",
+            "-o",
+            &format!("ControlPath={control_path_str}"),
+            "-o",
+            "ControlPersist=300",
+            hub.as_str(), // short MagicDNS name (ssh_config FQDN pin handles resolution)
             remote_cmd,
         ])
         .stdout(Stdio::piped())
@@ -538,7 +543,9 @@ fn ssh_fetch() -> Result<UsageData, FetchError> {
 /// parsed it above, so serialization here is just re-encoding the same data.
 fn write_positive_cache(data: &UsageData) -> Result<(), FetchError> {
     let cache_path = paths::usage_cache();
-    let parent = cache_path.parent().unwrap_or_else(|| std::path::Path::new("."));
+    let parent = cache_path
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."));
     std::fs::create_dir_all(parent)?;
 
     // Write to a temp file in the same directory (same FS = atomic rename).
@@ -683,7 +690,10 @@ mod tests {
     #[test]
     fn parse_valid_json_succeeds() {
         let result = parse_usage_json(VALID_USAGE_JSON);
-        assert!(result.is_ok(), "expected Ok for valid JSON, got: {result:?}");
+        assert!(
+            result.is_ok(),
+            "expected Ok for valid JSON, got: {result:?}"
+        );
         let data = result.unwrap();
         assert!(data.profiles.contains_key("personal"));
     }
@@ -719,7 +729,10 @@ mod tests {
     fn parse_minimal_json_succeeds() {
         let json = r#"{"profiles": {}}"#;
         let result = parse_usage_json(json);
-        assert!(result.is_ok(), "expected Ok for minimal JSON, got: {result:?}");
+        assert!(
+            result.is_ok(),
+            "expected Ok for minimal JSON, got: {result:?}"
+        );
     }
 
     // ── negative_cache_active ─────────────────────────────────────────────────
@@ -738,7 +751,10 @@ mod tests {
 
         // Test: a file that doesn't exist → not active.
         let non_existent = std::path::Path::new("/tmp/csm_test_never_exists_xyz123.fail");
-        assert!(!non_existent.exists(), "precondition: file should not exist");
+        assert!(
+            !non_existent.exists(),
+            "precondition: file should not exist"
+        );
 
         // The logic: if file doesn't exist → false.
         let active = if !non_existent.exists() {
@@ -910,14 +926,11 @@ mod tests {
 
         // Verify the final file is valid.
         assert!(cache_path.exists(), "cache file should exist after write");
-        assert!(
-            !tmp_path.exists(),
-            "tmp file should not exist after rename"
-        );
+        assert!(!tmp_path.exists(), "tmp file should not exist after rename");
 
         let on_disk = fs::read_to_string(&cache_path).unwrap();
-        let parsed: UsageData = serde_json::from_str(&on_disk)
-            .expect("on-disk cache must be valid JSON");
+        let parsed: UsageData =
+            serde_json::from_str(&on_disk).expect("on-disk cache must be valid JSON");
         assert!(
             parsed.profiles.contains_key("personal"),
             "on-disk cache should contain personal profile"
@@ -969,7 +982,10 @@ mod tests {
         std::env::remove_var("CLAUDE_USAGE_URL");
 
         let url = resolve_usage_url();
-        assert!(url.is_none(), "unset CLAUDE_USAGE_URL should disable HTTP (no compiled default)");
+        assert!(
+            url.is_none(),
+            "unset CLAUDE_USAGE_URL should disable HTTP (no compiled default)"
+        );
 
         match saved {
             Some(v) => std::env::set_var("CLAUDE_USAGE_URL", v),
