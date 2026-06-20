@@ -43,9 +43,11 @@ step.
 
 ## Invariant reminders (what the checks protect)
 
-- The leak guard enforces invariant #1 (no private identifiers in production
-  `src/`). If it fails, a `personal`/`work`/`workstation`/`example-tnet`/email
-  literal leaked into a non-`#[cfg(test)]` line — move it behind the registry/env
-  contract, don't suppress the guard.
+- The leak guard enforces invariant #1 (no private identifiers anywhere in
+  `src/`, including `#[cfg(test)]` fixtures). If it fails, an operator
+  account-profile name, hub/host name, real home path, tailnet suffix, or email
+  literal leaked in — replace it with a neutral placeholder (`work`, `home`,
+  `/Users/example`, `Acme-…`) or move it behind the registry/env contract.
+  Never suppress the guard or weaken its forbidden list.
 - If `cargo` resolves to the wrong toolchain (rare; sandbox/PATH), fall back to
   the explicit pin documented in `CLAUDE.md` and re-run.

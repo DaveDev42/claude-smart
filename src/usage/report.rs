@@ -22,7 +22,7 @@
 //! - `Ok`       — otherwise.
 //!
 //! # Spec reference
-//! `docs/2026-06-19-csm-usage-and-interactive-cas-edit.md` §1.
+//! `dave-environment docs/superpowers/specs/2026-06-19-csm-usage-and-interactive-cas-edit.md` §1.
 
 use serde::Serialize;
 

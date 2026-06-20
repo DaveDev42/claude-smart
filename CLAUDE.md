@@ -1,8 +1,10 @@
 # CLAUDE.md — claude-smart (`csm`)
 
-Working notes for Claude Code in this repo. User-facing docs live in `README.md`;
-design specs in `docs/`. Keep design detail in the specs, not inlined here — this
-file is the orientation map + the rules that must hold.
+Working notes for Claude Code in this repo. User-facing docs live in `README.md`.
+Design specs are kept in the private `dave-environment` repo under
+`docs/superpowers/specs/` (they reference operator-private context and so are not
+checked into this public crate). This file is the orientation map + the rules
+that must hold.
 
 ## What this is
 
@@ -41,7 +43,8 @@ It is consumed by the **private** `dave-environment` Ansible repo (the operator'
   Stop/SubagentStop/SessionEnd hook, sidecar store, OS launch/relaunch/proc
   checks, statusline, canonical state paths.
 - `tests/no_private_names.rs` — CI leak guard (recursively greps `src/`).
-- `docs/` — design specs (dated). `.github/workflows/release-please.yml` — CI.
+- `.github/workflows/release-please.yml` — CI. (Design specs live in the private
+  `dave-environment` repo, not here.)
 
 ## Commands
 
@@ -63,14 +66,16 @@ Run `/verify` before every commit (test + clippy + leak guard, in one pass).
 
 ## Invariants (a violation is a regression — fix, don't ship)
 
-1. **Public crate ships ZERO private identifiers.** No tailnet suffix
-   (`example-tnet.ts.net`), no hub hostname (`workstation`), no account names
-   (`personal`/`work`), no personal email — in **production** (`#[cfg(test)]`
-   fixtures are exempt and skipped by the guard). The hub is reached only via the
-   env contract `CLAUDE_USAGE_URL` + `CLAUDE_HUB_HOSTNAME` (both empty/unset =
-   disabled). Profile names come from `ProfileMap` (the registry), never literals.
-   `cargo test` runs `tests/no_private_names.rs` which enforces this; `docs/` is
-   excluded from the crate tarball (`Cargo.toml` `exclude`).
+1. **Public crate ships ZERO private identifiers.** No operator tailnet suffix,
+   hub/host names, account-profile names, real home paths, or personal email —
+   anywhere under `src/`, **including `#[cfg(test)]` fixtures**. Examples use
+   neutral placeholders (`work`, `home`, `/Users/example`, `Acme-…`). The hub is
+   reached only via the env contract `CLAUDE_USAGE_URL` + `CLAUDE_HUB_HOSTNAME`
+   (both empty/unset = disabled), and any host-naming convention is injected via
+   `CSM_HOST_REPLACE` — never compiled in. Profile names come from `ProfileMap`
+   (the registry), never literals. `cargo test` runs `tests/no_private_names.rs`,
+   which scans every line of `src/` and fails on any leak (its forbidden list is
+   assembled from fragments so the guard file itself stays clean).
 2. **No collision with `claude`'s CLI.** `csm` treats a word as its own
    subcommand ONLY at `args[1]`, and the reserved set is disjoint from claude's
    (`agents/auth/auto-mode/doctor/install/mcp/plugin(s)/project/setup-token/
@@ -94,7 +99,8 @@ Run `/verify` before every commit (test + clippy + leak guard, in one pass).
 `run, hook, profiles {list|add|set|rm|use|edit|dir}, usage [--json|--no-fetch],
 pick-account, scan, sidecar, statusline, completions, newuuid` + machine
 interface `cas` (+ back-compat `cas <verb>` aliases, `current-usage`). Full
-design + collision analysis: `docs/2026-06-19-csm-cli-surface-design.md`.
+design + collision analysis: `dave-environment` spec
+`docs/superpowers/specs/2026-06-19-csm-cli-surface-design.md`.
 
 ## Git workflow
 
