@@ -1016,7 +1016,7 @@ mod tests {
     #[test]
     fn reindex_creates_index_for_project_dir() {
         let tmp = TempDir::new().unwrap();
-        let project_dir = tmp.path().join("projects").join("-home-dave-myproject");
+        let project_dir = tmp.path().join("projects").join("-home-you-myproject");
         fs::create_dir_all(&project_dir).unwrap();
 
         // Redirect smart_dir to tmp; we can't easily override paths::smart_dir_no_create,

@@ -688,7 +688,7 @@ mod tests {
     /// do not depend on the real home directory.
     fn test_profiles() -> ProfileMap {
         let mut m = HashMap::new();
-        m.insert("personal".to_owned(), "/tmp/.claude.personal".to_owned());
+        m.insert("home".to_owned(), "/tmp/.claude.home".to_owned());
         m.insert("work".to_owned(), "/tmp/.claude.work".to_owned());
         ProfileMap(m)
     }
@@ -712,19 +712,19 @@ mod tests {
         let p = test_profiles();
         let f = state_file("work\n");
         assert_eq!(p.default_name_with(f.path()), "work");
-        let f = state_file("personal");
-        assert_eq!(p.default_name_with(f.path()), "personal");
+        let f = state_file("home");
+        assert_eq!(p.default_name_with(f.path()), "home");
     }
 
     #[test]
     fn default_name_unknown_token_falls_back_to_preferred() {
         // A populated map + an unknown/blank token → preferred_default()
-        // (alphabetical-first; for {work, personal} that is "work").
+        // (alphabetical-first; for {work, home} that is "home").
         let p = test_profiles();
         let f = state_file("hacker");
-        assert_eq!(p.default_name_with(f.path()), "work");
+        assert_eq!(p.default_name_with(f.path()), "home");
         let f = state_file("   ");
-        assert_eq!(p.default_name_with(f.path()), "work");
+        assert_eq!(p.default_name_with(f.path()), "home");
     }
 
     #[test]
@@ -733,7 +733,7 @@ mod tests {
         let f = state_file("  work  ");
         assert_eq!(p.default_name_with(f.path()), "work");
         let f = state_file("\tpersonal\n");
-        assert_eq!(p.default_name_with(f.path()), "personal");
+        assert_eq!(p.default_name_with(f.path()), "home");
     }
 
     #[test]
@@ -765,16 +765,16 @@ mod tests {
     #[test]
     fn profile_map_contains_replaces_allowlist() {
         let p = test_profiles();
-        assert!(p.contains("personal"));
+        assert!(p.contains("home"));
         assert!(p.contains("work"));
         assert!(!p.contains("toss"));
         // Empty map contains nothing.
-        assert!(!empty_profiles().contains("personal"));
+        assert!(!empty_profiles().contains("home"));
     }
 
     #[test]
     fn is_valid_name_syntax() {
-        assert!(ProfileMap::is_valid_name("personal"));
+        assert!(ProfileMap::is_valid_name("home"));
         assert!(ProfileMap::is_valid_name("work-2"));
         assert!(ProfileMap::is_valid_name("a.b_c"));
         assert!(!ProfileMap::is_valid_name(""));
@@ -786,19 +786,19 @@ mod tests {
 
     #[test]
     fn shell_zsh_export_line() {
-        let line = Shell::Zsh.export_line("/Users/example/.claude.personal");
+        let line = Shell::Zsh.export_line("/Users/example/.claude.home");
         assert_eq!(
             line,
-            "export CLAUDE_CONFIG_DIR='/Users/example/.claude.personal'"
+            "export CLAUDE_CONFIG_DIR='/Users/example/.claude.home'"
         );
     }
 
     #[test]
     fn shell_pwsh_export_line() {
-        let line = Shell::Pwsh.export_line(r"C:\Users\example\.claude.personal");
+        let line = Shell::Pwsh.export_line(r"C:\Users\example\.claude.home");
         assert_eq!(
             line,
-            r"$env:CLAUDE_CONFIG_DIR = 'C:\Users\example\.claude.personal'"
+            r"$env:CLAUDE_CONFIG_DIR = 'C:\Users\example\.claude.home'"
         );
     }
 
@@ -880,7 +880,7 @@ mod tests {
     #[test]
     fn op_variants_constructible() {
         let _ = Op::Switch {
-            profile: "personal".to_owned(),
+            profile: "home".to_owned(),
         };
         let _ = Op::Minus;
         let _ = Op::Global {
@@ -900,8 +900,8 @@ mod tests {
     #[test]
     fn resolve_profile_personal_in_map() {
         let profiles = test_profiles();
-        let result = resolve_profile("personal", &profiles);
-        assert_eq!(result.unwrap(), "/tmp/.claude.personal");
+        let result = resolve_profile("home", &profiles);
+        assert_eq!(result.unwrap(), "/tmp/.claude.home");
     }
 
     #[test]
@@ -922,7 +922,7 @@ mod tests {
             "expected 'unknown profile' in: {msg}"
         );
         assert!(
-            msg.contains("personal"),
+            msg.contains("home"),
             "expected available profiles in: {msg}"
         );
     }
@@ -930,11 +930,11 @@ mod tests {
     #[test]
     fn resolve_profile_empty_map_synthesizes_path() {
         let profiles = empty_profiles();
-        let result = resolve_profile("personal", &profiles);
+        let result = resolve_profile("home", &profiles);
         assert!(result.is_ok());
         let dir = result.unwrap();
-        // Should end with .claude.personal
-        assert!(dir.ends_with(".claude.personal"), "synthesized dir: {dir}");
+        // Should end with .claude.home
+        assert!(dir.ends_with(".claude.home"), "synthesized dir: {dir}");
     }
 
     // ── eval_emit: Op::Minus emits error snippet ──────────────────────────────
@@ -994,11 +994,11 @@ mod tests {
     #[test]
     fn toggle_resolves_previous_profile() {
         let profiles = test_profiles();
-        // Simulate: user was on "personal", ran `cas work` (which sets
-        // _CLAUDE_AS_PREV="personal"), then runs `cas -`.
-        // The shim resolves _CLAUDE_AS_PREV to "personal" and calls csm with "personal".
-        let result = resolve_profile("personal", &profiles);
-        assert_eq!(result.unwrap(), "/tmp/.claude.personal");
+        // Simulate: user was on "home", ran `cas work` (which sets
+        // _CLAUDE_AS_PREV="home"), then runs `cas -`.
+        // The shim resolves _CLAUDE_AS_PREV to "home" and calls csm with "home".
+        let result = resolve_profile("home", &profiles);
+        assert_eq!(result.unwrap(), "/tmp/.claude.home");
     }
 
     /// Toggle to "work" (the other direction).
@@ -1019,11 +1019,11 @@ mod tests {
     #[test]
     fn resync_resolves_via_default_profile_logic() {
         let profiles = test_profiles();
-        // Simulate default_profile() returning "personal":
-        let profile = "personal";
+        // Simulate default_profile() returning "home":
+        let profile = "home";
         let dir = resolve_profile(profile, &profiles).unwrap();
         let line = Shell::Zsh.export_line(&dir);
-        assert_eq!(line, "export CLAUDE_CONFIG_DIR='/tmp/.claude.personal'");
+        assert_eq!(line, "export CLAUDE_CONFIG_DIR='/tmp/.claude.home'");
     }
 
     #[test]
@@ -1045,10 +1045,7 @@ mod tests {
         let msg = result.unwrap_err().to_string();
         assert!(msg.contains("unknown profile"), "got: {msg}");
         assert!(msg.contains("configured:"), "got: {msg}");
-        assert!(
-            msg.contains("personal") && msg.contains("work"),
-            "got: {msg}"
-        );
+        assert!(msg.contains("home") && msg.contains("work"), "got: {msg}");
     }
 
     #[test]
@@ -1065,13 +1062,13 @@ mod tests {
 
     #[test]
     fn parse_args_switch_personal() {
-        let args = ["--eval", "--shell", "zsh", "--", "personal"];
+        let args = ["--eval", "--shell", "zsh", "--", "home"];
         let (shell, op) = parse_cas_args_for_test(&args).unwrap();
         assert_eq!(shell, Shell::Zsh);
         assert_eq!(
             op,
             Op::Switch {
-                profile: "personal".to_owned()
+                profile: "home".to_owned()
             }
         );
     }
@@ -1091,13 +1088,13 @@ mod tests {
 
     #[test]
     fn parse_args_switch_pwsh() {
-        let args = ["--eval", "--shell", "pwsh", "--", "personal"];
+        let args = ["--eval", "--shell", "pwsh", "--", "home"];
         let (shell, op) = parse_cas_args_for_test(&args).unwrap();
         assert_eq!(shell, Shell::Pwsh);
         assert_eq!(
             op,
             Op::Switch {
-                profile: "personal".to_owned()
+                profile: "home".to_owned()
             }
         );
     }
@@ -1112,13 +1109,13 @@ mod tests {
 
     #[test]
     fn parse_args_global() {
-        let args = ["--eval", "--shell", "zsh", "--", "-g", "personal"];
+        let args = ["--eval", "--shell", "zsh", "--", "-g", "home"];
         let (shell, op) = parse_cas_args_for_test(&args).unwrap();
         assert_eq!(shell, Shell::Zsh);
         assert_eq!(
             op,
             Op::Global {
-                profile: "personal".to_owned()
+                profile: "home".to_owned()
             }
         );
     }
@@ -1180,13 +1177,13 @@ mod tests {
     #[test]
     fn parse_args_no_shell_defaults_to_zsh() {
         // When --shell is absent (bare call), default to zsh.
-        let args = ["--eval", "--", "personal"];
+        let args = ["--eval", "--", "home"];
         let (shell, op) = parse_cas_args_for_test(&args).unwrap();
         assert_eq!(shell, Shell::Zsh);
         assert_eq!(
             op,
             Op::Switch {
-                profile: "personal".to_owned()
+                profile: "home".to_owned()
             }
         );
     }

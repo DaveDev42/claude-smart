@@ -384,7 +384,7 @@ mod tests {
             effort: Some("high".to_owned()),
             model: Some("claude-opus-4-5".to_owned()),
             cwd: Some("/tmp".to_owned()),
-            profile: Some("personal".to_owned()),
+            profile: Some("home".to_owned()),
             ts: Some(1_700_000_000.0),
             hop: Some(Sidecar::hop_value(1)),
             ..Default::default()
@@ -512,7 +512,7 @@ mod tests {
             permission_mode: Some("bypassPermissions".to_owned()),
             effort: Some("max".to_owned()),
             cwd: Some("/tmp/project".to_owned()),
-            profile: Some("personal".to_owned()),
+            profile: Some("home".to_owned()),
             hop: Some(Sidecar::hop_value(0)),
             ..Default::default()
         };

@@ -22,7 +22,7 @@
 //!     `PosixLauncher` — the hook reads it mid-session).
 //!
 //! ⚠ Two BLOCKING empirical checks gate shipping the Windows relaunch loop
-//!   (§4 / §8), verified on Acme-Win against real `claude.exe`:
+//!   (§4 / §8), verified on Acme-Windows against real `claude.exe`:
 //!     1. Interactive Ctrl-C forwarding cancels claude's prompt (not the supervisor).
 //!     2. CTRL_BREAK transcript flush: the `.jsonl` is complete after a switch.
 

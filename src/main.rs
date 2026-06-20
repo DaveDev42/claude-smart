@@ -349,7 +349,7 @@ fn derive_current_profile_name(profiles: &account::ProfileMap) -> String {
     if let Some((name, _)) = profiles.iter().find(|(_, d)| *d == dir.as_str()) {
         return name.to_owned();
     }
-    // Derive from the directory basename (e.g. `.claude.personal` → `personal`).
+    // Derive from the directory basename (e.g. `.claude.home` → `personal`).
     std::path::Path::new(&dir)
         .file_name()
         .and_then(|n| n.to_str())
@@ -1195,7 +1195,7 @@ mod tests {
 
     #[test]
     fn dispatch_explicit_hook() {
-        let a = argv(&["csm", "hook", "--owner", "/tmp/.claude.personal"]);
+        let a = argv(&["csm", "hook", "--owner", "/tmp/.claude.home"]);
         let (cmd, rest_len) = dispatch_subcommand(&a);
         assert_eq!(cmd, "hook");
         assert_eq!(rest_len, 2);
@@ -1203,7 +1203,7 @@ mod tests {
 
     #[test]
     fn dispatch_explicit_cas() {
-        let a = argv(&["csm", "cas", "--eval", "--shell", "zsh", "--", "personal"]);
+        let a = argv(&["csm", "cas", "--eval", "--shell", "zsh", "--", "home"]);
         let (cmd, rest_len) = dispatch_subcommand(&a);
         assert_eq!(cmd, "cas");
         assert_eq!(rest_len, 5);
@@ -1211,7 +1211,7 @@ mod tests {
 
     #[test]
     fn dispatch_explicit_pick_account() {
-        let a = argv(&["csm", "pick-account", "personal", "--include-current"]);
+        let a = argv(&["csm", "pick-account", "home", "--include-current"]);
         let (cmd, _) = dispatch_subcommand(&a);
         assert_eq!(cmd, "pick-account");
     }
@@ -1259,7 +1259,7 @@ mod tests {
 
     #[test]
     fn dispatch_explicit_current_usage() {
-        let a = argv(&["csm", "current-usage", "personal"]);
+        let a = argv(&["csm", "current-usage", "home"]);
         let (cmd, rest_len) = dispatch_subcommand(&a);
         assert_eq!(cmd, "current-usage");
         assert_eq!(rest_len, 1);
@@ -1374,16 +1374,16 @@ mod tests {
 
     #[test]
     fn parse_owner_flag_space_form() {
-        let args = argv(&["--owner", "/Users/example/.claude.personal"]);
+        let args = argv(&["--owner", "/Users/example/.claude.home"]);
         let result = parse_owner_flag(&args);
-        assert_eq!(result, Some(PathBuf::from("/Users/example/.claude.personal")));
+        assert_eq!(result, Some(PathBuf::from("/Users/example/.claude.home")));
     }
 
     #[test]
     fn parse_owner_flag_equals_form() {
-        let args = argv(&["--owner=/Users/example/.claude.personal"]);
+        let args = argv(&["--owner=/Users/example/.claude.home"]);
         let result = parse_owner_flag(&args);
-        assert_eq!(result, Some(PathBuf::from("/Users/example/.claude.personal")));
+        assert_eq!(result, Some(PathBuf::from("/Users/example/.claude.home")));
     }
 
     #[test]
@@ -1401,11 +1401,11 @@ mod tests {
 
     #[test]
     fn parse_cas_flags_eval_shell_double_dash() {
-        let args = argv(&["--eval", "--shell", "zsh", "--", "personal"]);
+        let args = argv(&["--eval", "--shell", "zsh", "--", "home"]);
         let f = parse_cas_flags(&args).unwrap();
         assert!(f.eval_mode);
         assert_eq!(f.shell.as_deref(), Some("zsh"));
-        assert_eq!(f.op_args, vec!["personal"]);
+        assert_eq!(f.op_args, vec!["home"]);
         assert!(!f.print_default_dir);
     }
 
@@ -1428,9 +1428,9 @@ mod tests {
 
     #[test]
     fn parse_cas_flags_global_op() {
-        let args = argv(&["--eval", "--shell", "zsh", "--", "-g", "personal"]);
+        let args = argv(&["--eval", "--shell", "zsh", "--", "-g", "home"]);
         let f = parse_cas_flags(&args).unwrap();
-        assert_eq!(f.op_args, vec!["-g", "personal"]);
+        assert_eq!(f.op_args, vec!["-g", "home"]);
     }
 
     #[test]
@@ -1446,8 +1446,8 @@ mod tests {
 
     #[test]
     fn parse_cas_op_switch() {
-        let op = parse_cas_op(&["personal".to_owned()]).unwrap();
-        assert!(matches!(op, cas::Op::Switch { profile } if profile == "personal"));
+        let op = parse_cas_op(&["home".to_owned()]).unwrap();
+        assert!(matches!(op, cas::Op::Switch { profile } if profile == "home"));
     }
 
     #[test]
@@ -1503,8 +1503,8 @@ mod tests {
 
     #[test]
     fn parse_cas_op_global_long_form() {
-        let op = parse_cas_op(&["--global".to_owned(), "personal".to_owned()]).unwrap();
-        assert!(matches!(op, cas::Op::Global { profile } if profile == "personal"));
+        let op = parse_cas_op(&["--global".to_owned(), "home".to_owned()]).unwrap();
+        assert!(matches!(op, cas::Op::Global { profile } if profile == "home"));
     }
 
     // ── parse_cas_op: registry management verbs ───────────────────────────────
@@ -1599,7 +1599,7 @@ mod tests {
     fn parse_cache_sections_full_payload() {
         let json: serde_json::Value = serde_json::json!({
             "profiles": {
-                "personal": {
+                "home": {
                     "session": { "pct": 3 },
                     "week_all": { "pct": 32, "resets": "Jun 18 at 9pm (Asia/Seoul)" }
                 },
@@ -1614,10 +1614,10 @@ mod tests {
         });
         let (profiles, errors) = parse_cache_sections(&Some(json));
         assert_eq!(profiles.len(), 2);
-        assert_eq!(profiles["personal"].session_pct, Some(3));
-        assert_eq!(profiles["personal"].week_all_pct, Some(32));
+        assert_eq!(profiles["home"].session_pct, Some(3));
+        assert_eq!(profiles["home"].week_all_pct, Some(32));
         assert_eq!(
-            profiles["personal"].resets.as_deref(),
+            profiles["home"].resets.as_deref(),
             Some("Jun 18 at 9pm (Asia/Seoul)")
         );
         assert!(profiles["work"].session_pct.is_none());
@@ -1629,7 +1629,7 @@ mod tests {
     fn parse_cache_sections_absent_errors_key() {
         let json: serde_json::Value = serde_json::json!({
             "profiles": {
-                "personal": {
+                "home": {
                     "week_all": { "pct": 50 }
                 }
             }

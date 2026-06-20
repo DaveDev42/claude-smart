@@ -627,7 +627,7 @@ mod tests {
     const VALID_USAGE_JSON: &str = r#"{
       "captured_at": "2026-06-17T07:13:19Z",
       "profiles": {
-        "personal": {
+        "home": {
           "session":  { "pct": 42, "resets": "9pm (Asia/Seoul)" },
           "week_all": { "pct": 31, "resets": "Jun 18 at 9pm (Asia/Seoul)" }
         },
@@ -695,7 +695,7 @@ mod tests {
             "expected Ok for valid JSON, got: {result:?}"
         );
         let data = result.unwrap();
-        assert!(data.profiles.contains_key("personal"));
+        assert!(data.profiles.contains_key("home"));
     }
 
     #[test]
@@ -932,8 +932,8 @@ mod tests {
         let parsed: UsageData =
             serde_json::from_str(&on_disk).expect("on-disk cache must be valid JSON");
         assert!(
-            parsed.profiles.contains_key("personal"),
-            "on-disk cache should contain personal profile"
+            parsed.profiles.contains_key("home"),
+            "on-disk cache should contain home profile"
         );
     }
 

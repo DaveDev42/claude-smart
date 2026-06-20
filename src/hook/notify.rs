@@ -277,7 +277,7 @@ mod tests {
     /// This test verifies the Rust JSON is valid and extractable.
     #[test]
     fn osc777_json_extractable_for_cc() {
-        let body = "[personal] hit session 99% → switching to [work] (hop 1)";
+        let body = "[home] hit session 99% → switching to [work] (hop 1)";
         let json = build_osc777_json("limit detected", body);
         let val: serde_json::Value = serde_json::from_str(&json).unwrap();
         let seq = val["terminalSequence"]
@@ -289,7 +289,7 @@ mod tests {
             "must start with ESC]777;: {seq:?}"
         );
         // The body content (with escaped semicolons) must be present.
-        assert!(seq.contains("personal"), "body content missing: {seq}");
+        assert!(seq.contains("home"), "body content missing: {seq}");
         assert!(seq.contains("work"), "body content missing: {seq}");
     }
 }

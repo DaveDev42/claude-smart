@@ -407,14 +407,14 @@ mod tests {
         ProfileMap(m)
     }
 
-    /// A usage blob: `personal` ok, `work` near-limit (week_all=96), one
+    /// A usage blob: `home` ok, `work` near-limit (week_all=96), one
     /// errored profile, plus a hub-only `ghost` profile.
     fn sample_usage() -> UsageData {
         serde_json::from_str(
             r#"{
               "captured_at": "2026-06-19T07:00:00Z",
               "profiles": {
-                "personal": {
+                "home": {
                   "session": {"pct": 12, "resets": "9pm (Asia/Seoul)"},
                   "week_all": {"pct": 34, "resets": "Jun 22"},
                   "week_sonnet": {"pct": 8}
@@ -429,7 +429,7 @@ mod tests {
                   "week_all": {"pct": 5}
                 }
               },
-              "errors": { "work": "HTTP 401: no credentials" }
+              "errors": { "errored-acct": "HTTP 401: no credentials" }
             }"#,
         )
         .unwrap()
@@ -437,25 +437,25 @@ mod tests {
 
     #[test]
     fn join_classifies_status_per_profile() {
-        let reg = registry(&["personal", "work", "work"]);
+        let reg = registry(&["home", "work", "errored-acct"]);
         let u = sample_usage();
         let report = build_report(&reg, Some(&u), true, Some(5));
 
         let by = |n: &str| report.rows.iter().find(|r| r.name == n).unwrap().clone();
-        assert_eq!(by("personal").status, Status::Ok);
-        assert_eq!(by("personal").session_pct, Some(12));
+        assert_eq!(by("home").status, Status::Ok);
+        assert_eq!(by("home").session_pct, Some(12));
         assert_eq!(by("work").status, Status::NearLimit); // week_all=96 ≥ 95
-        assert_eq!(by("work").status, Status::Errored);
+        assert_eq!(by("errored-acct").status, Status::Errored);
         assert_eq!(
-            by("work").error.as_deref(),
+            by("errored-acct").error.as_deref(),
             Some("HTTP 401: no credentials")
         );
     }
 
     #[test]
     fn registered_without_hub_data_is_no_data() {
-        let reg = registry(&["personal", "lonely"]);
-        let u = sample_usage(); // has personal but not "lonely"
+        let reg = registry(&["home", "lonely"]);
+        let u = sample_usage(); // has home but not "lonely"
         let report = build_report(&reg, Some(&u), true, None);
         let lonely = report.rows.iter().find(|r| r.name == "lonely").unwrap();
         assert_eq!(lonely.status, Status::NoData);
@@ -465,7 +465,7 @@ mod tests {
 
     #[test]
     fn unregistered_hub_profile_is_appended_and_tagged() {
-        let reg = registry(&["personal", "work"]); // ghost not registered
+        let reg = registry(&["home", "work"]); // ghost not registered
         let u = sample_usage();
         let report = build_report(&reg, Some(&u), true, None);
         let ghost = report.rows.iter().find(|r| r.name == "ghost").unwrap();
@@ -473,9 +473,9 @@ mod tests {
         // Registered rows come first, unregistered after.
         let names: Vec<&str> = report.rows.iter().map(|r| r.name.as_str()).collect();
         let ghost_idx = names.iter().position(|n| *n == "ghost").unwrap();
-        let personal_idx = names.iter().position(|n| *n == "personal").unwrap();
+        let home_idx = names.iter().position(|n| *n == "home").unwrap();
         assert!(
-            ghost_idx > personal_idx,
+            ghost_idx > home_idx,
             "unregistered must sort after registered: {names:?}"
         );
         // And the rendered name carries the tag.
@@ -485,18 +485,18 @@ mod tests {
 
     #[test]
     fn error_only_hub_profile_surfaces_as_row() {
-        // "work" is errored and has NO profiles entry — it must still appear.
-        let reg = registry(&["personal"]);
+        // "errored-acct" is errored and has NO profiles entry — it must still appear.
+        let reg = registry(&["home"]);
         let u = sample_usage();
         let report = build_report(&reg, Some(&u), true, None);
-        let work = report.rows.iter().find(|r| r.name == "work");
-        assert!(work.is_some(), "error-only hub profile must surface");
-        assert_eq!(work.unwrap().status, Status::Errored);
+        let errored = report.rows.iter().find(|r| r.name == "errored-acct");
+        assert!(errored.is_some(), "error-only hub profile must surface");
+        assert_eq!(errored.unwrap().status, Status::Errored);
     }
 
     #[test]
     fn no_usage_blob_makes_every_registered_row_no_data() {
-        let reg = registry(&["personal", "work"]);
+        let reg = registry(&["home", "work"]);
         let report = build_report(&reg, None, true, None);
         assert!(report.no_usage);
         assert_eq!(report.rows.len(), 2);
@@ -510,12 +510,12 @@ mod tests {
 
     #[test]
     fn unconfigured_shows_disabled_message_and_registry() {
-        let reg = registry(&["personal"]);
+        let reg = registry(&["home"]);
         let report = build_report(&reg, None, /*configured=*/ false, None);
         let table = render_table(&report);
         assert!(table.contains("usage metering disabled"), "table:\n{table}");
         assert!(
-            table.contains("personal"),
+            table.contains("home"),
             "registry must still render: {table}"
         );
         // Disabled never claims the hub is "unavailable" (that's a different state).
@@ -532,7 +532,7 @@ mod tests {
 
     #[test]
     fn stale_header_only_when_old() {
-        let reg = registry(&["personal"]);
+        let reg = registry(&["home"]);
         let u = sample_usage();
         // Fresh (5s): no stale header.
         let fresh = render_table(&build_report(&reg, Some(&u), true, Some(5)));
@@ -555,7 +555,7 @@ mod tests {
 
     #[test]
     fn json_shape_is_stable_and_sorted() {
-        let reg = registry(&["personal", "work"]);
+        let reg = registry(&["home", "work"]);
         let u = sample_usage();
         let report = build_report(&reg, Some(&u), true, Some(30));
         let json = render_json(&report).unwrap();
@@ -564,7 +564,7 @@ mod tests {
         assert_eq!(v["configured"], serde_json::json!(true));
         assert_eq!(v["stale_secs"], serde_json::json!(30));
         assert_eq!(v["captured_at"], serde_json::json!("2026-06-19T07:00:00Z"));
-        // BTreeMap → keys sorted: work before ghost before personal.
+        // BTreeMap → keys sorted: errored-acct before ghost before home before work.
         let keys: Vec<&str> = v["profiles"]
             .as_object()
             .unwrap()
@@ -579,16 +579,13 @@ mod tests {
             v["profiles"]["work"]["status"],
             serde_json::json!("near_limit")
         );
+        assert_eq!(v["profiles"]["home"]["session_pct"], serde_json::json!(12));
         assert_eq!(
-            v["profiles"]["personal"]["session_pct"],
-            serde_json::json!(12)
-        );
-        assert_eq!(
-            v["profiles"]["work"]["status"],
+            v["profiles"]["errored-acct"]["status"],
             serde_json::json!("errored")
         );
         assert_eq!(
-            v["profiles"]["work"]["error"],
+            v["profiles"]["errored-acct"]["error"],
             serde_json::json!("HTTP 401: no credentials")
         );
     }

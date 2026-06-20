@@ -687,7 +687,7 @@ mod tests {
         assert_epoch("Jun 20 at 8:20pm (Asia/Seoul)", expected);
     }
 
-    /// `"9pm (Asia/Seoul)"` from personal.session in the spec.
+    /// `"9pm (Asia/Seoul)"` from home.session in the spec.
     #[test]
     fn spec_sample_9pm_seoul_not_past() {
         // 9pm KST = 12:00 UTC Jun 17; fixed_now = 12:00 UTC Jun 17 → NOT past

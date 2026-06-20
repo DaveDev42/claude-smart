@@ -538,8 +538,8 @@ mod tests {
 
     #[test]
     fn parse_profile_space() {
-        let r = parse(&os_args(&["--profile", "personal"]));
-        assert_eq!(r.flags.profile.as_deref(), Some("personal"));
+        let r = parse(&os_args(&["--profile", "home"]));
+        assert_eq!(r.flags.profile.as_deref(), Some("home"));
         assert!(r.passthru.is_empty());
     }
 
@@ -581,8 +581,8 @@ mod tests {
 
     #[test]
     fn parse_profile_equals() {
-        let r = parse(&os_args(&["--profile=personal"]));
-        assert_eq!(r.flags.profile.as_deref(), Some("personal"));
+        let r = parse(&os_args(&["--profile=home"]));
+        assert_eq!(r.flags.profile.as_deref(), Some("home"));
     }
 
     // ══════════════════════════════════════════════════════════════════════════

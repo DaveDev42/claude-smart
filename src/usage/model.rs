@@ -40,7 +40,7 @@ pub struct UsageData {
     #[serde(default)]
     pub captured_at: Option<String>,
 
-    /// Per-profile usage.  Key = profile name (e.g. `"personal"`, `"work"`).
+    /// Per-profile usage.  Key = profile name (e.g. `"home"`, `"work"`).
     #[serde(default)]
     pub profiles: HashMap<String, ProfileUsage>,
 
@@ -122,7 +122,7 @@ mod tests {
     use super::*;
 
     /// A representative `.usage-cache.json` payload with:
-    /// - `personal`: all three sections present with real values
+    /// - `home`: all three sections present with real values
     /// - `work`: `week_sonnet` absent (null), `session.resets` null
     /// - `errors`: one errored profile
     /// - top-level `captured_at` present
@@ -130,7 +130,7 @@ mod tests {
     {
       "captured_at": "2026-06-17T07:13:19Z",
       "profiles": {
-        "personal": {
+        "home": {
           "captured_at": "2026-06-17T07:13:17Z",
           "session": {
             "pct": 42,
@@ -178,23 +178,23 @@ mod tests {
             "top-level captured_at"
         );
 
-        // personal profile
-        let personal = data.profiles.get("personal").expect("personal profile");
-        let sess = personal.session.as_ref().expect("personal.session");
+        // home profile
+        let home = data.profiles.get("home").expect("home profile");
+        let sess = home.session.as_ref().expect("home.session");
         assert_eq!(sess.pct, 42);
         assert_eq!(sess.resets.as_deref(), Some("9pm (Asia/Seoul)"));
 
-        let week_all = personal.week_all.as_ref().expect("personal.week_all");
+        let week_all = home.week_all.as_ref().expect("home.week_all");
         assert_eq!(week_all.pct, 31);
         assert_eq!(
             week_all.resets.as_deref(),
             Some("Jun 18 at 9pm (Asia/Seoul)")
         );
 
-        let week_sonnet = personal.week_sonnet.as_ref().expect("personal.week_sonnet");
+        let week_sonnet = home.week_sonnet.as_ref().expect("home.week_sonnet");
         assert_eq!(week_sonnet.pct, 15);
 
-        assert_eq!(personal.session_stats.len(), 2);
+        assert_eq!(home.session_stats.len(), 2);
 
         // work profile — week_sonnet is null → None
         let work = data.profiles.get("work").expect("work profile");
@@ -205,10 +205,7 @@ mod tests {
         // session.resets is null → None
         let esess = work.session.as_ref().expect("work.session");
         assert_eq!(esess.pct, 5);
-        assert!(
-            esess.resets.is_none(),
-            "work.session.resets should be None"
-        );
+        assert!(esess.resets.is_none(), "work.session.resets should be None");
         assert!(work.session_stats.is_empty());
 
         // errors map
@@ -223,14 +220,13 @@ mod tests {
     #[test]
     fn deserialize_minimal_json_no_errors_key() {
         // The `errors` key is absent when all profiles succeeded.
-        let json =
-            r#"{"profiles": {"personal": {"session": {"pct": 10}, "week_all": {"pct": 20}}}}"#;
+        let json = r#"{"profiles": {"home": {"session": {"pct": 10}, "week_all": {"pct": 20}}}}"#;
         let data: UsageData = serde_json::from_str(json).expect("minimal JSON");
         assert!(
             data.errors.is_none(),
             "errors should be None when key absent"
         );
-        let p = data.profiles.get("personal").expect("personal");
+        let p = data.profiles.get("home").expect("home");
         assert!(p.week_sonnet.is_none());
     }
 
@@ -239,7 +235,7 @@ mod tests {
         let data: UsageData =
             serde_json::from_str(SAMPLE_CACHE_JSON).expect("parse for current_usage test");
 
-        let (sess, week) = data.current_usage("personal").expect("personal present");
+        let (sess, week) = data.current_usage("home").expect("home present");
         assert_eq!(sess, 42);
         assert_eq!(week, 31);
 
@@ -286,8 +282,8 @@ mod tests {
 
         // Spot-check a field to verify the roundtrip.
         assert_eq!(
-            data.profiles["personal"].session.as_ref().unwrap().pct,
-            data2.profiles["personal"].session.as_ref().unwrap().pct
+            data.profiles["home"].session.as_ref().unwrap().pct,
+            data2.profiles["home"].session.as_ref().unwrap().pct
         );
     }
 }

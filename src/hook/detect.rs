@@ -701,7 +701,7 @@ fn extract_timestamp_epoch(v: &serde_json::Value) -> i64 {
 /// Derive the profile name from the owner dir by taking the last path segment
 /// and stripping the `.claude.` prefix.
 ///
-/// e.g. `/Users/example/.claude.personal` → `"personal"`
+/// e.g. `/Users/example/.claude.home` → `"home"`
 ///      `/Users/example/.claude.work` → `"work"`
 ///      (unknown dir) → use the last segment as-is
 pub(crate) fn owner_dir_to_profile_name(owner_dir: &Path) -> String {
@@ -927,7 +927,7 @@ mod tests {
             "session_id": "01234567-89ab-cdef-0123-456789abcdef",
             "cwd": "/Users/example/Projects/github.com/foo",
             "reason": "stop",
-            "transcript_path": "/Users/example/.claude.shared/projects/-Users-dave-Projects-github-com-foo/01234567-89ab-cdef-0123-456789abcdef.jsonl"
+            "transcript_path": "/Users/example/.claude.shared/projects/-Users-example-Projects-github-com-foo/01234567-89ab-cdef-0123-456789abcdef.jsonl"
         }"#;
         let input: HookInput = serde_json::from_str(json).expect("deserialize full payload");
         assert_eq!(
@@ -1288,9 +1288,9 @@ mod tests {
     // ── owner_dir_to_profile_name tests ───────────────────────────────────────
 
     #[test]
-    fn owner_dir_profile_name_personal() {
-        let p = Path::new("/Users/example/.claude.personal");
-        assert_eq!(owner_dir_to_profile_name(p), "personal");
+    fn owner_dir_profile_name_home() {
+        let p = Path::new("/Users/example/.claude.home");
+        assert_eq!(owner_dir_to_profile_name(p), "home");
     }
 
     #[test]
@@ -1314,13 +1314,10 @@ mod tests {
         // Remove any env override
         let prev = std::env::var("CLAUDE_SMART_RESUME_PROMPT");
         std::env::remove_var("CLAUDE_SMART_RESUME_PROMPT");
-        let h = build_handoff("01234567", "personal", "work", 1);
+        let h = build_handoff("01234567", "home", "work", 1);
         // Should contain Korean text
         assert!(h.contains("01234567"), "should contain sid_short: {h}");
-        assert!(
-            h.contains("personal"),
-            "should contain current profile: {h}"
-        );
+        assert!(h.contains("home"), "should contain current profile: {h}");
         assert!(h.contains("work"), "should contain target profile: {h}");
         assert!(h.contains("hop 1"), "should contain hop: {h}");
         // Restore
@@ -1334,7 +1331,7 @@ mod tests {
         let _g = ENV_LOCK.lock().unwrap();
         let prev = std::env::var("CLAUDE_SMART_RESUME_PROMPT");
         std::env::set_var("CLAUDE_SMART_RESUME_PROMPT", "");
-        let h = build_handoff("01234567", "personal", "work", 1);
+        let h = build_handoff("01234567", "home", "work", 1);
         assert!(h.is_empty(), "empty env var should suppress handoff");
         if let Ok(v) = prev {
             std::env::set_var("CLAUDE_SMART_RESUME_PROMPT", v);
@@ -1348,7 +1345,7 @@ mod tests {
         let _g = ENV_LOCK.lock().unwrap();
         let prev = std::env::var("CLAUDE_SMART_RESUME_PROMPT");
         std::env::set_var("CLAUDE_SMART_RESUME_PROMPT", "custom prompt here");
-        let h = build_handoff("01234567", "personal", "work", 1);
+        let h = build_handoff("01234567", "home", "work", 1);
         assert_eq!(h, "custom prompt here");
         if let Ok(v) = prev {
             std::env::set_var("CLAUDE_SMART_RESUME_PROMPT", v);

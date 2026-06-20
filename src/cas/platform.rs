@@ -220,7 +220,7 @@ mod tests {
     #[test]
     fn apply_global_does_not_panic() {
         // Soft failure only — never panics or returns hard error on POSIX.
-        let result = apply_global("personal", "/tmp/.claude.personal");
+        let result = apply_global("home", "/tmp/.claude.home");
         assert!(
             result.is_ok(),
             "apply_global must not return hard error: {:?}",
@@ -233,7 +233,7 @@ mod tests {
     fn launchctl_setenv_does_not_panic_with_valid_args() {
         // In a sandboxed CI environment launchctl may fail — that's the soft
         // failure we're testing: it should log a warning, not panic or return Err.
-        let result = launchctl_setenv("personal", "/tmp/.claude.personal");
+        let result = launchctl_setenv("home", "/tmp/.claude.home");
         assert!(
             result.is_ok(),
             "launchctl_setenv should soft-fail, not hard-fail: {:?}",
@@ -245,7 +245,7 @@ mod tests {
     #[test]
     fn linux_apply_global_is_noop() {
         // On Linux/WSL the function must succeed (no-op).
-        let result = apply_global("personal", "/tmp/.claude.personal");
+        let result = apply_global("home", "/tmp/.claude.home");
         assert!(result.is_ok());
     }
 }

@@ -251,7 +251,7 @@ mod tests {
     fn roundtrip_sentinel() {
         let sentinel = RelaunchSentinel {
             session_id: "abc123".to_string(),
-            target_profile: "personal".to_string(),
+            target_profile: "home".to_string(),
             cwd: "/home/you/projects".to_string(),
             handoff: "resume".to_string(),
             hop: 1,
@@ -308,7 +308,7 @@ mod tests {
         let path = tmp_dir.path().join("test.relaunch");
         let sentinel = RelaunchSentinel {
             session_id: "test-sid".to_string(),
-            target_profile: "personal".to_string(),
+            target_profile: "home".to_string(),
             cwd: "/tmp".to_string(),
             handoff: "resume".to_string(),
             hop: 0,

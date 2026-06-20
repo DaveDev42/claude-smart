@@ -201,13 +201,13 @@ mod tests {
 
     #[test]
     fn encode_cwd_home_github_path() {
-        // /Users/example/Projects/github.com/dave-environment
+        // /Users/example/Projects/github.com/some-project
         // current: / and . → -  →  github.com → github-com
         // legacy:  / → - only   →  github.com stays as github.com (dot preserved)
         check(
-            "/Users/example/Projects/github.com/dave-environment",
-            "-Users-dave-Projects-github-com-dave-environment",
-            "-Users-dave-Projects-github.com-dave-environment",
+            "/Users/example/Projects/github.com/some-project",
+            "-Users-example-Projects-github-com-some-project",
+            "-Users-example-Projects-github.com-some-project",
         );
     }
 
@@ -218,8 +218,8 @@ mod tests {
         // legacy:  dots preserved; only slashes → dashes
         check(
             "/Users/example/Projects/github.com/some.repo",
-            "-Users-dave-Projects-github-com-some-repo",
-            "-Users-dave-Projects-github.com-some.repo",
+            "-Users-example-Projects-github-com-some-repo",
+            "-Users-example-Projects-github.com-some.repo",
         );
     }
 
@@ -239,8 +239,8 @@ mod tests {
         // /home/you/a.b.c/d.e
         check(
             "/home/you/a.b.c/d.e",
-            "-home-dave-a-b-c-d-e",
-            "-home-dave-a.b.c-d.e",
+            "-home-you-a-b-c-d-e",
+            "-home-you-a.b.c-d.e",
         );
     }
 

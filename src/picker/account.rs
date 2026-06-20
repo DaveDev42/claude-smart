@@ -67,9 +67,9 @@ impl AccountRow {
     ///
     /// Spec §4a "Row format / Rendered examples":
     /// ```text
-    /// personal   session 3%   week 32%   resets Jun 18 9pm   (stale 4m ago)
-    /// work    [error: no credentials]                      (stale 4m ago)
-    /// personal   (no usage data)
+    /// home   session 3%   week 32%   resets Jun 18 9pm   (stale 4m ago)
+    /// work   [error: no credentials]                      (stale 4m ago)
+    /// home   (no usage data)
     /// ```
     pub fn build(profile: &str, data: &StaleProfileData, cache_mtime_secs: Option<u64>) -> Self {
         let stale_annotation = cache_mtime_secs.map(|mtime| {
@@ -84,7 +84,7 @@ impl AccountRow {
         // The display column (col2, shown via --with-nth=2..) MUST lead with the
         // profile name — col1 is hidden for recovery, so without this the user
         // could not tell which account each row is. Matches the spec §4a example
-        // (`personal   session 3%   …`). Left-pad to a fixed width so the usage
+        // (`home   session 3%   …`). Left-pad to a fixed width so the usage
         // columns line up across rows.
         let usage = render_display(data, stale_annotation.as_deref());
         let display = format!("{:<10} {usage}", profile);
@@ -259,12 +259,12 @@ mod tests {
     #[test]
     fn account_row_to_tsv_col1_is_profile() {
         let row = AccountRow {
-            profile: "personal".to_string(),
+            profile: "home".to_string(),
             display: "session 3%   week 32%".to_string(),
         };
         let tsv = row.to_tsv();
         let col1 = tsv.split('\t').next().unwrap();
-        assert_eq!(col1, "personal");
+        assert_eq!(col1, "home");
     }
 
     #[test]
@@ -335,14 +335,14 @@ mod tests {
             resets: None,
             error: None,
         };
-        let row = AccountRow::build("personal", &data, Some(old_mtime));
-        assert_eq!(row.profile, "personal");
+        let row = AccountRow::build("home", &data, Some(old_mtime));
+        assert_eq!(row.profile, "home");
         // Display should contain the stale annotation (approximately 5m ago).
         assert!(row.display.contains("stale"), "got: {}", row.display);
         // …and MUST lead with the profile name (col1 is hidden via --with-nth=2..,
         // so the name only appears to the user if it is in the display column).
         assert!(
-            row.display.starts_with("personal"),
+            row.display.starts_with("home"),
             "display must start with profile name, got: {}",
             row.display
         );
@@ -382,7 +382,7 @@ mod tests {
     fn build_fzf_input_col1_is_profile() {
         let rows = vec![
             AccountRow {
-                profile: "personal".to_string(),
+                profile: "home".to_string(),
                 display: "session 5%".to_string(),
             },
             AccountRow {
@@ -397,7 +397,7 @@ mod tests {
             .iter()
             .map(|l| l.split('\t').next().unwrap())
             .collect();
-        assert_eq!(profiles[0], "personal");
+        assert_eq!(profiles[0], "home");
         assert_eq!(profiles[1], "work");
     }
 }

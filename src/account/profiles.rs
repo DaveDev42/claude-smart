@@ -66,7 +66,7 @@ impl ProfileMap {
         names
     }
 
-    // ─── registry authority (replaces the hardcoded personal|work allowlist) ──
+    // ─── registry authority (replaces the hardcoded home|work allowlist) ──
 
     /// `true` iff `name` is a configured profile. Replaces the free
     /// `cas::is_valid_profile`. On an empty map this is always `false`
@@ -79,7 +79,7 @@ impl ProfileMap {
     /// the first profile by sorted name. `None` on an empty map.
     ///
     /// Alphabetical-first is a deterministic, documented tie-break. Intent is
-    /// pinned by the Ansible-seeded `default` file (dave-environment), so this
+    /// pinned by the Ansible-seeded `default` file (environment repo), so this
     /// only fires on a hand-corrupted/absent `default` — external users get a
     /// stable, predictable choice.
     pub fn preferred_default(&self) -> Option<String> {
@@ -185,27 +185,27 @@ mod tests {
 
     #[test]
     fn single_profile_roundtrip() {
-        let pm = parse_profiles(r#"{"personal": "/Users/example/.claude.personal"}"#).unwrap();
+        let pm = parse_profiles(r#"{"home": "/Users/example/.claude.home"}"#).unwrap();
         assert!(!pm.is_empty());
-        assert_eq!(pm.get("personal"), Some("/Users/example/.claude.personal"));
+        assert_eq!(pm.get("home"), Some("/Users/example/.claude.home"));
         assert_eq!(pm.get("work"), None);
     }
 
     #[test]
     fn two_profiles_names_sorted() {
         let pm = parse_profiles(
-            r#"{"work": "/Users/example/.claude.work", "personal": "/Users/example/.claude.personal"}"#,
+            r#"{"home": "/Users/example/.claude.home", "work": "/Users/example/.claude.work"}"#,
         )
         .unwrap();
-        assert_eq!(pm.names_sorted(), vec!["work", "personal"]);
+        assert_eq!(pm.names_sorted(), vec!["home", "work"]);
     }
 
     #[test]
     fn iter_yields_all_entries() {
-        let pm = parse_profiles(r#"{"personal": "/a", "work": "/b"}"#).unwrap();
+        let pm = parse_profiles(r#"{"home": "/a", "work": "/b"}"#).unwrap();
         let mut pairs: Vec<(&str, &str)> = pm.iter().collect();
         pairs.sort_unstable();
-        assert_eq!(pairs, vec![("work", "/b"), ("personal", "/a")]);
+        assert_eq!(pairs, vec![("home", "/a"), ("work", "/b")]);
     }
 
     #[test]
@@ -241,12 +241,12 @@ mod tests {
         let mut f = NamedTempFile::new().unwrap();
         write!(
             f,
-            r#"{{"personal": "/Users/example/.claude.personal", "work": "/Users/example/.claude.work"}}"#
+            r#"{{"home": "/Users/example/.claude.home", "work": "/Users/example/.claude.work"}}"#
         )
         .unwrap();
         let s = std::fs::read_to_string(f.path()).unwrap();
         let pm = parse_profiles(&s).unwrap();
-        assert_eq!(pm.get("personal"), Some("/Users/example/.claude.personal"));
+        assert_eq!(pm.get("home"), Some("/Users/example/.claude.home"));
         assert_eq!(pm.get("work"), Some("/Users/example/.claude.work"));
     }
 
@@ -302,7 +302,7 @@ mod tests {
 
     #[test]
     fn is_valid_name_rules() {
-        assert!(ProfileMap::is_valid_name("personal"));
+        assert!(ProfileMap::is_valid_name("home"));
         assert!(ProfileMap::is_valid_name("a.b_c-1"));
         assert!(!ProfileMap::is_valid_name(""));
         assert!(!ProfileMap::is_valid_name("a b"));
