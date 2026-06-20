@@ -17,12 +17,13 @@ use std::path::{Path, PathBuf};
 /// not sit searchable in this public file.
 fn forbidden() -> Vec<String> {
     vec![
-        "example-tnet".to_string(),               // tailnet suffix
+        format!("{}{}", "tail", "91e9e"),      // tailnet suffix
         format!("{}{}", "dave-", "macmini"),   // hub hostname (lowercase)
         format!("{}{}", "Dave-", "MacMini"),   // hub hostname (display)
         format!("{}{}", "helloworld", "4625"), // personal email local-part
         format!("{}{}", "ely", "vian"),        // private account-profile name
         format!("/Users/{}", "dave"),          // real home path (account owner)
+        format!("/home/{}", "dave"),           // real home path (Linux/WSL)
         format!(r"C:\Users\{}", "dave"),       // real home path (Windows)
     ]
 }
@@ -35,9 +36,16 @@ fn forbidden_host_prefix() -> String {
     format!("{}-", "Dave")
 }
 
-/// Profile-name literals forbidden as string literals anywhere in `src/`.
-/// They are valid only in the dave-environment SSOT, never compiled in.
-const FORBIDDEN_PROFILE_LITERALS: &[&str] = &["\"personal\"", "\"work\""];
+/// Profile-name literals forbidden as quoted string literals anywhere in `src/`.
+/// They are valid only in the dave-environment SSOT, never compiled in. Built
+/// from fragments + the quote chars so the full literal isn't searchable here.
+fn forbidden_profile_literals() -> Vec<String> {
+    let q = '"';
+    vec![
+        format!("{q}{}{q}", "personal"),
+        format!("{q}{}{}{q}", "ely", "vian"),
+    ]
+}
 
 fn collect_rs(dir: &Path, out: &mut Vec<PathBuf>) {
     let entries = match fs::read_dir(dir) {
@@ -68,6 +76,7 @@ fn no_private_identifiers_in_shipped_source() {
     let mut violations: Vec<String> = Vec::new();
     let forbidden = forbidden();
     let host_prefix = forbidden_host_prefix();
+    let profile_literals = forbidden_profile_literals();
 
     for file in &files {
         let src = fs::read_to_string(file).expect("read source");
@@ -99,7 +108,7 @@ fn no_private_identifiers_in_shipped_source() {
             // comments (`///`, `//!`, `//`) may mention them illustratively.
             let code = line.trim_start();
             if !code.starts_with("//") {
-                for needle in FORBIDDEN_PROFILE_LITERALS {
+                for needle in &profile_literals {
                     if line.contains(needle) {
                         violations.push(format!(
                             "{}:{}: profile-name literal {:?} (use ProfileMap / a neutral example)",
