@@ -5,17 +5,19 @@ edition      = "2021"
 rust-version = "1.88"
 default-run  = "csm"
 description  = "Cross-platform Claude Code smart session manager"
-license      = "MIT OR Apache-2.0"
+license      = "BSD-3-Clause"
 repository   = "https://github.com/DaveDev42/claude-smart"
 homepage     = "https://github.com/DaveDev42/claude-smart"
 keywords     = ["claude", "ai", "cli", "session"]
 categories   = ["command-line-utilities"]
 readme       = "README.md"
-# Keep the published crate tarball free of internal runbooks and CI config.
-# docs/ holds machine-specific operator notes (private hostnames, the
-# dave-environment provisioning repo); .github/ is release plumbing. Neither
-# belongs in the registry artifact. (src/ test fixtures still ship — inert.)
-exclude      = ["docs/", ".github/", "IN_PROGRESS.md"]
+# Keep the published crate tarball free of internal runbooks, CI config, and
+# the in-repo Claude Code harness. docs/ holds machine-specific operator notes
+# (private hostnames, the dave-environment provisioning repo); .github/ is
+# release plumbing; CLAUDE.md + .claude/ are editor-agent memory/config that
+# reference private context and mean nothing to a registry consumer. None
+# belong in the artifact. (src/ test fixtures still ship — inert.)
+exclude      = ["docs/", ".github/", "IN_PROGRESS.md", "CLAUDE.md", ".claude/"]
 
 [[bin]]
 name = "csm"

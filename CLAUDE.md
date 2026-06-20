@@ -6,8 +6,8 @@ file is the orientation map + the rules that must hold.
 
 ## What this is
 
-`claude-smart` is a public Rust crate (`github.com/DaveDev42/claude-smart`, MIT OR
-Apache-2.0) producing a single cross-platform binary **`csm`** that wraps the
+`claude-smart` is a public Rust crate (`github.com/DaveDev42/claude-smart`,
+BSD-3-Clause) producing a single cross-platform binary **`csm`** that wraps the
 `claude` CLI with: smart session selection, a user-configurable profile registry
 (`CLAUDE_CONFIG_DIR` switching), account scoring + auto-switch, multi-profile
 usage metering, a limit-detection hook, and a relaunch/handoff loop. Runs on

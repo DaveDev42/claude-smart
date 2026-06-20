@@ -121,4 +121,4 @@ documented in the design notes under `docs/`.)
 
 ## License
 
-See repository.
+BSD 3-Clause License. See [`LICENSE`](LICENSE).
