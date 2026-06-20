@@ -156,11 +156,25 @@ jobs:
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
         run: |
+          set -euo pipefail
           ver="$(cargo metadata --no-deps --format-version 1 \
             | python3 -c 'import sys,json;print(json.load(sys.stdin)["packages"][0]["version"])')"
           echo "Cargo.toml version: $ver"
-          if cargo search claude-smart | grep -q "^claude-smart = \"$ver\""; then
+
+          # Ask the crates.io sparse index directly — the source of truth cargo
+          # itself uses — instead of scraping `cargo search` output (whose spacing
+          # and quoting vary by cargo version, and which only reports the max
+          # non-yanked version). The index lists EVERY published version, yanked
+          # or not, one JSON object per line.
+          index="https://index.crates.io/cl/au/claude-smart"
+          published="$(curl -fsSL "$index" \
+            | python3 -c 'import sys,json; print("\n".join(json.loads(l)["vers"] for l in sys.stdin if l.strip()))')"
+          echo "Published versions:"; echo "$published" | sed 's/^/  /'
+
+          if printf '%s\n' "$published" | grep -qxF "$ver"; then
             echo "claude-smart $ver already on crates.io — skipping publish."
-          else
-            cargo publish
+            exit 0
           fi
+
+          echo "claude-smart $ver not yet published — publishing."
+          cargo publish
