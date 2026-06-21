@@ -1,0 +1,79 @@
+name: CI
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# Cancel superseded runs on the same ref (a force-push / new commit makes the
+# in-flight check obsolete).
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Per-target compile + lint gate. release-please.yml only builds the 4 targets
+  # when a release is cut, so without this a cfg-gated regression (e.g. a Windows
+  # #[cfg(windows)] branch that fails to compile or trips dead_code) would stay
+  # hidden until the release build matrix runs — and break the release itself.
+  # This runs the same 4 targets on every push/PR so cfg-divergence is caught
+  # before merge. clippy --all-targets enforces the warning-clean invariant.
+  check:
+    name: check (${{ matrix.target }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # native_test = the runner's OS+arch matches the target, so it can also
+          # `cargo test` natively. The x86_64-darwin row compile-checks on an
+          # arm64 macOS runner (cross-arch, same OS) — clippy covers it; tests run
+          # on the aarch64-darwin row.
+          - { target: x86_64-unknown-linux-gnu, os: ubuntu-latest,  native_test: true  }
+          - { target: aarch64-apple-darwin,     os: macos-latest,   native_test: true  }
+          - { target: x86_64-apple-darwin,      os: macos-latest,   native_test: false }
+          - { target: x86_64-pc-windows-msvc,   os: windows-latest, native_test: true  }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      # clippy compiles + lints each target on a runner whose OS matches the
+      # target's OS (linux→ubuntu, darwin→macOS, windows→windows), so no
+      # cross-OS toolchain is needed — the x86_64-darwin row is the only
+      # cross-ARCH build, which the native macOS toolchain handles directly.
+      - name: Clippy (all targets, warnings = errors)
+        shell: bash
+        run: cargo clippy --all-targets --target ${{ matrix.target }} -- -D warnings
+      # Tests run natively where the runner's OS matches the target. This covers
+      # unix (macOS arm64) and Windows-native; the leak guard (tests/no_private_names.rs)
+      # runs in both, and the Windows run exercises the #[cfg(windows)] launch path's
+      # compiled code.
+      - name: Test (native target)
+        if: matrix.native_test
+        shell: bash
+        run: cargo test --target ${{ matrix.target }}
+
+  # Formatting is host-agnostic — one cheap job, not per-target.
+  fmt:
+    name: fmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - name: Format check
+        run: cargo fmt --check
