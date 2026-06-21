@@ -19,7 +19,7 @@ implementation to keep in sync.
 ## Install
 
 ```sh
-# from crates.io (once published)
+# from crates.io
 cargo install claude-smart
 
 # or build from source
