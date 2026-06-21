@@ -1,7 +1,14 @@
 //! Relaunch loop and the `RelaunchSentinel` serde model.
 //!
-//! The relaunch loop (`run_relaunch_loop`) has **no cfg guards** — it is
-//! platform-agnostic and consumes a `&dyn Launcher` + `ProcCheck`.
+//! The relaunch loop (`relaunch_loop`) is platform-agnostic and consumes a
+//! `&dyn Launcher` + `ProcCheck`.  The public entry point `run_relaunch_loop`
+//! gates it per platform: on unix it runs the full loop; on Windows it falls
+//! back to a single launch-without-relaunch (`run_once`) because the Windows
+//! console-stop path has two BLOCKING empirical checks that are not yet
+//! verified (interactive Ctrl-C forwarding + CTRL_BREAK transcript flush — see
+//! `platform/windows.rs` and `TODO.md`).  Shipping the relaunch loop on Windows
+//! before those pass risks losing the supervisor (Ctrl-C kills it) or
+//! truncating the session transcript on a limit switch.
 //!
 //! ## RelaunchSentinel — read-compat with legacy zsh `write_relaunch`
 //!
@@ -75,6 +82,55 @@ pub fn write_relaunch(path: &Path, sentinel: &RelaunchSentinel) -> anyhow::Resul
 /// - A sentinel atomic-consume race is detected.
 ///
 pub fn run_relaunch_loop(
+    launcher: &dyn crate::platform::launcher::Launcher,
+    spec: &LaunchSpec,
+) -> anyhow::Result<()> {
+    // Windows: the console-stop relaunch path is gated off until its two BLOCKING
+    // empirical checks pass (see module doc + `platform/windows.rs`). Fall back to
+    // a single launch with no relaunch so an unverified supervisor can never eat an
+    // interactive Ctrl-C or truncate the transcript on a switch.
+    #[cfg(windows)]
+    {
+        return run_once(launcher, spec);
+    }
+    #[cfg(not(windows))]
+    {
+        relaunch_loop(launcher, spec)
+    }
+}
+
+/// Single launch with no relaunch handling — the Windows fall-back while the
+/// console-stop relaunch loop is gated off. Spawns claude once in the foreground,
+/// cleans up `<sid>.pid`, and propagates the child's exit code. Any `.relaunch`
+/// sentinel the hook may have written is intentionally ignored (no relaunch).
+#[cfg(windows)]
+fn run_once(
+    launcher: &dyn crate::platform::launcher::Launcher,
+    spec: &LaunchSpec,
+) -> anyhow::Result<()> {
+    use std::collections::HashMap;
+
+    use crate::paths;
+
+    let sid = spec.session_id.clone();
+    let pid_path = paths::pid_file(&sid);
+
+    let mut env: HashMap<OsString, OsString> = HashMap::new();
+    env.insert(
+        OsString::from("CLAUDE_CONFIG_DIR"),
+        spec.profile_dir.clone().into_os_string(),
+    );
+
+    let (status, _handle) = launcher.run_foreground(&sid, &spec.cli, &env)?;
+    let _ = std::fs::remove_file(&pid_path);
+    exit_with(status)
+}
+
+/// The full platform-agnostic relaunch loop (used on unix; gated off on Windows,
+/// where `run_relaunch_loop` dispatches to `run_once` instead, so this is not
+/// compiled there).
+#[cfg(not(windows))]
+fn relaunch_loop(
     launcher: &dyn crate::platform::launcher::Launcher,
     spec: &LaunchSpec,
 ) -> anyhow::Result<()> {
@@ -188,7 +244,8 @@ pub fn run_relaunch_loop(
 
 /// Build the claude CLI for the next relaunch hop: resume the same session,
 /// pass the handoff prompt (if any), and stamp the hop count so the hook can
-/// increment it again.
+/// increment it again. Only used by the unix relaunch loop.
+#[cfg(not(windows))]
 fn build_next_cli(sid: &str, sentinel: &RelaunchSentinel) -> Vec<OsString> {
     let mut cli: Vec<OsString> = Vec::new();
     cli.push(OsString::from("--resume"));
