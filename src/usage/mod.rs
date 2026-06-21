@@ -31,7 +31,9 @@ pub enum FetchError {
     #[error("HTTP fetch failed: {0}")]
     Http(#[from] reqwest::Error),
 
-    /// The SSH fallback failed (POSIX only; compiled away on Windows).
+    /// The SSH fallback failed (POSIX only; compiled away on Windows — the
+    /// `ssh_fetch` constructor is `#[cfg(unix)]`, so this variant must be too).
+    #[cfg(unix)]
     #[error("SSH fallback failed: {0}")]
     Ssh(String),
 

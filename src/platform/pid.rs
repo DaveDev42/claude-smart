@@ -33,6 +33,10 @@ pub fn write_pid_file(path: &Path, pid: u32, born: i64) -> io::Result<()> {
 /// - File absent (`NotFound`)
 /// - Any parse error (treated as "no live managed session" per spec §6)
 /// - Malformed content
+// Read only by the unix relaunch loop's clobber guard; on Windows the loop is
+// gated off (`run_once`), so this is unused in the Windows bin build (still
+// covered by the cfg(test) suite). Kept for when the Windows loop is ungated.
+#[cfg_attr(windows, allow(dead_code))]
 pub fn read_pid_file(path: &Path) -> io::Result<Option<(u32, i64)>> {
     let content = match std::fs::read_to_string(path) {
         Ok(s) => s,

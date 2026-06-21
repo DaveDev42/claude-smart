@@ -48,10 +48,17 @@ pub struct RelaunchSentinel {
 
 /// Maximum number of limit-switch hops before the relaunch loop breaks.
 /// Matches the legacy zsh `MAX_HOPS=1` constant.
+// Only the unix relaunch loop reads this; on Windows the loop is gated off
+// (`run_relaunch_loop` → `run_once`), so the const is unused in the Windows bin
+// build (still exercised by the cfg(test) suite). Kept for when the Windows loop
+// is ungated.
+#[cfg_attr(windows, allow(dead_code))]
 pub const MAX_HOPS: i64 = 1;
 
 /// Read `<sid>.relaunch` from `path`.  Returns `None` if the file is absent;
 /// propagates I/O or parse errors.
+// Unused in the Windows bin build (relaunch loop gated off); see `MAX_HOPS`.
+#[cfg_attr(windows, allow(dead_code))]
 pub fn read_relaunch(path: &Path) -> anyhow::Result<Option<RelaunchSentinel>> {
     match std::fs::read_to_string(path) {
         Ok(s) => Ok(Some(serde_json::from_str(&s)?)),
@@ -69,7 +76,7 @@ pub fn write_relaunch(path: &Path, sentinel: &RelaunchSentinel) -> anyhow::Resul
     Ok(())
 }
 
-/// Entry point for the foreground relaunch loop.
+/// Entry point for the foreground relaunch loop (unix).
 ///
 /// `launcher`    — platform-specific `Launcher` impl (POSIX or Windows).
 /// `spec`        — launch parameters (CLI argv, sidecar sid, profile dir, etc.).
@@ -80,23 +87,24 @@ pub fn write_relaunch(path: &Path, sentinel: &RelaunchSentinel) -> anyhow::Resul
 /// - `sentinel.hop > MAX_HOPS`, OR
 /// - `target_profile` is unknown (abort), OR
 /// - A sentinel atomic-consume race is detected.
-///
+#[cfg(not(windows))]
 pub fn run_relaunch_loop(
     launcher: &dyn crate::platform::launcher::Launcher,
     spec: &LaunchSpec,
 ) -> anyhow::Result<()> {
-    // Windows: the console-stop relaunch path is gated off until its two BLOCKING
-    // empirical checks pass (see module doc + `platform/windows.rs`). Fall back to
-    // a single launch with no relaunch so an unverified supervisor can never eat an
-    // interactive Ctrl-C or truncate the transcript on a switch.
-    #[cfg(windows)]
-    {
-        return run_once(launcher, spec);
-    }
-    #[cfg(not(windows))]
-    {
-        relaunch_loop(launcher, spec)
-    }
+    relaunch_loop(launcher, spec)
+}
+
+/// Entry point on Windows — the console-stop relaunch path is gated OFF until its
+/// two BLOCKING empirical checks pass (see module doc + `platform/windows.rs`).
+/// Falls back to a single launch with no relaunch so an unverified supervisor can
+/// never eat an interactive Ctrl-C or truncate the transcript on a switch.
+#[cfg(windows)]
+pub fn run_relaunch_loop(
+    launcher: &dyn crate::platform::launcher::Launcher,
+    spec: &LaunchSpec,
+) -> anyhow::Result<()> {
+    run_once(launcher, spec)
 }
 
 /// Single launch with no relaunch handling — the Windows fall-back while the

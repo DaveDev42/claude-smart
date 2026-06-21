@@ -15,6 +15,9 @@ pub struct ChildHandle {
     /// diagnostics and any future clobber-guard cross-check.
     #[allow(dead_code)]
     pub pid: u32,
+    /// Read by the unix relaunch loop's born-check; the Windows launch path
+    /// (`run_once`) does no relaunch, so it is unused in the Windows build.
+    #[cfg_attr(windows, allow(dead_code))]
     pub born: i64,
 }
 

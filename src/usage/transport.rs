@@ -649,8 +649,9 @@ mod tests {
     ///
     /// Uses `touch -t [[CC]YY]MMDDhhmm[.SS]` (BSD macOS touch, also accepted
     /// by GNU touch), derived from a computed target epoch via `date -r EPOCH`
-    /// (macOS) or `date -d @EPOCH` (Linux/GNU).  Both are gated by
-    /// `#[cfg(unix)]` at the call sites.
+    /// (macOS) or `date -d @EPOCH` (Linux/GNU).  Both this helper and all its
+    /// callers are `#[cfg(unix)]` (the mtime-aging trick is POSIX-only).
+    #[cfg(unix)]
     fn write_aged_file(path: &std::path::Path, content: &str, age_secs: u64) {
         fs::write(path, content).unwrap();
 
