@@ -98,6 +98,24 @@ function cas { Invoke-Expression ((Get-Command csm -CommandType Application).Sou
 sets the machine-wide default; `cas status` shows the current/default/available
 profiles.
 
+### Without a registry (degraded mode)
+
+The registry is **optional**. With no `~/.config/claude-as/profiles.json` (a
+fresh machine, or a "toss" box you never set up), `csm` runs in a degraded mode:
+the plain smart launcher still works, and the registry-dependent commands fail
+*safe* rather than erroring out —
+
+| Command | Without a registry |
+|---|---|
+| `csm run` (and bare `csm`) | works — launches `claude` under the current `CLAUDE_CONFIG_DIR` |
+| `csm scan`, `statusline`, `newuuid`, `completions`, `sidecar` | work — they don't need the registry |
+| `csm profiles list` | prints `(profiles.json absent — CAS/pick features disabled)` |
+| `csm usage` | prints `usage metering disabled …` + `(no profiles configured — `csm profiles add <name>`)` |
+| `csm pick-account` | no-op (empty stdout), prints the `csm profiles add <name>` hint, exits 0 |
+
+So account scoring / auto-switch / pick-account simply don't engage until you
+`csm profiles add` at least one profile — nothing crashes.
+
 ## Hub (usage metering — opt-in)
 
 `csm usage` and account scoring read usage data from a **hub** — a machine you
@@ -115,6 +133,13 @@ registry. When the hub is unreachable, `csm usage` serves the last-known cache
 with a staleness header (`⚠ hub data is 7m old …`); `--no-fetch` reads only the
 cache. No hub identifiers are baked into the binary — it ships clean for anyone
 to use.
+
+**Hub-down account selection.** When account auto-selection needs fresh usage but
+the hub can't be reached, `csm` does *not* silently keep the current account. In
+an interactive terminal it opens an fzf account picker showing the last-known
+(stale) usage so you can choose deliberately; in a non-interactive context (the
+Stop hook, scripts) it fails safe to the current profile instead of blocking on a
+picker.
 
 (The usage JSON shape, the collector, and a reference hub deployment are
 documented in the design notes under `docs/`.)

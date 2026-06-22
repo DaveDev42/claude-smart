@@ -27,17 +27,6 @@ off and fall back to launch-without-relaunch on Windows.
 
 ## Should-do
 
-### 🟠 Publish to crates.io
-
-`README.md` still says `cargo install claude-smart` works "once published," and
-`cargo install` from the registry is the documented happy path. Confirm the
-crate is actually published (and that the release CI's publish job succeeds), then
-drop the "once published" caveat from the README.
-
-- [ ] Verify `claude-smart` 0.2.0 (or later) is live on crates.io and the index
-      carries it (so `cargo install` / `cargo binstall` resolve without `--git`).
-- [ ] Once confirmed, remove the "(once published)" note in `README.md`.
-
 ### 🟠 Graceful degraded mode when the profile registry is absent
 
 When `~/.config/claude-as/profiles.json` is missing, account scoring / auto-switch
@@ -45,10 +34,15 @@ When `~/.config/claude-as/profiles.json` is missing, account scoring / auto-swit
 `csm cas status` report nothing useful. This is correct fail-safe behavior but it
 is easy to be in this state without noticing.
 
-- [ ] Emit a clear one-line hint pointing at `csm profiles add` when a
-      registry-dependent command runs with no `profiles.json`.
-- [ ] Document the degraded-mode contract (what works without a registry vs.
-      what needs one) in `README.md`.
+- [x] Emit a clear one-line hint pointing at `csm profiles add` when a
+      registry-dependent command runs with no `profiles.json`. *(done: `csm
+      usage` already prints the hint via `report.rs`; `csm pick-account` now
+      bails gracefully with the same hint instead of a raw hub-fetch error, and
+      `csm profiles list` no longer renders an empty `global default:` line —
+      commit 703bdb8.)*
+- [x] Document the degraded-mode contract (what works without a registry vs.
+      what needs one) in `README.md`. *(done: "Without a registry (degraded
+      mode)" table under Profiles.)*
 
 ### 🟠 Statusline is implemented but dormant
 
@@ -80,4 +74,5 @@ picker (showing stale cached usage) rather than silently keeping the current
 account. Make sure this behavior is documented where account selection is
 described in `README.md`.
 
-- [ ] Document the hub-down fallback (fzf picker with stale-cache annotation).
+- [x] Document the hub-down fallback (fzf picker with stale-cache annotation).
+      *(done: "Hub-down account selection" paragraph under Hub.)*
