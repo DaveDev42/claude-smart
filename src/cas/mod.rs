@@ -563,7 +563,11 @@ fn print_status(_shell: Shell, profiles: &ProfileMap) -> anyhow::Result<()> {
     // Show the RESOLVED config dir of the default profile (not a hardcoded path),
     // so the user can see where the default actually points — falls back to the
     // pointer-file location when the dir can't be resolved.
-    if default_dir.is_empty() {
+    if default.is_empty() {
+        // Degraded / no registry: there is no default profile name, so don't print
+        // an empty name with a bogus `.claude.`-suffixed dir built from it.
+        println!("global default: (none — no default profile set)");
+    } else if default_dir.is_empty() {
         println!("global default: {default} (~/.config/claude-as/default)");
     } else {
         println!("global default: {default} ({default_dir})");

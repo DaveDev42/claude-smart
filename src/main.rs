@@ -970,6 +970,15 @@ fn cmd_pick_account(args: &[OsString]) -> anyhow::Result<()> {
         }
     }
 
+    // Degraded mode: no registry → no accounts to pick between. Bail gracefully
+    // (empty stdout, a hint on stderr, rc 0) instead of attempting a hub fetch
+    // that fails with a raw "hub returned empty payload". Mirrors the
+    // `profiles.is_empty()` guard in `proactive_pick_profile`.
+    if account::ProfileMap::load().unwrap_or_default().is_empty() {
+        eprintln!("csm pick-account: no profiles configured — `csm profiles add <name>`");
+        return Ok(());
+    }
+
     match account::pick_account(&current, include_current) {
         Ok(Some(winner)) => println!("{winner}"),
         Ok(None) => {}
