@@ -431,6 +431,25 @@ mod tests {
         assert_eq!(result.as_deref(), Some("better"));
     }
 
+    /// include_current=true with the current profile as the ONLY candidate, but
+    /// saturated: the saturation gate drops it, leaving zero candidates, so the
+    /// result is AllSaturated — NOT Ok(None). The distinction matters: Ok(None)
+    /// means "stay, you're already best"; AllSaturated means "nothing viable,
+    /// caller must warn". A saturated sole-current must take the second path so
+    /// proactive launch surfaces the saturation rather than silently proceeding
+    /// as if the current profile were a healthy pick.
+    #[test]
+    fn include_current_sole_saturated_current_is_all_saturated_not_noop() {
+        let mut profiles = HashMap::new();
+        profiles.insert("current".to_string(), make_profile(Some(10), 97, None)); // >= SATURATION_PCT
+        let data = make_data(profiles);
+        let err = pick_best(&data, "current", true).unwrap_err();
+        assert!(
+            matches!(err, ScoringError::AllSaturated),
+            "a saturated sole current must be AllSaturated, not a no-op Ok(None)"
+        );
+    }
+
     /// include_current=false: exclude current from candidates.
     #[test]
     fn exclude_current_in_reactive_mode() {
