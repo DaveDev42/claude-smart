@@ -1218,6 +1218,10 @@ mod tests {
     #[cfg(unix)]
     fn run_usage_command_parses_valid_json_stdout() {
         // A command that emits a valid UsageData JSON on stdout → Ok(data).
+        // VALID_USAGE_JSON is tiny (~350 bytes), so inlining it as a shell
+        // argument is ARG_MAX-safe. Do NOT inline a LARGE payload this way —
+        // it overflows execve's ARG_MAX on Linux (see the deadlock test below,
+        // which has the child generate its big payload via awk instead).
         let cmd = format!("printf '%s' '{}'", VALID_USAGE_JSON.replace('\n', " "));
         let result = run_usage_command(&cmd);
         assert!(result.is_ok(), "expected Ok, got: {result:?}");
@@ -1292,35 +1296,21 @@ mod tests {
         // the wall time a deadlock would burn — so a deadlock fails the test fast.
         std::env::set_var("CSM_USAGE_CMD_TIMEOUT", "3");
 
-        // Enough profiles to push the JSON well past the OS pipe buffer (~64 KB),
-        // which is all that's needed to trigger the deadlock. Aim comfortably
-        // above 256 KB so the test stays meaningful on platforms with a larger
-        // buffer.
-        let n_profiles = 2500;
-        let mut profiles = String::new();
-        for i in 0..n_profiles {
-            if i > 0 {
-                profiles.push(',');
-            }
-            profiles.push_str(&format!(
-                r#""p{i}":{{"session":{{"pct":{},"resets":"some-reset-string-{i}"}},"week_all":{{"pct":{},"resets":"another-reset-{i}"}}}}"#,
-                i % 100,
-                (i * 7) % 100,
-            ));
-        }
-        let json = format!(
-            r#"{{"captured_at":"2026-06-23T00:00:00Z","profiles":{{{profiles}}},"errors":{{}}}}"#
-        );
-        assert!(
-            json.len() > 256 * 1024,
-            "fixture must exceed the pipe buffer, got {} bytes",
-            json.len()
-        );
-
-        // Emit it via printf so the child actually streams it through the pipe.
-        let cmd = format!("printf '%s' '{}'", json.replace('\'', r"'\''"));
+        // Have the CHILD generate the large payload itself, via a tiny awk
+        // program, rather than inlining a >256 KB JSON string as a shell
+        // ARGUMENT. Inlining it (`printf '%s' '<huge json>'`) overflows
+        // ARG_MAX on Linux (execve E2BIG) even though macOS's larger ARG_MAX
+        // tolerated it — that divergence is exactly what broke CI. The awk
+        // command string is ~300 bytes (ARG_MAX-safe by 400x) while its stdout
+        // is ~341 KB, comfortably past the OS pipe buffer (~64 KB) that the
+        // drain thread must survive. POSIX awk only (BEGIN, printf, C-style
+        // for/if, %d, % modulo) — no gawk extensions, no seq, no bash-isms —
+        // so it runs identically on GNU/Linux and BSD/macOS. i goes 0..=3000,
+        // yielding 3001 profiles.
+        let n_profiles = 3001;
+        let cmd = r#"awk 'BEGIN{printf "{\"captured_at\":\"2024-01-01T00:00:00Z\",\"profiles\":{"; for(i=0;i<=3000;i++){if(i>0)printf ","; printf "\"p%d\":{\"session\":{\"pct\":%d,\"resets\":\"2024-01-01T00:00:00Z\"},\"week_all\":{\"pct\":%d,\"resets\":\"2024-01-01T00:00:00Z\"}}",i,i%100,i%100}; printf "},\"errors\":{}}"}'"#;
         let start = std::time::Instant::now();
-        let result = run_usage_command(&cmd);
+        let result = run_usage_command(cmd);
         let elapsed = start.elapsed();
 
         assert!(
