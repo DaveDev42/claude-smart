@@ -151,7 +151,7 @@ slow command is not re-run within the cache TTL.
 
 | Variable | Meaning |
 |---|---|
-| `CSM_USAGE_CMD` | Shell command whose stdout is a usage JSON blob. Empty/unset = disabled. Runs via `sh -c` (POSIX) / `cmd /C` (Windows). |
+| `CSM_USAGE_CMD` | Shell command whose stdout is a usage JSON blob. Empty/unset = disabled. Runs via `sh -c` (POSIX) / `cmd /C` (Windows) — so on Windows the value must be `cmd.exe`-safe (single-quote quoting and Unix pipelines won't work; wrap complex logic in a `.cmd`/`.ps1` script and point at that). |
 | `CSM_USAGE_CMD_TIMEOUT` | Hard deadline in seconds for that command (default `10`). On timeout `csm` falls through to the hub. |
 | `CLAUDE_USAGE_TTL` / `CSM_USAGE_TTL_SECS` | Positive-cache lifetime in seconds (default `60`). The legacy name wins if both are set. |
 
