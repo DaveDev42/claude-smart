@@ -37,6 +37,11 @@ pub enum FetchError {
     #[error("SSH fallback failed: {0}")]
     Ssh(String),
 
+    /// The user-supplied usage command (`CSM_USAGE_CMD`) failed to run, exited
+    /// non-zero, or produced output that did not parse as `UsageData`.
+    #[error("usage command failed: {0}")]
+    Command(String),
+
     /// The JSON payload from the hub was unparseable.
     #[error("JSON parse error: {0}")]
     Json(#[from] serde_json::Error),

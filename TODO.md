@@ -27,6 +27,25 @@ off and fall back to launch-without-relaunch on Windows.
 
 ## Should-do
 
+### 🟢 Pluggable usage source via `CSM_USAGE_CMD` *(done)*
+
+The hub was the only fresh-usage source; a machine without a hub had no way to
+meter usage. Add an operator-injected command source + a configurable cache TTL.
+
+- [x] `CSM_USAGE_CMD` — a shell command whose stdout is a `UsageData` JSON blob,
+      run ahead of the hub HTTP/SSH transports (the explicit "check via my own
+      script" path), cached like a network fetch, with a `CSM_USAGE_CMD_TIMEOUT`
+      (default 10 s) hard deadline. Runs *before* the negative cooldown so a hub
+      outage can't suppress an explicit command. `is_configured()` counts it.
+- [x] Configurable positive-cache TTL via `CSM_USAGE_TTL_SECS` (alias of the
+      legacy `CLAUDE_USAGE_TTL`; legacy wins if both set).
+- [x] Documented in `README.md` ("Custom usage command"), including why a plain
+      `claude -p`-based recipe is *not* recommended (PoC found `claude`'s
+      `/usage` does not reliably emit the session/week gauges non-interactively).
+- [x] `FetchError::Command` variant + 40 unit tests (valid/empty/non-JSON/
+      non-zero-exit/timeout/alias/is_configured). Scoring reaches it for free
+      (both `pick_account` and `current_usage` go through `usage::fetch()`).
+
 ### 🟠 Graceful degraded mode when the profile registry is absent
 
 When `~/.config/claude-as/profiles.json` is missing, account scoring / auto-switch

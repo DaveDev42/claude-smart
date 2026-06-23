@@ -11,8 +11,16 @@
 //!    Shell lines 657–662: `if printf '%s' "$host" | grep -qi "^$USAGE_HUB$"; then cat "$USAGE_CACHE"; return 0`
 //!
 //! 2. **Positive TTL check**: if `paths::usage_cache()` exists and mtime age <
-//!    `POSITIVE_TTL_SECS` (60 s, env `CLAUDE_USAGE_TTL`) → parse + return.
+//!    `POSITIVE_TTL_SECS` (60 s, env `CLAUDE_USAGE_TTL` / alias `CSM_USAGE_TTL_SECS`)
+//!    → parse + return.
 //!    Shell lines 666–675: `if [ -s "$pos_cache" ]; then … if [ $(( cnow - cmt )) -lt "$USAGE_TTL" ]; then cat …`
+//!
+//! 2.5. **User command** (`CSM_USAGE_CMD`, if set): run it via the shell, parse
+//!    stdout as `UsageData`. This is the operator-injected "check via a provided
+//!    script" source; it runs *before* the negative cooldown (an explicit
+//!    command is independent of a hub outage) and takes precedence over HTTP/SSH.
+//!    On success the result is cached; on failure it falls through to the hub.
+//!    Not in the shell original — csm-native (env-injected, never compiled in).
 //!
 //! 3. **Negative cooldown check**: if `paths::fetch_failed()` exists and age <
 //!    `NEGATIVE_COOLDOWN_SECS` (120 s, env `CLAUDE_USAGE_FAIL_COOLDOWN`) →
@@ -91,6 +99,36 @@ pub fn fetch() -> Result<UsageData, FetchError> {
     // Shell lines 666–675.
     if let Some(data) = try_positive_cache(positive_ttl)? {
         return Ok(data);
+    }
+
+    // Step 2.5 — user-supplied usage command (`CSM_USAGE_CMD`), if set.
+    //
+    // When the operator wires a metering command (a site script, a PTY scraper
+    // around `claude`, or anything that emits UsageData JSON on stdout), it is
+    // the explicit "check via a provided script" source and takes precedence
+    // over the hub HTTP/SSH transports.
+    //
+    // It runs *before* the negative-cooldown gate on purpose: that cooldown
+    // exists to avoid hammering a down *hub*, but an explicit command is an
+    // independent source the user asked for — a hub outage must not silently
+    // suppress it. Success is cached like a network fetch so the (potentially
+    // slow) command is not re-run within the positive TTL.
+    if let Some(cmd) = resolve_usage_command() {
+        match run_usage_command(&cmd) {
+            Ok(data) => {
+                if let Err(e) = write_positive_cache(&data) {
+                    eprintln!("csm: warning: could not write usage cache: {e}");
+                }
+                let _ = std::fs::remove_file(paths::fetch_failed());
+                return Ok(data);
+            }
+            Err(e) => {
+                // Command failed — fall through to the hub paths (the command is
+                // an override, not a hard gate). The negative-cooldown check and
+                // the final stamp below still apply to the hub transports.
+                eprintln!("csm: warning: CSM_USAGE_CMD failed: {e}");
+            }
+        }
     }
 
     // Step 3 — negative cooldown (< NEGATIVE_COOLDOWN_SECS).
@@ -174,6 +212,93 @@ fn resolve_usage_url() -> Option<String> {
     }
 }
 
+// ─── user-supplied usage command (CSM_USAGE_CMD) ──────────────────────────────
+
+/// Resolve the operator-supplied usage command from `CSM_USAGE_CMD`.
+///
+/// Empty/unset = disabled (returns `None`) — no command path is compiled in.
+/// The command is run via the platform shell so a full pipeline / script path
+/// works; its stdout must be a `UsageData` JSON object.
+///
+/// This honors the crate's separation invariant: the extraction *mechanism*
+/// (which is fragile and site-specific — see the PoC findings on `claude`'s
+/// `/usage`) is injected, never baked into the binary.
+fn resolve_usage_command() -> Option<String> {
+    std::env::var("CSM_USAGE_CMD")
+        .ok()
+        .map(|s| s.trim().to_owned())
+        .filter(|s| !s.is_empty())
+}
+
+/// Run `cmd` through the platform shell, parse its stdout as `UsageData`.
+///
+/// Honors `CSM_USAGE_CMD_TIMEOUT` (seconds, default 10) as a hard deadline —
+/// claude-direct extraction is slow (~2–30 s in PoC), so the command must not
+/// block csm indefinitely on a prompt-path call.
+fn run_usage_command(cmd: &str) -> Result<UsageData, FetchError> {
+    use std::process::{Command, Stdio};
+    use std::time::{Duration, Instant};
+
+    let timeout_secs = std::env::var("CSM_USAGE_CMD_TIMEOUT")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(10);
+
+    #[cfg(unix)]
+    let mut child = Command::new("sh")
+        .args(["-c", cmd])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .stdin(Stdio::null())
+        .spawn()
+        .map_err(|e| FetchError::Command(format!("spawn failed: {e}")))?;
+
+    #[cfg(not(unix))]
+    let mut child = Command::new("cmd")
+        .args(["/C", cmd])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .stdin(Stdio::null())
+        .spawn()
+        .map_err(|e| FetchError::Command(format!("spawn failed: {e}")))?;
+
+    let start = Instant::now();
+    let deadline = Duration::from_secs(timeout_secs);
+    let output = loop {
+        match child.try_wait() {
+            Ok(Some(_)) => {
+                break child
+                    .wait_with_output()
+                    .map_err(|e| FetchError::Command(format!("wait failed: {e}")))?;
+            }
+            Ok(None) => {
+                if start.elapsed() >= deadline {
+                    let _ = child.kill();
+                    return Err(FetchError::Command(format!(
+                        "timed out after {timeout_secs}s"
+                    )));
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(e) => return Err(FetchError::Command(format!("wait failed: {e}"))),
+        }
+    };
+
+    if !output.status.success() {
+        return Err(FetchError::Command(format!(
+            "command exited with status {}",
+            output.status
+        )));
+    }
+
+    let body = String::from_utf8_lossy(&output.stdout).to_string();
+    if body.trim().is_empty() {
+        return Err(FetchError::Command("command produced empty output".into()));
+    }
+    serde_json::from_str(&body)
+        .map_err(|e| FetchError::Command(format!("output not UsageData: {e}")))
+}
+
 // ─── hub-local fast path ─────────────────────────────────────────────────────
 
 /// The configured hub hostname (short name), or `None` when unset/empty.
@@ -198,8 +323,12 @@ pub fn hub_hostname() -> Option<String> {
 ///
 /// This is the env-opt-in gate: an external user (or a toss machine) with
 /// neither variable set gets a clean "disabled" path, not a fetch failure.
+///
+/// A user-supplied `CSM_USAGE_CMD` also counts as configured — it is a usage
+/// source in its own right, so `csm usage` must run the ladder (and hit the
+/// command layer) rather than reporting "metering disabled".
 pub fn is_configured() -> bool {
-    is_hub_local() || resolve_usage_url().is_some()
+    is_hub_local() || resolve_usage_url().is_some() || resolve_usage_command().is_some()
 }
 
 /// Age in seconds of the positive usage cache file (`.usage-cache.json`), or
@@ -270,12 +399,22 @@ fn short_hostname() -> String {
 
 // ─── positive TTL cache ───────────────────────────────────────────────────────
 
-/// Read `CLAUDE_USAGE_TTL` env (seconds). Default: 60.
+/// Read the positive cache TTL (seconds). Default: 60.
+///
+/// Precedence: `CLAUDE_USAGE_TTL` (the legacy shell name) then
+/// `CSM_USAGE_TTL_SECS` (the csm-native alias), then the default. Exposing the
+/// alias lets users configure the cache lifetime under a csm-prefixed name
+/// without knowing the legacy variable.
 /// Shell: `USAGE_TTL="${CLAUDE_USAGE_TTL:-60}"`.
 fn positive_ttl_secs() -> u64 {
     std::env::var("CLAUDE_USAGE_TTL")
         .ok()
         .and_then(|v| v.parse().ok())
+        .or_else(|| {
+            std::env::var("CSM_USAGE_TTL_SECS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+        })
         .unwrap_or(DEFAULT_POSITIVE_TTL_SECS)
 }
 
@@ -1021,6 +1160,137 @@ mod tests {
         match saved {
             Some(v) => std::env::set_var("CLAUDE_USAGE_URL", v),
             None => std::env::remove_var("CLAUDE_USAGE_URL"),
+        }
+    }
+
+    // ── CSM_USAGE_CMD (user-supplied usage command) ───────────────────────────
+
+    #[test]
+    fn resolve_usage_command_disabled_when_unset() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let saved = std::env::var("CSM_USAGE_CMD").ok();
+        std::env::remove_var("CSM_USAGE_CMD");
+        assert!(resolve_usage_command().is_none(), "unset → None");
+        // set-but-empty / whitespace → None
+        std::env::set_var("CSM_USAGE_CMD", "   ");
+        assert!(resolve_usage_command().is_none(), "blank → None");
+        match saved {
+            Some(v) => std::env::set_var("CSM_USAGE_CMD", v),
+            None => std::env::remove_var("CSM_USAGE_CMD"),
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn run_usage_command_parses_valid_json_stdout() {
+        // A command that emits a valid UsageData JSON on stdout → Ok(data).
+        let cmd = format!("printf '%s' '{}'", VALID_USAGE_JSON.replace('\n', " "));
+        let result = run_usage_command(&cmd);
+        assert!(result.is_ok(), "expected Ok, got: {result:?}");
+        assert!(result.unwrap().profiles.contains_key("home"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn run_usage_command_nonzero_exit_is_command_error() {
+        let result = run_usage_command("exit 3");
+        assert!(
+            matches!(result, Err(FetchError::Command(_))),
+            "non-zero exit must be a Command error, got: {result:?}"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn run_usage_command_empty_stdout_is_command_error() {
+        let result = run_usage_command("true"); // exits 0, no stdout
+        assert!(
+            matches!(result, Err(FetchError::Command(_))),
+            "empty stdout must be a Command error, got: {result:?}"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn run_usage_command_non_json_stdout_is_command_error() {
+        let result = run_usage_command("echo not-json-at-all");
+        assert!(
+            matches!(result, Err(FetchError::Command(_))),
+            "non-JSON stdout must be a Command error, got: {result:?}"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn run_usage_command_respects_timeout() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let saved = std::env::var("CSM_USAGE_CMD_TIMEOUT").ok();
+        std::env::set_var("CSM_USAGE_CMD_TIMEOUT", "1");
+        let start = std::time::Instant::now();
+        let result = run_usage_command("sleep 10");
+        let elapsed = start.elapsed();
+        assert!(
+            matches!(result, Err(FetchError::Command(_))),
+            "a command past the deadline must error, got: {result:?}"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "timeout must fire well before the command's own 10s, took {elapsed:?}"
+        );
+        match saved {
+            Some(v) => std::env::set_var("CSM_USAGE_CMD_TIMEOUT", v),
+            None => std::env::remove_var("CSM_USAGE_CMD_TIMEOUT"),
+        }
+    }
+
+    #[test]
+    fn is_configured_true_when_only_command_set() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let saved_cmd = std::env::var("CSM_USAGE_CMD").ok();
+        let saved_url = std::env::var("CLAUDE_USAGE_URL").ok();
+        let saved_hub = std::env::var("CLAUDE_HUB_HOSTNAME").ok();
+        // Disable hub paths, enable only the command.
+        std::env::set_var("CLAUDE_USAGE_URL", "");
+        std::env::remove_var("CLAUDE_HUB_HOSTNAME");
+        std::env::set_var("CSM_USAGE_CMD", "echo {}");
+        assert!(
+            is_configured(),
+            "CSM_USAGE_CMD alone must count as configured"
+        );
+        // restore
+        match saved_cmd {
+            Some(v) => std::env::set_var("CSM_USAGE_CMD", v),
+            None => std::env::remove_var("CSM_USAGE_CMD"),
+        }
+        match saved_url {
+            Some(v) => std::env::set_var("CLAUDE_USAGE_URL", v),
+            None => std::env::remove_var("CLAUDE_USAGE_URL"),
+        }
+        match saved_hub {
+            Some(v) => std::env::set_var("CLAUDE_HUB_HOSTNAME", v),
+            None => std::env::remove_var("CLAUDE_HUB_HOSTNAME"),
+        }
+    }
+
+    #[test]
+    fn positive_ttl_alias_csm_secs() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let saved_legacy = std::env::var("CLAUDE_USAGE_TTL").ok();
+        let saved_alias = std::env::var("CSM_USAGE_TTL_SECS").ok();
+        // Legacy unset, alias set → alias wins.
+        std::env::remove_var("CLAUDE_USAGE_TTL");
+        std::env::set_var("CSM_USAGE_TTL_SECS", "17");
+        assert_eq!(positive_ttl_secs(), 17, "alias should be honored");
+        // Legacy set → legacy takes precedence over alias.
+        std::env::set_var("CLAUDE_USAGE_TTL", "5");
+        assert_eq!(positive_ttl_secs(), 5, "legacy var should win over alias");
+        match saved_legacy {
+            Some(v) => std::env::set_var("CLAUDE_USAGE_TTL", v),
+            None => std::env::remove_var("CLAUDE_USAGE_TTL"),
+        }
+        match saved_alias {
+            Some(v) => std::env::set_var("CSM_USAGE_TTL_SECS", v),
+            None => std::env::remove_var("CSM_USAGE_TTL_SECS"),
         }
     }
 

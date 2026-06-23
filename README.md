@@ -141,6 +141,28 @@ an interactive terminal it opens an fzf account picker showing the last-known
 Stop hook, scripts) it fails safe to the current profile instead of blocking on a
 picker.
 
+### Custom usage command (`CSM_USAGE_CMD`)
+
+You don't have to run a hub. Set `CSM_USAGE_CMD` to any command that prints a
+usage JSON blob (the same shape the hub serves) on stdout, and `csm` will use it
+as a usage source. It runs ahead of the hub HTTP/SSH transports — the explicit
+"check via my own script" path — and its result is cached like a hub fetch, so a
+slow command is not re-run within the cache TTL.
+
+| Variable | Meaning |
+|---|---|
+| `CSM_USAGE_CMD` | Shell command whose stdout is a usage JSON blob. Empty/unset = disabled. Runs via `sh -c` (POSIX) / `cmd /C` (Windows). |
+| `CSM_USAGE_CMD_TIMEOUT` | Hard deadline in seconds for that command (default `10`). On timeout `csm` falls through to the hub. |
+| `CLAUDE_USAGE_TTL` / `CSM_USAGE_TTL_SECS` | Positive-cache lifetime in seconds (default `60`). The legacy name wins if both are set. |
+
+The command is **not** compiled in — the extraction mechanism is yours to own,
+because a robust one is environment-specific. (Note: at the time of writing, the
+`claude` CLI has no usage subcommand, and its `/usage` slash command does not
+reliably emit the session/week percent gauges in non-interactive mode — so a
+plain `claude -p`-based recipe is *not* recommended as a usage source. If you
+script one, validate that your command actually yields the gauges before relying
+on it for account scoring.)
+
 (The usage JSON shape, the collector, and a reference hub deployment are
 documented in the design notes under `docs/`.)
 
