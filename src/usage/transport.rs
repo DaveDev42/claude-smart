@@ -286,9 +286,14 @@ fn run_usage_command(cmd: &str) -> Result<UsageData, FetchError> {
                 if start.elapsed() >= deadline {
                     let _ = child.kill();
                     let _ = child.wait(); // reap so we don't leave a zombie
-                                          // The reader thread unblocks once the killed child closes the
-                                          // pipe; join it to avoid leaking the thread.
-                    let _ = reader.join();
+                                          // Do NOT join the reader here. Killing the direct child does
+                                          // not guarantee the pipe's write-end closes: a grandchild
+                                          // (e.g. `cmd | cat`) can inherit it and outlive the parent,
+                                          // so read_to_end never reaches EOF and a join would block past
+                                          // the deadline — defeating the whole timeout. Drop the handle
+                                          // instead: the detached thread ends on its own once the last
+                                          // write-end finally closes, and is reaped at process exit.
+                    drop(reader);
                     return Err(FetchError::Command(format!(
                         "timed out after {timeout_secs}s"
                     )));
@@ -298,7 +303,9 @@ fn run_usage_command(cmd: &str) -> Result<UsageData, FetchError> {
             Err(e) => {
                 let _ = child.kill();
                 let _ = child.wait();
-                let _ = reader.join();
+                // Same rationale as the timeout path: a surviving grandchild can
+                // keep the pipe open, so detach rather than join.
+                drop(reader);
                 return Err(FetchError::Command(format!("wait failed: {e}")));
             }
         }
@@ -1328,6 +1335,43 @@ mod tests {
         assert!(
             elapsed < std::time::Duration::from_secs(3),
             "must not hit the deadline — a deadlock would, took {elapsed:?}"
+        );
+
+        match saved {
+            Some(v) => std::env::set_var("CSM_USAGE_CMD_TIMEOUT", v),
+            None => std::env::remove_var("CSM_USAGE_CMD_TIMEOUT"),
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn run_usage_command_timeout_is_hard_even_when_a_grandchild_holds_the_pipe() {
+        // The stdout-drain thread reads to EOF, which it only reaches when the
+        // pipe's last write-end closes. On timeout we kill the DIRECT child
+        // (`sh`), but a grandchild can inherit the same stdout pipe and outlive
+        // it — e.g. `sleep | cat`, where `cat` holds the write-end. If the
+        // timeout path were to `reader.join()` unconditionally, that join would
+        // block until the grandchild died on its own, silently defeating the
+        // hard deadline. This test pins that the timeout returns within the
+        // deadline regardless of a surviving grandchild.
+        let _guard = ENV_LOCK.lock().unwrap();
+        let saved = std::env::var("CSM_USAGE_CMD_TIMEOUT").ok();
+        std::env::set_var("CSM_USAGE_CMD_TIMEOUT", "1");
+
+        // `sleep 30 | cat`: cat inherits our stdout pipe and stays alive ~30s
+        // after sh is killed, holding the write-end open so read_to_end can't
+        // reach EOF.
+        let start = std::time::Instant::now();
+        let result = run_usage_command("sleep 30 | cat");
+        let elapsed = start.elapsed();
+
+        assert!(
+            matches!(result, Err(FetchError::Command(_))),
+            "a command past the deadline must error, got: {result:?}"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "timeout must stay hard even with a grandchild holding the pipe, took {elapsed:?}"
         );
 
         match saved {
