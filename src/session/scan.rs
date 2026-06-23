@@ -348,12 +348,20 @@ pub(crate) fn write_scan_index(
     refresh_start: i64,
     rows: &[SessionRow],
 ) -> io::Result<()> {
-    // Build the full content.
+    // Build the full content. The index is line- and tab-delimited, so any
+    // newline/CR/tab inside a text field (a multi-line prompt or aiTitle can
+    // carry a real '\n') would split or mis-column the row on read. Collapse
+    // those to spaces here — the single choke point every write passes through —
+    // so the on-disk format is always one intact row per line.
+    let sanitize = |s: &str| s.replace(['\n', '\r', '\t'], " ");
     let mut content = format!("{}{}\n", INDEX_HEADER_PREFIX, refresh_start);
     for row in rows {
         content.push_str(&format!(
             "{}\t{}\t{}\t{}\n",
-            row.sid, row.mtime, row.mode, row.label
+            sanitize(&row.sid),
+            row.mtime,
+            sanitize(&row.mode),
+            sanitize(&row.label)
         ));
     }
 
@@ -998,6 +1006,39 @@ mod tests {
         let (_, rows) = load_scan_index(&idx).unwrap();
         assert_eq!(rows.len(), 1, "the short row is skipped, the good row kept");
         assert_eq!(rows[0].sid, "good");
+    }
+
+    #[test]
+    fn label_with_newline_does_not_corrupt_the_index() {
+        // A label can come from a multi-line user prompt or aiTitle, so it may
+        // contain a real '\n'. The index is line-oriented (one row per line), so
+        // an unsanitized newline in the label splits one row into two — the label
+        // is truncated at the newline and the tail is parsed as a bogus row.
+        let tmp = TempDir::new().unwrap();
+        let idx = tmp.path().join("scan-meta-v2.dedup.tsv");
+        let rows = vec![SessionRow {
+            sid: "nl-sid".to_owned(),
+            mtime: 100,
+            human_ts: "06-23 13:00".to_owned(),
+            mode: "normal".to_owned(),
+            label: "first line\nsecond line".to_owned(),
+        }];
+        write_scan_index(&idx, 1, &rows).unwrap();
+        let (_, loaded) = load_scan_index(&idx).unwrap();
+        // Exactly one row must survive (no phantom row from a split line)...
+        assert_eq!(
+            loaded.len(),
+            1,
+            "newline in label split the row into multiple index lines"
+        );
+        assert_eq!(loaded[0].sid, "nl-sid");
+        // ...and the label content must round-trip without being truncated at
+        // the newline. write_scan_index must sanitize the newline (to a space)
+        // so the line-oriented format stays intact AND no text is lost.
+        assert_eq!(
+            loaded[0].label, "first line second line",
+            "label was corrupted/truncated by an unsanitized newline"
+        );
     }
 
     #[test]

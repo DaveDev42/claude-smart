@@ -23,7 +23,11 @@ use std::path::Path;
 pub fn write_pid_file(path: &Path, pid: u32, born: i64) -> io::Result<()> {
     let tmp = path.with_extension("pid.tmp");
     std::fs::write(&tmp, format!("{pid} {born}\n"))?;
-    std::fs::rename(&tmp, path)?;
+    // Clean up the tmp file if the atomic rename fails, so a failed write never
+    // leaves a stale .pid.tmp on disk.
+    std::fs::rename(&tmp, path).inspect_err(|_| {
+        let _ = std::fs::remove_file(&tmp);
+    })?;
     Ok(())
 }
 

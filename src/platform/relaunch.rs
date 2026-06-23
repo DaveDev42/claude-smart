@@ -72,7 +72,11 @@ pub fn write_relaunch(path: &Path, sentinel: &RelaunchSentinel) -> anyhow::Resul
     let tmp = path.with_extension("relaunch.tmp");
     let json = serde_json::to_string(sentinel)?;
     std::fs::write(&tmp, json)?;
-    std::fs::rename(&tmp, path)?;
+    // Clean up the tmp file if the atomic rename fails (e.g. cross-filesystem),
+    // so a failed write never leaves a stale .relaunch.tmp on disk.
+    std::fs::rename(&tmp, path).inspect_err(|_| {
+        let _ = std::fs::remove_file(&tmp);
+    })?;
     Ok(())
 }
 
@@ -347,6 +351,37 @@ mod tests {
         assert_eq!(s.target_profile, "work");
         assert_eq!(s.hop, 0_i64);
         assert_eq!(s.born, 1_700_000_000_i64);
+    }
+
+    #[test]
+    fn read_compat_unknown_future_field_is_ignored_not_fatal() {
+        // Rollback safety: a NEWER binary may write an extra field this version
+        // doesn't know. Reading it must succeed (the sentinel is consume-and-
+        // delete, so dropping the unknown field loses nothing) and the known
+        // fields must still be correct — never a parse abort.
+        let json = r#"{
+            "session_id":"sid-9","target_profile":"work","cwd":"/tmp",
+            "handoff":"resume","hop":1,"born":1700000000,
+            "futureField":"ignored","another":{"x":1}
+        }"#;
+        let s: RelaunchSentinel = serde_json::from_str(json).expect("unknown field must not abort");
+        assert_eq!(s.session_id, "sid-9");
+        assert_eq!(s.target_profile, "work");
+        assert_eq!(s.hop, 1_i64);
+    }
+
+    #[test]
+    fn read_compat_corrupt_relaunch_errs_without_panic() {
+        // A truncated/garbled .relaunch must surface as Err (the loop aborts the
+        // relaunch and cleans up) — never a panic. Locks the failure mode.
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let path = tmp_dir.path().join("corrupt.relaunch");
+        std::fs::write(&path, "not json at all{{{").unwrap();
+        let result = read_relaunch(&path);
+        assert!(
+            result.is_err(),
+            "corrupt .relaunch must be Err, got {result:?}"
+        );
     }
 
     #[test]
