@@ -262,36 +262,63 @@ fn run_usage_command(cmd: &str) -> Result<UsageData, FetchError> {
         .spawn()
         .map_err(|e| FetchError::Command(format!("spawn failed: {e}")))?;
 
+    // Drain stdout on a dedicated thread so the child never blocks on a full
+    // pipe buffer (~64 KB) while we poll for exit. Without this, a command that
+    // emits more than the buffer deadlocks: the child blocks writing, we block in
+    // try_wait, and the (valid) result is lost to the timeout. The reader thread
+    // owns the pipe and reads to EOF, which it reaches when the child exits.
+    let stdout_pipe = child
+        .stdout
+        .take()
+        .ok_or_else(|| FetchError::Command("stdout pipe missing".into()))?;
+    let reader = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let mut pipe = stdout_pipe;
+        std::io::Read::read_to_end(&mut pipe, &mut buf).map(|_| buf)
+    });
+
     let start = Instant::now();
     let deadline = Duration::from_secs(timeout_secs);
-    let output = loop {
+    let status = loop {
         match child.try_wait() {
-            Ok(Some(_)) => {
-                break child
-                    .wait_with_output()
-                    .map_err(|e| FetchError::Command(format!("wait failed: {e}")))?;
-            }
+            Ok(Some(status)) => break status,
             Ok(None) => {
                 if start.elapsed() >= deadline {
                     let _ = child.kill();
+                    let _ = child.wait(); // reap so we don't leave a zombie
+                                          // The reader thread unblocks once the killed child closes the
+                                          // pipe; join it to avoid leaking the thread.
+                    let _ = reader.join();
                     return Err(FetchError::Command(format!(
                         "timed out after {timeout_secs}s"
                     )));
                 }
                 std::thread::sleep(Duration::from_millis(50));
             }
-            Err(e) => return Err(FetchError::Command(format!("wait failed: {e}"))),
+            Err(e) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = reader.join();
+                return Err(FetchError::Command(format!("wait failed: {e}")));
+            }
         }
     };
 
-    if !output.status.success() {
+    let stdout_bytes = match reader.join() {
+        Ok(Ok(bytes)) => bytes,
+        Ok(Err(e)) => return Err(FetchError::Command(format!("read failed: {e}"))),
+        Err(_) => return Err(FetchError::Command("stdout reader thread panicked".into())),
+    };
+
+    if !status.success() {
         return Err(FetchError::Command(format!(
-            "command exited with status {}",
-            output.status
+            "command exited with status {status}"
         )));
     }
 
-    let body = String::from_utf8_lossy(&output.stdout).to_string();
+    // A clear diagnostic for non-UTF-8 output beats a confusing JSON parse error.
+    let body = String::from_utf8(stdout_bytes)
+        .map_err(|_| FetchError::Command("command output is not valid UTF-8".into()))?;
     if body.trim().is_empty() {
         return Err(FetchError::Command("command produced empty output".into()));
     }
@@ -1237,6 +1264,72 @@ mod tests {
             elapsed < std::time::Duration::from_secs(5),
             "timeout must fire well before the command's own 10s, took {elapsed:?}"
         );
+        match saved {
+            Some(v) => std::env::set_var("CSM_USAGE_CMD_TIMEOUT", v),
+            None => std::env::remove_var("CSM_USAGE_CMD_TIMEOUT"),
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn run_usage_command_handles_large_output_without_deadlock() {
+        // Regression for the pipe-deadlock finding: if the command writes more
+        // than the OS pipe buffer (~64 KB) to stdout, a wait-then-read loop that
+        // never drains the pipe will deadlock — the child blocks on write while
+        // we block in try_wait — and only escape via the timeout, discarding the
+        // (valid) result. Build a >256 KB valid UsageData JSON and assert it
+        // parses well within a short deadline.
+        let _guard = ENV_LOCK.lock().unwrap();
+        let saved = std::env::var("CSM_USAGE_CMD_TIMEOUT").ok();
+        // 3s deadline: comfortably long for a correct drain, but far shorter than
+        // the wall time a deadlock would burn — so a deadlock fails the test fast.
+        std::env::set_var("CSM_USAGE_CMD_TIMEOUT", "3");
+
+        // Enough profiles to push the JSON well past the OS pipe buffer (~64 KB),
+        // which is all that's needed to trigger the deadlock. Aim comfortably
+        // above 256 KB so the test stays meaningful on platforms with a larger
+        // buffer.
+        let n_profiles = 2500;
+        let mut profiles = String::new();
+        for i in 0..n_profiles {
+            if i > 0 {
+                profiles.push(',');
+            }
+            profiles.push_str(&format!(
+                r#""p{i}":{{"session":{{"pct":{},"resets":"some-reset-string-{i}"}},"week_all":{{"pct":{},"resets":"another-reset-{i}"}}}}"#,
+                i % 100,
+                (i * 7) % 100,
+            ));
+        }
+        let json = format!(
+            r#"{{"captured_at":"2026-06-23T00:00:00Z","profiles":{{{profiles}}},"errors":{{}}}}"#
+        );
+        assert!(
+            json.len() > 256 * 1024,
+            "fixture must exceed the pipe buffer, got {} bytes",
+            json.len()
+        );
+
+        // Emit it via printf so the child actually streams it through the pipe.
+        let cmd = format!("printf '%s' '{}'", json.replace('\'', r"'\''"));
+        let start = std::time::Instant::now();
+        let result = run_usage_command(&cmd);
+        let elapsed = start.elapsed();
+
+        assert!(
+            result.is_ok(),
+            "large output must parse (deadlock would time out): {result:?}"
+        );
+        assert_eq!(
+            result.unwrap().profiles.len(),
+            n_profiles,
+            "all profiles parsed"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(3),
+            "must not hit the deadline — a deadlock would, took {elapsed:?}"
+        );
+
         match saved {
             Some(v) => std::env::set_var("CSM_USAGE_CMD_TIMEOUT", v),
             None => std::env::remove_var("CSM_USAGE_CMD_TIMEOUT"),
