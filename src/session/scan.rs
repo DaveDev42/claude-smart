@@ -968,6 +968,61 @@ mod tests {
         assert_eq!(rows[0].sid, "real-sid");
     }
 
+    // ─── mid-upgrade read-compat for the scan index (TODO #86) ─────────────────
+
+    #[test]
+    fn read_compat_label_may_contain_tabs() {
+        // The label is the 4th column and is taken verbatim via splitn(4), so a
+        // legacy label that itself contains tabs must be preserved, not split.
+        let tmp = TempDir::new().unwrap();
+        let idx = tmp.path().join("scan-meta-v2.dedup.tsv");
+        let content = "# refresh-start: 7\nsid1\t100\tnormal\tfirst prompt\twith\ttabs\n";
+        fs::write(&idx, content).unwrap();
+        let (start, rows) = load_scan_index(&idx).unwrap();
+        assert_eq!(start, 7);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].label, "first prompt\twith\ttabs",
+            "tabs in label lost"
+        );
+    }
+
+    #[test]
+    fn read_compat_short_rows_are_skipped_not_fatal() {
+        // A legacy/truncated row missing columns must be skipped (not abort the
+        // whole load) so one bad line never loses the rest of the index.
+        let tmp = TempDir::new().unwrap();
+        let idx = tmp.path().join("scan-meta-v2.dedup.tsv");
+        let content = "# refresh-start: 1\nshort-row-only-two\t100\ngood\t200\tnormal\tok\n";
+        fs::write(&idx, content).unwrap();
+        let (_, rows) = load_scan_index(&idx).unwrap();
+        assert_eq!(rows.len(), 1, "the short row is skipped, the good row kept");
+        assert_eq!(rows[0].sid, "good");
+    }
+
+    #[test]
+    fn read_compat_write_then_load_round_trips() {
+        // What this binary writes must be readable by this binary's loader with
+        // every field intact — the baseline for cross-version read-compat.
+        let tmp = TempDir::new().unwrap();
+        let idx = tmp.path().join("scan-meta-v2.dedup.tsv");
+        let rows = vec![SessionRow {
+            sid: "rt-sid".to_owned(),
+            mtime: 12345,
+            human_ts: "06-23 13:00".to_owned(),
+            mode: "acceptEdits".to_owned(),
+            label: "round trip label".to_owned(),
+        }];
+        write_scan_index(&idx, 999, &rows).unwrap();
+        let (start, loaded) = load_scan_index(&idx).unwrap();
+        assert_eq!(start, 999);
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].sid, "rt-sid");
+        assert_eq!(loaded[0].mtime, 12345);
+        assert_eq!(loaded[0].mode, "acceptEdits");
+        assert_eq!(loaded[0].label, "round trip label");
+    }
+
     // ─── dedup_rows_by_sid ────────────────────────────────────────────────────
 
     #[test]

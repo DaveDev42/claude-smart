@@ -432,6 +432,95 @@ mod tests {
         // read_sidecar wraps this and returns Default — tested in I/O tests below.
     }
 
+    // ─── mid-upgrade read-compatibility (TODO #86) ─────────────────────────────
+    //
+    // A binary upgrade can happen mid-session, so an OLDER binary must read a
+    // sidecar written by a NEWER one without destroying fields it does not know,
+    // and a NEWER binary must read the legacy (zsh-written) shape without loss.
+    // These fixtures lock that contract.
+
+    #[test]
+    fn read_compat_unknown_future_fields_are_preserved() {
+        // A future binary wrote two fields this version has no struct member for.
+        // They must survive deserialize → reserialize untouched (the #[flatten]
+        // `extra` map is the rollback-safety guarantee).
+        let raw = r#"{
+            "sessionId":"fut",
+            "hop":1,
+            "futureScalar":"keep-me",
+            "futureObject":{"nested":[1,2,3]}
+        }"#;
+        let s: Sidecar = serde_json::from_str(raw).expect("deserialize future shape");
+        assert_eq!(
+            s.extra.get("futureScalar"),
+            Some(&serde_json::Value::String("keep-me".to_owned())),
+            "unknown scalar must land in extra"
+        );
+        assert!(
+            s.extra.contains_key("futureObject"),
+            "unknown object must land in extra"
+        );
+
+        // Reserialize and confirm the unknown fields are still present.
+        let back = serde_json::to_string(&s).expect("reserialize");
+        assert!(
+            back.contains("futureScalar") && back.contains("keep-me"),
+            "unknown scalar lost on round-trip: {back}"
+        );
+        assert!(
+            back.contains("futureObject") && back.contains("nested"),
+            "unknown object lost on round-trip: {back}"
+        );
+    }
+
+    #[test]
+    fn read_compat_full_legacy_sidecar_round_trips_without_loss() {
+        // A complete sidecar as the zsh helper would have written it: hop as a
+        // STRING, camelCase keys, every known field populated. Deserialize, then
+        // assert each known field survived, and reserialize preserves them.
+        let raw = r#"{
+            "sessionId":"01234567-89ab-cdef-0123-456789abcdef",
+            "ts":1718600000.5,
+            "permissionMode":"acceptEdits",
+            "effort":"high",
+            "model":"claude-opus-4-5",
+            "cwd":"/work/proj",
+            "profile":"work",
+            "hop":"4"
+        }"#;
+        let s: Sidecar = serde_json::from_str(raw).expect("deserialize legacy full");
+        assert_eq!(
+            s.session_id.as_deref(),
+            Some("01234567-89ab-cdef-0123-456789abcdef")
+        );
+        assert_eq!(s.ts, Some(1718600000.5));
+        assert_eq!(s.permission_mode.as_deref(), Some("acceptEdits"));
+        assert_eq!(s.effort.as_deref(), Some("high"));
+        assert_eq!(s.model.as_deref(), Some("claude-opus-4-5"));
+        assert_eq!(s.cwd.as_deref(), Some("/work/proj"));
+        assert_eq!(s.profile.as_deref(), Some("work"));
+        assert_eq!(s.hop_int(), 4, "legacy string hop must read as 4");
+
+        // Reserialize: known fields preserved (hop emitted in current form is
+        // fine — hop_int() reads either, which is what callers use).
+        let back = serde_json::to_string(&s).expect("reserialize");
+        let reparsed: Sidecar = serde_json::from_str(&back).expect("reparse");
+        assert_eq!(reparsed.session_id, s.session_id);
+        assert_eq!(reparsed.profile, s.profile);
+        assert_eq!(reparsed.hop_int(), 4, "hop survived round-trip");
+    }
+
+    #[test]
+    fn read_compat_empty_object_is_all_none() {
+        // The minimal legacy file: `{}`. Must deserialize to an all-None sidecar
+        // (no panic, no spurious defaults that would emit unwanted CLI flags).
+        let s: Sidecar = serde_json::from_str("{}").expect("deserialize empty");
+        assert!(s.session_id.is_none());
+        assert!(s.permission_mode.is_none());
+        assert_eq!(s.hop_int(), 0, "absent hop reads as 0");
+        assert!(s.sidecar_flags().is_empty(), "empty sidecar emits no flags");
+    }
+
     // ─── sidecar_flags() tests ────────────────────────────────────────────────
 
     #[test]

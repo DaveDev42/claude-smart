@@ -83,8 +83,13 @@ A binary upgrade can happen mid-session, so `csm` must read state files
 (including the legacy shell implementation it replaces). Read-compat is claimed
 in the code but not covered by an explicit cross-version fixture test.
 
-- [ ] Add a regression test that loads legacy-format state fixtures and asserts
-      they parse without data loss.
+- [x] Add a regression test that loads legacy-format state fixtures and asserts
+      they parse without data loss. *(done: 6 fixtures — `sidecar` round-trips a
+      full zsh-written sidecar (string `hop`), preserves unknown future fields
+      via `#[flatten] extra` (rollback safety), and reads `{}` as all-None; the
+      `scan` index preserves tabs in the label column, skips truncated rows
+      without aborting the load, and round-trips write→load with every field
+      intact.)*
 
 ### 🟡 Document the hub-down picker behavior
 
