@@ -1,5 +1,41 @@
 # Changelog
 
+## [0.3.0](https://github.com/DaveDev42/claude-smart/compare/v0.2.2...v0.3.0) (2026-06-24)
+
+
+### ⚠ BREAKING CHANGES
+
+* remove all private identifiers; inject host rewrite via env
+
+### Features
+
+* **cas:** csm가 CAS 기능을 완전 흡수 — 프로필 레지스트리 end-to-end ([22923dd](https://github.com/DaveDev42/claude-smart/commit/22923dd0e774446cee49b4ca376426d91b1a62fb))
+* **cli:** csm usage + profiles noun-verb + interactive editor ([c9c1ffc](https://github.com/DaveDev42/claude-smart/commit/c9c1ffc35b51bdddd4d1a7f73524d9ba9e107054))
+* phase 1 — pure core logic (parser, sidecar merge, account scoring, reset-epoch, usage transport, session scan) ([eb73f1b](https://github.com/DaveDev42/claude-smart/commit/eb73f1ba67b8fe6aa8c0045f3392b091cee4c4eb))
+* phase 2 — proc_check, liveness, fzf pickers (session + hub-down account) ([0acefd6](https://github.com/DaveDev42/claude-smart/commit/0acefd6d87e00bfc97d4d83eadf0ea6bd9aeddea))
+* phase 3 — POSIX foreground supervisor, relaunch loop, hook, cas, statusline, dispatch ([dbd0e41](https://github.com/DaveDev42/claude-smart/commit/dbd0e41b668f75f189f1fe6b5dc00a120eef6d51))
+* phase 4 — Windows console-control launcher (build+test verified, 2 BLOCKING checks pending manual) ([e89850f](https://github.com/DaveDev42/claude-smart/commit/e89850fb6205f2856cc883643738478751e916bc))
+* **usage:** add CSM_USAGE_CMD pluggable usage source + configurable TTL ([26de714](https://github.com/DaveDev42/claude-smart/commit/26de714398822f8152bb4367d5c621da84099ee0))
+
+
+### Bug Fixes
+
+* **completions:** accept `pwsh` as alias for `powershell` ([eeb0a5e](https://github.com/DaveDev42/claude-smart/commit/eeb0a5eeae29882ba87eec249c49e70484649e59))
+* **degraded:** graceful pick-account + clean profiles-list when no registry ([703bdb8](https://github.com/DaveDev42/claude-smart/commit/703bdb8689cc1837ca00e727ae5abf3a16e12fd0))
+* **picker:** treat Escape as cancel, not as proceed-with-default ([7bf85d6](https://github.com/DaveDev42/claude-smart/commit/7bf85d68fed76fdbff3b8f688798b543f812d10b))
+* **publish-gate:** remove private hub identifiers from public crate ([63e3faf](https://github.com/DaveDev42/claude-smart/commit/63e3faf97c592581a6177231685c9c8a3e2d1cc0))
+* **scan:** sanitize newlines/tabs in index fields; harden state read-compat ([c065518](https://github.com/DaveDev42/claude-smart/commit/c065518f5374087b0a6620f8f446ac13aa6c0b51))
+* **test:** generate large deadlock fixture in-child to avoid Linux ARG_MAX ([cafcb5f](https://github.com/DaveDev42/claude-smart/commit/cafcb5fefc7e30ea8ef5b0ee5615589d6e9d5289))
+* **usage:** drain CSM_USAGE_CMD stdout to avoid a pipe deadlock ([2c1c296](https://github.com/DaveDev42/claude-smart/commit/2c1c296cfff1775b95de92ec87bfdaff3b255ff4))
+* **usage:** make CSM_USAGE_CMD timeout hard against a pipe-holding grandchild ([d96cd3a](https://github.com/DaveDev42/claude-smart/commit/d96cd3aa4a3dd1d412d4e5f13a15f17ad062ab30))
+* **windows:** gate the unverified relaunch loop off, fall back to launch-once ([ba4a9f0](https://github.com/DaveDev42/claude-smart/commit/ba4a9f074e5b7a4df20c4b9c797ae316092aa3a8))
+* **windows:** resolve dead_code under clippy -D warnings on windows-msvc ([b88fdcc](https://github.com/DaveDev42/claude-smart/commit/b88fdcc2ae4078c3c5f6779a116b971771655219))
+
+
+### Code Refactoring
+
+* remove all private identifiers; inject host rewrite via env ([de91d2f](https://github.com/DaveDev42/claude-smart/commit/de91d2f0296cd04925a35d24449b9722e7554887))
+
 ## [0.2.2](https://github.com/DaveDev42/claude-smart/compare/v0.2.1...v0.2.2) (2026-06-24)
 
 
