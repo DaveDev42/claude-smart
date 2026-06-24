@@ -4,7 +4,7 @@
       "release-type": "rust",
       "component": "",
       "include-component-in-tag": false,
-      "draft": true,
+      "draft": false,
       "bump-major-pre-major": false,
       "bump-minor-pre-major": true,
       "bump-patch-for-minor-pre-major": true,

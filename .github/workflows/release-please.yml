@@ -112,6 +112,14 @@ jobs:
           cd artifacts
           sha256sum csm-*/* > ../SHA256SUMS.txt
           cat ../SHA256SUMS.txt
+      # The release is created already-published (release-please-config.json has
+      # "draft": false), so there is no draft to flip here — softprops appends
+      # the built assets to the existing published release by tag. We publish
+      # non-draft on purpose: release-please's "find latest release" ignores
+      # DRAFT releases, so a draft would make the next run fail to locate the
+      # previous version and re-aggregate the full tag history into a phantom
+      # bump (googleapis/release-please#1650). Trade-off: the release is visible
+      # for the few minutes the build runs before its assets are attached.
       - name: Upload release assets
         uses: softprops/action-gh-release@v3
         with:
@@ -119,11 +127,6 @@ jobs:
           files: |
             artifacts/csm-*/*
             SHA256SUMS.txt
-      - name: Publish release
-        run: gh release edit "$TAG" --draft=false
-        env:
-          GH_TOKEN: ${{ github.token }}
-          TAG: ${{ needs.resolve-release.outputs.tag_name }}
       - name: Bump Formula/claude-smart.rb in DaveDev42/homebrew-tap
         uses: DaveDev42/homebrew-tap-release@v1
         with:
