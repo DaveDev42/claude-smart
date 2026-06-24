@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.2](https://github.com/DaveDev42/claude-smart/compare/v0.2.1...v0.2.2) (2026-06-24)
+
+
+### Bug Fixes
+
+* **picker:** treat Escape as cancel, not as proceed-with-default ([7bf85d6](https://github.com/DaveDev42/claude-smart/commit/7bf85d68fed76fdbff3b8f688798b543f812d10b))
+
 ## [0.2.1](https://github.com/DaveDev42/claude-smart/compare/v0.2.0...v0.2.1) (2026-06-23)
 
 
