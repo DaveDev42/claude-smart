@@ -139,7 +139,9 @@ the hub can't be reached, `csm` does *not* silently keep the current account. In
 an interactive terminal it opens an fzf account picker showing the last-known
 (stale) usage so you can choose deliberately; in a non-interactive context (the
 Stop hook, scripts) it fails safe to the current profile instead of blocking on a
-picker.
+picker. Pressing **Escape / Ctrl-C in any picker cancels the launch entirely**
+(`csm` exits without starting `claude`) — it does not silently fall through to a
+default.
 
 ### Custom usage command (`CSM_USAGE_CMD`)
 
@@ -155,6 +157,9 @@ slow command is not re-run within the cache TTL.
 | `CSM_USAGE_CMD_TIMEOUT` | Hard deadline in seconds for that command (default `10`). On timeout `csm` falls through to the hub. |
 | `CLAUDE_USAGE_TTL` / `CSM_USAGE_TTL_SECS` | Positive-cache lifetime in seconds (default `60`). The legacy name wins if both are set. |
 
+`csm` does the scoring and the account choice itself — the command only reports
+the **facts** (each profile's usage); you do not pick a profile in it.
+
 The command is **not** compiled in — the extraction mechanism is yours to own,
 because a robust one is environment-specific. (Note: at the time of writing, the
 `claude` CLI has no usage subcommand, and its `/usage` slash command does not
@@ -163,7 +168,10 @@ plain `claude -p`-based recipe is *not* recommended as a usage source. If you
 script one, validate that your command actually yields the gauges before relying
 on it for account scoring.)
 
-(The usage JSON shape, the collector, and a reference hub deployment are
+See [`examples/usage-collector.sh`](examples/usage-collector.sh) for a reference
+`CSM_USAGE_CMD`: it shows the three practical strategies — proxy an existing hub
+endpoint (one `curl`), re-emit a cache file, or synthesize the JSON from
+per-profile facts. (The full usage JSON shape and a reference hub deployment are
 documented in the design notes under `docs/`.)
 
 ## License
