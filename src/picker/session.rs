@@ -107,6 +107,10 @@ pub enum PickedSession {
     Continue,
     /// User chose a real session; `session_id` is the UUID.
     Resume(String),
+    /// User pressed Escape / Ctrl-C — abort the launch entirely (do NOT fall
+    /// back to a fresh session). Distinct from `Fresh`, which is an explicit
+    /// "start new" choice or a graceful degrade when no picker can run.
+    Cancel,
 }
 
 // ─── SessionPicker ────────────────────────────────────────────────────────────
@@ -138,18 +142,21 @@ impl SessionPicker {
     ///
     /// - Empty `rows` → `PickedSession::Fresh` (no picker shown).
     /// - fzf unavailable → `None` (caller degrades to newest-free-sid / fresh).
-    /// - Escape / Ctrl-C / empty selection → `None`.
+    /// - Escape / Ctrl-C → `Some(PickedSession::Cancel)` (caller aborts the launch).
     /// - `__NEW__` → `Fresh`, `__CONTINUE__` → `Continue`, UUID → `Resume(uuid)`.
     pub fn pick(&self, newest_live_label: Option<&str>) -> Option<PickedSession> {
         if self.rows.is_empty() {
             return Some(PickedSession::Fresh);
         }
-        if !crate::picker::fzf::fzf_available() {
-            return None;
-        }
         let lines = self.build_fzf_input(newest_live_label);
-        let col1 = crate::picker::fzf::run_fzf(&lines, &Self::fzf_opts())?;
-        Some(Self::resolve(&col1))
+        match crate::picker::fzf::run_fzf(&lines, &Self::fzf_opts()) {
+            crate::picker::fzf::PickerOutcome::Selected(col1) => Some(Self::resolve(&col1)),
+            // Escape / Ctrl-C → explicit cancel: surface it so the caller aborts
+            // instead of silently starting a fresh session.
+            crate::picker::fzf::PickerOutcome::Cancelled => Some(PickedSession::Cancel),
+            // fzf missing or unusable → degrade (None) per the existing contract.
+            crate::picker::fzf::PickerOutcome::Unavailable => None,
+        }
     }
 
     /// Map a recovered col1 (sentinel constant or UUID) to a `PickedSession`.
@@ -303,6 +310,25 @@ mod tests {
         assert_eq!(opts.prompt, "session > ");
         assert_eq!(opts.with_nth, "3..");
         assert_eq!(opts.delimiter, "\t");
+    }
+
+    /// `resolve` never produces `Cancel`: a recovered col1 is always a real
+    /// choice (NEW/CONTINUE/uuid). `Cancel` arises ONLY from an fzf
+    /// Escape/Ctrl-C in `pick`, so it must stay a distinct variant from `Fresh`
+    /// — collapsing the two would resurrect "Escape silently starts fresh".
+    #[test]
+    fn resolve_never_yields_cancel_and_cancel_is_distinct_from_fresh() {
+        assert_eq!(SessionPicker::resolve(SENTINEL_NEW), PickedSession::Fresh);
+        assert_eq!(
+            SessionPicker::resolve(SENTINEL_CONTINUE),
+            PickedSession::Continue
+        );
+        assert_eq!(
+            SessionPicker::resolve("dead-beef"),
+            PickedSession::Resume("dead-beef".to_string())
+        );
+        // The type-level guarantee the caller relies on:
+        assert_ne!(PickedSession::Cancel, PickedSession::Fresh);
     }
 
     #[test]

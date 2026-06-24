@@ -174,23 +174,22 @@ impl AccountPicker {
         Self { rows }
     }
 
-    /// Run the picker and return the selected profile name, or `None`.
+    /// Run the picker and return a [`PickerOutcome`]:
+    /// - `Selected(profile_name)` — user selected a profile.
+    /// - `Cancelled` — user pressed Escape / Ctrl-C (caller aborts the launch).
+    /// - `Unavailable` — empty rows or fzf missing (caller keeps current profile).
     ///
-    /// Returns:
-    /// - `Some(profile_name)` — user selected a profile.
-    /// - `None` — empty/cancelled selection OR fzf unavailable (degraded).
-    ///
-    /// When `fzf_available()` is false → stderr warning + `None` (degrade).
-    /// Escape / Ctrl-C / empty selection → `None`. Otherwise the chosen profile.
-    pub fn pick(&self) -> Option<String> {
+    /// When `fzf_available()` is false → stderr warning + `Unavailable` (degrade).
+    pub fn pick(&self) -> crate::picker::fzf::PickerOutcome {
+        use crate::picker::fzf::PickerOutcome;
         if self.rows.is_empty() {
-            return None;
+            return PickerOutcome::Unavailable;
         }
         if !fzf_available() {
             eprintln!(
                 "csm: hub usage fetch failed and fzf not available — keeping current profile"
             );
-            return None;
+            return PickerOutcome::Unavailable;
         }
         let lines = self.build_fzf_input();
         crate::picker::fzf::run_fzf(&lines, &Self::fzf_opts())

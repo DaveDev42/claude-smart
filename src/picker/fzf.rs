@@ -6,11 +6,29 @@
 //! key, and `--with-nth` to display the rest. The selected row's col1 is recovered
 //! via `cut -f1` equivalent (field split in Rust, no subprocess).
 //!
-//! Empty selection (user pressed Escape) or fzf exit code 130 (Ctrl-C) → `None`.
-//! The caller degrades gracefully (session: newest-free-sid/fresh; account: current
-//! profile + stderr warning).
+//! The outcome distinguishes three cases that callers handle differently:
+//! - `Selected` — the user chose a row.
+//! - `Cancelled` — the user pressed Escape / Ctrl-C (fzf exit 1 / 130). Callers
+//!   treat this as "abort the whole operation", NOT as a fall-through default.
+//! - `Unavailable` — fzf is missing or produced no usable output. Callers degrade
+//!   gracefully (session: newest-free-sid/fresh; account: current profile).
 
 use std::process::{Command, Stdio};
+
+/// The result of an fzf invocation.
+///
+/// Separating `Cancelled` from `Unavailable` is what lets a caller honor Escape
+/// as "cancel the command" instead of silently proceeding with a default.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PickerOutcome {
+    /// The user selected a row; the payload is the recovered col1 key.
+    Selected(String),
+    /// The user pressed Escape or Ctrl-C (fzf exit 1 / 130) — abort.
+    Cancelled,
+    /// fzf was unavailable (not on PATH, spawn failed) or returned no usable
+    /// output — the caller should degrade to its default path.
+    Unavailable,
+}
 
 /// Options passed to a single fzf invocation.
 ///
@@ -62,30 +80,28 @@ pub fn fzf_available() -> bool {
         .unwrap_or(false)
 }
 
-/// Pipe `rows` to fzf and return the **first tab-delimited field** (the hidden
-/// recovery key, col1) of the selected row, or `None` on empty/cancelled
-/// selection.
+/// Pipe `rows` to fzf and recover the **first tab-delimited field** (the hidden
+/// recovery key, col1) of the selected row, as a [`PickerOutcome`].
 ///
 /// `rows` — each element is one fzf input line. May contain `\t`; the first
 /// field is the hidden recovery key. Pass `--with-nth=2..` (or similar) in
 /// `opts` to hide col1 from the display.
 ///
-/// Returns:
-/// - `Some(col1)` — user selected a row; col1 is extracted by splitting on `\t`.
-/// - `None` — fzf was not selected (exit 130 = Ctrl-C/Escape, or empty output,
-///   or fzf exited with any non-zero code that does not represent a valid
-///   selection).
+/// Returns a [`PickerOutcome`]:
+/// - `Selected(col1)` — user selected a row; col1 is split out on the delimiter.
+/// - `Cancelled` — fzf exited 1 (Escape / no match) or 130 (Ctrl-C / Ctrl-G).
+/// - `Unavailable` — spawn failed, empty input, or exit 0 with empty output.
 ///
 /// fzf exit code for "no match / user cancelled" (Escape).
 const FZF_EXIT_NO_MATCH: i32 = 1;
 /// fzf exit code for "interrupted" (Ctrl-C / Ctrl-G).
 const FZF_EXIT_INTERRUPTED: i32 = 130;
 
-pub fn run_fzf(rows: &[String], opts: &FzfOpts) -> Option<String> {
+pub fn run_fzf(rows: &[String], opts: &FzfOpts) -> PickerOutcome {
     use std::io::Write;
 
     if rows.is_empty() {
-        return None;
+        return PickerOutcome::Unavailable;
     }
 
     let mut cmd = Command::new("fzf");
@@ -106,7 +122,11 @@ pub fn run_fzf(rows: &[String], opts: &FzfOpts) -> Option<String> {
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit());
 
-    let mut child = cmd.spawn().ok()?;
+    // A spawn failure means fzf is unavailable — degrade, don't treat as cancel.
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(_) => return PickerOutcome::Unavailable,
+    };
 
     // Feed the rows. fzf may close stdin early (selection made before all rows
     // are read) → a BrokenPipe write is expected and must not abort.
@@ -117,25 +137,28 @@ pub fn run_fzf(rows: &[String], opts: &FzfOpts) -> Option<String> {
         // drop closes the pipe → fzf sees EOF
     }
 
-    let output = child.wait_with_output().ok()?;
-    // Only exit 0 is a real selection; Escape (1), Ctrl-C (130), and any other
-    // non-zero / signal exit all mean "no selection".
-    if output.status.code() != Some(0) {
-        debug_assert!(matches!(
-            output.status.code(),
-            None | Some(FZF_EXIT_NO_MATCH) | Some(FZF_EXIT_INTERRUPTED) | Some(_)
-        ));
-        return None;
+    let output = match child.wait_with_output() {
+        Ok(o) => o,
+        Err(_) => return PickerOutcome::Unavailable,
+    };
+
+    match output.status.code() {
+        Some(0) => {}
+        // Escape (1) and Ctrl-C (130) are explicit user cancellation.
+        Some(FZF_EXIT_NO_MATCH) | Some(FZF_EXIT_INTERRUPTED) => return PickerOutcome::Cancelled,
+        // Any other non-zero / signal exit is not a usable selection; degrade
+        // rather than cancel, so a weird fzf error doesn't kill the launch.
+        _ => return PickerOutcome::Unavailable,
     }
 
     let selected = String::from_utf8_lossy(&output.stdout);
-    let line = selected.lines().next()?; // first (only, with --no-multi) line
-    if line.is_empty() {
-        return None;
-    }
+    let line = match selected.lines().next() {
+        Some(l) if !l.is_empty() => l,
+        _ => return PickerOutcome::Unavailable,
+    };
     // Recover col1 = the hidden recovery key (split on the configured delimiter).
     let delim = opts.delimiter.chars().next().unwrap_or('\t');
-    Some(line.split(delim).next().unwrap_or(line).to_string())
+    PickerOutcome::Selected(line.split(delim).next().unwrap_or(line).to_string())
 }
 
 // ─── tests ────────────────────────────────────────────────────────────────────
@@ -177,5 +200,26 @@ mod tests {
         assert!(!opts.prompt.is_empty());
         assert!(opts.extra_args.contains(&"--reverse".to_string()));
         assert!(opts.extra_args.contains(&"--no-multi".to_string()));
+    }
+
+    /// Empty input rows never spawn fzf and map to `Unavailable` (a degrade),
+    /// NOT `Cancelled` — there was nothing for the user to cancel. The caller
+    /// must fall back, not abort.
+    #[test]
+    fn run_fzf_empty_rows_is_unavailable_not_cancelled() {
+        let out = run_fzf(&[], &FzfOpts::default());
+        assert_eq!(out, PickerOutcome::Unavailable);
+    }
+
+    /// `PickerOutcome` keeps `Cancelled` (Escape/Ctrl-C) distinct from
+    /// `Unavailable` (degrade) — the whole point of the type. A caller that
+    /// collapsed them would reintroduce the "Escape silently proceeds" bug.
+    #[test]
+    fn picker_outcome_cancelled_differs_from_unavailable() {
+        assert_ne!(PickerOutcome::Cancelled, PickerOutcome::Unavailable);
+        assert_ne!(
+            PickerOutcome::Selected("x".into()),
+            PickerOutcome::Cancelled
+        );
     }
 }

@@ -186,10 +186,18 @@ fn cmd_run(args: &[OsString]) -> anyhow::Result<()> {
         current_profile_dir(&profiles)
     } else {
         // Proactive pick (include_current=true — no-op switch if already best).
-        proactive_pick_profile(&current_profile_name, &profiles, flags.pick_account)?
+        // `None` = the hub-down picker was cancelled with Escape → abort.
+        match proactive_pick_profile(&current_profile_name, &profiles, flags.pick_account)? {
+            Some(dir) => dir,
+            None => {
+                eprintln!("csm: cancelled.");
+                return Ok(());
+            }
+        }
     };
 
     // ── 3. Resolve session id ──────────────────────────────────────────────────
+    // A picker path may yield `None` = the user pressed Escape → cancel the launch.
     let session_id: String = if let Some(explicit_sid) = &flags.session_id {
         explicit_sid.clone()
     } else if let Some(resume_arg) = &flags.resume {
@@ -204,20 +212,38 @@ fn cmd_run(args: &[OsString]) -> anyhow::Result<()> {
                     })?
                 }
             }
-            ResumeArg::Picker => resolve_session_via_picker(&cwd)?,
+            ResumeArg::Picker => match resolve_session_via_picker(&cwd)? {
+                Some(sid) => sid,
+                None => {
+                    eprintln!("csm: cancelled.");
+                    return Ok(());
+                }
+            },
         }
     } else if flags.new {
         // `-n`/`--new`: explicit fresh session.
         newuuid()
     } else if flags.interactive {
         // `-i`/`--interactive`: open session picker.
-        resolve_session_via_picker(&cwd)?
+        match resolve_session_via_picker(&cwd)? {
+            Some(sid) => sid,
+            None => {
+                eprintln!("csm: cancelled.");
+                return Ok(());
+            }
+        }
     } else if flags.continue_ {
         // `-c`/`--continue`: newest free session or fresh.
         newest_free_sid(&cwd)?.unwrap_or_else(newuuid)
     } else {
         // Default: 0 → fresh, 1 → auto-resume, 2+ → picker.
-        resolve_session_default(&cwd)?
+        match resolve_session_default(&cwd)? {
+            Some(sid) => sid,
+            None => {
+                eprintln!("csm: cancelled.");
+                return Ok(());
+            }
+        }
     };
 
     // ── 4. Build the claude CLI and launch ──────────────────────────────────────
@@ -253,9 +279,13 @@ fn cmd_run(args: &[OsString]) -> anyhow::Result<()> {
 
 // ─── session id resolution helpers ───────────────────────────────────────────
 
-/// Open the interactive fzf session picker. Falls back to fresh UUID when
-/// fzf is unavailable, no rows exist, or the user escapes.
-fn resolve_session_via_picker(cwd: &std::path::Path) -> anyhow::Result<String> {
+/// Open the interactive fzf session picker.
+///
+/// Returns:
+/// - `Ok(Some(sid))` — a session id to launch (selected, continued, or fresh —
+///   including the graceful degrade to fresh when fzf is unavailable / no rows).
+/// - `Ok(None)` — the user pressed Escape / Ctrl-C: cancel the launch entirely.
+fn resolve_session_via_picker(cwd: &std::path::Path) -> anyhow::Result<Option<String>> {
     use picker::session::SessionRow as PickerRow;
     use picker::session::{PickedSession, SessionPicker};
 
@@ -279,9 +309,12 @@ fn resolve_session_via_picker(cwd: &std::path::Path) -> anyhow::Result<String> {
     let newest_live_label: Option<&str> = None; // TODO: derive in Phase 9
 
     match sp.pick(newest_live_label) {
-        None | Some(PickedSession::Fresh) => Ok(newuuid()),
-        Some(PickedSession::Continue) => Ok(newest_free_sid(cwd)?.unwrap_or_else(newuuid)),
-        Some(PickedSession::Resume(sid)) => Ok(sid),
+        // `None` (fzf unavailable) and `Fresh` both mean "start new" — degrade.
+        None | Some(PickedSession::Fresh) => Ok(Some(newuuid())),
+        Some(PickedSession::Continue) => Ok(Some(newest_free_sid(cwd)?.unwrap_or_else(newuuid))),
+        Some(PickedSession::Resume(sid)) => Ok(Some(sid)),
+        // Escape / Ctrl-C → cancel the whole launch.
+        Some(PickedSession::Cancel) => Ok(None),
     }
 }
 
@@ -289,14 +322,16 @@ fn resolve_session_via_picker(cwd: &std::path::Path) -> anyhow::Result<String> {
 ///   0 free sessions → fresh UUID
 ///   1 free session  → auto-resume that session (0-based free-session sort)
 ///   2+ free sessions → open picker
-fn resolve_session_default(cwd: &std::path::Path) -> anyhow::Result<String> {
+/// Returns `Ok(Some(sid))` to launch, or `Ok(None)` when the 2+-session picker
+/// was cancelled (Escape / Ctrl-C).
+fn resolve_session_default(cwd: &std::path::Path) -> anyhow::Result<Option<String>> {
     let rows = session::scan(cwd);
     let free: Vec<&session::SessionRow> =
         rows.iter().filter(|r| !session::sid_live(&r.sid)).collect();
 
     match free.len() {
-        0 => Ok(newuuid()),
-        1 => Ok(free[0].sid.clone()),
+        0 => Ok(Some(newuuid())),
+        1 => Ok(Some(free[0].sid.clone())),
         _ => resolve_session_via_picker(cwd),
     }
 }
@@ -359,7 +394,8 @@ fn derive_current_profile_name(profiles: &account::ProfileMap) -> String {
 
 /// Proactive account pick with hub-down picker fallback (spec §4a).
 ///
-/// Returns the resolved profile directory.
+/// Returns `Ok(Some(dir))` with the resolved profile directory, or `Ok(None)`
+/// when the hub-down picker was cancelled (Escape / Ctrl-C) — the caller aborts.
 ///
 /// Pick guard (mirrors zsh `claude-smart.zsh` lines 204-209, 316-323):
 /// - `pick_account(current, include_current=true)` → scoring pick.
@@ -370,20 +406,20 @@ fn proactive_pick_profile(
     current_profile: &str,
     profiles: &account::ProfileMap,
     _force_pick: bool,
-) -> anyhow::Result<PathBuf> {
+) -> anyhow::Result<Option<PathBuf>> {
     use account::scoring::ScoringError;
 
     let current_dir = current_profile_dir(profiles);
 
     // No ProfileMap (toss / first-boot) — skip all picking.
     if profiles.is_empty() {
-        return Ok(current_dir);
+        return Ok(Some(current_dir));
     }
 
     match account::pick_account(current_profile, true) {
         Ok(None) => {
             // Already on the best profile — keep current.
-            Ok(current_dir)
+            Ok(Some(current_dir))
         }
         Ok(Some(winner)) => {
             let dir = resolve_profile_dir(&winner, profiles)
@@ -391,13 +427,13 @@ fn proactive_pick_profile(
             if winner != current_profile {
                 eprintln!("csm: auto-pick → {winner}");
             }
-            Ok(PathBuf::from(dir))
+            Ok(Some(PathBuf::from(dir)))
         }
         Err(ScoringError::AllSaturated) => {
             eprintln!(
                 "csm: warning: all accounts at session/week limit — keeping current profile ({current_profile})"
             );
-            Ok(current_dir)
+            Ok(Some(current_dir))
         }
         Err(ScoringError::FetchFailed(_)) => hub_down_pick(profiles, &current_dir),
     }
@@ -407,22 +443,33 @@ fn proactive_pick_profile(
 ///
 /// Interactive + fetch-miss → open fzf account picker with stale usage data.
 /// Non-interactive → silent fail-safe to current profile.
-fn hub_down_pick(profiles: &account::ProfileMap, current_dir: &Path) -> anyhow::Result<PathBuf> {
+///
+/// Returns `Ok(Some(dir))` to launch under `dir`, or `Ok(None)` when the user
+/// pressed Escape / Ctrl-C in the picker (cancel the launch entirely).
+fn hub_down_pick(
+    profiles: &account::ProfileMap,
+    current_dir: &Path,
+) -> anyhow::Result<Option<PathBuf>> {
+    use picker::fzf::PickerOutcome;
+
     // TTY gate: isatty(0) && isatty(1) — matches zsh `[[ -t 0 && -t 1 ]]`.
     if !is_interactive() {
-        return Ok(current_dir.to_path_buf());
+        return Ok(Some(current_dir.to_path_buf()));
     }
 
     let rows = build_account_rows(profiles);
     let ap = picker::AccountPicker::new(rows);
 
     match ap.pick() {
-        Some(winner) => {
+        PickerOutcome::Selected(winner) => {
             let dir = resolve_profile_dir(&winner, profiles)
                 .context("csm: hub-down picker — selected profile not in map")?;
-            Ok(PathBuf::from(dir))
+            Ok(Some(PathBuf::from(dir)))
         }
-        None => Ok(current_dir.to_path_buf()),
+        // Escape / Ctrl-C → cancel the launch.
+        PickerOutcome::Cancelled => Ok(None),
+        // fzf missing / empty → keep current profile (graceful degrade).
+        PickerOutcome::Unavailable => Ok(Some(current_dir.to_path_buf())),
     }
 }
 
