@@ -139,7 +139,13 @@ the hub can't be reached, `csm` does *not* silently keep the current account. In
 an interactive terminal it opens an fzf account picker showing the last-known
 (stale) usage so you can choose deliberately; in a non-interactive context (the
 Stop hook, scripts) it fails safe to the current profile instead of blocking on a
-picker. Pressing **Escape / Ctrl-C in any picker cancels the launch entirely**
+picker. **The picker is ordered by recommendation, not alphabetically:** rows are
+ranked exactly as the live scorer (`pick_best`) would choose — viable accounts
+first (highest `week_all.pct`, soonest-reset tie-break), saturated / session-limited
+/ errored / no-data rows below — so the account auto-pick *would* have selected
+leads the list. Because fzf's cursor starts on the first row, **pressing Enter
+takes the recommendation**; you only need to move when you want a different one.
+Pressing **Escape / Ctrl-C in any picker cancels the launch entirely**
 (`csm` exits without starting `claude`) — it does not silently fall through to a
 default.
 
