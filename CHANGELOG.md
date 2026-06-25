@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.4](https://github.com/DaveDev42/claude-smart/compare/v0.2.3...v0.2.4) (2026-06-25)
+
+
+### Features
+
+* **picker:** order hub-down account picker by recommendation ([c46eeec](https://github.com/DaveDev42/claude-smart/commit/c46eeec32a760379ff3f5719b20e0ad272e8c35f))
+
 ## [0.2.3](https://github.com/DaveDev42/claude-smart/compare/v0.2.2...v0.2.3) (2026-06-25)
 
 
