@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.3](https://github.com/DaveDev42/claude-smart/compare/v0.2.2...v0.2.3) (2026-06-25)
+
+
+### Bug Fixes
+
+* **session:** resume existing sessions with --resume, not --session-id ([db554c6](https://github.com/DaveDev42/claude-smart/commit/db554c6bd8ac47c80b13c1c1fc0a25152d132c17))
+
 ## [0.2.2](https://github.com/DaveDev42/claude-smart/compare/v0.2.1...v0.2.2) (2026-06-24)
 
 
