@@ -531,7 +531,52 @@ fn hub_down_pick(
     }
 }
 
-/// Build `AccountRow` list for the hub-down picker.
+/// Recommendation rank for a hub-down picker row, mirroring `scoring::pick_best`.
+///
+/// The picker is fzf with `--reverse` and no explicit cursor, so the cursor sits
+/// on the FIRST row — pressing Enter selects it. We therefore order rows so the
+/// recommended profile (the one `pick_best` would auto-select when the hub is up)
+/// leads, and the user can just press Enter.
+///
+/// Returns a sort key where SMALLER sorts first:
+/// - `0` bucket = viable candidate (no error, has week_all.pct, session.pct < LIMIT,
+///   week_all.pct < SATURATION). Within it, HIGHER week_all.pct ranks first
+///   (negated), then SOONER reset epoch, matching `pick_best`'s tie-break.
+/// - `1` bucket = everything else (saturated, session-limited, errored, or no data),
+///   ordered by name for stability.
+///
+/// `name` is the final tie-break so ordering is deterministic.
+fn account_row_rank(
+    name: &str,
+    data: &picker::account::StaleProfileData,
+) -> (u8, i64, i64, String) {
+    use account::scoring::{ABSENT_SESSION_PCT, LIMIT_PCT, SATURATION_PCT};
+
+    let session_pct = data.session_pct.unwrap_or(ABSENT_SESSION_PCT);
+    let viable = data.error.is_none()
+        && data.week_all_pct.is_some()
+        && session_pct < LIMIT_PCT
+        && data.week_all_pct.unwrap() < SATURATION_PCT;
+
+    if !viable {
+        // Non-viable rows sink to the bottom, ordered by name.
+        return (1, 0, 0, name.to_owned());
+    }
+
+    let week_pct = data.week_all_pct.unwrap();
+    // Higher week_all.pct first → negate so smaller sorts first.
+    // Soonest reset epoch next → i64::MAX when unknown so known beats unknown.
+    let epoch = data
+        .resets
+        .as_deref()
+        .and_then(|r| account::reset::resets_to_epoch(r).ok())
+        .map(|dt| dt.timestamp())
+        .unwrap_or(i64::MAX);
+    (0, -week_pct, epoch, name.to_owned())
+}
+
+/// Build `AccountRow` list for the hub-down picker, ordered by recommendation so
+/// the top row is what `pick_best` would auto-select (Enter selects it).
 fn build_account_rows(profiles: &account::ProfileMap) -> Vec<picker::account::AccountRow> {
     use picker::account::{AccountRow, StaleProfileData};
 
@@ -559,19 +604,21 @@ fn build_account_rows(profiles: &account::ProfileMap) -> Vec<picker::account::Ac
             all_names.push(name.clone());
         }
     }
-    all_names.sort_unstable();
 
-    all_names
-        .iter()
+    // Build (name, StaleProfileData) so we can order by recommendation before
+    // rendering rows. (HashMap iteration order is non-deterministic; the rank's
+    // name tie-break makes the final order stable regardless.)
+    let mut entries: Vec<(String, StaleProfileData)> = all_names
+        .into_iter()
         .map(|profile| {
-            let data = if let Some(err) = cache_errors.get(profile) {
+            let data = if let Some(err) = cache_errors.get(&profile) {
                 StaleProfileData {
                     session_pct: None,
                     week_all_pct: None,
                     resets: None,
                     error: Some(err.clone()),
                 }
-            } else if let Some(pu) = cache_profiles.get(profile) {
+            } else if let Some(pu) = cache_profiles.get(&profile) {
                 StaleProfileData {
                     session_pct: pu.session_pct,
                     week_all_pct: pu.week_all_pct,
@@ -586,8 +633,17 @@ fn build_account_rows(profiles: &account::ProfileMap) -> Vec<picker::account::Ac
                     error: None,
                 }
             };
-            AccountRow::build(profile, &data, cache_mtime)
+            (profile, data)
         })
+        .collect();
+
+    // Recommended-first ordering: the top row is what pick_best would auto-select,
+    // so Enter (cursor starts on row 0 under fzf --reverse) selects the recommendation.
+    entries.sort_by_key(|(name, data)| account_row_rank(name, data));
+
+    entries
+        .iter()
+        .map(|(profile, data)| AccountRow::build(profile, data, cache_mtime))
         .collect()
 }
 
@@ -1839,5 +1895,85 @@ mod tests {
         );
         assert_eq!(id, OsString::from(&existing));
         assert_eq!(res.sid(), existing);
+    }
+
+    // ── account_row_rank (hub-down picker: recommended profile leads) ─────────
+    // The fzf picker starts the cursor on row 0, so the top row is what Enter
+    // selects. account_row_rank must order rows the same way pick_best chooses,
+    // so the recommendation leads and a bare Enter picks it.
+
+    use picker::account::StaleProfileData;
+
+    fn data(session: Option<i64>, week: Option<i64>, resets: Option<&str>) -> StaleProfileData {
+        StaleProfileData {
+            session_pct: session,
+            week_all_pct: week,
+            resets: resets.map(|s| s.to_owned()),
+            error: None,
+        }
+    }
+
+    /// Sort names by rank and return them in display order (row 0 first).
+    fn ranked_order(mut rows: Vec<(&str, StaleProfileData)>) -> Vec<String> {
+        rows.sort_by_key(|(name, data)| account_row_rank(name, data));
+        rows.into_iter().map(|(n, _)| n.to_owned()).collect()
+    }
+
+    #[test]
+    fn viable_higher_week_pct_leads() {
+        // Both viable; the higher week_all.pct is the recommendation (pick_best
+        // picks the most-used non-saturated account). It must be row 0.
+        let order = ranked_order(vec![
+            ("low", data(Some(2), Some(10), None)),
+            ("high", data(Some(5), Some(40), None)),
+        ]);
+        assert_eq!(order, vec!["high", "low"]);
+    }
+
+    #[test]
+    fn saturated_and_errored_sink_below_viable() {
+        let errored = StaleProfileData {
+            session_pct: None,
+            week_all_pct: None,
+            resets: None,
+            error: Some("no credentials".to_owned()),
+        };
+        let order = ranked_order(vec![
+            ("saturated", data(Some(5), Some(96), None)), // week >= 95 → not viable
+            ("errored", errored),
+            ("viable", data(Some(5), Some(50), None)),
+            ("nodata", data(None, None, None)),
+        ]);
+        // The one viable profile must lead; the rest sink (name-ordered).
+        assert_eq!(order[0], "viable");
+        assert!(order[1..].contains(&"saturated".to_owned()));
+        assert!(order[1..].contains(&"errored".to_owned()));
+        assert!(order[1..].contains(&"nodata".to_owned()));
+    }
+
+    #[test]
+    fn session_limited_is_not_viable() {
+        // session.pct >= 99 → excluded from viable even if week is low.
+        let order = ranked_order(vec![
+            ("limited", data(Some(99), Some(5), None)),
+            ("ok", data(Some(10), Some(20), None)),
+        ]);
+        assert_eq!(order[0], "ok");
+    }
+
+    #[test]
+    fn equal_week_pct_known_reset_beats_unknown() {
+        // Same week_all.pct → a known reset epoch beats an unknown (None) one,
+        // mirroring pick_best's "known beats unknown" tie-break. This is
+        // date-independent (no reliance on what "today" is, unlike comparing two
+        // bare month/day strings whose inferred year flips around today).
+        let order = ranked_order(vec![
+            ("noreset", data(Some(3), Some(30), None)),
+            (
+                "hasreset",
+                data(Some(3), Some(30), Some("Jun 18 at 9pm (Asia/Seoul)")),
+            ),
+        ]);
+        assert_eq!(order, vec!["hasreset", "noreset"]);
     }
 }
