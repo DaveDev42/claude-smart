@@ -21,6 +21,36 @@ fn newuuid() -> String {
     Uuid::new_v4().to_string()
 }
 
+/// How a resolved session id should be handed to `claude`.
+///
+/// This distinction is the difference between the two claude CLI verbs:
+/// - `--session-id <uuid>` *creates* a session with that id and **rejects**
+///   (`Error: Session ID <uuid> is already in use`) if a session file for it
+///   already exists on disk.
+/// - `--resume <uuid>` *continues* an existing session.
+///
+/// Every resolution path knows which it produced (a brand-new UUID vs an id
+/// scanned off disk), so it must carry that intent forward — otherwise the
+/// launcher would `--session-id` a pre-existing id and claude would refuse to
+/// start. (This was the `csm resume` "already in use" bug: resume paths picked
+/// an existing id but the launcher always passed `--session-id`.)
+#[derive(Debug, Clone)]
+enum SessionResolution {
+    /// A brand-new session id → launch with `--session-id <id>`.
+    Fresh(String),
+    /// An existing session id picked off disk → launch with `--resume <id>`.
+    Resume(String),
+}
+
+impl SessionResolution {
+    /// The session id string, regardless of fresh/resume.
+    fn sid(&self) -> &str {
+        match self {
+            SessionResolution::Fresh(s) | SessionResolution::Resume(s) => s,
+        }
+    }
+}
+
 fn main() -> anyhow::Result<()> {
     let args: Vec<OsString> = std::env::args_os().collect();
 
@@ -198,22 +228,29 @@ fn cmd_run(args: &[OsString]) -> anyhow::Result<()> {
 
     // ── 3. Resolve session id ──────────────────────────────────────────────────
     // A picker path may yield `None` = the user pressed Escape → cancel the launch.
-    let session_id: String = if let Some(explicit_sid) = &flags.session_id {
-        explicit_sid.clone()
+    // Each arm yields a `SessionResolution` that records whether the id is a
+    // brand-new session (→ `--session-id`, create) or an existing one off disk
+    // (→ `--resume`, continue). Passing an existing id via `--session-id` is what
+    // produced the `Error: Session ID … is already in use` failure.
+    let resolution: SessionResolution = if let Some(explicit_sid) = &flags.session_id {
+        // `--session-id <uuid>`: the user explicitly asked to CREATE this id.
+        SessionResolution::Fresh(explicit_sid.clone())
     } else if let Some(resume_arg) = &flags.resume {
         match resume_arg {
             ResumeArg::Id(raw) => {
-                // Resolve alias if not UUID-shaped.
-                if looks_like_uuid(raw) {
+                // Resolve alias if not UUID-shaped. Either way this is an
+                // existing session the user asked to resume.
+                let sid = if looks_like_uuid(raw) {
                     raw.clone()
                 } else {
                     session::resolve_alias(raw).with_context(|| {
                         format!("csm: --resume alias resolution failed for {raw:?}")
                     })?
-                }
+                };
+                SessionResolution::Resume(sid)
             }
             ResumeArg::Picker => match resolve_session_via_picker(&cwd)? {
-                Some(sid) => sid,
+                Some(res) => res,
                 None => {
                     eprintln!("csm: cancelled.");
                     return Ok(());
@@ -222,23 +259,26 @@ fn cmd_run(args: &[OsString]) -> anyhow::Result<()> {
         }
     } else if flags.new {
         // `-n`/`--new`: explicit fresh session.
-        newuuid()
+        SessionResolution::Fresh(newuuid())
     } else if flags.interactive {
         // `-i`/`--interactive`: open session picker.
         match resolve_session_via_picker(&cwd)? {
-            Some(sid) => sid,
+            Some(res) => res,
             None => {
                 eprintln!("csm: cancelled.");
                 return Ok(());
             }
         }
     } else if flags.continue_ {
-        // `-c`/`--continue`: newest free session or fresh.
-        newest_free_sid(&cwd)?.unwrap_or_else(newuuid)
+        // `-c`/`--continue`: newest free session (Resume) or fresh.
+        match newest_free_sid(&cwd)? {
+            Some(sid) => SessionResolution::Resume(sid),
+            None => SessionResolution::Fresh(newuuid()),
+        }
     } else {
         // Default: 0 → fresh, 1 → auto-resume, 2+ → picker.
         match resolve_session_default(&cwd)? {
-            Some(sid) => sid,
+            Some(res) => res,
             None => {
                 eprintln!("csm: cancelled.");
                 return Ok(());
@@ -246,15 +286,27 @@ fn cmd_run(args: &[OsString]) -> anyhow::Result<()> {
         }
     };
 
+    let session_id: String = resolution.sid().to_owned();
+
     // ── 4. Build the claude CLI and launch ──────────────────────────────────────
-    // Always pass `--session-id <sid>`.
+    // Choose the verb by intent: `--session-id` creates a new session, `--resume`
+    // continues an existing one. Using `--session-id` for an existing id is what
+    // claude rejects with "Session ID … is already in use".
     // Restore previous mode/effort/model via sidecar flags (perfect-continue).
     let sidecar_path = paths::sidecar(&session_id);
     let existing_sidecar = sidecar::read_sidecar(&sidecar_path).unwrap_or_default();
 
     let mut cli: Vec<OsString> = Vec::new();
-    cli.push(OsString::from("--session-id"));
-    cli.push(OsString::from(&session_id));
+    match &resolution {
+        SessionResolution::Fresh(sid) => {
+            cli.push(OsString::from("--session-id"));
+            cli.push(OsString::from(sid));
+        }
+        SessionResolution::Resume(sid) => {
+            cli.push(OsString::from("--resume"));
+            cli.push(OsString::from(sid));
+        }
+    }
 
     // Append sidecar flags (mode/effort/model from previous session).
     // Explicit passthru flags override at the claude CLI level (last-wins).
@@ -282,10 +334,11 @@ fn cmd_run(args: &[OsString]) -> anyhow::Result<()> {
 /// Open the interactive fzf session picker.
 ///
 /// Returns:
-/// - `Ok(Some(sid))` — a session id to launch (selected, continued, or fresh —
-///   including the graceful degrade to fresh when fzf is unavailable / no rows).
+/// - `Ok(Some(resolution))` — a session to launch (selected → Resume, continued
+///   → Resume, or fresh → Fresh, including the graceful degrade to Fresh when
+///   fzf is unavailable / no rows).
 /// - `Ok(None)` — the user pressed Escape / Ctrl-C: cancel the launch entirely.
-fn resolve_session_via_picker(cwd: &std::path::Path) -> anyhow::Result<Option<String>> {
+fn resolve_session_via_picker(cwd: &std::path::Path) -> anyhow::Result<Option<SessionResolution>> {
     use picker::session::SessionRow as PickerRow;
     use picker::session::{PickedSession, SessionPicker};
 
@@ -310,28 +363,33 @@ fn resolve_session_via_picker(cwd: &std::path::Path) -> anyhow::Result<Option<St
 
     match sp.pick(newest_live_label) {
         // `None` (fzf unavailable) and `Fresh` both mean "start new" — degrade.
-        None | Some(PickedSession::Fresh) => Ok(Some(newuuid())),
-        Some(PickedSession::Continue) => Ok(Some(newest_free_sid(cwd)?.unwrap_or_else(newuuid))),
-        Some(PickedSession::Resume(sid)) => Ok(Some(sid)),
+        None | Some(PickedSession::Fresh) => Ok(Some(SessionResolution::Fresh(newuuid()))),
+        // Continue → newest free session (Resume) — but if there is none, the
+        // unwrap_or falls back to a brand-new id, which must launch as Fresh.
+        Some(PickedSession::Continue) => Ok(Some(match newest_free_sid(cwd)? {
+            Some(sid) => SessionResolution::Resume(sid),
+            None => SessionResolution::Fresh(newuuid()),
+        })),
+        Some(PickedSession::Resume(sid)) => Ok(Some(SessionResolution::Resume(sid))),
         // Escape / Ctrl-C → cancel the whole launch.
         Some(PickedSession::Cancel) => Ok(None),
     }
 }
 
 /// Default session resolution (no explicit flags):
-///   0 free sessions → fresh UUID
-///   1 free session  → auto-resume that session (0-based free-session sort)
+///   0 free sessions → fresh UUID (Fresh)
+///   1 free session  → auto-resume that session (Resume)
 ///   2+ free sessions → open picker
-/// Returns `Ok(Some(sid))` to launch, or `Ok(None)` when the 2+-session picker
-/// was cancelled (Escape / Ctrl-C).
-fn resolve_session_default(cwd: &std::path::Path) -> anyhow::Result<Option<String>> {
+/// Returns `Ok(Some(resolution))` to launch, or `Ok(None)` when the 2+-session
+/// picker was cancelled (Escape / Ctrl-C).
+fn resolve_session_default(cwd: &std::path::Path) -> anyhow::Result<Option<SessionResolution>> {
     let rows = session::scan(cwd);
     let free: Vec<&session::SessionRow> =
         rows.iter().filter(|r| !session::sid_live(&r.sid)).collect();
 
     match free.len() {
-        0 => Ok(Some(newuuid())),
-        1 => Ok(Some(free[0].sid.clone())),
+        0 => Ok(Some(SessionResolution::Fresh(newuuid()))),
+        1 => Ok(Some(SessionResolution::Resume(free[0].sid.clone()))),
         _ => resolve_session_via_picker(cwd),
     }
 }
@@ -1730,5 +1788,56 @@ mod tests {
     #[test]
     fn is_interactive_does_not_panic() {
         let _ = is_interactive();
+    }
+
+    // ── session-verb selection (regression: "Session ID … is already in use") ──
+    // Mirror the cold-launch verb choice in main(): Fresh → `--session-id`,
+    // Resume → `--resume`. The bug was that an existing (resumed) session id was
+    // launched with `--session-id`, which claude rejects as "already in use".
+
+    /// The leading two CLI tokens (verb + id) main() builds for a resolution.
+    fn launch_verb_and_id(res: &SessionResolution) -> (OsString, OsString) {
+        let mut cli: Vec<OsString> = Vec::new();
+        match res {
+            SessionResolution::Fresh(sid) => {
+                cli.push(OsString::from("--session-id"));
+                cli.push(OsString::from(sid));
+            }
+            SessionResolution::Resume(sid) => {
+                cli.push(OsString::from("--resume"));
+                cli.push(OsString::from(sid));
+            }
+        }
+        (cli[0].clone(), cli[1].clone())
+    }
+
+    #[test]
+    fn fresh_resolution_launches_with_session_id() {
+        let res = SessionResolution::Fresh("11111111-2222-3333-4444-555555555555".to_owned());
+        let (verb, id) = launch_verb_and_id(&res);
+        assert_eq!(verb, OsString::from("--session-id"));
+        assert_eq!(id, OsString::from("11111111-2222-3333-4444-555555555555"));
+        assert_eq!(res.sid(), "11111111-2222-3333-4444-555555555555");
+    }
+
+    #[test]
+    fn resume_resolution_launches_with_resume_not_session_id() {
+        // The exact failure mode: an existing id must NOT be passed via
+        // --session-id (claude → "Session ID … is already in use").
+        let existing = "aabd04a6-7a93-4f38-88cb-ff942f94d013".to_owned();
+        let res = SessionResolution::Resume(existing.clone());
+        let (verb, id) = launch_verb_and_id(&res);
+        assert_eq!(
+            verb,
+            OsString::from("--resume"),
+            "resumed sessions must use --resume, never --session-id"
+        );
+        assert_ne!(
+            verb,
+            OsString::from("--session-id"),
+            "the 'already in use' bug: --session-id on an existing id"
+        );
+        assert_eq!(id, OsString::from(&existing));
+        assert_eq!(res.sid(), existing);
     }
 }

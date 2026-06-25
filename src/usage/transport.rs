@@ -89,7 +89,21 @@ pub fn fetch() -> Result<UsageData, FetchError> {
     // Step 1 — hub-local fast path.
     // Shell lines 657–662.
     if is_hub_local() {
-        return read_hub_local();
+        let data = read_hub_local()?;
+        // Prime the positive cache from the hub-local read (best-effort).
+        //
+        // The hub reads its own usage-limits.json directly and never hit the
+        // network, so historically nothing wrote `.usage-cache.json` here. That
+        // left the cache empty on the hub, so any caller that reads ONLY the
+        // positive cache — `--no-fetch`, or the launcher's `build_account_rows`
+        // when CLAUDE_HUB_HOSTNAME is unset and its hub-local fallback is gated
+        // off — saw "(no usage data)" on the very machine that has the data.
+        // Writing it here closes that gap; failure to cache never fails a good read.
+        if let Err(e) = write_positive_cache(&data) {
+            eprintln!("csm: warning: could not write usage cache: {e}");
+        }
+        let _ = std::fs::remove_file(paths::fetch_failed());
+        return Ok(data);
     }
 
     let positive_ttl = positive_ttl_secs();
