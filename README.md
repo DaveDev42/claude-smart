@@ -37,6 +37,16 @@ parent's environment, so this part is a tiny shim — see *Profiles* below).
 csm [claude-args...]                 bare = smart launch (implicit `csm run`)
 csm run [csm-flags] [-- claude...]   smart launcher (session + account + relaunch)
 
+# run flags (account + session selection)
+  --profile <name>                   launch under this profile (skip all picking)
+  -i, --interactive                  manual pick: force account + session pickers
+  --no-pick                          keep current profile, no scoring
+  -n, --new                          fresh session (skip auto-resume)
+  -c, --continue                     resume newest free session
+  # default: auto-pick the best account by usage; if usage is unavailable
+  #   (hub down OR no scorable data) it opens the picker instead of silently
+  #   staying put. `-i` skips the auto-pick entirely and always asks.
+
 csm profiles [list]                  list configured profiles
 csm profiles add  <name> [<dir>]     register (dir defaults to ~/.claude.<name>)
 csm profiles set  <name> <dir>       register/overwrite a profile dir
@@ -134,12 +144,22 @@ with a staleness header (`⚠ hub data is 7m old …`); `--no-fetch` reads only 
 cache. No hub identifiers are baked into the binary — it ships clean for anyone
 to use.
 
-**Hub-down account selection.** When account auto-selection needs fresh usage but
-the hub can't be reached, `csm` does *not* silently keep the current account. In
-an interactive terminal it opens an fzf account picker showing the last-known
-(stale) usage so you can choose deliberately; in a non-interactive context (the
-Stop hook, scripts) it fails safe to the current profile instead of blocking on a
-picker. **The picker is ordered by recommendation, not alphabetically:** rows are
+**Account picker (hub-down or no scorable data).** Account auto-selection opens
+the fzf account picker — rather than silently keeping the current account —
+whenever it cannot score, which is two distinct cases: (1) **hub-down** — the hub
+can't be reached / returns no usable blob (a *fetch* failure); (2) **no scorable
+data** — the hub responds but no profile yields a usable percentage (every
+profile errored, or none has a `week_all` section, or the profile map is empty).
+Both surface the picker in an interactive terminal so you can choose deliberately
+against the last-known (stale) usage; in a non-interactive context (the Stop
+hook, scripts) both fail safe to the current profile instead of blocking on a
+picker. This is distinct from **all-saturated** — when real percentages exist but
+*every* account is over the limit, there is nothing better to pick, so `csm`
+keeps the current profile with a warning and does **not** open the picker.
+Passing **`-i` / `--interactive`** forces the picker in all of these cases too:
+it skips the auto-pick entirely and always asks (and also forces the session
+picker). `--profile <name>` still wins over everything — explicit, no picking.
+**The picker is ordered by recommendation, not alphabetically:** rows are
 ranked exactly as the live scorer (`pick_best`) would choose — viable accounts
 first (highest `week_all.pct`, soonest-reset tie-break), saturated / session-limited
 / errored / no-data rows below — so the account auto-pick *would* have selected
