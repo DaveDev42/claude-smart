@@ -67,6 +67,17 @@ pub enum ScoringError {
     #[error("all profiles are saturated or at session limit")]
     AllSaturated,
 
+    /// No profile carried any usable usage data — every profile was errored or
+    /// had no `week_all` section (the fetch returned an empty/degenerate blob,
+    /// not a confident "all limited" verdict). Distinct from [`AllSaturated`],
+    /// where we *did* read real percentages and they were all over the line.
+    ///
+    /// "We couldn't tell" must not be silently treated as "stay put": the caller
+    /// opens the interactive picker so the user chooses deliberately, exactly as
+    /// it does for [`FetchFailed`].
+    #[error("no usable usage data for any profile")]
+    NoUsableData,
+
     /// The usage fetch failed (hub down / negative-cache cooldown).
     /// Caller should open the hub-down interactive picker.
     #[error("usage fetch failed: {0}")]
@@ -212,6 +223,12 @@ pub fn pick_best(data: &UsageData, current_profile: &str, include_current: bool)
     }
 
     match best_name {
+        // No winner. Distinguish "we read real numbers and they were all over
+        // the limit" (AllSaturated → keep current) from "no profile had any
+        // usable usage at all" (NoUsableData → open the picker). `candidates`
+        // already excluded errored / no-week_all profiles, so an empty
+        // candidate set means we never had data to score on.
+        None if candidates.is_empty() => Err(ScoringError::NoUsableData),
         None => Err(ScoringError::AllSaturated),
         Some(name) => {
             // include_current=true: winner == current → no-op (shell lines 967–969).
@@ -450,6 +467,56 @@ mod tests {
         );
     }
 
+    // ─── no-usable-data vs all-saturated ──────────────────────────────────────
+
+    /// A profile with NO week_all section (the usage blob arrived empty /
+    /// degenerate for it). `make_profile` always fills week_all, so build it by
+    /// hand.
+    fn make_profile_no_week(session_pct: Option<i64>) -> ProfileUsage {
+        ProfileUsage {
+            captured_at: None,
+            session: session_pct.map(|p| make_section(p, None)),
+            week_all: None,
+            week_sonnet: None,
+            session_stats: vec![],
+        }
+    }
+
+    /// Every profile lacks week_all → zero candidates ever formed. This is
+    /// "we couldn't tell" (NoUsableData → caller opens the picker), NOT
+    /// AllSaturated ("we read real numbers and they were all over the line").
+    #[test]
+    fn no_week_data_anywhere_is_no_usable_data_not_saturated() {
+        let mut profiles = HashMap::new();
+        profiles.insert("a".to_string(), make_profile_no_week(Some(10)));
+        profiles.insert("b".to_string(), make_profile_no_week(None));
+        let data = make_data(profiles);
+        let err = pick_best(&data, "", true).unwrap_err();
+        assert!(
+            matches!(err, ScoringError::NoUsableData),
+            "all-no-week must be NoUsableData (open picker), got {err:?}"
+        );
+    }
+
+    // (empty-profiles and all-errored NoUsableData cases live next to their
+    // former AllSaturated counterparts below, updated to the new verdict.)
+
+    /// Contrast: profiles DID have week_all and they were all saturated →
+    /// candidates formed then gated out → AllSaturated (keep current), NOT
+    /// NoUsableData. Guards the boundary between the two verdicts.
+    #[test]
+    fn real_saturation_stays_all_saturated_not_no_usable_data() {
+        let mut profiles = HashMap::new();
+        profiles.insert("a".to_string(), make_profile(Some(10), 96, None)); // >= SATURATION
+        profiles.insert("b".to_string(), make_profile(Some(10), 98, None));
+        let data = make_data(profiles);
+        let err = pick_best(&data, "", true).unwrap_err();
+        assert!(
+            matches!(err, ScoringError::AllSaturated),
+            "real all-saturated must stay AllSaturated, got {err:?}"
+        );
+    }
+
     /// include_current=false: exclude current from candidates.
     #[test]
     fn exclude_current_in_reactive_mode() {
@@ -482,12 +549,13 @@ mod tests {
         );
     }
 
-    /// Empty profiles → AllSaturated.
+    /// Empty profiles → NoUsableData (we never had a number to score on — the
+    /// caller opens the picker, it must not be mistaken for "all at the limit").
     #[test]
-    fn empty_profiles_is_all_saturated() {
+    fn empty_profiles_is_no_usable_data() {
         let data = make_data(HashMap::new());
         let err = pick_best(&data, "", false).unwrap_err();
-        assert!(matches!(err, ScoringError::AllSaturated));
+        assert!(matches!(err, ScoringError::NoUsableData));
     }
 
     // ─── errored profiles excluded ────────────────────────────────────────────
@@ -513,16 +581,17 @@ mod tests {
         );
     }
 
-    /// All profiles errored → AllSaturated.
+    /// All profiles errored → NoUsableData (transport/scrape failures, not real
+    /// limits — the caller opens the picker rather than silently keeping current).
     #[test]
-    fn all_errored_is_all_saturated() {
+    fn all_errored_is_no_usable_data() {
         let mut profiles = HashMap::new();
         profiles.insert("p1".to_string(), make_profile(Some(5), 50, None));
         let mut errors = HashMap::new();
         errors.insert("p1".to_string(), "error".to_string());
         let data = make_data_with_errors(profiles, errors);
         let err = pick_best(&data, "", false).unwrap_err();
-        assert!(matches!(err, ScoringError::AllSaturated));
+        assert!(matches!(err, ScoringError::NoUsableData));
     }
 
     // ─── session-limit gate ───────────────────────────────────────────────────

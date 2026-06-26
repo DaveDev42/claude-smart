@@ -61,8 +61,10 @@ pub enum ResumeArg {
 /// ```
 #[derive(Debug, Default, PartialEq)]
 pub struct Flags {
-    /// `-i` / `--interactive` — force interactive (TTY) mode.
-    /// (`want_picker=true` in the zsh source)
+    /// `-i` / `--interactive` — manual pick. Forces BOTH pickers: skips account
+    /// auto-pick and always opens the recommendation-ordered account picker, and
+    /// opens the session picker. `--profile <p>` still wins. (`want_picker=true`
+    /// in the zsh source — which forced only the session picker.)
     pub interactive: bool,
     /// `-n` / `--new` — start a fresh session (skip auto-resume).
     /// (`want_new=true` in the zsh source)

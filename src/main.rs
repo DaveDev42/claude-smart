@@ -149,6 +149,14 @@ fn print_help() {
         "  csm run [csm-flags] [-- claude...]   smart launcher (session + account + relaunch)"
     );
     println!("  csm <subcommand> ...\n");
+    println!("RUN FLAGS (account + session selection)");
+    println!("  --profile <name>                     launch under this profile (skip all picking)");
+    println!("  -i, --interactive                    manual pick: force account + session pickers");
+    println!("  --no-pick                            keep current profile, no scoring");
+    println!("  -n, --new                            fresh session (skip auto-resume)");
+    println!("  -c, --continue                       resume newest free session");
+    println!("  (default: auto-pick best account by usage; opens the picker when usage is");
+    println!("   unavailable — hub down or no scorable data — instead of silently staying put)\n");
     println!("PROFILES (registry — ~/.config/claude-as/profiles.json)");
     println!("  csm profiles [list]                  list configured profiles");
     println!("  csm profiles add  <name> [<dir>]     register (dir default ~/.claude.<name>)");
@@ -186,12 +194,19 @@ fn print_help() {
 ///   4. Build `LaunchSpec` (session_id + profile_dir + cwd + cli) and hand off
 ///      to `run_relaunch_loop`.
 ///
-/// Hub-down picker gate (spec §4a):
-///   Open the interactive account picker ONLY when ALL of:
+/// Account picker gates:
+///   `-i`/`--interactive` (manual pick) — ALWAYS open the account picker (and
+///   the session picker), skipping auto-pick, as long as interactive + a
+///   non-empty ProfileMap. `--profile <p>` still wins (explicit choice).
+///
+///   Otherwise the *hub-down / no-data* picker opens when ALL of:
 ///   - interactive (isatty(0) && isatty(1))
 ///   - proactive pick context (not `--profile` / not `--no-pick`)
-///   - `pick_account` returned `Err(FetchFailed)`
-///     NOT when hook / `--profile` / `--no-pick` / non-interactive.
+///   - `pick_account` returned `Err(FetchFailed)` (hub unreachable) OR
+///     `Err(NoUsableData)` (fetch ok but no profile had scorable usage —
+///     "couldn't tell" must not silently keep current).
+///     NOT when hook / `--profile` / `--no-pick` / non-interactive, and NOT for
+///     `AllSaturated` (real limits read → warn + keep current).
 fn cmd_run(args: &[OsString]) -> anyhow::Result<()> {
     use cli::parser::{parse, ResumeArg};
     use platform::relaunch::LaunchSpec;
@@ -208,9 +223,22 @@ fn cmd_run(args: &[OsString]) -> anyhow::Result<()> {
     let current_profile_name = derive_current_profile_name(&profiles);
 
     let profile_dir: PathBuf = if let Some(pin) = &flags.profile {
-        // `--profile <p>` pin — skip all picking.
+        // `--profile <p>` pin — explicit choice, skip all picking (wins over -i).
         let dir = resolve_profile_dir(pin, &profiles)?;
         PathBuf::from(dir)
+    } else if flags.interactive {
+        // `-i`/`--interactive` — manual pick: disable *all* auto-pick / skip.
+        // Always open the account picker (recommendation-ordered, never the
+        // silent auto-pick), regardless of whether the hub is up. Empty
+        // ProfileMap (toss/first-boot) keeps current. The session picker is
+        // also forced later by the same flag.
+        match force_account_pick(&profiles)? {
+            Some(dir) => dir,
+            None => {
+                eprintln!("csm: cancelled.");
+                return Ok(());
+            }
+        }
     } else if flags.no_pick {
         // `--no-pick` — keep current profile without scoring.
         current_profile_dir(&profiles)
@@ -457,9 +485,10 @@ fn derive_current_profile_name(profiles: &account::ProfileMap) -> String {
 ///
 /// Pick guard (mirrors zsh `claude-smart.zsh` lines 204-209, 316-323):
 /// - `pick_account(current, include_current=true)` → scoring pick.
-/// - `Err(FetchFailed)` + interactive → hub-down fzf account picker (§4a).
-/// - `Err(FetchFailed)` + non-interactive → silent fail-safe to current.
-/// - `Err(AllSaturated)` → warn + keep current (no picker; spec §4a).
+/// - `Err(FetchFailed)` (hub down) or `Err(NoUsableData)` (fetch ok but no
+///   scorable usage) + interactive → hub-down fzf account picker (§4a).
+/// - same errors + non-interactive → silent fail-safe to current.
+/// - `Err(AllSaturated)` → warn + keep current (no picker; real limits read).
 fn proactive_pick_profile(
     current_profile: &str,
     profiles: &account::ProfileMap,
@@ -493,7 +522,13 @@ fn proactive_pick_profile(
             );
             Ok(Some(current_dir))
         }
-        Err(ScoringError::FetchFailed(_)) => hub_down_pick(profiles, &current_dir),
+        // Hub unreachable OR fetch succeeded but carried no usable usage for any
+        // profile. Both mean "we could not determine the best account" — never
+        // silently keep current. Open the interactive picker (interactive) or
+        // fail safe to current (non-interactive), same as a hub-down miss.
+        Err(ScoringError::FetchFailed(_)) | Err(ScoringError::NoUsableData) => {
+            hub_down_pick(profiles, &current_dir)
+        }
     }
 }
 
@@ -508,12 +543,41 @@ fn hub_down_pick(
     profiles: &account::ProfileMap,
     current_dir: &Path,
 ) -> anyhow::Result<Option<PathBuf>> {
-    use picker::fzf::PickerOutcome;
-
     // TTY gate: isatty(0) && isatty(1) — matches zsh `[[ -t 0 && -t 1 ]]`.
     if !is_interactive() {
         return Ok(Some(current_dir.to_path_buf()));
     }
+    run_account_picker(profiles, current_dir, "hub-down picker")
+}
+
+/// Forced account picker for `-i`/`--interactive` (manual pick).
+///
+/// Unlike [`hub_down_pick`], this is invoked even when the hub is up and a
+/// confident auto-pick exists: `-i` means "let me choose", so we skip the
+/// auto-pick entirely and always present the recommendation-ordered picker
+/// (Enter still takes the recommendation). The TTY gate still applies — a piped
+/// `-i` has no terminal to host fzf, so it keeps the current profile. An empty
+/// ProfileMap (toss / first-boot) likewise keeps current, nothing to pick.
+fn force_account_pick(profiles: &account::ProfileMap) -> anyhow::Result<Option<PathBuf>> {
+    let current_dir = current_profile_dir(profiles);
+    if profiles.is_empty() || !is_interactive() {
+        return Ok(Some(current_dir));
+    }
+    run_account_picker(profiles, &current_dir, "interactive picker")
+}
+
+/// Shared fzf account-picker driver for [`hub_down_pick`] and
+/// [`force_account_pick`]. Builds recommendation-ordered rows (stale usage if
+/// that is all we have) and maps the fzf outcome:
+/// - Selected → that profile's dir.
+/// - Cancelled (Escape / Ctrl-C) → `None` (caller aborts the launch).
+/// - Unavailable (fzf missing / no rows) → keep current profile.
+fn run_account_picker(
+    profiles: &account::ProfileMap,
+    current_dir: &Path,
+    ctx: &str,
+) -> anyhow::Result<Option<PathBuf>> {
+    use picker::fzf::PickerOutcome;
 
     let rows = build_account_rows(profiles);
     let ap = picker::AccountPicker::new(rows);
@@ -521,7 +585,7 @@ fn hub_down_pick(
     match ap.pick() {
         PickerOutcome::Selected(winner) => {
             let dir = resolve_profile_dir(&winner, profiles)
-                .context("csm: hub-down picker — selected profile not in map")?;
+                .with_context(|| format!("csm: {ctx} — selected profile not in map"))?;
             Ok(Some(PathBuf::from(dir)))
         }
         // Escape / Ctrl-C → cancel the launch.
@@ -1145,6 +1209,10 @@ fn cmd_pick_account(args: &[OsString]) -> anyhow::Result<()> {
         Ok(None) => {}
         Err(account::scoring::ScoringError::AllSaturated) => {
             eprintln!("csm pick-account: all accounts saturated");
+        }
+        Err(account::scoring::ScoringError::NoUsableData) => {
+            eprintln!("csm pick-account: no usable usage data for any profile");
+            std::process::exit(1);
         }
         Err(account::scoring::ScoringError::FetchFailed(e)) => {
             eprintln!("csm pick-account: usage fetch failed: {e}");
