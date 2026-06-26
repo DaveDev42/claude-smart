@@ -41,6 +41,7 @@ csm run [csm-flags] [-- claude...]   smart launcher (session + account + relaunc
   --profile <name>                   launch under this profile (skip all picking)
   -i, --interactive                  manual pick: force account + session pickers
   --no-pick                          keep current profile, no scoring
+  -A, --pick-account                 force an account pick this launch (overrides --no-pick)
   -n, --new                          fresh session (skip auto-resume)
   -c, --continue                     resume newest free session
   # default: auto-pick the best account by usage; if usage is unavailable
@@ -51,7 +52,7 @@ csm profiles [list]                  list configured profiles
 csm profiles add  <name> [<dir>]     register (dir defaults to ~/.claude.<name>)
 csm profiles set  <name> <dir>       register/overwrite a profile dir
 csm profiles rm   <name>             unregister (refused if it is the default)
-csm profiles use  <name>             set the machine default profile
+csm profiles use  <name>             set the machine default profile (+ floor)
 csm profiles edit                    interactive editor (TTY)
 csm profiles dir  [<name>]           print a profile's config dir
 
@@ -59,9 +60,16 @@ csm usage [--json] [--no-fetch]      multi-profile usage table (opt-in; see Hub)
 
 csm pick-account [<cur>] [--include-current]
 csm scan [<cwd>]                     session listing (TSV)
+csm sidecar {read|write|merge|flags} <sid> [k=v...]   per-session state store
 csm statusline                       `<profile>@<host>` for the shell prompt
 csm completions {zsh|bash|pwsh}      shell completions
 ```
+
+> `csm` also recognizes a few **machine-interface** subcommands meant for
+> automation, not hand typing: `csm hook` (the Stop/SubagentStop/SessionEnd
+> limit-switch hook, wired from Claude Code `settings.json`), `csm cas` (the
+> `eval`-shim contract behind the shell `cas` function), and `csm current-usage`
+> (a raw usage probe used by the shims). They work without a profile registry.
 
 ### No collision with `claude`
 
@@ -108,6 +116,12 @@ function cas { Invoke-Expression ((Get-Command csm -CommandType Application).Sou
 sets the machine-wide default; `cas status` shows the current/default/available
 profiles.
 
+Setting the machine default also updates a **floor** — a platform-level default
+`CLAUDE_CONFIG_DIR` (a `launchctl setenv` on macOS, an `HKCU\Environment` value
+on Windows) so that GUI / launchd / non-shell launches of `claude` land on the
+real profile too, not just shells that sourced the `cas` function. On systems
+without such a mechanism the floor step is a no-op.
+
 ### Without a registry (degraded mode)
 
 The registry is **optional**. With no `~/.config/claude-as/profiles.json` (a
@@ -118,7 +132,7 @@ the plain smart launcher still works, and the registry-dependent commands fail
 | Command | Without a registry |
 |---|---|
 | `csm run` (and bare `csm`) | works — launches `claude` under the current `CLAUDE_CONFIG_DIR` |
-| `csm scan`, `statusline`, `newuuid`, `completions`, `sidecar` | work — they don't need the registry |
+| `csm scan`, `statusline`, `newuuid`, `completions`, `sidecar`, `hook` | work — they don't need the registry (`hook` falls back to the current `CLAUDE_CONFIG_DIR`) |
 | `csm profiles list` | prints `(profiles.json absent — CAS/pick features disabled)` |
 | `csm usage` | prints `usage metering disabled …` + `(no profiles configured — `csm profiles add <name>`)` |
 | `csm pick-account` | no-op (empty stdout), prints the `csm profiles add <name>` hint, exits 0 |
@@ -197,8 +211,9 @@ on it for account scoring.)
 See [`examples/usage-collector.sh`](examples/usage-collector.sh) for a reference
 `CSM_USAGE_CMD`: it shows the three practical strategies — proxy an existing hub
 endpoint (one `curl`), re-emit a cache file, or synthesize the JSON from
-per-profile facts. (The full usage JSON shape and a reference hub deployment are
-documented in the design notes under `docs/`.)
+per-profile facts. Its header comment also documents the **full usage JSON
+shape** (`profiles[<name>].session.pct` / `.week_all.pct` / `.resets`) and the
+scoring rules csm applies to it, so it doubles as the format reference.
 
 ## License
 
