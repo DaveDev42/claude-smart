@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.5](https://github.com/DaveDev42/claude-smart/compare/v0.2.4...v0.2.5) (2026-06-26)
+
+
+### Features
+
+* **picker:** usage 파악 불가 시 auto-pick skip 금지 + -i로 picker 강제 ([b2971b0](https://github.com/DaveDev42/claude-smart/commit/b2971b0d8c45d14817a6f79f4647d4e71c68b393))
+
 ## [0.2.4](https://github.com/DaveDev42/claude-smart/compare/v0.2.3...v0.2.4) (2026-06-25)
 
 
