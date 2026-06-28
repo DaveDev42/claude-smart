@@ -191,44 +191,19 @@ fn stop_managed_process(sid: &str) -> anyhow::Result<()> {
 /// Returns true if `pid` is a live process whose exe basename ends with "claude" or "node"
 /// (case-insensitive; `.exe` stripped on Windows).
 ///
-/// Uses targeted `sysinfo` refresh (never a full sweep) on Windows/Linux,
-/// and `ps -o comm=` on macOS (POSIX-only path).
+/// Uses a targeted `sysinfo` refresh (never a full sweep) on every platform.
 pub fn check_is_live_claude_or_node(pid: u32) -> bool {
-    platform_is_live_claude_or_node(pid)
+    is_live_claude_or_node(pid)
 }
 
 fn is_live_claude_or_node(pid: u32) -> bool {
-    platform_is_live_claude_or_node(pid)
-}
-
-/// Shared name-check helper: `basename` must end with "claude" or "node" (case-insensitive).
-pub fn is_claude_or_node_name(base: &str) -> bool {
-    let l = base.to_ascii_lowercase();
-    l.ends_with("claude") || l.ends_with("node")
+    // Cross-platform: `SysinfoProcCheck` does a single-process refresh + exe()
+    // basename match (no `ps` spawn). Wired identically on macOS/Linux/Windows.
+    use crate::platform::proc_check::ProcCheck;
+    crate::platform::proc_check::SysinfoProcCheck::is_live_claude_or_node(pid)
 }
 
 // ─── cfg(unix) implementations ────────────────────────────────────────────────
-
-#[cfg(unix)]
-fn platform_is_live_claude_or_node(pid: u32) -> bool {
-    // POSIX: `ps -o comm= -p <pid>` — NOT `-o args=` (avoids leaking CLAUDE_CONFIG_DIR).
-    use std::process::Command;
-    let output = match Command::new("ps")
-        .args(["-o", "comm=", "-p", &pid.to_string()])
-        .output()
-    {
-        Ok(o) => o,
-        Err(_) => return false,
-    };
-    if !output.status.success() {
-        return false;
-    }
-    let comm = String::from_utf8_lossy(&output.stdout);
-    let base = comm.trim();
-    // Strip path prefix: take only the final component.
-    let basename = base.rsplit('/').next().unwrap_or(base);
-    is_claude_or_node_name(basename)
-}
 
 #[cfg(unix)]
 fn platform_stop(pid: u32, _sid: &str) -> anyhow::Result<()> {
@@ -241,25 +216,6 @@ fn platform_stop(pid: u32, _sid: &str) -> anyhow::Result<()> {
 }
 
 // ─── cfg(windows) implementations ─────────────────────────────────────────────
-
-#[cfg(windows)]
-fn platform_is_live_claude_or_node(pid: u32) -> bool {
-    // Windows: targeted sysinfo refresh (never a full system sweep on the hot stop path).
-    use sysinfo::{Pid, ProcessRefreshKind, System};
-    let mut sys = System::new();
-    let sysinfo_pid = Pid::from_u32(pid);
-    sys.refresh_process_specifics(sysinfo_pid, ProcessRefreshKind::new());
-    let Some(proc) = sys.process(sysinfo_pid) else {
-        return false;
-    };
-    let Some(exe_name) = proc.exe().and_then(|p| p.file_name()) else {
-        return false;
-    };
-    let name = exe_name.to_string_lossy();
-    // Strip .exe suffix for comparison.
-    let base = name.strip_suffix(".exe").unwrap_or(&name);
-    is_claude_or_node_name(base)
-}
 
 #[cfg(windows)]
 fn platform_stop(pid: u32, sid: &str) -> anyhow::Result<()> {
@@ -308,39 +264,9 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
-    /// is_claude_or_node_name recognizes bare "claude" and "node".
-    #[test]
-    fn name_check_basic() {
-        assert!(is_claude_or_node_name("claude"));
-        assert!(is_claude_or_node_name("node"));
-    }
-
-    /// is_claude_or_node_name is case-insensitive.
-    #[test]
-    fn name_check_case_insensitive() {
-        assert!(is_claude_or_node_name("Claude"));
-        assert!(is_claude_or_node_name("NODE"));
-        assert!(is_claude_or_node_name("CLAUDE"));
-    }
-
-    /// is_claude_or_node_name rejects unrelated names.
-    #[test]
-    fn name_check_rejects_unrelated() {
-        assert!(!is_claude_or_node_name("bash"));
-        assert!(!is_claude_or_node_name("python3"));
-        assert!(!is_claude_or_node_name("csm"));
-        assert!(!is_claude_or_node_name(""));
-    }
-
-    /// is_claude_or_node_name is tolerant of "some-claude" style names (ends_with).
-    #[test]
-    fn name_check_ends_with_tolerant() {
-        // Spec: `l.ends_with("claude") || l.ends_with("node")`
-        // "claude-3" does NOT end with "claude" — correct per spec.
-        assert!(!is_claude_or_node_name("claude-3"));
-        // A name ending in "claude" (e.g. from a renamed binary) matches.
-        assert!(is_claude_or_node_name("some-claude"));
-    }
+    // The exe-basename name check (claude/node, case-insensitive, ends_with)
+    // lives in `platform::proc_check` and is tested there; this module delegates
+    // to `SysinfoProcCheck` rather than re-implementing it.
 
     /// write_noclobber: first write succeeds; second write is silently ignored.
     #[test]

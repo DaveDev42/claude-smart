@@ -32,11 +32,9 @@ pub fn is_claude_or_node_name(base: &str) -> bool {
 /// refresh (never `refresh_all()` — a full sweep stalls the hot Stop path on a
 /// busy Windows box).
 ///
-/// This impl is available on any platform where `sysinfo` is compiled in (all
-/// targets), but the `platform/mod.rs` dispatch wires it only for Windows-native.
-/// On Linux it is available as an alternative to `PosixProcCheck` if needed.
-/// (Dead on unix builds where `PosixProcCheck` is wired; live on Windows-native.)
-#[cfg_attr(unix, allow(dead_code))]
+/// `platform/mod.rs` wires this as `PlatformProcCheck` on every target — sysinfo
+/// gives a targeted exe()-basename lookup on macOS, Linux/WSL, and Windows alike,
+/// so there is no external `ps` spawn and no per-OS proc-check code to maintain.
 pub struct SysinfoProcCheck;
 
 impl ProcCheck for SysinfoProcCheck {

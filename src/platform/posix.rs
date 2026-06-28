@@ -13,8 +13,9 @@
 //!   - On exit: `tcsetpgrp(tty_fd, parent_pgid)` reclaims the tty and SIGTTOU is
 //!     restored.
 //!
-//! `PosixProcCheck` — `ps -o comm= -p <pid>` (NOT `-o args=` — that would leak
-//! `CLAUDE_CONFIG_DIR` into log-visible call traces).
+//! The "is PID a live claude/node?" check is platform-agnostic and lives in
+//! `proc_check::SysinfoProcCheck` (no external `ps` spawn), so this module only
+//! provides the POSIX launcher.
 
 use std::collections::HashMap;
 use std::ffi::OsString;
@@ -24,7 +25,6 @@ use std::process::{Command, ExitStatus};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::launcher::{ChildHandle, Launcher};
-use super::proc_check::{is_claude_or_node_name, ProcCheck};
 
 /// The binary `csm run` launches. Overridable via `CLAUDE_SMART_CLAUDE_BIN`
 /// for tests / non-standard installs (matches the shell's `$CLAUDE_BIN`).
@@ -144,39 +144,5 @@ fn wait_for(mut child: std::process::Child) -> io::Result<ExitStatus> {
     }
 }
 
-// ─── PosixProcCheck ───────────────────────────────────────────────────────────
-
-/// POSIX `ProcCheck` implementation via `ps -o comm= -p <pid>`.
-///
-/// Uses `comm` (not `args`) so that `CLAUDE_CONFIG_DIR` and other env vars are
-/// never visible in the command that this process itself runs (avoids leaking
-/// secrets into audit logs or `ps` output visible to other users).
-///
-/// Linux `comm` truncates at 15 chars, but "claude" (6) and "node" (4) both fit.
-pub struct PosixProcCheck;
-
-impl ProcCheck for PosixProcCheck {
-    fn is_live_claude_or_node(pid: u32) -> bool {
-        use std::process::Command;
-
-        let out = Command::new("ps")
-            .args(["-o", "comm=", "-p", &pid.to_string()])
-            .output();
-
-        match out {
-            Ok(o) if o.status.success() => {
-                let comm = String::from_utf8_lossy(&o.stdout);
-                let basename = comm.trim();
-                // `comm` may include a full path on some systems; take the last
-                // component before the name check.
-                let name = std::path::Path::new(basename)
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or(basename);
-                is_claude_or_node_name(name)
-            }
-            // Process absent or ps failed → not live.
-            _ => false,
-        }
-    }
-}
+// The "is PID a live claude/node?" check lives in `proc_check::SysinfoProcCheck`,
+// wired as `PlatformProcCheck` for every target (no external `ps` spawn).

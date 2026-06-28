@@ -12,11 +12,10 @@ pub mod windows;
 // ─── Compile-time platform dispatch ──────────────────────────────────────────
 //
 // PlatformLauncher: the OS-specific foreground supervisor impl.
-// PlatformProcCheck: the OS-specific "is PID a live claude/node?" impl.
-//
-// Linux (WSL): PosixLauncher + PosixProcCheck.  Both fit because "claude" and
-// "node" are well under the 15-char comm truncation limit, and ps(1) is always
-// present.  sysinfo would also work on Linux; ps is simpler.
+// PlatformProcCheck: the "is PID a live claude/node?" impl — `SysinfoProcCheck`
+// on every platform. sysinfo gives a targeted single-process refresh + exe()
+// basename on all targets, so there is no external `ps` spawn (and no separate
+// POSIX vs Windows code path to keep in sync). The launcher stays OS-specific.
 
 #[cfg(unix)]
 pub use posix::PosixLauncher as PlatformLauncher;
@@ -24,9 +23,4 @@ pub use posix::PosixLauncher as PlatformLauncher;
 #[cfg(windows)]
 pub use windows::WindowsLauncher as PlatformLauncher;
 
-#[cfg(unix)]
-pub use posix::PosixProcCheck as PlatformProcCheck;
-
-// Windows-native: use SysinfoProcCheck (exe() path instead of ps comm).
-#[cfg(all(not(unix), windows))]
 pub use proc_check::SysinfoProcCheck as PlatformProcCheck;
