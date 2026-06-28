@@ -178,7 +178,9 @@ impl SessionPicker {
             // instead of silently starting a fresh session.
             engine::PickerOutcome::Cancelled => Some(PickedSession::Cancel),
             // No usable terminal → degrade (None) per the existing contract.
-            engine::PickerOutcome::Unavailable => None,
+            // `SelectedMulti` is unreachable (this picker is single-select
+            // `run_picker`); fold it into the same degrade to stay exhaustive.
+            engine::PickerOutcome::Unavailable | engine::PickerOutcome::SelectedMulti(_) => None,
         }
     }
 

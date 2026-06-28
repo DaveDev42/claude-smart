@@ -4,14 +4,18 @@
 //! (`platform/posix.rs`). When claude (or `csm` itself) dies abnormally it can
 //! leave residual processes behind: MCP servers, sandbox helpers, Bash-tool
 //! background commands, or — if the supervisor died — a `claude` that outlived
-//! it. This module discovers those candidates and (in later phases) lets the
-//! user pick which to kill. **Phase 1 implements discovery + `--dry-run` only**:
-//! it lists candidates and exits without an interactive picker or any kill.
+//! it. This module discovers those candidates and lets the user pick which to
+//! kill: candidates are shown in a multi-select picker and exactly the chosen
+//! pids are signalled (SIGKILL by default, SIGTERM with `--term`). `--dry-run`
+//! lists candidates and exits without a picker or any kill. No kill ever happens
+//! without an interactive selection — a non-interactive context reports and
+//! exits rather than auto-killing.
 //!
 //! The decision logic lives in the pure `scan` submodule; this file is the thin
 //! I/O shell that captures the live process table (sysinfo + `getpgid`) and the
 //! clock, then calls in.
 
+pub mod kill;
 pub mod scan;
 
 use std::ffi::OsString;
@@ -20,8 +24,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::Context as _;
 
 use crate::paths;
+use crate::picker::engine::{self, PickerOpts, PickerOutcome};
 use crate::platform::pid::read_pid_file;
-use scan::{candidate_row, select_candidates, Candidate, ProcRow, Session};
+use kill::{kill_all, summarize, KillSignal};
+use scan::{candidate_row, select_candidates, session_claude_is_live, Candidate, ProcRow, Session};
 
 /// Which sessions a reap run is scoped to.
 #[derive(Debug, Clone)]
@@ -162,13 +168,19 @@ fn cmd_snippet(cmd: &[String]) -> String {
 
 /// Run the reaper for `scope`.
 ///
-/// **Phase 1**: only `dry_run = true` is supported — discover candidates and
-/// print them, killing nothing. A non-dry-run call returns an error directing
-/// the user to the (not-yet-built) interactive path so the command can never
-/// silently kill before the picker + kill mechanics land in Phase 2.
-pub fn run(scope: ReapScope, dry_run: bool) -> anyhow::Result<()> {
-    let sessions = sessions_for(&scope);
-    if sessions.is_empty() {
+/// `dry_run` lists candidates and exits without a picker or any kill. Otherwise
+/// the candidates are shown in a multi-select picker and the chosen pids are
+/// killed (`term` selects SIGTERM over the default SIGKILL). No kill ever
+/// happens without an interactive selection: a non-interactive context degrades
+/// to "report and exit" rather than auto-killing.
+///
+/// **Live-session guard:** a session whose recorded claude is still alive and
+/// supervised is skipped entirely — its children are legitimate working
+/// processes, not orphans. Only sessions whose claude has died (stale pidfile)
+/// contribute candidates.
+pub fn run(scope: ReapScope, dry_run: bool, term: bool) -> anyhow::Result<()> {
+    let all_sessions = sessions_for(&scope);
+    if all_sessions.is_empty() {
         match &scope {
             ReapScope::One(sid) => {
                 println!("csm reap: no pidfile for session {sid} — nothing to inspect");
@@ -184,34 +196,49 @@ pub fn run(scope: ReapScope, dry_run: bool) -> anyhow::Result<()> {
     let self_pid = std::process::id();
     let now = now_epoch();
 
-    // Per-session candidates. `include_live_claude = false` in Phase 1: the
-    // startup class-3 ("claude outlived a dead csm") path is a later phase, and
-    // surfacing a still-supervised claude as a kill target here would be unsafe.
+    // Live-session guard: drop sessions whose claude is still alive + supervised.
+    // Their descendants are working processes, not orphans.
+    let mut skipped_live = 0usize;
+    let mut sessions: Vec<&Session> = Vec::new();
+    for s in &all_sessions {
+        if session_claude_is_live(&table, s) {
+            skipped_live += 1;
+        } else {
+            sessions.push(s);
+        }
+    }
+
+    // Per-session candidates. `include_live_claude = false`: the startup class-3
+    // ("claude outlived a dead csm") path is a later phase, and surfacing a
+    // supervised claude as a kill target here would be unsafe.
     let mut total: Vec<(String, Candidate)> = Vec::new();
     for session in &sessions {
-        let cands = select_candidates(&table, session, self_pid, false);
-        for c in cands {
+        for c in select_candidates(&table, session, self_pid, false) {
             total.push((session.sid.clone(), c));
         }
     }
 
+    let live_note = if skipped_live > 0 {
+        format!(" ({skipped_live} live session(s) skipped)")
+    } else {
+        String::new()
+    };
+
     if total.is_empty() {
         println!(
-            "csm reap: {} session(s) inspected, no orphan candidates found",
-            sessions.len()
+            "csm reap: {} session(s) inspected, no orphan candidates found{live_note}",
+            all_sessions.len()
         );
         return Ok(());
     }
 
     if dry_run {
         println!(
-            "csm reap (dry-run): {} candidate(s) across {} session(s):",
+            "csm reap (dry-run): {} candidate(s) across {} dead session(s){live_note}:",
             total.len(),
             sessions.len()
         );
         for (sid, c) in &total {
-            // Re-use the picker TSV layout, but show col1/col2 too in dry-run so
-            // the human sees the pid + kind plainly.
             let row = candidate_row(c, now);
             let display = row.splitn(3, '\t').nth(2).unwrap_or(&row);
             println!(
@@ -223,12 +250,52 @@ pub fn run(scope: ReapScope, dry_run: bool) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    // Phase 2 will replace this with the multi-select picker + SIGKILL.
-    anyhow::bail!(
-        "csm reap: interactive kill is not implemented yet (Phase 2). \
-         Re-run with --dry-run to list the {} candidate(s).",
-        total.len()
-    )
+    // ── interactive kill ────────────────────────────────────────────────────
+    // Build the picker rows (col1 = pid, col2 = kind tag, field 3+ = display).
+    let rows: Vec<String> = total.iter().map(|(_, c)| candidate_row(c, now)).collect();
+    let opts = PickerOpts {
+        prompt: "reap > ".to_string(),
+        display_from: 3,
+        delimiter: '\t',
+    };
+
+    match engine::run_multi_picker(&rows, &opts) {
+        PickerOutcome::SelectedMulti(keys) => {
+            let pids: Vec<u32> = keys.iter().filter_map(|k| k.parse().ok()).collect();
+            if pids.is_empty() {
+                println!("csm reap: nothing selected — killed nothing");
+                return Ok(());
+            }
+            let signal = if term {
+                KillSignal::Term
+            } else {
+                KillSignal::Kill
+            };
+            let results = kill_all(&pids, signal);
+            println!("{}", summarize(&results));
+            Ok(())
+        }
+        // Escape / Ctrl-C → the user aborted; kill nothing.
+        PickerOutcome::Cancelled => {
+            println!("csm reap: cancelled — killed nothing");
+            Ok(())
+        }
+        // No usable terminal (piped / headless) or empty → never auto-kill.
+        // Report the candidate count and exit cleanly so a non-interactive
+        // context degrades instead of hanging or surprising the user.
+        PickerOutcome::Unavailable => {
+            println!(
+                "csm reap: {} orphan candidate(s) found across {} dead session(s){live_note}, \
+                 but no interactive terminal is available — killed nothing. \
+                 Re-run with --dry-run to list them, or run interactively to select.",
+                total.len(),
+                sessions.len()
+            );
+            Ok(())
+        }
+        // Unreachable: run_multi_picker never returns the single-select variant.
+        PickerOutcome::Selected(_) => unreachable!("multi picker never returns Selected"),
+    }
 }
 
 /// First 8 chars of a session id, for compact dry-run lines.
@@ -244,11 +311,13 @@ pub fn cmd(args: &[OsString]) -> anyhow::Result<()> {
     let mut session: Option<String> = None;
     let mut dry_run = false;
     let mut explicit_all = false;
+    let mut term = false;
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.to_string_lossy().as_ref() {
             "--dry-run" => dry_run = true,
             "--all" => explicit_all = true,
+            "--term" => term = true,
             "--session" => {
                 let v = it
                     .next()
@@ -265,25 +334,34 @@ pub fn cmd(args: &[OsString]) -> anyhow::Result<()> {
     if explicit_all && session.is_some() {
         anyhow::bail!("csm reap: --all and --session are mutually exclusive");
     }
-    run(ReapScope::resolve(session), dry_run)
+    run(ReapScope::resolve(session), dry_run, term)
 }
 
 fn print_help() {
     println!(
-        "csm reap — discover orphan processes left by a csm-managed claude session\n\
+        "csm reap — discover and kill orphan processes left by a csm-managed claude session\n\
          \n\
          USAGE:\n\
-         \x20   csm reap [--dry-run] [--all | --session <sid>]\n\
+         \x20   csm reap [--dry-run] [--term] [--all | --session <sid>]\n\
          \n\
          FLAGS:\n\
-         \x20   --dry-run          List candidates and exit (Phase 1: the only mode that runs)\n\
+         \x20   --dry-run          List candidates and exit without a picker or any kill\n\
+         \x20   --term             Send SIGTERM instead of the default SIGKILL (POSIX;\n\
+         \x20                      ignored on Windows, which has no SIGTERM analogue)\n\
          \x20   --all              Inspect every csm-managed session (default scope)\n\
          \x20   --session <sid>    Inspect one session\n\
          \x20   -h, --help         Show this help\n\
          \n\
          A candidate is a live process correlated to a session's claude by process\n\
          group (durable across re-parenting) or parent chain, started after the\n\
-         session began. Interactive kill lands in a later phase."
+         session began. Sessions whose claude is still alive are skipped — their\n\
+         children are working processes, not orphans.\n\
+         \n\
+         Without --dry-run, candidates are shown in a multi-select picker (space/tab\n\
+         to toggle, ⌃a to toggle all, ⏎ to confirm) and exactly the chosen pids are\n\
+         killed. Nothing is killed without an interactive selection: with no usable\n\
+         terminal the candidates are reported and the command exits, never\n\
+         auto-killing."
     );
 }
 
