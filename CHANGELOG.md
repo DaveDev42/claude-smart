@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.9](https://github.com/DaveDev42/claude-smart/compare/v0.2.8...v0.2.9) (2026-06-28)
+
+
+### Features
+
+* **config:** launch a configurable drop-in command instead of claude ([e3e2b5d](https://github.com/DaveDev42/claude-smart/commit/e3e2b5d1f7d9fd988f39a68f32ab7380e4b1924c))
+
 ## [0.2.8](https://github.com/DaveDev42/claude-smart/compare/v0.2.7...v0.2.8) (2026-06-28)
 
 
