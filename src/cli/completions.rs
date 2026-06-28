@@ -141,12 +141,15 @@ pub enum CompletionsSubcmd {
         cwd: Option<String>,
     },
 
-    /// Discover orphan processes left behind by a csm-managed claude session.
+    /// Discover and kill orphan processes left behind by a csm-managed claude session.
     #[command(name = "reap")]
     Reap {
-        /// List candidates and exit without killing anything.
+        /// List candidates and exit without a picker or any kill.
         #[arg(long)]
         dry_run: bool,
+        /// Send SIGTERM instead of the default SIGKILL (POSIX; ignored on Windows).
+        #[arg(long)]
+        term: bool,
         /// Inspect every csm-managed session (the default scope).
         #[arg(long)]
         all: bool,

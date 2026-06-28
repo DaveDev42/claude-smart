@@ -44,6 +44,11 @@ use nucleo_matcher::{Config, Matcher};
 pub enum PickerOutcome {
     /// The user selected a row; the payload is the recovered col1 key.
     Selected(String),
+    /// The user confirmed a multi-select; the payload is the recovered col1 key
+    /// of every toggled row, in original `rows` order. May be empty (the user
+    /// confirmed with nothing toggled) — the caller treats that as "select none".
+    /// Only produced by [`run_multi_picker`].
+    SelectedMulti(Vec<String>),
     /// The user pressed Escape or Ctrl-C / Ctrl-G — abort.
     Cancelled,
     /// No usable terminal, empty input, or a terminal I/O error — the caller
@@ -166,6 +171,173 @@ pub fn run_picker(rows: &[String], opts: &PickerOpts) -> PickerOutcome {
     // A terminal I/O error degrades to `Unavailable` (caller falls back) rather
     // than bubbling up — a picker failure must never abort the launch.
     run_picker_inner(rows, opts).unwrap_or(PickerOutcome::Unavailable)
+}
+
+/// Interactive **multi-select** fuzzy picker over `rows`. See the module contract.
+///
+/// Same display/recovery rules as [`run_picker`], but the user toggles any number
+/// of rows (Space/Tab), can toggle every currently-filtered row at once (Ctrl-A),
+/// and confirms with Enter. Returns:
+/// - `SelectedMulti(keys)` on Enter — the col1 keys of all toggled rows in
+///   original `rows` order (possibly empty if nothing was toggled),
+/// - `Cancelled` on Escape / Ctrl-C / Ctrl-G,
+/// - `Unavailable` for empty `rows`, no usable terminal, or a terminal I/O error.
+///
+/// Selection is tracked by **original row index**, so toggles survive query
+/// changes (filtering a row out of view never drops its selection).
+pub fn run_multi_picker(rows: &[String], opts: &PickerOpts) -> PickerOutcome {
+    if rows.is_empty() {
+        return PickerOutcome::Unavailable;
+    }
+    if !terminal_available() {
+        return PickerOutcome::Unavailable;
+    }
+    run_multi_picker_inner(rows, opts).unwrap_or(PickerOutcome::Unavailable)
+}
+
+/// Toggle every row index in `filtered` within `selected` (Ctrl-A semantics).
+///
+/// If *all* filtered rows are already selected, the action deselects them all;
+/// otherwise it selects all of them. This "select-all / clear-all" toggle is the
+/// convenience the reaper exposes for "kill everything". Pure for unit testing.
+pub(crate) fn toggle_all(filtered: &[usize], selected: &mut std::collections::BTreeSet<usize>) {
+    let all_selected = !filtered.is_empty() && filtered.iter().all(|i| selected.contains(i));
+    if all_selected {
+        for i in filtered {
+            selected.remove(i);
+        }
+    } else {
+        for &i in filtered {
+            selected.insert(i);
+        }
+    }
+}
+
+fn run_multi_picker_inner(rows: &[String], opts: &PickerOpts) -> io::Result<PickerOutcome> {
+    use std::collections::BTreeSet;
+
+    let _guard = TermGuard::enter()?;
+    let mut out = io::stderr();
+    let mut matcher = Matcher::new(Config::DEFAULT);
+
+    let mut query = String::new();
+    let mut filtered: Vec<usize> = rank(rows, &query, opts, &mut matcher);
+    let mut cursor_pos: usize = 0; // index into `filtered`
+    let mut selected: BTreeSet<usize> = BTreeSet::new(); // original row indices
+
+    loop {
+        let (cols, term_rows) = terminal::size().unwrap_or((80, 24));
+        // 2 lines of chrome: the query line + a help/status line.
+        let list_capacity = (term_rows as usize).saturating_sub(2).max(1);
+        let visible = filtered.len().min(list_capacity);
+        if visible == 0 {
+            cursor_pos = 0;
+        } else if cursor_pos >= visible {
+            cursor_pos = visible - 1;
+        }
+
+        // ── render ──────────────────────────────────────────────────────────
+        queue!(out, cursor::MoveTo(0, 0), Clear(ClearType::All))?;
+        queue!(
+            out,
+            Print(format!(
+                "{}{}    [{} selected]",
+                opts.prompt,
+                query,
+                selected.len()
+            ))
+        )?;
+        for (screen_row, &row_idx) in filtered.iter().take(list_capacity).enumerate() {
+            let mut text = project_display(&rows[row_idx], opts);
+            // Marker is 6 chars: "> [x] " / "  [ ] ".
+            let max = (cols as usize).saturating_sub(6);
+            if text.chars().count() > max {
+                text = text.chars().take(max).collect();
+            }
+            let cursor_mark = if screen_row == cursor_pos { ">" } else { " " };
+            let check = if selected.contains(&row_idx) {
+                "x"
+            } else {
+                " "
+            };
+            queue!(
+                out,
+                cursor::MoveTo(0, (screen_row + 1) as u16),
+                Print(format!("{cursor_mark} [{check}] {text}"))
+            )?;
+        }
+        // Help line at the bottom of the list.
+        queue!(
+            out,
+            cursor::MoveTo(0, (visible + 1) as u16),
+            Print("  ⏎ confirm · space/tab toggle · ⌃a all · esc cancel")
+        )?;
+        out.flush()?;
+
+        // ── input ───────────────────────────────────────────────────────────
+        match event::read()? {
+            Event::Key(k) if k.kind == KeyEventKind::Press => {
+                let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
+                match k.code {
+                    KeyCode::Esc => return Ok(PickerOutcome::Cancelled),
+                    KeyCode::Char('c') if ctrl => return Ok(PickerOutcome::Cancelled),
+                    KeyCode::Char('g') if ctrl => return Ok(PickerOutcome::Cancelled),
+                    KeyCode::Enter => {
+                        // Confirm: recover col1 of every selected row, in
+                        // original `rows` order (BTreeSet iterates ascending).
+                        let keys: Vec<String> = selected
+                            .iter()
+                            .map(|&i| recover_col1(&rows[i], opts.delimiter))
+                            .collect();
+                        return Ok(PickerOutcome::SelectedMulti(keys));
+                    }
+                    // Toggle the row under the cursor (Space or Tab).
+                    KeyCode::Char(' ') | KeyCode::Tab => {
+                        if let Some(&row_idx) = filtered.get(cursor_pos) {
+                            if !selected.remove(&row_idx) {
+                                selected.insert(row_idx);
+                            }
+                            // Advance so repeated toggles walk down the list.
+                            if cursor_pos + 1 < visible {
+                                cursor_pos += 1;
+                            }
+                        }
+                    }
+                    // Ctrl-A: toggle all currently-filtered rows.
+                    KeyCode::Char('a') if ctrl => {
+                        toggle_all(&filtered, &mut selected);
+                    }
+                    KeyCode::Up => cursor_pos = cursor_pos.saturating_sub(1),
+                    KeyCode::Char('p') if ctrl => cursor_pos = cursor_pos.saturating_sub(1),
+                    KeyCode::Down => {
+                        if cursor_pos + 1 < visible {
+                            cursor_pos += 1;
+                        }
+                    }
+                    KeyCode::Char('n') if ctrl => {
+                        if cursor_pos + 1 < visible {
+                            cursor_pos += 1;
+                        }
+                    }
+                    KeyCode::Backspace => {
+                        query.pop();
+                        filtered = rank(rows, &query, opts, &mut matcher);
+                        cursor_pos = 0;
+                    }
+                    // Printable chars extend the query. Space is reserved for
+                    // toggle above, so it never reaches here.
+                    KeyCode::Char(c) if !ctrl => {
+                        query.push(c);
+                        filtered = rank(rows, &query, opts, &mut matcher);
+                        cursor_pos = 0;
+                    }
+                    _ => {}
+                }
+            }
+            Event::Resize(_, _) => {}
+            _ => {}
+        }
+    }
 }
 
 /// RAII terminal guard: enters raw mode + alternate screen on construction and
@@ -375,5 +547,63 @@ mod tests {
             PickerOutcome::Selected("x".into()),
             PickerOutcome::Cancelled
         );
+    }
+
+    // ── multi-select helpers ──────────────────────────────────────────────────
+
+    #[test]
+    fn toggle_all_selects_then_clears() {
+        use std::collections::BTreeSet;
+        let filtered = vec![0usize, 2, 5];
+        let mut sel: BTreeSet<usize> = BTreeSet::new();
+        // First toggle: none selected → select all filtered.
+        toggle_all(&filtered, &mut sel);
+        assert_eq!(sel, BTreeSet::from([0, 2, 5]));
+        // Second toggle: all selected → clear them.
+        toggle_all(&filtered, &mut sel);
+        assert!(sel.is_empty(), "second toggle_all should clear: {sel:?}");
+    }
+
+    #[test]
+    fn toggle_all_selects_when_partially_selected() {
+        use std::collections::BTreeSet;
+        let filtered = vec![0usize, 1, 2];
+        let mut sel: BTreeSet<usize> = BTreeSet::from([1]); // partial
+                                                            // Not all selected → select all (does not clear).
+        toggle_all(&filtered, &mut sel);
+        assert_eq!(sel, BTreeSet::from([0, 1, 2]));
+    }
+
+    #[test]
+    fn toggle_all_only_touches_filtered_rows() {
+        use std::collections::BTreeSet;
+        // A row selected but NOT in the current filter must be left alone.
+        let filtered = vec![0usize, 1];
+        let mut sel: BTreeSet<usize> = BTreeSet::from([9]); // 9 not in filter
+        toggle_all(&filtered, &mut sel);
+        assert!(
+            sel.contains(&9),
+            "out-of-filter selection must persist: {sel:?}"
+        );
+        assert!(sel.contains(&0) && sel.contains(&1));
+    }
+
+    #[test]
+    fn selected_multi_recovers_col1_in_row_order() {
+        // Simulate what the confirm branch does: a BTreeSet of row indices maps
+        // back to col1 keys in ascending (original) order.
+        use std::collections::BTreeSet;
+        let rows = [
+            "100\tchild\tfoo".to_string(),
+            "200\tchild\tbar".to_string(),
+            "300\tchild\tbaz".to_string(),
+        ];
+        let selected: BTreeSet<usize> = BTreeSet::from([2, 0]); // out-of-order insert
+        let keys: Vec<String> = selected
+            .iter()
+            .map(|&i| recover_col1(&rows[i], '\t'))
+            .collect();
+        // BTreeSet iterates ascending → keys are in original row order.
+        assert_eq!(keys, vec!["100".to_string(), "300".to_string()]);
     }
 }

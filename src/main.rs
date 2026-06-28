@@ -175,7 +175,7 @@ fn print_help() {
     println!("  csm pick-account [<cur>] [--include-current]   scoring → winner profile");
     println!("  csm scan [<cwd>]                     session TSV for the picker");
     println!(
-        "  csm reap [--dry-run] [--all|--session <sid>]   list orphan processes left by claude"
+        "  csm reap [--dry-run] [--term] [--all|--session <sid>]   kill orphan processes left by claude"
     );
     println!("  csm sidecar {{read|write|merge|flags}} <sid> [k=v...]");
     println!("  csm statusline                       `<profile>@<host>` for the shell prompt");
@@ -592,7 +592,11 @@ fn run_account_picker(
         // Escape / Ctrl-C → cancel the launch.
         PickerOutcome::Cancelled => Ok(None),
         // No usable terminal / empty → keep current profile (graceful degrade).
-        PickerOutcome::Unavailable => Ok(Some(current_dir.to_path_buf())),
+        // `SelectedMulti` is unreachable here (the account picker is single-select
+        // `run_picker`); fold it into the same graceful degrade to stay exhaustive.
+        PickerOutcome::Unavailable | PickerOutcome::SelectedMulti(_) => {
+            Ok(Some(current_dir.to_path_buf()))
+        }
     }
 }
 

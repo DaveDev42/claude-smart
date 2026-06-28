@@ -131,6 +131,28 @@ pub fn ppid_descendants(table: &[ProcRow], root: u32) -> std::collections::BTree
     reached
 }
 
+/// PURE: is this session's claude **still alive and supervised** in the snapshot?
+///
+/// True iff the recorded `claude_pid` is present in `table`, its `start_time`
+/// matches the session's `born` exactly (so it is THE claude we recorded, not a
+/// recycled pid), and its exe is `claude`/`node`. When true, the session is a
+/// *live* one — its children are legitimate working processes, NOT orphans — so
+/// the reaper must skip the whole session (the live-session guard). When false,
+/// the recorded claude has died (the pidfile is stale) and its descendants are
+/// real orphan candidates.
+///
+/// This is the reaper's analogue of the relaunch loop's clobber guard
+/// (`platform/relaunch.rs`): both ask "is the recorded pid a live claude that
+/// genuinely belongs to this session?" — here against a one-shot snapshot so the
+/// answer is consistent with the candidate scan that uses the same table.
+pub fn session_claude_is_live(table: &[ProcRow], session: &Session) -> bool {
+    table.iter().any(|p| {
+        p.pid == session.claude_pid
+            && p.start_time == session.born
+            && is_claude_or_node_name(&p.exe_base)
+    })
+}
+
 /// PURE: select reap candidates for `session` from a process-table snapshot.
 ///
 /// `self_pid` is the reaper's own pid (never a candidate). `include_live_claude`
@@ -429,5 +451,38 @@ mod tests {
         // Display portion carries the human bits.
         assert!(r.contains("age=0:01:05"), "row: {r}");
         assert!(r.contains("node mcp-server.js"), "row: {r}");
+    }
+
+    #[test]
+    fn session_live_when_claude_present_born_matches_and_exe_is_claude() {
+        let table = vec![
+            row(CLAUDE, Some(1), Some(CLAUDE), BORN, "claude"),
+            row(200, Some(CLAUDE), Some(CLAUDE), BORN + 5, "node"),
+        ];
+        assert!(
+            session_claude_is_live(&table, &session(CLAUDE, BORN)),
+            "a present claude with matching born + claude exe must read as live"
+        );
+    }
+
+    #[test]
+    fn session_not_live_when_claude_pid_absent() {
+        // The recorded claude died (pidfile is stale); only its orphaned child
+        // remains. Not live → its children are real candidates.
+        let table = vec![row(200, Some(1), Some(CLAUDE), BORN + 5, "node")];
+        assert!(
+            !session_claude_is_live(&table, &session(CLAUDE, BORN)),
+            "absent claude pid must read as not-live"
+        );
+    }
+
+    #[test]
+    fn session_not_live_on_born_mismatch_or_wrong_exe() {
+        // Same pid, different start_time → a recycled pid, not our claude.
+        let recycled = vec![row(CLAUDE, Some(1), Some(CLAUDE), BORN + 99, "claude")];
+        assert!(!session_claude_is_live(&recycled, &session(CLAUDE, BORN)));
+        // Exact born but a non-claude exe → a same-second impostor on the pid.
+        let impostor = vec![row(CLAUDE, Some(1), Some(CLAUDE), BORN, "firefox")];
+        assert!(!session_claude_is_live(&impostor, &session(CLAUDE, BORN)));
     }
 }
