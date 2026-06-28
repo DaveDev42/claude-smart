@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.6](https://github.com/DaveDev42/claude-smart/compare/v0.2.5...v0.2.6) (2026-06-28)
+
+
+### Bug Fixes
+
+* **paths:** encode cwd with [^A-Za-z0-9]→- to match Claude Code ([9433fbb](https://github.com/DaveDev42/claude-smart/commit/9433fbb0010a8cce085e84250a5eaafe06afb162))
+
 ## [0.2.5](https://github.com/DaveDev42/claude-smart/compare/v0.2.4...v0.2.5) (2026-06-26)
 
 
