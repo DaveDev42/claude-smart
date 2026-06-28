@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.2.8](https://github.com/DaveDev42/claude-smart/compare/v0.2.7...v0.2.8) (2026-06-28)
+
+
+### Features
+
+* **reaper:** add `csm reap` orphan-process discovery (Phase 1, dry-run only) ([9776463](https://github.com/DaveDev42/claude-smart/commit/9776463dd4e267d36118d0bfbb3d73a6b3fea9c6))
+* **reaper:** interactive multi-select kill for csm reap (Phase 2) ([38dc41e](https://github.com/DaveDev42/claude-smart/commit/38dc41ebbe7b183091765bc3b2ca5d9f96c5094a))
+
+
+### Bug Fixes
+
+* **reaper:** Windows kill_one — HANDLE is isize in windows-sys 0.52 ([a398536](https://github.com/DaveDev42/claude-smart/commit/a3985368310e1bd16e5fad25e53690edf6ad9c24))
+
 ## [0.2.7](https://github.com/DaveDev42/claude-smart/compare/v0.2.6...v0.2.7) (2026-06-28)
 
 
