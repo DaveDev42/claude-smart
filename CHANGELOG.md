@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.7](https://github.com/DaveDev42/claude-smart/compare/v0.2.6...v0.2.7) (2026-06-28)
+
+
+### Bug Fixes
+
+* **picker:** always show session picker, mark recommended account with ★ ([23b789e](https://github.com/DaveDev42/claude-smart/commit/23b789e43624f36f67a991b35568d0f26fd61332))
+
 ## [0.2.6](https://github.com/DaveDev42/claude-smart/compare/v0.2.5...v0.2.6) (2026-06-28)
 
 
