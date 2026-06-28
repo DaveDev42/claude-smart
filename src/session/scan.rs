@@ -687,7 +687,7 @@ mod tests {
     #[test]
     fn encode_cwd_dots_in_path() {
         let (cur, leg) = paths::encode_cwd(Path::new("/Users/example/Projects/github.com/foo"));
-        // current: slashes AND dots → dashes
+        // current: every non-alphanumeric char → dash (so the '.' in github.com too)
         assert!(cur.contains("github-com"));
         // legacy: only slashes → dashes; dots preserved
         assert!(leg.contains("github.com"));

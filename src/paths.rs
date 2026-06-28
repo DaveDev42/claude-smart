@@ -145,38 +145,53 @@ pub fn session_base_dir() -> PathBuf {
 
 // ─── cwd encoding ─────────────────────────────────────────────────────────────
 //
-// Claude Code encodes the cwd into the `projects/` subdir name. Two variants
-// exist on disk across machines/versions; callers must union both.
+// Claude Code encodes the cwd into the `projects/` subdir name. The rule (per
+// the official CC docs + empirical evidence) is a naive per-character
+// substitution over the raw native path string: **every non-alphanumeric
+// character (`[^A-Za-z0-9]`) → `-`**. No normalization, no run-collapsing.
 //
-// Derived from `claude-smart-helper.sh.j2` `encode_cwd()` (lines 197-203):
+//   POSIX:   /Users/example/Projects/github.com/foo
+//            → -Users-example-Projects-github-com-foo
+//   Windows: C:\Users\example\Projects\github.com\foo
+//            → C--Users-example-Projects-github-com-foo
+//            (note `C:\` → `C--`: colon → `-` AND backslash → `-`, two dashes)
 //
-//   # current: / and . → -
-//   printf '%s\n' "${cwd//[\/.]/-}"
-//   # legacy: only / → -
-//   printf '%s\n' "${cwd//\//-}"
+// A *legacy* variant also exists: older CC versions wrote a directory name
+// where only `/` was replaced (`.` and other chars preserved). Both dirs can
+// coexist on a machine, so `encode_cwd` returns both and the caller unions all
+// that exist on disk (`session_dirs_for`), deduplicating identical results (a
+// cwd whose every char is alphanumeric or `/` produces the same string from
+// both variants). On Windows the legacy `/`-only string still contains `\`/`:`,
+// so that directory never exists on disk → a harmless dead union member.
 //
-// The *current* encoding (what CC writes today) replaces BOTH `/` and `.` with
-// `-`. The *legacy* encoding preserved `.` and only replaced `/`. On any given
-// machine both dirs may exist, so `encode_cwd` returns both and the caller
-// unions all that exist on disk, deduplicating identical results (a cwd with no
-// dots produces the same string from both variants).
+// NOTE (ASCII vs Unicode): we use ASCII `is_ascii_alphanumeric`, matching CC's
+// ASCII character class — a non-ASCII folder char (e.g. a Korean letter) is
+// non-alphanumeric here and becomes `-`. If a future empirical check shows CC
+// preserves Unicode letters, switch `current` to `char::is_alphanumeric`.
 
 /// Return `(current, legacy)` encoded forms of `path`.
 ///
-/// - `current`: every `/` **and** `.` → `-`
-/// - `legacy`:  every `/` → `-` only (`.` preserved)
+/// - `current`: every non-alphanumeric char (`[^A-Za-z0-9]`) → `-`
+///   (mirrors what Claude Code writes to `projects/<enc>` today).
+/// - `legacy`:  every `/` → `-` only (historical CC format; other chars kept).
 ///
-/// When `path` has no `.` characters, `current == legacy`. Callers must dedup.
+/// When every char of `path` is alphanumeric or `/`, `current == legacy`.
+/// Callers must dedup.
 pub fn encode_cwd(path: &Path) -> (String, String) {
     let s = path.to_string_lossy();
 
-    // current: replace both '/' and '.' with '-'
+    // current: replace every non-alphanumeric character with '-'.
+    // Mirrors Claude Code's own cwd→projects-dir rule: a naive per-character
+    // substitution of `[^A-Za-z0-9]` → `-` over the raw native path string
+    // (so a Windows `C:\…` prefix becomes `C--…`: colon → `-` AND backslash → `-`).
+    // ASCII-only `is_ascii_alphanumeric` is intentional — CC's rule is an ASCII
+    // character class, so non-ASCII path chars are replaced too (see module note).
     let current: String = s
         .chars()
-        .map(|c| if c == '/' || c == '.' { '-' } else { c })
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
         .collect();
 
-    // legacy: replace only '/' with '-'
+    // legacy: replace only '/' with '-' (historical CC format; '.' preserved).
     let legacy: String = s.chars().map(|c| if c == '/' { '-' } else { c }).collect();
 
     (current, legacy)
@@ -260,6 +275,34 @@ mod tests {
     fn encode_cwd_identical_when_no_dots() {
         let (cur, leg) = encode_cwd(Path::new("/foo/bar/baz"));
         assert_eq!(cur, leg);
+    }
+
+    #[test]
+    fn encode_cwd_windows_path() {
+        // Windows cwd. CC replaces every non-alphanumeric char with '-', so the
+        // `C:\` drive prefix becomes `C--` (colon → '-' AND backslash → '-').
+        // legacy replaces only '/', so a backslash path is left fully intact —
+        // that dir never exists on disk → harmless dead union member.
+        //
+        // Cross-platform note: `Path::new(r"C:\Users\example\...")` on macOS/Linux
+        // treats '\' as an ordinary path char, so `to_string_lossy()` round-trips
+        // the backslashes verbatim and this assertion holds on the dev machine too.
+        check(
+            r"C:\Users\example\Projects\github.com\magicmoment",
+            "C--Users-example-Projects-github-com-magicmoment",
+            r"C:\Users\example\Projects\github.com\magicmoment",
+        );
+    }
+
+    #[test]
+    fn encode_cwd_space_and_underscore_broaden() {
+        // Locks the broad `[^A-Za-z0-9]` rule: spaces and underscores (neither '/'
+        // nor '.') must become '-' in the current encoding. legacy keeps them.
+        check(
+            "/Users/example/My Project/some_repo",
+            "-Users-example-My-Project-some-repo",
+            "-Users-example-My Project-some_repo",
+        );
     }
 
     #[test]
