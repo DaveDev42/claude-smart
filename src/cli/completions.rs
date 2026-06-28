@@ -141,6 +141,20 @@ pub enum CompletionsSubcmd {
         cwd: Option<String>,
     },
 
+    /// Discover orphan processes left behind by a csm-managed claude session.
+    #[command(name = "reap")]
+    Reap {
+        /// List candidates and exit without killing anything.
+        #[arg(long)]
+        dry_run: bool,
+        /// Inspect every csm-managed session (the default scope).
+        #[arg(long)]
+        all: bool,
+        /// Inspect a single session by id.
+        #[arg(long, value_name = "SID")]
+        session: Option<String>,
+    },
+
     /// Print session/week usage percentages for a profile.
     #[command(name = "current-usage")]
     CurrentUsage {
@@ -319,6 +333,7 @@ mod tests {
             "cas",
             "pick-account",
             "scan",
+            "reap",
             "current-usage",
             "sidecar",
             "statusline",

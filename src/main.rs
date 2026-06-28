@@ -5,6 +5,7 @@ mod hook;
 mod paths;
 mod picker;
 mod platform;
+mod reaper;
 mod session;
 mod sidecar;
 mod statusline;
@@ -93,7 +94,7 @@ fn main() -> anyhow::Result<()> {
         }
         match candidate.as_ref() {
             "run" | "hook" | "profiles" | "usage" | "cas" | "pick-account" | "scan"
-            | "current-usage" | "sidecar" | "statusline" | "completions" | "newuuid" => {
+            | "current-usage" | "sidecar" | "statusline" | "completions" | "newuuid" | "reap" => {
                 subcommand = Box::leak(candidate.into_owned().into_boxed_str());
                 rest = &args[2..];
             }
@@ -117,6 +118,7 @@ fn main() -> anyhow::Result<()> {
         "cas" => cmd_cas(rest),
         "pick-account" => cmd_pick_account(rest),
         "scan" => cmd_scan(rest),
+        "reap" => reaper::cmd(rest),
         "current-usage" => cmd_current_usage(rest),
         "sidecar" => cmd_sidecar(rest),
         "statusline" => cmd_statusline(rest),
@@ -172,6 +174,9 @@ fn print_help() {
     println!("OTHER");
     println!("  csm pick-account [<cur>] [--include-current]   scoring → winner profile");
     println!("  csm scan [<cwd>]                     session TSV for the picker");
+    println!(
+        "  csm reap [--dry-run] [--all|--session <sid>]   list orphan processes left by claude"
+    );
     println!("  csm sidecar {{read|write|merge|flags}} <sid> [k=v...]");
     println!("  csm statusline                       `<profile>@<host>` for the shell prompt");
     println!("  csm completions {{zsh|bash|pwsh}}      shell completions");
