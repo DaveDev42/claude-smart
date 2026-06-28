@@ -51,11 +51,6 @@ const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
 /// the child pid immediately after spawn; 0 means "no child / don't forward".
 static CHILD_PGID: AtomicU32 = AtomicU32::new(0);
 
-/// The binary `csm run` launches. Overridable via `CLAUDE_SMART_CLAUDE_BIN`.
-fn claude_bin() -> OsString {
-    std::env::var_os("CLAUDE_SMART_CLAUDE_BIN").unwrap_or_else(|| OsString::from("claude"))
-}
-
 /// Console control handler. Runs on a dedicated OS thread when the user presses
 /// Ctrl-C / Ctrl-Break or the console signals close.
 ///
@@ -102,7 +97,13 @@ impl Launcher for WindowsLauncher {
             .map(|d| d.as_secs() as i64)
             .unwrap_or(0);
 
-        let mut cmd = Command::new(claude_bin());
+        // Resolve the launch command: CLAUDE_SMART_CLAUDE_BIN env > config.json
+        // `launchCommand` > "claude". out[0] is the binary; out[1..] are tokens
+        // prepended to the claude-style argv (multi-token, e.g. `npx happy`).
+        let launch = crate::config::resolve_launch_command();
+        let (bin, prefix) = launch.split_first().expect("resolver returns ≥1 token");
+        let mut cmd = Command::new(bin);
+        cmd.args(prefix);
         cmd.args(cli);
         for (k, v) in env {
             cmd.env(k, v);

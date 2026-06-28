@@ -1,6 +1,7 @@
 mod account;
 mod cas;
 mod cli;
+mod config;
 mod hook;
 mod paths;
 mod picker;
@@ -93,7 +94,7 @@ fn main() -> anyhow::Result<()> {
             _ => {}
         }
         match candidate.as_ref() {
-            "run" | "hook" | "profiles" | "usage" | "cas" | "pick-account" | "scan"
+            "run" | "hook" | "profiles" | "config" | "usage" | "cas" | "pick-account" | "scan"
             | "current-usage" | "sidecar" | "statusline" | "completions" | "newuuid" | "reap" => {
                 subcommand = Box::leak(candidate.into_owned().into_boxed_str());
                 rest = &args[2..];
@@ -114,6 +115,7 @@ fn main() -> anyhow::Result<()> {
         "run" => cmd_run(rest),
         "hook" => cmd_hook(rest),
         "profiles" => cmd_profiles(rest),
+        "config" => cmd_config(rest),
         "usage" => cmd_usage(rest),
         "cas" => cmd_cas(rest),
         "pick-account" => cmd_pick_account(rest),
@@ -139,9 +141,11 @@ fn main() -> anyhow::Result<()> {
 ///
 /// The reserved subcommand words are DELIBERATELY disjoint from `claude`'s
 /// subcommand set (agents/auth/auto-mode/doctor/install/mcp/plugin/project/
-/// setup-token/ultrareview/update). Any first token NOT listed here falls
-/// through to an implicit `csm run` → forwarded verbatim to `claude`, so
-/// `csm mcp …`, `csm doctor`, etc. reach claude untouched.
+/// setup-token/ultrareview/update). `config` is also disjoint — `claude config`
+/// is not a recognized claude subcommand (it prints top-level help). Any first
+/// token NOT listed here falls through to an implicit `csm run` → forwarded
+/// verbatim to `claude`, so `csm mcp …`, `csm doctor`, etc. reach claude
+/// untouched.
 fn print_help() {
     let v = env!("CARGO_PKG_VERSION");
     println!("csm {v} — claude-smart launcher\n");
@@ -169,6 +173,13 @@ fn print_help() {
     println!("  csm profiles use  <name>             set machine default + floor");
     println!("  csm profiles edit                    interactive editor (TTY)");
     println!("  csm profiles dir  [<name>]           print a profile's dir (default if omitted)\n");
+    println!("CONFIG (csm's own — ~/.config/claude-smart/config.json)");
+    println!("  csm config [show]                    print the config JSON");
+    println!("  csm config get launch-command        print the resolved launch command");
+    println!(
+        "  csm config set launch-command <cmd>...   launch <cmd> instead of `claude` (e.g. happy)"
+    );
+    println!("  csm config unset launch-command      revert to launching `claude`\n");
     println!("USAGE METERING");
     println!("  csm usage [--json] [--no-fetch]      multi-profile usage table (offline-aware)\n");
     println!("OTHER");
@@ -1056,6 +1067,83 @@ fn parse_cas_op(op_args: &[String]) -> anyhow::Result<cas::Op> {
             profile: profile.to_owned(),
         }),
     }
+}
+
+// ─── config ──────────────────────────────────────────────────────────────────
+
+/// `csm config <verb> ...` — csm's own global config (`~/.config/claude-smart/
+/// config.json`), distinct from the `~/.config/claude-as/` profile contract.
+///
+/// Verbs (noun-verb, mirroring `cmd_profiles`):
+///   show                         print the config JSON (bare `csm config` ≡ show)
+///   get   launch-command         print the resolved launch command tokens
+///   set   launch-command <c>...  launch `<c> …` instead of `claude` (drop-in)
+///   unset launch-command         clear the override (revert to `claude`)
+///
+/// Only the `launch-command` key is exposed today; the grammar leaves room for
+/// future keys without changing the verb shape.
+fn cmd_config(args: &[OsString]) -> anyhow::Result<()> {
+    let verb = args.first().map(|a| a.to_string_lossy().into_owned());
+    let key = args.get(1).map(|a| a.to_string_lossy().into_owned());
+    // Remaining tokens (after `<verb> <key>`) are the launch-command argv.
+    let rest: Vec<String> = args
+        .iter()
+        .skip(2)
+        .map(|a| a.to_string_lossy().into_owned())
+        .collect();
+
+    /// Reject any key other than the single one we expose today.
+    fn require_launch_command(key: Option<&str>, verb: &str) -> anyhow::Result<()> {
+        match key {
+            Some("launch-command") => Ok(()),
+            Some(other) => {
+                anyhow::bail!("csm config {verb}: unknown key '{other}' (expected launch-command)")
+            }
+            None => anyhow::bail!("csm config {verb}: missing key (expected launch-command)"),
+        }
+    }
+
+    match verb.as_deref() {
+        None | Some("show") => {
+            let cfg = config::Config::load().context("csm config: failed to load config.json")?;
+            println!("{}", serde_json::to_string_pretty(&cfg)?);
+        }
+        Some("get") => {
+            require_launch_command(key.as_deref(), "get")?;
+            // Print the EFFECTIVE launch command (env > config > "claude"),
+            // space-joined, so users see what `csm run` will actually spawn.
+            let tokens = config::resolve_launch_command();
+            let joined: Vec<String> = tokens
+                .iter()
+                .map(|t| t.to_string_lossy().into_owned())
+                .collect();
+            println!("{}", joined.join(" "));
+        }
+        Some("set") => {
+            require_launch_command(key.as_deref(), "set")?;
+            if rest.is_empty() {
+                anyhow::bail!(
+                    "csm config set launch-command: missing command \
+                     (e.g. `csm config set launch-command happy`)"
+                );
+            }
+            let mut cfg = config::Config::load().unwrap_or_default();
+            cfg.launch_command = rest;
+            cfg.save()
+                .context("csm config: failed to write config.json")?;
+        }
+        Some("unset") => {
+            require_launch_command(key.as_deref(), "unset")?;
+            let mut cfg = config::Config::load().unwrap_or_default();
+            cfg.launch_command.clear();
+            cfg.save()
+                .context("csm config: failed to write config.json")?;
+        }
+        Some(other) => {
+            anyhow::bail!("csm config: unknown verb '{other}' (expected show|get|set|unset)");
+        }
+    }
+    Ok(())
 }
 
 // ─── profiles ────────────────────────────────────────────────────────────────

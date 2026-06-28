@@ -111,6 +111,13 @@ pub enum CompletionsSubcmd {
         verb: Option<ProfilesVerb>,
     },
 
+    /// csm's own global config (~/.config/claude-smart/config.json).
+    #[command(name = "config")]
+    Config {
+        #[command(subcommand)]
+        verb: Option<ConfigVerb>,
+    },
+
     /// Multi-profile usage table (registry ∪ hub), offline-aware.
     #[command(name = "usage")]
     Usage {
@@ -241,6 +248,35 @@ pub enum ProfilesVerb {
     },
 }
 
+/// `csm config <verb>` — global config verbs.
+#[derive(clap::Subcommand)]
+pub enum ConfigVerb {
+    /// Print the config JSON (bare `csm config` ≡ show).
+    #[command(name = "show")]
+    Show,
+    /// Print the resolved value of a config key.
+    #[command(name = "get")]
+    Get {
+        /// Config key (currently: launch-command).
+        key: String,
+    },
+    /// Set a config key. e.g. `set launch-command happy`.
+    #[command(name = "set")]
+    Set {
+        /// Config key (currently: launch-command).
+        key: String,
+        /// Value tokens (the launch command argv).
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        value: Vec<String>,
+    },
+    /// Clear a config key (revert to default). e.g. `unset launch-command`.
+    #[command(name = "unset")]
+    Unset {
+        /// Config key (currently: launch-command).
+        key: String,
+    },
+}
+
 // ─── generate ─────────────────────────────────────────────────────────────────
 
 /// Generate completions for `shell` and write them to `out`.
@@ -332,6 +368,7 @@ mod tests {
             "run",
             "hook",
             "profiles",
+            "config",
             "usage",
             "cas",
             "pick-account",

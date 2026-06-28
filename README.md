@@ -142,6 +142,32 @@ the plain smart launcher still works, and the registry-dependent commands fail
 So account scoring / auto-switch / pick-account simply don't engage until you
 `csm profiles add` at least one profile — nothing crashes.
 
+## Configuration
+
+`csm` keeps its own settings in `~/.config/claude-smart/config.json` (separate
+from the `~/.config/claude-as/` profile registry above). Today the only setting
+is the **launch command**: which binary `csm run` spawns instead of `claude`.
+This lets you point `csm` at a drop-in Claude Code wrapper — e.g.
+[`happy`](https://github.com/slopus/happy-cli) (mobile/web client) or `tp` —
+that accepts the same arguments as `claude`:
+
+```sh
+csm config set launch-command happy   # csm run now launches `happy`
+csm config get launch-command         # prints the effective launch command
+csm config show                       # prints the whole config JSON
+csm config unset launch-command       # revert to launching `claude`
+```
+
+The value is stored as an **argv token array**, so multi-token commands work
+too — `csm config set launch-command npx happy` writes
+`{ "launchCommand": ["npx", "happy"] }` and spawns `npx happy …`. Tokens are
+never shell-split; pass each word separately.
+
+Resolution precedence (highest first): the `CLAUDE_SMART_CLAUDE_BIN` environment
+variable (a single binary, for tests / one-off overrides) → the config file's
+`launchCommand` → the default `claude`. An absent or empty config launches
+`claude` as before.
+
 ## Hub (usage metering — opt-in)
 
 `csm usage` and account scoring read usage data from a **hub** — a machine you

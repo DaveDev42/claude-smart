@@ -96,7 +96,8 @@ Run `/verify` before every commit (test + clippy + leak guard, in one pass).
 
 ## CLI surface (collision-safe)
 
-`run, hook, profiles {list|add|set|rm|use|edit|dir}, usage [--json|--no-fetch],
+`run, hook, profiles {list|add|set|rm|use|edit|dir},
+config {show|get|set|unset launch-command}, usage [--json|--no-fetch],
 pick-account, scan, sidecar, statusline, completions, newuuid` + machine
 interface `cas` (+ back-compat `cas <verb>` aliases, `current-usage`). Full
 design + collision analysis: `dave-environment` spec

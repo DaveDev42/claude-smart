@@ -26,12 +26,6 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::launcher::{ChildHandle, Launcher};
 
-/// The binary `csm run` launches. Overridable via `CLAUDE_SMART_CLAUDE_BIN`
-/// for tests / non-standard installs (matches the shell's `$CLAUDE_BIN`).
-fn claude_bin() -> OsString {
-    std::env::var_os("CLAUDE_SMART_CLAUDE_BIN").unwrap_or_else(|| OsString::from("claude"))
-}
-
 // ─── PosixLauncher ────────────────────────────────────────────────────────────
 
 /// POSIX foreground supervisor.  See module-level doc for the full protocol.
@@ -64,7 +58,13 @@ impl Launcher for PosixLauncher {
             .open("/dev/tty")
             .ok();
 
-        let mut cmd = Command::new(claude_bin());
+        // Resolve the launch command: CLAUDE_SMART_CLAUDE_BIN env > config.json
+        // `launchCommand` > "claude". out[0] is the binary; out[1..] are tokens
+        // prepended to the claude-style argv (multi-token, e.g. `npx happy`).
+        let launch = crate::config::resolve_launch_command();
+        let (bin, prefix) = launch.split_first().expect("resolver returns ≥1 token");
+        let mut cmd = Command::new(bin);
+        cmd.args(prefix);
         cmd.args(cli);
         for (k, v) in env {
             cmd.env(k, v);

@@ -110,6 +110,18 @@ pub fn profiles_json() -> PathBuf {
         .join("profiles.json")
 }
 
+/// `~/.config/claude-smart/config.json` — csm's OWN global config (drop-in
+/// launch command + future settings). Distinct from `~/.config/claude-as/`,
+/// which is the profile-switch contract shared with the `cas` shell shims;
+/// this is csm's own runtime config, not part of that contract.
+pub fn config_json() -> PathBuf {
+    dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".config")
+        .join("claude-smart")
+        .join("config.json")
+}
+
 /// Hub-local usage limits cache (read directly when this machine IS the hub —
 /// the `CLAUDE_HUB_HOSTNAME` fast path).
 /// `$HOME/claude-code-usage/cache/usage-limits.json`
@@ -331,6 +343,25 @@ mod tests {
         assert!(
             s.contains("claude-as"),
             "profiles_json not under claude-as: {s}"
+        );
+    }
+
+    #[test]
+    fn config_json_is_under_claude_smart() {
+        let p = config_json();
+        let s = p.to_string_lossy();
+        assert!(s.contains(".config"), "config_json not under .config: {s}");
+        assert!(
+            s.contains("claude-smart"),
+            "config_json not under claude-smart: {s}"
+        );
+        assert!(
+            !s.contains("claude-as"),
+            "config_json must NOT be under the claude-as profile contract: {s}"
+        );
+        assert!(
+            s.ends_with("config.json"),
+            "config_json must end with config.json: {s}"
         );
     }
 
