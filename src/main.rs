@@ -153,10 +153,12 @@ fn print_help() {
     println!("  --profile <name>                     launch under this profile (skip all picking)");
     println!("  -i, --interactive                    manual pick: force account + session pickers");
     println!("  --no-pick                            keep current profile, no scoring");
-    println!("  -n, --new                            fresh session (skip auto-resume)");
     println!("  -c, --continue                       resume newest free session");
-    println!("  (default: auto-pick best account by usage; opens the picker when usage is");
-    println!("   unavailable — hub down or no scorable data — instead of silently staying put)\n");
+    println!("  (default: always opens the session picker — new / continue / pick existing —");
+    println!("   and auto-picks the best account by usage; opens the account picker when usage");
+    println!(
+        "   is unavailable — hub down or no scorable data — instead of silently staying put)\n"
+    );
     println!("PROFILES (registry — ~/.config/claude-as/profiles.json)");
     println!("  csm profiles [list]                  list configured profiles");
     println!("  csm profiles add  <name> [<dir>]     register (dir default ~/.claude.<name>)");
@@ -285,9 +287,6 @@ fn cmd_run(args: &[OsString]) -> anyhow::Result<()> {
                 }
             },
         }
-    } else if flags.new {
-        // `-n`/`--new`: explicit fresh session.
-        SessionResolution::Fresh(newuuid())
     } else if flags.interactive {
         // `-i`/`--interactive`: open session picker.
         match resolve_session_via_picker(&cwd)? {
@@ -404,22 +403,19 @@ fn resolve_session_via_picker(cwd: &std::path::Path) -> anyhow::Result<Option<Se
     }
 }
 
-/// Default session resolution (no explicit flags):
-///   0 free sessions → fresh UUID (Fresh)
-///   1 free session  → auto-resume that session (Resume)
-///   2+ free sessions → open picker
-/// Returns `Ok(Some(resolution))` to launch, or `Ok(None)` when the 2+-session
-/// picker was cancelled (Escape / Ctrl-C).
+/// Default session resolution (no explicit flags): ALWAYS open the session
+/// picker so the choice (new / continue / pick an existing session) is never
+/// made silently. The picker's `__NEW__` / `__CONTINUE__` sentinels mean a
+/// zero- or one-session directory still presents a meaningful choice.
+///
+/// Skipping only happens where a picker *cannot* run: no usable terminal
+/// (pipe / CI / hook) degrades to a fresh session inside
+/// [`resolve_session_via_picker`], so non-interactive launches never block.
+///
+/// Returns `Ok(Some(resolution))` to launch, or `Ok(None)` when the picker was
+/// cancelled (Escape / Ctrl-C).
 fn resolve_session_default(cwd: &std::path::Path) -> anyhow::Result<Option<SessionResolution>> {
-    let rows = session::scan(cwd);
-    let free: Vec<&session::SessionRow> =
-        rows.iter().filter(|r| !session::sid_live(&r.sid)).collect();
-
-    match free.len() {
-        0 => Ok(Some(SessionResolution::Fresh(newuuid()))),
-        1 => Ok(Some(SessionResolution::Resume(free[0].sid.clone()))),
-        _ => resolve_session_via_picker(cwd),
-    }
+    resolve_session_via_picker(cwd)
 }
 
 /// Return the newest free (non-live) session id for `cwd`, or `None`.
@@ -705,9 +701,21 @@ fn build_account_rows(profiles: &account::ProfileMap) -> Vec<picker::account::Ac
     // so Enter (cursor starts on row 0) selects the recommendation.
     entries.sort_by_key(|(name, data)| account_row_rank(name, data));
 
+    // The recommended row is the FIRST entry *iff* it is a viable candidate
+    // (rank bucket 0). When every profile is saturated / errored / dataless,
+    // pick_best would recommend nothing, so no row gets the ★.
+    let recommended_idx = entries
+        .first()
+        .filter(|(name, data)| account_row_rank(name, data).0 == 0)
+        .map(|_| 0usize);
+
     entries
         .iter()
-        .map(|(profile, data)| AccountRow::build(profile, data, cache_mtime))
+        .enumerate()
+        .map(|(idx, (profile, data))| {
+            let recommended = Some(idx) == recommended_idx;
+            AccountRow::build(profile, data, cache_mtime, recommended)
+        })
         .collect()
 }
 
@@ -1545,7 +1553,7 @@ mod tests {
 
     #[test]
     fn dispatch_csm_flag_only_is_run() {
-        let a = argv(&["csm", "-n"]);
+        let a = argv(&["csm", "-c"]);
         let (cmd, rest_len) = dispatch_subcommand(&a);
         assert_eq!(cmd, "run");
         assert_eq!(rest_len, 1);
@@ -1560,7 +1568,7 @@ mod tests {
 
     #[test]
     fn dispatch_explicit_run_subcommand() {
-        let a = argv(&["csm", "run", "-n", "--profile=personal"]);
+        let a = argv(&["csm", "run", "-c", "--profile=personal"]);
         let (cmd, rest_len) = dispatch_subcommand(&a);
         assert_eq!(cmd, "run");
         assert_eq!(rest_len, 2);
@@ -1588,10 +1596,10 @@ mod tests {
 
     #[test]
     fn parser_run_flags() {
-        let a = argv(&["csm", "run", "-n", "--profile=work"]);
+        let a = argv(&["csm", "run", "-c", "--profile=work"]);
         let rest = &a[2..];
         let parsed = parser::parse(rest);
-        assert!(parsed.flags.new);
+        assert!(parsed.flags.continue_);
         assert_eq!(parsed.flags.profile.as_deref(), Some("work"));
         assert!(parsed.passthru.is_empty());
     }
@@ -1601,7 +1609,7 @@ mod tests {
         let a = argv(&["csm", "run", "--", "--dangerously-skip-permissions"]);
         let rest = &a[2..];
         let parsed = parser::parse(rest);
-        assert!(!parsed.flags.new);
+        assert!(!parsed.flags.continue_);
         assert_eq!(
             parsed.passthru,
             vec![OsString::from("--dangerously-skip-permissions")]

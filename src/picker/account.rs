@@ -45,6 +45,14 @@ pub struct StaleProfileData {
     pub error: Option<String>,
 }
 
+/// Star marker prefixed to the recommended row's display (what `pick_best`
+/// would auto-select). Non-recommended rows get an equal-width blank prefix so
+/// the usage columns stay aligned.
+pub const RECOMMENDED_MARKER: &str = "★ ";
+/// Blank prefix (same display width as [`RECOMMENDED_MARKER`]) for the rows that
+/// are not the recommendation, keeping every row's columns aligned.
+pub const PLAIN_MARKER: &str = "  ";
+
 /// One row of the account picker display.
 #[derive(Debug, Clone)]
 pub struct AccountRow {
@@ -52,12 +60,26 @@ pub struct AccountRow {
     pub profile: String,
     /// Pre-rendered display string (everything after the tab).
     pub display: String,
+    /// Whether this is the recommended row (the one `pick_best` would
+    /// auto-select). Exactly one row is recommended when a viable candidate
+    /// exists; the display gets a leading `★` so the user can see the pick.
+    pub recommended: bool,
 }
 
 impl AccountRow {
-    /// Render to a tab-delimited picker input line: `profile\tdisplay`.
+    /// Render to a tab-delimited picker input line: `profile\t<marker>display`.
+    ///
+    /// The marker (`★ ` when recommended, two spaces otherwise) leads the
+    /// display column so the recommendation is visible AND the usage columns
+    /// stay aligned across rows. col1 (`profile`) is the hidden recovery key and
+    /// is never decorated.
     pub fn to_tsv(&self) -> String {
-        format!("{}\t{}", self.profile, self.display)
+        let marker = if self.recommended {
+            RECOMMENDED_MARKER
+        } else {
+            PLAIN_MARKER
+        };
+        format!("{}\t{}{}", self.profile, marker, self.display)
     }
 
     /// Build an `AccountRow` from a profile name and its stale data.
@@ -65,13 +87,21 @@ impl AccountRow {
     /// Stale-age annotation is appended as `(stale Nm ago)` when `cache_mtime_secs`
     /// is `Some`.
     ///
+    /// `recommended` marks this as the row `pick_best` would auto-select; it gets
+    /// a leading `★` at render time (see [`AccountRow::to_tsv`]).
+    ///
     /// Spec §4a "Row format / Rendered examples":
     /// ```text
     /// home   session 3%   week 32%   resets Jun 18 9pm   (stale 4m ago)
     /// work   [error: no credentials]                      (stale 4m ago)
     /// home   (no usage data)
     /// ```
-    pub fn build(profile: &str, data: &StaleProfileData, cache_mtime_secs: Option<u64>) -> Self {
+    pub fn build(
+        profile: &str,
+        data: &StaleProfileData,
+        cache_mtime_secs: Option<u64>,
+        recommended: bool,
+    ) -> Self {
         let stale_annotation = cache_mtime_secs.map(|mtime| {
             let now = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -92,6 +122,7 @@ impl AccountRow {
         AccountRow {
             profile: profile.to_string(),
             display,
+            recommended,
         }
     }
 }
@@ -256,10 +287,47 @@ mod tests {
         let row = AccountRow {
             profile: "home".to_string(),
             display: "session 3%   week 32%".to_string(),
+            recommended: false,
         };
         let tsv = row.to_tsv();
         let col1 = tsv.split('\t').next().unwrap();
         assert_eq!(col1, "home");
+    }
+
+    #[test]
+    fn to_tsv_recommended_row_gets_star_marker() {
+        let row = AccountRow {
+            profile: "home".to_string(),
+            display: "session 3%   week 32%".to_string(),
+            recommended: true,
+        };
+        let tsv = row.to_tsv();
+        // col1 (recovery key) must NOT be decorated.
+        assert_eq!(tsv.split('\t').next().unwrap(), "home");
+        // The display column (col2) leads with the ★ marker.
+        let col2 = tsv.split('\t').nth(1).unwrap();
+        assert!(col2.starts_with(RECOMMENDED_MARKER), "got: {col2}");
+        assert!(col2.contains("session 3%"), "got: {col2}");
+    }
+
+    #[test]
+    fn to_tsv_plain_row_gets_blank_marker_same_width() {
+        let row = AccountRow {
+            profile: "home".to_string(),
+            display: "session 3%".to_string(),
+            recommended: false,
+        };
+        let col2 = row.to_tsv().split('\t').nth(1).unwrap().to_string();
+        assert!(col2.starts_with(PLAIN_MARKER), "got: {col2}");
+        assert!(
+            !col2.contains('★'),
+            "plain row must not have a star: {col2}"
+        );
+        // Same display width as the star marker keeps columns aligned.
+        assert_eq!(
+            RECOMMENDED_MARKER.chars().count(),
+            PLAIN_MARKER.chars().count()
+        );
     }
 
     #[test]
@@ -330,7 +398,7 @@ mod tests {
             resets: None,
             error: None,
         };
-        let row = AccountRow::build("home", &data, Some(old_mtime));
+        let row = AccountRow::build("home", &data, Some(old_mtime), false);
         assert_eq!(row.profile, "home");
         // Display should contain the stale annotation (approximately 5m ago).
         assert!(row.display.contains("stale"), "got: {}", row.display);
@@ -352,7 +420,7 @@ mod tests {
             resets: None,
             error: Some("no credentials".to_string()),
         };
-        let row = AccountRow::build("work", &data, None);
+        let row = AccountRow::build("work", &data, None, false);
         assert!(row.display.starts_with("work"), "got: {}", row.display);
         assert!(
             row.display.contains("[error: no credentials]"),
@@ -379,10 +447,12 @@ mod tests {
             AccountRow {
                 profile: "home".to_string(),
                 display: "session 5%".to_string(),
+                recommended: true,
             },
             AccountRow {
                 profile: "work".to_string(),
                 display: "session 80%".to_string(),
+                recommended: false,
             },
         ];
         let picker = AccountPicker::new(rows);

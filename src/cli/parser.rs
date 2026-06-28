@@ -6,8 +6,8 @@
 //! about; everything else accumulates in `passthru`.
 //!
 //! Implements spec §2 "Arg parsing" in full:
-//! - Consumed-internally flags: `-i`/`--interactive`, `-n`/`--new`,
-//!   `-c`/`--continue`, `-A`/`--pick-account`, `--no-pick`, `-r`/`--resume`,
+//! - Consumed-internally flags: `-i`/`--interactive`, `-c`/`--continue`,
+//!   `-A`/`--pick-account`, `--no-pick`, `-r`/`--resume`,
 //!   `--permission-mode`, `--effort`, `--model`, `--session-id`, `--profile`.
 //! - **Equals-form (N7):** `--resume=<id>`, `--permission-mode=<m>`,
 //!   `--effort=<e>`, `--model=<m>`, `--session-id=<id>`, `--profile=<p>`.
@@ -56,7 +56,6 @@ pub enum ResumeArg {
 /// Reproduces the local variables at `claude-smart.zsh` lines 116–118:
 /// ```zsh
 /// local want_picker=false want_continue=false pick_account=false no_pick=false
-/// local want_new=false
 /// local resume_id="" o_mode="" o_effort="" o_model="" o_session="" o_profile=""
 /// ```
 #[derive(Debug, Default, PartialEq)]
@@ -66,9 +65,6 @@ pub struct Flags {
     /// opens the session picker. `--profile <p>` still wins. (`want_picker=true`
     /// in the zsh source — which forced only the session picker.)
     pub interactive: bool,
-    /// `-n` / `--new` — start a fresh session (skip auto-resume).
-    /// (`want_new=true` in the zsh source)
-    pub new: bool,
     /// `-c` / `--continue` — continue the newest free session.
     /// (`want_continue=true` in the zsh source)
     pub continue_: bool,
@@ -148,10 +144,6 @@ pub fn parse(args: &[OsString]) -> ParsedArgs {
         // zsh lines 123–127
         if s == "-i" || s == "--interactive" {
             flags.interactive = true;
-            continue;
-        }
-        if s == "-n" || s == "--new" {
-            flags.new = true;
             continue;
         }
         if s == "-c" || s == "--continue" {
@@ -321,24 +313,30 @@ mod tests {
     fn parse_interactive_short() {
         let r = parse(&os_args(&["-i"]));
         assert!(r.flags.interactive);
-        assert!(!r.flags.new);
         assert!(!r.flags.continue_);
         assert!(!r.flags.pick_account);
         assert!(!r.flags.no_pick);
     }
 
+    /// `-n` / `--new` was removed: the session picker's `[ start a new session ]`
+    /// row replaces it. The token now falls through to passthru (claude has no
+    /// `-n`, so this is harmless) instead of being consumed by csm.
     #[test]
-    fn parse_new_short() {
+    fn parse_new_short_now_passes_through() {
         let r = parse(&os_args(&["-n"]));
-        assert!(r.flags.new);
-        assert!(!r.flags.interactive);
+        assert_eq!(r.passthru, os_args(&["-n"]));
+    }
+
+    #[test]
+    fn parse_new_long_now_passes_through() {
+        let r = parse(&os_args(&["--new"]));
+        assert_eq!(r.passthru, os_args(&["--new"]));
     }
 
     #[test]
     fn parse_continue_short() {
         let r = parse(&os_args(&["-c"]));
         assert!(r.flags.continue_);
-        assert!(!r.flags.new);
     }
 
     #[test]
@@ -361,13 +359,6 @@ mod tests {
     fn parse_interactive_long() {
         let r = parse(&os_args(&["--interactive"]));
         assert!(r.flags.interactive);
-        assert!(r.passthru.is_empty());
-    }
-
-    #[test]
-    fn parse_new_long() {
-        let r = parse(&os_args(&["--new"]));
-        assert!(r.flags.new);
         assert!(r.passthru.is_empty());
     }
 
@@ -493,7 +484,7 @@ mod tests {
     #[test]
     fn parse_resume_absent_means_none() {
         // No -r/--resume at all → None (not Picker)
-        let r = parse(&os_args(&["-n"]));
+        let r = parse(&os_args(&["-i"]));
         assert_eq!(r.flags.resume, None);
     }
 
@@ -635,8 +626,8 @@ mod tests {
 
     #[test]
     fn double_dash_stops_parsing_passes_rest() {
-        let r = parse(&os_args(&["-n", "--", "--model", "raw-arg"]));
-        assert!(r.flags.new);
+        let r = parse(&os_args(&["-c", "--", "--model", "raw-arg"]));
+        assert!(r.flags.continue_);
         // --model after -- is NOT consumed as a flag
         assert!(r.flags.model.is_none());
         assert_eq!(r.passthru, os_args(&["--model", "raw-arg"]));
@@ -652,9 +643,9 @@ mod tests {
     #[test]
     fn double_dash_at_start() {
         // Everything (including csm-internal flags) ends up in passthru
-        let r = parse(&os_args(&["--", "-n", "--model", "x"]));
-        assert!(!r.flags.new);
-        assert_eq!(r.passthru, os_args(&["-n", "--model", "x"]));
+        let r = parse(&os_args(&["--", "-c", "--model", "x"]));
+        assert!(!r.flags.continue_);
+        assert_eq!(r.passthru, os_args(&["-c", "--model", "x"]));
     }
 
     #[test]
@@ -715,10 +706,10 @@ mod tests {
         // exactly this — each unrecognised arg lands in passthru independently)
         let r = parse(&os_args(&[
             "--dangerously-skip-permissions",
-            "-n",
+            "-c",
             "my prompt",
         ]));
-        assert!(r.flags.new);
+        assert!(r.flags.continue_);
         assert_eq!(
             r.passthru,
             os_args(&["--dangerously-skip-permissions", "my prompt"])
@@ -738,9 +729,8 @@ mod tests {
 
     #[test]
     fn all_boolean_flags_together() {
-        let r = parse(&os_args(&["-i", "-n", "-c", "-A", "--no-pick"]));
+        let r = parse(&os_args(&["-i", "-c", "-A", "--no-pick"]));
         assert!(r.flags.interactive);
-        assert!(r.flags.new);
         assert!(r.flags.continue_);
         assert!(r.flags.pick_account);
         assert!(r.flags.no_pick);
@@ -751,13 +741,11 @@ mod tests {
     fn all_boolean_flags_long_forms() {
         let r = parse(&os_args(&[
             "--interactive",
-            "--new",
             "--continue",
             "--pick-account",
             "--no-pick",
         ]));
         assert!(r.flags.interactive);
-        assert!(r.flags.new);
         assert!(r.flags.continue_);
         assert!(r.flags.pick_account);
         assert!(r.flags.no_pick);
@@ -786,14 +774,14 @@ mod tests {
     #[test]
     fn combined_flags_passthru_and_double_dash() {
         let r = parse(&os_args(&[
-            "-n",
+            "-c",
             "--profile=work",
             "--effort",
             "low",
             "--",
             "extra",
         ]));
-        assert!(r.flags.new);
+        assert!(r.flags.continue_);
         assert_eq!(r.flags.profile.as_deref(), Some("work"));
         assert_eq!(r.flags.effort.as_deref(), Some("low"));
         assert_eq!(r.passthru, os_args(&["extra"]));
@@ -843,7 +831,7 @@ mod tests {
         // `--resume=<id>` is self-contained — no peeking at the next token
         let r = parse(&os_args(&[
             "--resume=aaaabbbb-cccc-dddd-eeee-ffffaaaabbbb",
-            "-n",
+            "-c",
         ]));
         assert_eq!(
             r.flags.resume,
@@ -851,8 +839,8 @@ mod tests {
                 "aaaabbbb-cccc-dddd-eeee-ffffaaaabbbb".to_owned()
             ))
         );
-        // `-n` is still consumed correctly after the equals-form resume
-        assert!(r.flags.new);
+        // `-c` is still consumed correctly after the equals-form resume
+        assert!(r.flags.continue_);
     }
 
     #[test]
@@ -870,8 +858,8 @@ mod tests {
     #[test]
     fn unknown_flag_before_and_after_csm_flag() {
         // Interleaved: unknown flag, then csm flag, then unknown flag
-        let r = parse(&os_args(&["--output-format=json", "--new", "--print"]));
-        assert!(r.flags.new);
+        let r = parse(&os_args(&["--output-format=json", "--continue", "--print"]));
+        assert!(r.flags.continue_);
         assert_eq!(r.passthru, os_args(&["--output-format=json", "--print"]));
     }
 

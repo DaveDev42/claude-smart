@@ -4,7 +4,9 @@ Cross-platform smart session manager for [Claude Code](https://claude.ai/code).
 
 `csm` is a single binary that wraps the `claude` CLI with:
 
-- **smart session selection** — resume the right session, or start fresh, per
+- **smart session selection** — an interactive picker, shown on every launch,
+  to start fresh, continue the newest session, or pick an existing one (each row
+  shows its short id, time, mode, and title; type to fuzzy-filter), per
   directory;
 - **profile management** — multiple isolated Claude Code config homes
   (`CLAUDE_CONFIG_DIR`) with a one-command switcher;
@@ -42,11 +44,11 @@ csm run [csm-flags] [-- claude...]   smart launcher (session + account + relaunc
   -i, --interactive                  manual pick: force account + session pickers
   --no-pick                          keep current profile, no scoring
   -A, --pick-account                 force an account pick this launch (overrides --no-pick)
-  -n, --new                          fresh session (skip auto-resume)
   -c, --continue                     resume newest free session
-  # default: auto-pick the best account by usage; if usage is unavailable
-  #   (hub down OR no scorable data) it opens the picker instead of silently
-  #   staying put. `-i` skips the auto-pick entirely and always asks.
+  # default: ALWAYS opens the session picker (new / continue / pick existing) so the
+  #   choice is never made silently, and auto-picks the best account by usage; if
+  #   usage is unavailable (hub down OR no scorable data) it opens the account picker
+  #   instead of silently staying put. `-i` skips the account auto-pick entirely.
 
 csm profiles [list]                  list configured profiles
 csm profiles add  <name> [<dir>]     register (dir defaults to ~/.claude.<name>)
@@ -177,8 +179,10 @@ picker). `--profile <name>` still wins over everything — explicit, no picking.
 ranked exactly as the live scorer (`pick_best`) would choose — viable accounts
 first (highest `week_all.pct`, soonest-reset tie-break), saturated / session-limited
 / errored / no-data rows below — so the account auto-pick *would* have selected
-leads the list. Because the picker's cursor starts on the first row, **pressing
-Enter takes the recommendation**; you only need to move when you want a different one.
+leads the list and is flagged with a **`★`** marker. Because the picker's cursor
+starts on the first row, **pressing Enter takes the recommendation**; you only
+need to move when you want a different one. (When every account is saturated /
+errored / dataless there is no recommendation, so no row gets the `★`.)
 Pressing **Escape / Ctrl-C in any picker cancels the launch entirely**
 (`csm` exits without starting `claude`) — it does not silently fall through to a
 default.

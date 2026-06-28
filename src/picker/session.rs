@@ -5,8 +5,11 @@
 //!   (mtime 9999999998) are prepended to the picker input.
 //! - Live sessions are annotated with `● live in another pane · …`; col1 keeps
 //!   the real UUID.
-//! - Display fields 3.. (sid + mtime hidden), tab delimiter, `session > ` prompt;
-//!   single select, best match on top; col1 recovered by field split.
+//! - Display fields 3.. (full-UUID col1 + mtime col2 hidden) show
+//!   `human_ts short_id mode label`, where `short_id` is the first 8 UUID chars,
+//!   so the user can see WHICH session a row is without the full id; tab
+//!   delimiter, `session > ` prompt; single select, best match on top; col1
+//!   recovered by field split.
 //! - Escape / Ctrl-C → `PickedSession::Cancel` (caller aborts the launch).
 //! - When there is no usable terminal → degrade to newest-free-sid or fresh.
 //!
@@ -51,9 +54,14 @@ pub struct SessionRow {
 impl SessionRow {
     /// Render to a tab-delimited picker input line.
     ///
-    /// Format: `sid\tmtime\thuman_ts\tmode\tdisplay_label`
-    /// where `display_label` is the label, optionally prefixed with the live
-    /// annotation `● live in another pane · ` when `is_live == true`.
+    /// Format: `sid\tmtime\thuman_ts\tshort_id\tmode\tdisplay_label`
+    /// where `short_id` is the first 8 chars of the UUID (empty for sentinels)
+    /// so the user can see WHICH session each row is without the full UUID eating
+    /// the line, and `display_label` is the label, optionally prefixed with the
+    /// live annotation `● live in another pane · ` when `is_live == true`.
+    ///
+    /// col1 (`sid`) stays the full UUID — the hidden recovery key; the displayed
+    /// short id is a separate column (`--with-nth=3..` shows it, col1 is hidden).
     pub fn to_tsv(&self) -> String {
         let display_label = if self.is_live {
             format!("● live in another pane · {}", self.label)
@@ -61,9 +69,24 @@ impl SessionRow {
             self.label.clone()
         };
         format!(
-            "{}\t{}\t{}\t{}\t{}",
-            self.sid, self.mtime, self.human_ts, self.mode, display_label
+            "{}\t{}\t{}\t{}\t{}\t{}",
+            self.sid,
+            self.mtime,
+            self.human_ts,
+            self.short_id(),
+            self.mode,
+            display_label
         )
+    }
+
+    /// The short, human-facing session id: the first 8 chars of the UUID. Empty
+    /// for sentinel rows (`__NEW__` / `__CONTINUE__`), which have no real id.
+    pub fn short_id(&self) -> String {
+        if self.sid == SENTINEL_NEW || self.sid == SENTINEL_CONTINUE {
+            String::new()
+        } else {
+            self.sid.chars().take(8).collect()
+        }
     }
 
     /// Construct the `__NEW__` sentinel row.
@@ -184,7 +207,11 @@ impl SessionPicker {
 
     /// Picker opts for the session picker.
     ///
-    /// Display fields 3.. (sid + mtime hidden), tab delimiter, `session > ` prompt.
+    /// Display fields 3.. (full-UUID col1 + mtime col2 hidden), tab delimiter,
+    /// `session > ` prompt. The shown columns are `human_ts short_id mode label`
+    /// — the short id (first 8 UUID chars) is visible while the full UUID stays
+    /// hidden as the recovery key. Fuzzy matching also runs over these columns,
+    /// so the user can type a partial id, a date, or words from the label.
     pub fn picker_opts() -> PickerOpts {
         PickerOpts {
             prompt: "session > ".to_string(),
@@ -229,16 +256,19 @@ mod tests {
             is_live: true,
         };
         let tsv = row.to_tsv();
-        // display label (col5) must have the live prefix
-        let col5 = tsv.split('\t').nth(4).unwrap();
-        assert!(col5.starts_with("● live in another pane · "), "got: {col5}");
-        assert!(col5.contains("My session"));
+        // display label (col6, index 5) must have the live prefix
+        let label_col = tsv.split('\t').nth(5).unwrap();
+        assert!(
+            label_col.starts_with("● live in another pane · "),
+            "got: {label_col}"
+        );
+        assert!(label_col.contains("My session"));
 
         // Non-live row must NOT have the annotation.
         row.is_live = false;
         let tsv2 = row.to_tsv();
-        let col5_2 = tsv2.split('\t').nth(4).unwrap();
-        assert!(!col5_2.starts_with("●"), "got: {col5_2}");
+        let label_col_2 = tsv2.split('\t').nth(5).unwrap();
+        assert!(!label_col_2.starts_with("●"), "got: {label_col_2}");
     }
 
     #[test]
@@ -252,8 +282,32 @@ mod tests {
             is_live: false,
         };
         let tsv = row.to_tsv();
-        let col1 = tsv.split('\t').next().unwrap();
-        assert_eq!(col1, "deadbeef-0000-0000-0000-000000000000");
+        let cols: Vec<&str> = tsv.split('\t').collect();
+        // col1 (index 0) is the full UUID recovery key.
+        assert_eq!(cols[0], "deadbeef-0000-0000-0000-000000000000");
+        // col4 (index 3) is the displayed short id: first 8 UUID chars.
+        assert_eq!(cols[3], "deadbeef");
+        // The full UUID must NOT appear in any DISPLAYED column (index >= 2).
+        assert!(
+            !cols[2..].iter().any(|c| c.contains("0000-0000")),
+            "full UUID leaked into a displayed column: {cols:?}"
+        );
+    }
+
+    #[test]
+    fn short_id_is_first_8_chars_and_empty_for_sentinels() {
+        let row = SessionRow {
+            sid: "abcd1234-5678-90ab-cdef-000000000000".to_string(),
+            mtime: 1,
+            human_ts: String::new(),
+            mode: String::new(),
+            label: "x".to_string(),
+            is_live: false,
+        };
+        assert_eq!(row.short_id(), "abcd1234");
+        // Sentinels carry no real id → empty short id (no stray "__NEW__" text).
+        assert_eq!(SessionRow::new_session_sentinel().short_id(), "");
+        assert_eq!(SessionRow::continue_sentinel(None).short_id(), "");
     }
 
     #[test]
