@@ -159,7 +159,7 @@ cache. No hub identifiers are baked into the binary — it ships clean for anyon
 to use.
 
 **Account picker (hub-down or no scorable data).** Account auto-selection opens
-the fzf account picker — rather than silently keeping the current account —
+the account picker — rather than silently keeping the current account —
 whenever it cannot score, which is two distinct cases: (1) **hub-down** — the hub
 can't be reached / returns no usable blob (a *fetch* failure); (2) **no scorable
 data** — the hub responds but no profile yields a usable percentage (every
@@ -177,8 +177,8 @@ picker). `--profile <name>` still wins over everything — explicit, no picking.
 ranked exactly as the live scorer (`pick_best`) would choose — viable accounts
 first (highest `week_all.pct`, soonest-reset tie-break), saturated / session-limited
 / errored / no-data rows below — so the account auto-pick *would* have selected
-leads the list. Because fzf's cursor starts on the first row, **pressing Enter
-takes the recommendation**; you only need to move when you want a different one.
+leads the list. Because the picker's cursor starts on the first row, **pressing
+Enter takes the recommendation**; you only need to move when you want a different one.
 Pressing **Escape / Ctrl-C in any picker cancels the launch entirely**
 (`csm` exits without starting `claude`) — it does not silently fall through to a
 default.

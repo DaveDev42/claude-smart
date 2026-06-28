@@ -359,12 +359,12 @@ fn cmd_run(args: &[OsString]) -> anyhow::Result<()> {
 
 // ─── session id resolution helpers ───────────────────────────────────────────
 
-/// Open the interactive fzf session picker.
+/// Open the interactive session picker.
 ///
 /// Returns:
 /// - `Ok(Some(resolution))` — a session to launch (selected → Resume, continued
 ///   → Resume, or fresh → Fresh, including the graceful degrade to Fresh when
-///   fzf is unavailable / no rows).
+///   there is no usable terminal / no rows).
 /// - `Ok(None)` — the user pressed Escape / Ctrl-C: cancel the launch entirely.
 fn resolve_session_via_picker(cwd: &std::path::Path) -> anyhow::Result<Option<SessionResolution>> {
     use picker::session::SessionRow as PickerRow;
@@ -390,7 +390,7 @@ fn resolve_session_via_picker(cwd: &std::path::Path) -> anyhow::Result<Option<Se
     let newest_live_label: Option<&str> = None; // TODO: derive in Phase 9
 
     match sp.pick(newest_live_label) {
-        // `None` (fzf unavailable) and `Fresh` both mean "start new" — degrade.
+        // `None` (no usable terminal) and `Fresh` both mean "start new" — degrade.
         None | Some(PickedSession::Fresh) => Ok(Some(SessionResolution::Fresh(newuuid()))),
         // Continue → newest free session (Resume) — but if there is none, the
         // unwrap_or falls back to a brand-new id, which must launch as Fresh.
@@ -486,7 +486,7 @@ fn derive_current_profile_name(profiles: &account::ProfileMap) -> String {
 /// Pick guard (mirrors zsh `claude-smart.zsh` lines 204-209, 316-323):
 /// - `pick_account(current, include_current=true)` → scoring pick.
 /// - `Err(FetchFailed)` (hub down) or `Err(NoUsableData)` (fetch ok but no
-///   scorable usage) + interactive → hub-down fzf account picker (§4a).
+///   scorable usage) + interactive → hub-down account picker (§4a).
 /// - same errors + non-interactive → silent fail-safe to current.
 /// - `Err(AllSaturated)` → warn + keep current (no picker; real limits read).
 fn proactive_pick_profile(
@@ -534,7 +534,7 @@ fn proactive_pick_profile(
 
 /// Hub-down account picker (spec §4a Decision #1).
 ///
-/// Interactive + fetch-miss → open fzf account picker with stale usage data.
+/// Interactive + fetch-miss → open the account picker with stale usage data.
 /// Non-interactive → silent fail-safe to current profile.
 ///
 /// Returns `Ok(Some(dir))` to launch under `dir`, or `Ok(None)` when the user
@@ -556,8 +556,8 @@ fn hub_down_pick(
 /// confident auto-pick exists: `-i` means "let me choose", so we skip the
 /// auto-pick entirely and always present the recommendation-ordered picker
 /// (Enter still takes the recommendation). The TTY gate still applies — a piped
-/// `-i` has no terminal to host fzf, so it keeps the current profile. An empty
-/// ProfileMap (toss / first-boot) likewise keeps current, nothing to pick.
+/// `-i` has no usable terminal for the picker, so it keeps the current profile.
+/// An empty ProfileMap (toss / first-boot) likewise keeps current, nothing to pick.
 fn force_account_pick(profiles: &account::ProfileMap) -> anyhow::Result<Option<PathBuf>> {
     let current_dir = current_profile_dir(profiles);
     if profiles.is_empty() || !is_interactive() {
@@ -566,18 +566,18 @@ fn force_account_pick(profiles: &account::ProfileMap) -> anyhow::Result<Option<P
     run_account_picker(profiles, &current_dir, "interactive picker")
 }
 
-/// Shared fzf account-picker driver for [`hub_down_pick`] and
+/// Shared account-picker driver for [`hub_down_pick`] and
 /// [`force_account_pick`]. Builds recommendation-ordered rows (stale usage if
-/// that is all we have) and maps the fzf outcome:
+/// that is all we have) and maps the picker outcome:
 /// - Selected → that profile's dir.
 /// - Cancelled (Escape / Ctrl-C) → `None` (caller aborts the launch).
-/// - Unavailable (fzf missing / no rows) → keep current profile.
+/// - Unavailable (no usable terminal / no rows) → keep current profile.
 fn run_account_picker(
     profiles: &account::ProfileMap,
     current_dir: &Path,
     ctx: &str,
 ) -> anyhow::Result<Option<PathBuf>> {
-    use picker::fzf::PickerOutcome;
+    use picker::engine::PickerOutcome;
 
     let rows = build_account_rows(profiles);
     let ap = picker::AccountPicker::new(rows);
@@ -590,15 +590,15 @@ fn run_account_picker(
         }
         // Escape / Ctrl-C → cancel the launch.
         PickerOutcome::Cancelled => Ok(None),
-        // fzf missing / empty → keep current profile (graceful degrade).
+        // No usable terminal / empty → keep current profile (graceful degrade).
         PickerOutcome::Unavailable => Ok(Some(current_dir.to_path_buf())),
     }
 }
 
 /// Recommendation rank for a hub-down picker row, mirroring `scoring::pick_best`.
 ///
-/// The picker is fzf with `--reverse` and no explicit cursor, so the cursor sits
-/// on the FIRST row — pressing Enter selects it. We therefore order rows so the
+/// The picker renders top-to-bottom with the cursor on the FIRST row, so
+/// pressing Enter selects it. We therefore order rows so the
 /// recommended profile (the one `pick_best` would auto-select when the hub is up)
 /// leads, and the user can just press Enter.
 ///
@@ -702,7 +702,7 @@ fn build_account_rows(profiles: &account::ProfileMap) -> Vec<picker::account::Ac
         .collect();
 
     // Recommended-first ordering: the top row is what pick_best would auto-select,
-    // so Enter (cursor starts on row 0 under fzf --reverse) selects the recommendation.
+    // so Enter (cursor starts on row 0) selects the recommendation.
     entries.sort_by_key(|(name, data)| account_row_rank(name, data));
 
     entries
@@ -1966,7 +1966,7 @@ mod tests {
     }
 
     // ── account_row_rank (hub-down picker: recommended profile leads) ─────────
-    // The fzf picker starts the cursor on row 0, so the top row is what Enter
+    // The picker starts the cursor on row 0, so the top row is what Enter
     // selects. account_row_rank must order rows the same way pick_best chooses,
     // so the recommendation leads and a bare Enter picks it.
 

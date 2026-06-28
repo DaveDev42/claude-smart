@@ -1,20 +1,20 @@
-//! Session picker — fzf-based interactive session selector.
+//! Session picker — interactive session selector (in-process fuzzy picker).
 //!
 //! Spec §2 Picker (session-select):
 //! - Synthetic sentinel rows `__NEW__` (mtime 9999999999) and `__CONTINUE__`
-//!   (mtime 9999999998) are prepended to the fzf input.
+//!   (mtime 9999999998) are prepended to the picker input.
 //! - Live sessions are annotated with `● live in another pane · …`; col1 keeps
 //!   the real UUID.
-//! - fzf flags: `--with-nth=3.. --delimiter='\t' --prompt='session > '
-//!   --height=40% --reverse --no-multi`; col1 recovered by field split.
-//! - Exit 130 / empty selection → `None` (caller exits cleanly).
-//! - When fzf is absent or no TTY → degrade to newest-free-sid or fresh.
+//! - Display fields 3.. (sid + mtime hidden), tab delimiter, `session > ` prompt;
+//!   single select, best match on top; col1 recovered by field split.
+//! - Escape / Ctrl-C → `PickedSession::Cancel` (caller aborts the launch).
+//! - When there is no usable terminal → degrade to newest-free-sid or fresh.
 //!
 //! The `__NEW__` sentinel resolves to `PickedSession::Fresh`.
 //! The `__CONTINUE__` sentinel resolves to `PickedSession::Continue`.
 //! A real UUID resolves to `PickedSession::Resume(session_id)`.
 
-use crate::picker::fzf::FzfOpts;
+use crate::picker::engine::{self, PickerOpts};
 
 // ─── sentinel constants ───────────────────────────────────────────────────────
 
@@ -25,7 +25,7 @@ pub const SENTINEL_CONTINUE: &str = "__CONTINUE__";
 
 // ─── types ────────────────────────────────────────────────────────────────────
 
-/// A single row the session picker shows in fzf.
+/// A single row the session picker shows.
 ///
 /// TSV format (matches `session/scan.rs` output contract):
 /// `sid \t mtime \t human_ts \t mode \t label(≤80)`
@@ -33,7 +33,7 @@ pub const SENTINEL_CONTINUE: &str = "__CONTINUE__";
 /// Col1 (`sid`) is hidden from display (`--with-nth=3..`); it is the recovery key.
 #[derive(Debug, Clone)]
 pub struct SessionRow {
-    /// Session UUID (or sentinel constant). The hidden fzf col1.
+    /// Session UUID (or sentinel constant). The hidden col1 recovery key.
     pub sid: String,
     /// Unix mtime in seconds (u64 as string in TSV). Sentinels use 9999999999 /
     /// 9999999998 so they sort to the top with `--reverse`.
@@ -49,7 +49,7 @@ pub struct SessionRow {
 }
 
 impl SessionRow {
-    /// Render to a tab-delimited line for fzf stdin.
+    /// Render to a tab-delimited picker input line.
     ///
     /// Format: `sid\tmtime\thuman_ts\tmode\tdisplay_label`
     /// where `display_label` is the label, optionally prefixed with the live
@@ -101,7 +101,7 @@ impl SessionRow {
 /// The resolved result of the session picker.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PickedSession {
-    /// User chose `__NEW__` or picker was skipped (no sessions / no TTY / no fzf).
+    /// User chose `__NEW__` or picker was skipped (no sessions / no usable terminal).
     Fresh,
     /// User chose `__CONTINUE__` — resume the newest (free) session.
     Continue,
@@ -115,13 +115,13 @@ pub enum PickedSession {
 
 // ─── SessionPicker ────────────────────────────────────────────────────────────
 
-/// Interactive fzf session picker.
+/// Interactive session picker.
 ///
 /// Build with `SessionPicker::new(rows)`, then call `SessionPicker::pick()`.
 ///
 /// Spec §2 Picker:
 /// - When `rows` is empty, returns `PickedSession::Fresh` immediately (no picker).
-/// - When fzf is unavailable or there is no TTY, degrades to newest-free-sid
+/// - When there is no usable terminal, degrades to newest-free-sid
 ///   auto-selection (callers interpret `PickedSession::Continue` accordingly).
 /// - `__NEW__` and `__CONTINUE__` sentinels are prepended automatically; callers
 ///   must not include them in the input `rows`.
@@ -141,21 +141,21 @@ impl SessionPicker {
     /// Run the picker and return the user's selection.
     ///
     /// - Empty `rows` → `PickedSession::Fresh` (no picker shown).
-    /// - fzf unavailable → `None` (caller degrades to newest-free-sid / fresh).
+    /// - No usable terminal → `None` (caller degrades to newest-free-sid / fresh).
     /// - Escape / Ctrl-C → `Some(PickedSession::Cancel)` (caller aborts the launch).
     /// - `__NEW__` → `Fresh`, `__CONTINUE__` → `Continue`, UUID → `Resume(uuid)`.
     pub fn pick(&self, newest_live_label: Option<&str>) -> Option<PickedSession> {
         if self.rows.is_empty() {
             return Some(PickedSession::Fresh);
         }
-        let lines = self.build_fzf_input(newest_live_label);
-        match crate::picker::fzf::run_fzf(&lines, &Self::fzf_opts()) {
-            crate::picker::fzf::PickerOutcome::Selected(col1) => Some(Self::resolve(&col1)),
+        let lines = self.build_picker_input(newest_live_label);
+        match engine::run_picker(&lines, &Self::picker_opts()) {
+            engine::PickerOutcome::Selected(col1) => Some(Self::resolve(&col1)),
             // Escape / Ctrl-C → explicit cancel: surface it so the caller aborts
             // instead of silently starting a fresh session.
-            crate::picker::fzf::PickerOutcome::Cancelled => Some(PickedSession::Cancel),
-            // fzf missing or unusable → degrade (None) per the existing contract.
-            crate::picker::fzf::PickerOutcome::Unavailable => None,
+            engine::PickerOutcome::Cancelled => Some(PickedSession::Cancel),
+            // No usable terminal → degrade (None) per the existing contract.
+            engine::PickerOutcome::Unavailable => None,
         }
     }
 
@@ -168,11 +168,11 @@ impl SessionPicker {
         }
     }
 
-    /// Build the TSV lines to pipe to fzf, including sentinel rows at the top.
+    /// Build the TSV lines for the picker, including sentinel rows at the top.
     ///
     /// Returns the lines in display order: `__NEW__`, `__CONTINUE__`, then the
     /// real session rows newest-first.
-    pub fn build_fzf_input(&self, newest_live_label: Option<&str>) -> Vec<String> {
+    pub fn build_picker_input(&self, newest_live_label: Option<&str>) -> Vec<String> {
         let mut lines = Vec::with_capacity(self.rows.len() + 2);
         lines.push(SessionRow::new_session_sentinel().to_tsv());
         lines.push(SessionRow::continue_sentinel(newest_live_label).to_tsv());
@@ -182,17 +182,14 @@ impl SessionPicker {
         lines
     }
 
-    /// fzf opts for the session picker.
+    /// Picker opts for the session picker.
     ///
-    /// Spec: `--with-nth=3.. --delimiter='\t' --prompt='session > ' --height=40%
-    /// --reverse --no-multi`
-    pub fn fzf_opts() -> FzfOpts {
-        FzfOpts {
+    /// Display fields 3.. (sid + mtime hidden), tab delimiter, `session > ` prompt.
+    pub fn picker_opts() -> PickerOpts {
+        PickerOpts {
             prompt: "session > ".to_string(),
-            with_nth: "3..".to_string(),
-            delimiter: "\t".to_string(),
-            height: "40%".to_string(),
-            extra_args: vec!["--reverse".to_string(), "--no-multi".to_string()],
+            display_from: 3,
+            delimiter: '\t',
         }
     }
 }
@@ -260,9 +257,9 @@ mod tests {
     }
 
     #[test]
-    fn build_fzf_input_sentinel_order() {
+    fn build_picker_input_sentinel_order() {
         let picker = SessionPicker::new(vec![]);
-        let lines = picker.build_fzf_input(None);
+        let lines = picker.build_picker_input(None);
         // Sentinels must be first two lines.
         assert_eq!(lines.len(), 2);
         let col1_0 = lines[0].split('\t').next().unwrap();
@@ -272,7 +269,7 @@ mod tests {
     }
 
     #[test]
-    fn build_fzf_input_rows_follow_sentinels() {
+    fn build_picker_input_rows_follow_sentinels() {
         let rows = vec![
             SessionRow {
                 sid: "aaa".to_string(),
@@ -292,7 +289,7 @@ mod tests {
             },
         ];
         let picker = SessionPicker::new(rows);
-        let lines = picker.build_fzf_input(None);
+        let lines = picker.build_picker_input(None);
         assert_eq!(lines.len(), 4);
         let sids: Vec<&str> = lines
             .iter()
@@ -305,15 +302,15 @@ mod tests {
     }
 
     #[test]
-    fn fzf_opts_session_picker() {
-        let opts = SessionPicker::fzf_opts();
+    fn picker_opts_session_picker() {
+        let opts = SessionPicker::picker_opts();
         assert_eq!(opts.prompt, "session > ");
-        assert_eq!(opts.with_nth, "3..");
-        assert_eq!(opts.delimiter, "\t");
+        assert_eq!(opts.display_from, 3);
+        assert_eq!(opts.delimiter, '\t');
     }
 
     /// `resolve` never produces `Cancel`: a recovered col1 is always a real
-    /// choice (NEW/CONTINUE/uuid). `Cancel` arises ONLY from an fzf
+    /// choice (NEW/CONTINUE/uuid). `Cancel` arises ONLY from a picker
     /// Escape/Ctrl-C in `pick`, so it must stay a distinct variant from `Fresh`
     /// — collapsing the two would resurrect "Escape silently starts fresh".
     #[test]

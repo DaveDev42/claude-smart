@@ -39,9 +39,9 @@ It is consumed by the **private** `dave-environment` Ansible repo (the operator'
   → HTTP → SSH[unix]), `report.rs` (`csm usage`: pure `build_report` +
   `render_table`/`render_json`).
 - `src/session/`, `src/picker/`, `src/hook/`, `src/sidecar/`, `src/platform/`,
-  `src/statusline.rs`, `src/paths.rs` — session scan/index, fzf picker, the
-  Stop/SubagentStop/SessionEnd hook, sidecar store, OS launch/relaunch/proc
-  checks, statusline, canonical state paths.
+  `src/statusline.rs`, `src/paths.rs` — session scan/index, in-process fuzzy
+  picker (nucleo + crossterm), the Stop/SubagentStop/SessionEnd hook, sidecar
+  store, OS launch/relaunch/proc checks, statusline, canonical state paths.
 - `tests/no_private_names.rs` — CI leak guard (recursively greps `src/`).
 - `.github/workflows/release-please.yml` — CI. (Design specs live in the private
   `dave-environment` repo, not here.)

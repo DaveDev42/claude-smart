@@ -50,12 +50,21 @@ chrono-tz = "0.9"   # IANA zone table for resets_to_epoch (~3 MB binary overhead
 uuid = { version = "1", features = ["v4"] }   # newuuid: lowercase UUID v4
 dirs = "5"                                     # cross-platform ~/ resolution for Paths
 
-# liveness + comm check (replaces POSIX `ps -o comm=` on Linux + the Windows task walk).
+# liveness check on every target (replaces the external POSIX `ps -o comm=` spawn).
 # Only TARGETED refresh_process(Pid) — never a full sweep on the hot Stop path.
 sysinfo = { version = "0.30", default-features = false }  # no "process" feature in 0.30; process APIs always present
 
 anyhow    = "1"   # bin error propagation
 thiserror = "1"   # library-style errors in session/account/usage (UsageError, FetchError, SidecarError…)
+
+# In-process fuzzy picker (replaces the external `fzf` shell-out). nucleo-matcher
+# is the standalone scoring core of helix's nucleo (pure Rust, no worker threads);
+# crossterm draws the list + reads keys on the controlling terminal — its tty_fd()
+# falls back to /dev/tty (CONIN$/CONOUT$ on Windows) when stdin/stdout are piped,
+# so the picker behaves like fzf even with redirected stdio. No ratatui: we render
+# the small bounded list ourselves.
+nucleo-matcher = "0.3"
+crossterm      = "0.28"
 
 # ─── HTTP transport (usage fetch HTTP-first path, all 4 machines) ─────────────
 # rustls-tls (not native-tls): native-tls drags in system OpenSSL on Linux, which

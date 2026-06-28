@@ -1,10 +1,10 @@
-//! Hub-down account picker — interactive fzf account selector.
+//! Hub-down account picker — interactive account selector.
 //!
 //! Spec §4a "Hub-down account picker" (Decision #1):
 //!
 //! When an *interactive* proactive-pick context encounters a usage fetch miss
-//! (`Err(FetchError)`) or negative-cache active, the binary opens an fzf picker
-//! over configured profiles showing last-known stale usage from `.usage-cache.json`.
+//! (`Err(FetchError)`) or negative-cache active, the binary opens a picker over
+//! configured profiles showing last-known stale usage from `.usage-cache.json`.
 //!
 //! Trigger: proactive-pick + interactive (isatty(0)&&isatty(1)) + fetch miss.
 //! NOT triggered when: non-interactive / hook / `--profile` pin / `--no-pick`.
@@ -13,18 +13,18 @@
 //!   col1 = profile_name (hidden recovery key)
 //!   col2+ = display text (session%, week%, resets, stale-age annotation)
 //!
-//! fzf flags: `--with-nth=2.. --delimiter='\t' --prompt='account > '
-//!             --height=40% --reverse --no-multi`
+//! Picker: display fields 2.. (profile name hidden), tab delimiter,
+//! `account > ` prompt; single select, best match on top.
 //!
-//! Degrade path (Windows / no fzf):
-//!   Print to stderr: `csm: hub usage fetch failed and fzf not available — keeping current profile`
-//!   Return `None` (caller falls back to current profile).
+//! Degrade path (no usable terminal):
+//!   Print to stderr: `csm: hub usage fetch failed and no interactive terminal — keeping current profile`
+//!   Return `Unavailable` (caller falls back to current profile).
 //!
-//! Empty selection (Escape / Ctrl-C, exit 130): return `None`, stderr note.
+//! Escape / Ctrl-C → `Cancelled` (caller aborts the launch).
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::picker::fzf::{fzf_available, FzfOpts};
+use crate::picker::engine::{self, PickerOpts, PickerOutcome};
 
 // ─── types ────────────────────────────────────────────────────────────────────
 
@@ -48,14 +48,14 @@ pub struct StaleProfileData {
 /// One row of the account picker display.
 #[derive(Debug, Clone)]
 pub struct AccountRow {
-    /// Profile name — the hidden fzf col1 recovery key.
+    /// Profile name — the hidden col1 recovery key.
     pub profile: String,
     /// Pre-rendered display string (everything after the tab).
     pub display: String,
 }
 
 impl AccountRow {
-    /// Render to a tab-delimited fzf input line: `profile\tdisplay`.
+    /// Render to a tab-delimited picker input line: `profile\tdisplay`.
     pub fn to_tsv(&self) -> String {
         format!("{}\t{}", self.profile, self.display)
     }
@@ -153,14 +153,14 @@ pub fn format_stale_age(age_secs: u64) -> String {
 
 // ─── AccountPicker ────────────────────────────────────────────────────────────
 
-/// Interactive fzf account picker shown when the hub usage fetch fails.
+/// Interactive account picker shown when the hub usage fetch fails.
 ///
 /// Spec §4a "Hub-down account picker".
 ///
 /// Build with `AccountPicker::new(rows)`, then call `AccountPicker::pick()`.
 ///
-/// Degrade: when `fzf_available()` is `false`, `pick()` prints a stderr warning
-/// and returns `None` (caller keeps current profile).
+/// Degrade: when there is no usable terminal, `pick()` prints a stderr warning
+/// and returns `Unavailable` (caller keeps current profile).
 pub struct AccountPicker {
     rows: Vec<AccountRow>,
 }
@@ -177,40 +177,36 @@ impl AccountPicker {
     /// Run the picker and return a [`PickerOutcome`]:
     /// - `Selected(profile_name)` — user selected a profile.
     /// - `Cancelled` — user pressed Escape / Ctrl-C (caller aborts the launch).
-    /// - `Unavailable` — empty rows or fzf missing (caller keeps current profile).
+    /// - `Unavailable` — empty rows or no usable terminal (caller keeps current).
     ///
-    /// When `fzf_available()` is false → stderr warning + `Unavailable` (degrade).
-    pub fn pick(&self) -> crate::picker::fzf::PickerOutcome {
-        use crate::picker::fzf::PickerOutcome;
+    /// No usable terminal → stderr warning + `Unavailable` (degrade).
+    pub fn pick(&self) -> PickerOutcome {
         if self.rows.is_empty() {
             return PickerOutcome::Unavailable;
         }
-        if !fzf_available() {
+        if !engine::terminal_available() {
             eprintln!(
-                "csm: hub usage fetch failed and fzf not available — keeping current profile"
+                "csm: hub usage fetch failed and no interactive terminal — keeping current profile"
             );
             return PickerOutcome::Unavailable;
         }
-        let lines = self.build_fzf_input();
-        crate::picker::fzf::run_fzf(&lines, &Self::fzf_opts())
+        let lines = self.build_picker_input();
+        engine::run_picker(&lines, &Self::picker_opts())
     }
 
-    /// Build the TSV lines to pipe to fzf.
-    pub fn build_fzf_input(&self) -> Vec<String> {
+    /// Build the TSV lines for the picker.
+    pub fn build_picker_input(&self) -> Vec<String> {
         self.rows.iter().map(AccountRow::to_tsv).collect()
     }
 
-    /// fzf opts for the account picker.
+    /// Picker opts for the account picker.
     ///
-    /// Spec: `--with-nth=2.. --delimiter='\t' --prompt='account > ' --height=40%
-    /// --reverse --no-multi`
-    pub fn fzf_opts() -> FzfOpts {
-        FzfOpts {
+    /// Display fields 2.. (profile name hidden), tab delimiter, `account > ` prompt.
+    pub fn picker_opts() -> PickerOpts {
+        PickerOpts {
             prompt: "account > ".to_string(),
-            with_nth: "2..".to_string(),
-            delimiter: "\t".to_string(),
-            height: "40%".to_string(),
-            extra_args: vec!["--reverse".to_string(), "--no-multi".to_string()],
+            display_from: 2,
+            delimiter: '\t',
         }
     }
 }
@@ -370,15 +366,15 @@ mod tests {
     }
 
     #[test]
-    fn fzf_opts_account_picker() {
-        let opts = AccountPicker::fzf_opts();
+    fn picker_opts_account_picker() {
+        let opts = AccountPicker::picker_opts();
         assert_eq!(opts.prompt, "account > ");
-        assert_eq!(opts.with_nth, "2..");
-        assert_eq!(opts.delimiter, "\t");
+        assert_eq!(opts.display_from, 2);
+        assert_eq!(opts.delimiter, '\t');
     }
 
     #[test]
-    fn build_fzf_input_col1_is_profile() {
+    fn build_picker_input_col1_is_profile() {
         let rows = vec![
             AccountRow {
                 profile: "home".to_string(),
@@ -390,7 +386,7 @@ mod tests {
             },
         ];
         let picker = AccountPicker::new(rows);
-        let lines = picker.build_fzf_input();
+        let lines = picker.build_picker_input();
         assert_eq!(lines.len(), 2);
         let profiles: Vec<&str> = lines
             .iter()
