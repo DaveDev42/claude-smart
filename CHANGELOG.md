@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.10](https://github.com/DaveDev42/claude-smart/compare/v0.2.9...v0.2.10) (2026-06-29)
+
+
+### Features
+
+* **account:** usage max-age gate — stale 데이터로 auto-pick 금지 ([0bda824](https://github.com/DaveDev42/claude-smart/commit/0bda824da77f83f5ce912e6af86f63d1ca0ab342))
+
 ## [0.2.9](https://github.com/DaveDev42/claude-smart/compare/v0.2.8...v0.2.9) (2026-06-28)
 
 
