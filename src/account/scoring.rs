@@ -21,6 +21,8 @@
 use std::collections::HashMap;
 use std::env;
 
+use chrono::{DateTime, Utc};
+
 use crate::account::reset::resets_to_epoch;
 use crate::usage::{FetchError, UsageData};
 
@@ -55,6 +57,70 @@ fn saturation_pct() -> i64 {
         .ok()
         .and_then(|v| v.trim().parse::<i64>().ok())
         .unwrap_or(SATURATION_PCT)
+}
+
+/// Default max age, in seconds, of the usage data that account auto-pick will
+/// still trust. The hub re-scrapes `limits` every 30 min (and the cc-sync
+/// freshness alert pages at the same horizon), so data older than this means
+/// the hub's scrape has stalled — the percentages no longer reflect reality and
+/// auto-picking on them can route into an account that is actually over its
+/// limit. Override via `CLAUDE_USAGE_MAX_AGE` (alias `CSM_USAGE_MAX_AGE_SECS`).
+/// `0` disables the gate entirely (trust any age).
+pub const USAGE_MAX_AGE_SECS: u64 = 1800;
+
+/// Read the usage max-age gate (seconds) from the environment.
+///
+/// `CLAUDE_USAGE_MAX_AGE` wins; `CSM_USAGE_MAX_AGE_SECS` is the namespaced
+/// alias (mirrors the `CLAUDE_USAGE_TTL` / `CSM_USAGE_TTL_SECS` pair in the
+/// transport layer). Unparseable / unset → [`USAGE_MAX_AGE_SECS`]. `0` = gate
+/// off.
+fn usage_max_age_secs() -> u64 {
+    env::var("CLAUDE_USAGE_MAX_AGE")
+        .ok()
+        .or_else(|| env::var("CSM_USAGE_MAX_AGE_SECS").ok())
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(USAGE_MAX_AGE_SECS)
+}
+
+/// The freshest `captured_at` instant in `data`: the top-level field if
+/// present, else the newest per-profile `captured_at`. `None` when no timestamp
+/// anywhere parses (old cache files predate the field, or a non-hub source omit
+/// it). RFC-3339 / ISO-8601 with a `Z` or offset (e.g. `2026-06-17T07:13:19Z`).
+fn newest_captured_at(data: &UsageData) -> Option<DateTime<Utc>> {
+    fn parse(s: &str) -> Option<DateTime<Utc>> {
+        DateTime::parse_from_rfc3339(s.trim())
+            .ok()
+            .map(|dt| dt.with_timezone(&Utc))
+    }
+    let mut newest: Option<DateTime<Utc>> = data.captured_at.as_deref().and_then(parse);
+    for pu in data.profiles.values() {
+        if let Some(ts) = pu.captured_at.as_deref().and_then(parse) {
+            newest = Some(match newest {
+                Some(cur) if cur >= ts => cur,
+                _ => ts,
+            });
+        }
+    }
+    newest
+}
+
+/// Decide whether `data` is too stale to auto-pick on, relative to `now`.
+///
+/// **fail-open**: returns `false` (trust the data) when the gate is disabled
+/// (`max_age == 0`) OR no `captured_at` parses — we never *block* on an unknown
+/// age, only on a known-and-too-old one. This preserves the pre-gate behaviour
+/// for cache files / sources that carry no timestamp, while a hub whose scrape
+/// froze (its `captured_at` stops advancing) is correctly caught.
+fn data_too_stale_at(data: &UsageData, max_age_secs: u64, now: DateTime<Utc>) -> bool {
+    if max_age_secs == 0 {
+        return false; // gate disabled
+    }
+    let Some(captured) = newest_captured_at(data) else {
+        return false; // unknown age → fail-open
+    };
+    let age = now.signed_duration_since(captured);
+    // Negative age (captured_at in the future — clock skew) is not "stale".
+    age.num_seconds() > max_age_secs as i64
 }
 
 // ─── public error + result types ─────────────────────────────────────────────
@@ -105,9 +171,37 @@ pub type ScoringResult = Result<Option<String>, ScoringError>;
 /// - `Err(ScoringError::AllSaturated)` — no viable candidate; caller warns and
 ///   proceeds.
 ///
+/// # Staleness gate
+/// Before scoring, the data's freshness is checked against the usage max-age
+/// (`usage_max_age_secs`). If the newest `captured_at` is older than the gate,
+/// the percentages are no longer trustworthy and we return
+/// [`ScoringError::NoUsableData`] WITHOUT scoring — exactly as if no profile
+/// had usable data. The caller then opens the interactive picker (or, in a
+/// non-interactive / hook context, fail-safes to the current profile), rather
+/// than auto-routing into an account whose real usage we cannot see. The gate
+/// fail-opens on a missing/unparseable timestamp (see `data_too_stale_at`).
+///
 /// # Shell source
 /// `pick_account` in `claude-smart-helper.sh.j2` lines 883–971.
 pub fn pick_best(data: &UsageData, current_profile: &str, include_current: bool) -> ScoringResult {
+    pick_best_at(data, current_profile, include_current, Utc::now())
+}
+
+/// `now`-injected core of [`pick_best`], for deterministic staleness tests.
+/// Mirrors the `resets_to_epoch` / `resets_to_epoch_at` split in `reset.rs`.
+pub fn pick_best_at(
+    data: &UsageData,
+    current_profile: &str,
+    include_current: bool,
+    now: DateTime<Utc>,
+) -> ScoringResult {
+    // Staleness gate (spec: auto-pick must not fly on stale usage). A frozen hub
+    // scrape keeps serving the same `captured_at`; once that ages past the gate
+    // we refuse to score and let the caller fall back to the picker/current.
+    if data_too_stale_at(data, usage_max_age_secs(), now) {
+        return Err(ScoringError::NoUsableData);
+    }
+
     let lim = limit_pct();
     let sat = saturation_pct();
 
@@ -740,5 +834,133 @@ mod tests {
         // current is "main" but only "alt" exists; alt must win
         let result = pick_best(&data, "main", false).unwrap();
         assert_eq!(result.as_deref(), Some("alt"));
+    }
+
+    // ─── staleness gate (max-age) ────────────────────────────────────────────
+
+    use chrono::TimeZone;
+
+    /// A clearly-pickable single-profile dataset with a top-level `captured_at`.
+    fn make_data_captured(captured_at: &str) -> UsageData {
+        let mut profiles = HashMap::new();
+        profiles.insert("alt".to_string(), make_profile(Some(10), 50, None));
+        UsageData {
+            captured_at: Some(captured_at.to_string()),
+            profiles,
+            errors: None,
+        }
+    }
+
+    fn at(s: &str) -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&Utc)
+    }
+
+    #[test]
+    fn fresh_data_scores_normally() {
+        // captured 5 min before `now` — well inside the 1800s default gate.
+        let data = make_data_captured("2026-06-29T12:00:00Z");
+        let now = at("2026-06-29T12:05:00Z");
+        let result = pick_best_at(&data, "main", false, now).unwrap();
+        assert_eq!(result.as_deref(), Some("alt"), "fresh data must score");
+    }
+
+    #[test]
+    fn stale_data_degrades_to_no_usable_data() {
+        // captured 40 min before `now` — past the 1800s (30 min) default gate.
+        // Even though "alt" is trivially pickable, the gate must refuse to score
+        // and hand the caller NoUsableData (→ picker / fail-safe-to-current),
+        // NOT a confident auto-pick on percentages we can no longer trust.
+        let data = make_data_captured("2026-06-29T12:00:00Z");
+        let now = at("2026-06-29T12:40:00Z");
+        let err = pick_best_at(&data, "main", false, now).unwrap_err();
+        assert!(
+            matches!(err, ScoringError::NoUsableData),
+            "stale data must be NoUsableData (open picker), got {err:?}"
+        );
+    }
+
+    #[test]
+    fn missing_captured_at_fails_open() {
+        // No captured_at anywhere (legacy cache / non-hub source). The gate must
+        // NOT block — unknown age is trusted, preserving pre-gate behaviour.
+        let mut profiles = HashMap::new();
+        profiles.insert("alt".to_string(), make_profile(Some(10), 50, None));
+        let data = make_data(profiles); // captured_at: None
+        let now = at("2026-06-29T12:40:00Z");
+        let result = pick_best_at(&data, "main", false, now).unwrap();
+        assert_eq!(
+            result.as_deref(),
+            Some("alt"),
+            "missing captured_at must fail-open (trust the data)"
+        );
+    }
+
+    #[test]
+    fn per_profile_captured_at_is_used_when_top_level_absent() {
+        // top-level captured_at absent, but the profile carries one that is
+        // fresh → score normally (newest_captured_at falls back to per-profile).
+        let mut profiles = HashMap::new();
+        let mut p = make_profile(Some(10), 50, None);
+        p.captured_at = Some("2026-06-29T12:04:00Z".to_string());
+        profiles.insert("alt".to_string(), p);
+        let data = UsageData {
+            captured_at: None,
+            profiles,
+            errors: None,
+        };
+        let now = at("2026-06-29T12:05:00Z");
+        let result = pick_best_at(&data, "main", false, now).unwrap();
+        assert_eq!(result.as_deref(), Some("alt"));
+    }
+
+    #[test]
+    fn gate_disabled_with_zero_trusts_any_age() {
+        // CLAUDE_USAGE_MAX_AGE=0 disables the gate: even ancient data scores.
+        // env is process-global; set/restore around the assertion.
+        let saved = std::env::var("CLAUDE_USAGE_MAX_AGE").ok();
+        std::env::set_var("CLAUDE_USAGE_MAX_AGE", "0");
+        let data = make_data_captured("2020-01-01T00:00:00Z"); // years old
+        let now = at("2026-06-29T12:00:00Z");
+        let result = pick_best_at(&data, "main", false, now);
+        match saved {
+            Some(v) => std::env::set_var("CLAUDE_USAGE_MAX_AGE", v),
+            None => std::env::remove_var("CLAUDE_USAGE_MAX_AGE"),
+        }
+        assert_eq!(
+            result.unwrap().as_deref(),
+            Some("alt"),
+            "max-age 0 must disable the gate (trust any age)"
+        );
+    }
+
+    #[test]
+    fn future_captured_at_is_not_stale() {
+        // Clock skew: captured_at slightly in the future. A negative age must
+        // not be read as "stale" — score normally.
+        let data = make_data_captured("2026-06-29T12:10:00Z");
+        let now = at("2026-06-29T12:05:00Z");
+        let result = pick_best_at(&data, "main", false, now).unwrap();
+        assert_eq!(result.as_deref(), Some("alt"));
+    }
+
+    #[test]
+    fn newest_captured_at_prefers_top_level() {
+        // top-level present and fresh, a profile's per-slice stale → top-level
+        // wins (newest), so the dataset is fresh and scores.
+        let mut profiles = HashMap::new();
+        let mut p = make_profile(Some(10), 50, None);
+        p.captured_at = Some("2026-06-29T11:00:00Z".to_string()); // old slice
+        profiles.insert("alt".to_string(), p);
+        let data = UsageData {
+            captured_at: Some("2026-06-29T12:04:00Z".to_string()), // fresh top-level
+            profiles,
+            errors: None,
+        };
+        let now = at("2026-06-29T12:05:00Z");
+        let result = pick_best_at(&data, "main", false, now).unwrap();
+        assert_eq!(result.as_deref(), Some("alt"));
+        // sanity: the helper picks the newer of the two
+        let newest = newest_captured_at(&data).unwrap();
+        assert_eq!(newest, Utc.with_ymd_and_hms(2026, 6, 29, 12, 4, 0).unwrap());
     }
 }
