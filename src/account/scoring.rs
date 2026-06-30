@@ -172,33 +172,70 @@ pub type ScoringResult = Result<Option<String>, ScoringError>;
 ///   proceeds.
 ///
 /// # Staleness gate
-/// Before scoring, the data's freshness is checked against the usage max-age
-/// (`usage_max_age_secs`). If the newest `captured_at` is older than the gate,
-/// the percentages are no longer trustworthy and we return
-/// [`ScoringError::NoUsableData`] WITHOUT scoring — exactly as if no profile
-/// had usable data. The caller then opens the interactive picker (or, in a
-/// non-interactive / hook context, fail-safes to the current profile), rather
-/// than auto-routing into an account whose real usage we cannot see. The gate
-/// fail-opens on a missing/unparseable timestamp (see `data_too_stale_at`).
+/// When `apply_stale_gate` is `true`, the data's freshness is checked against
+/// the usage max-age (`usage_max_age_secs`) BEFORE scoring. If the newest
+/// `captured_at` is older than the gate, the percentages are no longer
+/// trustworthy and we return [`ScoringError::NoUsableData`] WITHOUT scoring —
+/// exactly as if no profile had usable data. The caller then opens the
+/// interactive picker (or, in a non-interactive context, fail-safes to the
+/// current profile), rather than auto-routing into an account whose real usage
+/// we cannot see. The gate fail-opens on a missing/unparseable timestamp (see
+/// `data_too_stale_at`).
+///
+/// Proactive launch and the explicit `csm pick-account` CLI pass `true` (they
+/// have a picker fallback, so "we can't tell → ask the user" is correct). The
+/// reactive **hook** passes `false`: it fires only because the current profile
+/// already hit a limit, and the hook is non-interactive (no picker). Refusing
+/// to score on stale data there would strand the user ON the limited profile;
+/// leaving for the freshest-known best, even on slightly stale numbers, is the
+/// safer choice. See [`pick_best`] / [`pick_best_gated`].
 ///
 /// # Shell source
 /// `pick_account` in `claude-smart-helper.sh.j2` lines 883–971.
+///
+/// Production callers go through [`pick_account`](crate::account::pick_account)
+/// → [`pick_best_gated`]; this gate-on convenience wrapper is the documented
+/// public entry and is exercised by the scoring tests, hence the non-test
+/// `dead_code` allow.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn pick_best(data: &UsageData, current_profile: &str, include_current: bool) -> ScoringResult {
-    pick_best_at(data, current_profile, include_current, Utc::now())
+    pick_best_at(data, current_profile, include_current, true, Utc::now())
+}
+
+/// Like [`pick_best`] but with explicit control over the staleness gate.
+/// `apply_stale_gate=false` scores even on stale data (reactive-hook path).
+pub fn pick_best_gated(
+    data: &UsageData,
+    current_profile: &str,
+    include_current: bool,
+    apply_stale_gate: bool,
+) -> ScoringResult {
+    pick_best_at(
+        data,
+        current_profile,
+        include_current,
+        apply_stale_gate,
+        Utc::now(),
+    )
 }
 
 /// `now`-injected core of [`pick_best`], for deterministic staleness tests.
 /// Mirrors the `resets_to_epoch` / `resets_to_epoch_at` split in `reset.rs`.
+///
+/// `apply_stale_gate` toggles the freshness gate (see [`pick_best`] docs).
 pub fn pick_best_at(
     data: &UsageData,
     current_profile: &str,
     include_current: bool,
+    apply_stale_gate: bool,
     now: DateTime<Utc>,
 ) -> ScoringResult {
-    // Staleness gate (spec: auto-pick must not fly on stale usage). A frozen hub
-    // scrape keeps serving the same `captured_at`; once that ages past the gate
-    // we refuse to score and let the caller fall back to the picker/current.
-    if data_too_stale_at(data, usage_max_age_secs(), now) {
+    // Staleness gate (spec: proactive auto-pick must not fly on stale usage). A
+    // frozen hub scrape keeps serving the same `captured_at`; once that ages
+    // past the gate we refuse to score and let the caller fall back to the
+    // picker/current. The reactive hook opts OUT (apply_stale_gate=false): it
+    // must move off an already-limited profile even on stale numbers.
+    if apply_stale_gate && data_too_stale_at(data, usage_max_age_secs(), now) {
         return Err(ScoringError::NoUsableData);
     }
 
@@ -860,7 +897,7 @@ mod tests {
         // captured 5 min before `now` — well inside the 1800s default gate.
         let data = make_data_captured("2026-06-29T12:00:00Z");
         let now = at("2026-06-29T12:05:00Z");
-        let result = pick_best_at(&data, "main", false, now).unwrap();
+        let result = pick_best_at(&data, "main", false, true, now).unwrap();
         assert_eq!(result.as_deref(), Some("alt"), "fresh data must score");
     }
 
@@ -872,10 +909,29 @@ mod tests {
         // NOT a confident auto-pick on percentages we can no longer trust.
         let data = make_data_captured("2026-06-29T12:00:00Z");
         let now = at("2026-06-29T12:40:00Z");
-        let err = pick_best_at(&data, "main", false, now).unwrap_err();
+        let err = pick_best_at(&data, "main", false, true, now).unwrap_err();
         assert!(
             matches!(err, ScoringError::NoUsableData),
             "stale data must be NoUsableData (open picker), got {err:?}"
+        );
+    }
+
+    #[test]
+    fn stale_data_scores_when_gate_off() {
+        // Same 40-min-stale dataset as `stale_data_degrades_to_no_usable_data`,
+        // but with the gate OFF (apply_stale_gate=false) — the reactive-hook
+        // path. The hook fires only because the current profile already hit a
+        // limit and is non-interactive, so it must move to the freshest-known
+        // best even on stale numbers rather than strand the user on the limited
+        // profile. This is the auto-switch bug fix: gate-on returned
+        // NoUsableData → NotifyOnly (no switch); gate-off scores → LimitSwitch.
+        let data = make_data_captured("2026-06-29T12:00:00Z");
+        let now = at("2026-06-29T12:40:00Z");
+        let result = pick_best_at(&data, "main", false, false, now).unwrap();
+        assert_eq!(
+            result.as_deref(),
+            Some("alt"),
+            "gate off must score stale data so the hook can switch off a limited profile"
         );
     }
 
@@ -887,7 +943,7 @@ mod tests {
         profiles.insert("alt".to_string(), make_profile(Some(10), 50, None));
         let data = make_data(profiles); // captured_at: None
         let now = at("2026-06-29T12:40:00Z");
-        let result = pick_best_at(&data, "main", false, now).unwrap();
+        let result = pick_best_at(&data, "main", false, true, now).unwrap();
         assert_eq!(
             result.as_deref(),
             Some("alt"),
@@ -909,7 +965,7 @@ mod tests {
             errors: None,
         };
         let now = at("2026-06-29T12:05:00Z");
-        let result = pick_best_at(&data, "main", false, now).unwrap();
+        let result = pick_best_at(&data, "main", false, true, now).unwrap();
         assert_eq!(result.as_deref(), Some("alt"));
     }
 
@@ -921,7 +977,7 @@ mod tests {
         std::env::set_var("CLAUDE_USAGE_MAX_AGE", "0");
         let data = make_data_captured("2020-01-01T00:00:00Z"); // years old
         let now = at("2026-06-29T12:00:00Z");
-        let result = pick_best_at(&data, "main", false, now);
+        let result = pick_best_at(&data, "main", false, true, now);
         match saved {
             Some(v) => std::env::set_var("CLAUDE_USAGE_MAX_AGE", v),
             None => std::env::remove_var("CLAUDE_USAGE_MAX_AGE"),
@@ -939,7 +995,7 @@ mod tests {
         // not be read as "stale" — score normally.
         let data = make_data_captured("2026-06-29T12:10:00Z");
         let now = at("2026-06-29T12:05:00Z");
-        let result = pick_best_at(&data, "main", false, now).unwrap();
+        let result = pick_best_at(&data, "main", false, true, now).unwrap();
         assert_eq!(result.as_deref(), Some("alt"));
     }
 
@@ -957,7 +1013,7 @@ mod tests {
             errors: None,
         };
         let now = at("2026-06-29T12:05:00Z");
-        let result = pick_best_at(&data, "main", false, now).unwrap();
+        let result = pick_best_at(&data, "main", false, true, now).unwrap();
         assert_eq!(result.as_deref(), Some("alt"));
         // sanity: the helper picks the newer of the two
         let newest = newest_captured_at(&data).unwrap();

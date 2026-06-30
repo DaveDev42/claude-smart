@@ -279,9 +279,20 @@ pub fn classify(input: &HookInput, owner_dir: &Path) -> anyhow::Result<Decision>
 
     // ── 6. Pick target profile (exclude current, reactive hook mode) ──────────
     // Shell: limit-switch.sh.j2 lines 267-285
+    //
+    // Gate OFF (apply_stale_gate=false): the proactive launch path refuses to
+    // auto-pick on stale usage (it has a picker fallback), but this hook fires
+    // ONLY because the current profile already hit a limit and is
+    // non-interactive. The tier-2 limit *detection* already bypasses the gate
+    // (it reads current_usage directly), so blocking the *target-pick* on the
+    // same stale data would leave the user stranded on the limited profile —
+    // detected-but-not-switched. Score on the freshest-known numbers instead.
     let current_profile = owner_dir_to_profile_name(owner_dir);
-    let target_result =
-        crate::account::pick_account(&current_profile, /*include_current=*/ false);
+    let target_result = crate::account::pick_account_gated(
+        &current_profile,
+        /*include_current=*/ false,
+        /*apply_stale_gate=*/ false,
+    );
     let target_profile = match target_result {
         Ok(Some(name)) => name,
         Ok(None) | Err(_) => {

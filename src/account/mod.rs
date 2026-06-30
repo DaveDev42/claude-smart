@@ -35,9 +35,29 @@ use scoring::{ScoringError, ScoringResult};
 ///   keeps the current profile.
 /// - `Err(ScoringError::FetchFailed(_))` — hub down / negative-cache active;
 ///   caller opens the hub-down interactive picker (spec §4a).
+///
+/// Applies the staleness gate (proactive / CLI path). For the reactive hook —
+/// which must switch off an already-limited profile even on stale data — use
+/// [`pick_account_gated`] with `apply_stale_gate=false`.
 pub fn pick_account(current_profile: &str, include_current: bool) -> ScoringResult {
+    pick_account_gated(current_profile, include_current, true)
+}
+
+/// [`pick_account`] with explicit control over the staleness gate.
+///
+/// `apply_stale_gate=true` is the proactive / CLI behaviour (refuse to score on
+/// stale data → caller opens the picker). `apply_stale_gate=false` is the
+/// reactive-hook behaviour: the hook fires because the current profile already
+/// hit a limit and is non-interactive, so it scores even on stale numbers to
+/// pick the freshest-known best rather than strand the user on the limited
+/// profile. See [`scoring::pick_best`] for the gate rationale.
+pub fn pick_account_gated(
+    current_profile: &str,
+    include_current: bool,
+    apply_stale_gate: bool,
+) -> ScoringResult {
     let data: UsageData = usage::fetch().map_err(ScoringError::FetchFailed)?;
-    scoring::pick_best(&data, current_profile, include_current)
+    scoring::pick_best_gated(&data, current_profile, include_current, apply_stale_gate)
 }
 
 /// Return `(session_pct, week_all_pct)` for `profile`, or `None` when the
