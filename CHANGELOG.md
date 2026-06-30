@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.2.11](https://github.com/DaveDev42/claude-smart/compare/v0.2.10...v0.2.11) (2026-06-30)
+
+
+### Features
+
+* **provision:** share plugins across profiles via shared SSOT symlink ([413252b](https://github.com/DaveDev42/claude-smart/commit/413252ba17e1b5083e5039dd2c4e851cc5426d5e))
+
+
+### Bug Fixes
+
+* **hook:** auto-switch off limited profile bypasses stale gate ([ffa1840](https://github.com/DaveDev42/claude-smart/commit/ffa1840b1ae0048ae8724212134b75fe472258e3))
+
 ## [0.2.10](https://github.com/DaveDev42/claude-smart/compare/v0.2.9...v0.2.10) (2026-06-29)
 
 
