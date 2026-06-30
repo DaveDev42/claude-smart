@@ -42,6 +42,11 @@ It is consumed by the **private** `dave-environment` Ansible repo (the operator'
   `src/statusline.rs`, `src/paths.rs` — session scan/index, in-process fuzzy
   picker (nucleo + crossterm), the Stop/SubagentStop/SessionEnd hook, sidecar
   store, OS launch/relaunch/proc checks, statusline, canonical state paths.
+- `src/provision.rs` — profile provisioning SSOT: `ensure_profile_provisioned`
+  (dir + `plugins/` → `~/.claude.shared/plugins` symlink) and the read-only
+  `diagnose_profile` core behind `csm profiles doctor`. Called implicitly on
+  every launch/switch/register so csm maintains its own invariants; explicit
+  via `bootstrap`/`doctor`. Unix-only symlink (non-unix = OS-side junction).
 - `tests/no_private_names.rs` — CI leak guard (recursively greps `src/`).
 - `.github/workflows/release-please.yml` — CI. (Design specs live in the private
   `dave-environment` repo, not here.)
@@ -96,7 +101,7 @@ Run `/verify` before every commit (test + clippy + leak guard, in one pass).
 
 ## CLI surface (collision-safe)
 
-`run, hook, profiles {list|add|set|rm|use|edit|dir},
+`run, hook, profiles {list|add|set|rm|use|edit|dir|bootstrap|doctor},
 config {show|get|set|unset launch-command}, usage [--json|--no-fetch],
 pick-account, scan, sidecar, statusline, completions, newuuid` + machine
 interface `cas` (+ back-compat `cas <verb>` aliases, `current-usage`). Full

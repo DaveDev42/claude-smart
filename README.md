@@ -57,6 +57,8 @@ csm profiles rm   <name>             unregister (refused if it is the default)
 csm profiles use  <name>             set the machine default profile (+ floor)
 csm profiles edit                    interactive editor (TTY)
 csm profiles dir  [<name>]           print a profile's config dir
+csm profiles bootstrap [<name>|--all] provision a profile's env (dir + shared plugins)
+csm profiles doctor [--fix] [<name>|--all] diagnose/repair provisioning
 
 csm usage [--json] [--no-fetch]      multi-profile usage table (opt-in; see Hub)
 
@@ -123,6 +125,34 @@ Setting the machine default also updates a **floor** — a platform-level defaul
 on Windows) so that GUI / launchd / non-shell launches of `claude` land on the
 real profile too, not just shells that sourced the `cas` function. On systems
 without such a mechanism the floor step is a no-op.
+
+### Shared plugins (provisioning)
+
+Claude Code stores its plugins and marketplace cache *under* `CLAUDE_CONFIG_DIR`.
+If each profile kept its own copy, switching profiles would leave the active
+profile's marketplace index pointing at the wrong store — Claude Code then fails
+to load marketplaces (`cache-miss`, "Run /reload-plugins"). To avoid that, `csm`
+makes every profile's `plugins/` a symlink to one shared store at
+`~/.claude.shared/plugins` (the same `~/.claude.shared` root that already holds
+your transcripts and history), so the marketplace cache stays consistent across
+switches.
+
+This is **provisioned automatically**: every launch / profile switch / registry
+add ensures the symlink exists (idempotent, best-effort — a hiccup never blocks
+the launch). You can also do it explicitly:
+
+```sh
+csm profiles bootstrap --all     # provision every profile (dir + shared plugins)
+csm profiles doctor              # read-only: report what's broken
+csm profiles doctor --fix        # repair anything unhealthy
+```
+
+The first time a profile with an existing real `plugins/` dir is provisioned,
+`csm` seeds the shared store from it (or backs the dir up if the shared store
+already has content) before replacing it with the symlink — no plugin data is
+lost. `settings.json` stays per-profile; `doctor` is where cross-profile drift
+(e.g. divergent marketplace registrations) gets surfaced. On Windows the symlink
+step is delegated to OS-native tooling and `csm` treats it as a no-op.
 
 ### Without a registry (degraded mode)
 

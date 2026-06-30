@@ -295,6 +295,9 @@ pub fn eval_emit(shell: Shell, op: &Op, profiles: &ProfileMap) -> anyhow::Result
                     if let Err(e) = platform::apply_global(profile, &dir) {
                         eprintln!("cas: platform setenv warning: {e}");
                     }
+                    // 2b. Provision the target (dir + plugins → shared SSOT) so a
+                    //     `cas <profile>` shell switch lands on a consistent dir.
+                    crate::provision::ensure_provisioned_soft(std::path::Path::new(&dir));
                     // 3. Emit the per-shell export line.
                     println!("{}", shell.export_line(&dir));
                     // 4. Print the informational message to stderr (matches
@@ -412,6 +415,9 @@ pub fn manage_emit(op: &Op, profiles: &mut ProfileMap) -> anyhow::Result<()> {
             let dir = resolve_new_dir(name, dir.as_deref());
             std::fs::create_dir_all(&dir)
                 .map_err(|e| anyhow::anyhow!("add: cannot create dir '{dir}': {e}"))?;
+            // Provision the new profile (dir + plugins → shared SSOT) so it is
+            // consistent the moment it is registered, not only on first launch.
+            crate::provision::ensure_provisioned_soft(std::path::Path::new(&dir));
             profiles.insert(name.clone(), dir.clone());
             profiles.save()?;
             eprintln!("added profile '{name}' → {dir}");
@@ -428,6 +434,7 @@ pub fn manage_emit(op: &Op, profiles: &mut ProfileMap) -> anyhow::Result<()> {
             }
             std::fs::create_dir_all(dir)
                 .map_err(|e| anyhow::anyhow!("set: cannot create dir '{dir}': {e}"))?;
+            crate::provision::ensure_provisioned_soft(std::path::Path::new(dir));
             let prev = profiles.insert(name.clone(), dir.clone());
             profiles.save()?;
             match prev {
@@ -464,6 +471,7 @@ pub fn manage_emit(op: &Op, profiles: &mut ProfileMap) -> anyhow::Result<()> {
             if let Err(e) = platform::apply_global(name, &dir) {
                 eprintln!("cas: platform setenv warning: {e}");
             }
+            crate::provision::ensure_provisioned_soft(std::path::Path::new(&dir));
             eprintln!("global default → {name} ({dir})");
             eprintln!("(new shells + GUI/launchd follow this; your current shell keeps its profile until you run `cas {name}` or open a new shell)");
         }

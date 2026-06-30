@@ -127,6 +127,10 @@ fn run_once(
     let sid = spec.session_id.clone();
     let pid_path = paths::pid_file(&sid);
 
+    // Ensure the launch profile is provisioned (no-op on non-unix, where the
+    // symlink is handled OS-side). Idempotent + best-effort.
+    crate::provision::ensure_provisioned_soft(&spec.profile_dir);
+
     let mut env: HashMap<OsString, OsString> = HashMap::new();
     env.insert(
         OsString::from("CLAUDE_CONFIG_DIR"),
@@ -180,6 +184,11 @@ fn relaunch_loop(
         // launch — remove anything older than the launch we are about to make.
         // (Defensive: the born-check below is the real guard.)
         let _ = std::fs::remove_file(&relaunch_path);
+
+        // Ensure this hop's profile satisfies the provisioning invariants
+        // (dir exists, plugins → shared SSOT) BEFORE launching claude under it.
+        // Idempotent + best-effort: a hiccup must not block the relaunch.
+        crate::provision::ensure_provisioned_soft(&profile_dir);
 
         // Per-launch child env: pin CLAUDE_CONFIG_DIR for this hop's profile.
         let mut env: HashMap<OsString, OsString> = HashMap::new();

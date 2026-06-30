@@ -147,12 +147,29 @@ pub fn scan_index_for(project_dir: &Path) -> PathBuf {
     smart_dir_no_create().join(format!("scan-meta-v2.{dir_name}.tsv"))
 }
 
-/// `$HOME/.claude.shared/projects` — transcript projects base directory.
-pub fn session_base_dir() -> PathBuf {
+/// `$HOME/.claude.shared` — the shared config root. Transcripts/projects, the
+/// smart state dir, and the cross-profile plugin SSOT all live under here; per
+/// the same philosophy that already shares `projects/`, the plugin store is
+/// shared so every profile sees one marketplace cache (avoids the
+/// `cache-miss` that a per-`CLAUDE_CONFIG_DIR` plugin dir causes on switch).
+pub fn shared_base_dir() -> PathBuf {
     dirs::home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join(".claude.shared")
-        .join("projects")
+}
+
+/// `$HOME/.claude.shared/projects` — transcript projects base directory.
+pub fn session_base_dir() -> PathBuf {
+    shared_base_dir().join("projects")
+}
+
+/// `$HOME/.claude.shared/plugins` — the single source of truth for Claude Code
+/// plugins/marketplaces shared across every profile. Each profile dir's
+/// `plugins` is symlinked here so the marketplace cache index stays consistent
+/// no matter which `CLAUDE_CONFIG_DIR` is active. See
+/// [`crate::provision::ensure_profile_provisioned`].
+pub fn shared_plugins_dir() -> PathBuf {
+    shared_base_dir().join("plugins")
 }
 
 // ─── cwd encoding ─────────────────────────────────────────────────────────────
