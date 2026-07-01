@@ -21,6 +21,11 @@ implementation to keep in sync.
 ## Install
 
 ```sh
+# Homebrew (macOS)
+brew install davedev42/tap/claude-smart
+#   `csm` and `smart-claude` are aliases for the same formula, so
+#   `brew install csm` and `brew upgrade smart-claude` also work.
+
 # from crates.io
 cargo install claude-smart
 
@@ -29,9 +34,14 @@ git clone https://github.com/DaveDev42/claude-smart
 cd claude-smart && cargo install --path .
 ```
 
-The binary is named `csm`. An optional shell function lets `cas` switch the
-active profile in your *current* shell (a child process cannot mutate its
-parent's environment, so this part is a tiny shim — see *Profiles* below).
+The primary binary is named **`csm`**; the Homebrew formula also installs
+**`smart-claude`** as an equivalent command name (they run the same binary — csm
+only special-cases the `csm-hook` invocation name, so any other name behaves
+identically). Use whichever reads better to you.
+
+An optional shell function lets `cas` switch the active profile in your *current*
+shell (a child process cannot mutate its parent's environment, so this part is a
+tiny shim — see *Profiles* below).
 
 ## Usage
 
