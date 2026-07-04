@@ -625,15 +625,19 @@ fn run_account_picker(
 ///
 /// Returns a sort key where SMALLER sorts first:
 /// - `0` bucket = viable candidate (no error, has week_all.pct, session.pct < LIMIT,
-///   week_all.pct < SATURATION). Within it, HIGHER week_all.pct ranks first
-///   (negated), then SOONER reset epoch, matching `pick_best`'s tie-break.
+///   week_all.pct < SATURATION). Within it, SOONER weekly reset epoch ranks
+///   first (`i64::MAX` when unknown, so a known reset beats an unknown one),
+///   then HIGHER week_all.pct (negated), matching `pick_best`'s ranking.
 /// - `1` bucket = everything else (saturated, session-limited, errored, or no data),
 ///   ordered by name for stability.
 ///
-/// `name` is the final tie-break so ordering is deterministic.
+/// `name` is the final tie-break so ordering is deterministic. `now` is the
+/// reference instant for reset-string parsing — callers pass `Utc::now()`
+/// once per picker build; tests inject a fixed instant for determinism.
 fn account_row_rank(
     name: &str,
     data: &picker::account::StaleProfileData,
+    now: chrono::DateTime<chrono::Utc>,
 ) -> (u8, i64, i64, String) {
     use account::scoring::{ABSENT_SESSION_PCT, LIMIT_PCT, SATURATION_PCT};
 
@@ -649,15 +653,15 @@ fn account_row_rank(
     }
 
     let week_pct = data.week_all_pct.unwrap();
-    // Higher week_all.pct first → negate so smaller sorts first.
-    // Soonest reset epoch next → i64::MAX when unknown so known beats unknown.
+    // Soonest weekly reset epoch first → i64::MAX when unknown so known beats
+    // unknown. Higher week_all.pct next → negate so smaller sorts first.
     let epoch = data
         .resets
         .as_deref()
-        .and_then(|r| account::reset::resets_to_epoch(r).ok())
+        .and_then(|r| account::reset::resets_to_epoch_at(r, now).ok())
         .map(|dt| dt.timestamp())
         .unwrap_or(i64::MAX);
-    (0, -week_pct, epoch, name.to_owned())
+    (0, epoch, -week_pct, name.to_owned())
 }
 
 /// Build `AccountRow` list for the hub-down picker, ordered by recommendation so
@@ -723,15 +727,17 @@ fn build_account_rows(profiles: &account::ProfileMap) -> Vec<picker::account::Ac
         .collect();
 
     // Recommended-first ordering: the top row is what pick_best would auto-select,
-    // so Enter (cursor starts on row 0) selects the recommendation.
-    entries.sort_by_key(|(name, data)| account_row_rank(name, data));
+    // so Enter (cursor starts on row 0) selects the recommendation. One shared
+    // `now` so every row's reset epoch is parsed against the same instant.
+    let now = chrono::Utc::now();
+    entries.sort_by_key(|(name, data)| account_row_rank(name, data, now));
 
     // The recommended row is the FIRST entry *iff* it is a viable candidate
     // (rank bucket 0). When every profile is saturated / errored / dataless,
     // pick_best would recommend nothing, so no row gets the ★.
     let recommended_idx = entries
         .first()
-        .filter(|(name, data)| account_row_rank(name, data).0 == 0)
+        .filter(|(name, data)| account_row_rank(name, data, now).0 == 0)
         .map(|_| 0usize);
 
     entries
@@ -2254,16 +2260,42 @@ mod tests {
         }
     }
 
+    /// Fixed reference instant for reset parsing (noon UTC Jun 17 2026 — the
+    /// `reset.rs` test convention), so date-string ordering never depends on
+    /// the wall clock at test time.
+    fn rank_now() -> chrono::DateTime<chrono::Utc> {
+        use chrono::TimeZone;
+        chrono::Utc.with_ymd_and_hms(2026, 6, 17, 12, 0, 0).unwrap()
+    }
+
     /// Sort names by rank and return them in display order (row 0 first).
     fn ranked_order(mut rows: Vec<(&str, StaleProfileData)>) -> Vec<String> {
-        rows.sort_by_key(|(name, data)| account_row_rank(name, data));
+        rows.sort_by_key(|(name, data)| account_row_rank(name, data, rank_now()));
         rows.into_iter().map(|(n, _)| n.to_owned()).collect()
     }
 
     #[test]
-    fn viable_higher_week_pct_leads() {
-        // Both viable; the higher week_all.pct is the recommendation (pick_best
-        // picks the most-used non-saturated account). It must be row 0.
+    fn viable_sooner_reset_leads() {
+        // Both viable; the SOONER weekly reset is the recommendation (pick_best
+        // drains the account whose budget refills first), even against a much
+        // lower week_all.pct. It must be row 0.
+        let order = ranked_order(vec![
+            (
+                "later",
+                data(Some(2), Some(70), Some("Jun 20 at 9pm (Asia/Seoul)")),
+            ),
+            (
+                "sooner",
+                data(Some(5), Some(10), Some("Jun 18 at 9pm (Asia/Seoul)")),
+            ),
+        ]);
+        assert_eq!(order, vec!["sooner", "later"]);
+    }
+
+    #[test]
+    fn viable_no_resets_higher_week_pct_leads() {
+        // Both viable with unknown resets → falls back to the higher
+        // week_all.pct (pick_best's secondary key). It must be row 0.
         let order = ranked_order(vec![
             ("low", data(Some(2), Some(10), None)),
             ("high", data(Some(5), Some(40), None)),
@@ -2303,13 +2335,11 @@ mod tests {
     }
 
     #[test]
-    fn equal_week_pct_known_reset_beats_unknown() {
-        // Same week_all.pct → a known reset epoch beats an unknown (None) one,
-        // mirroring pick_best's "known beats unknown" tie-break. This is
-        // date-independent (no reliance on what "today" is, unlike comparing two
-        // bare month/day strings whose inferred year flips around today).
+    fn known_reset_beats_unknown() {
+        // A known reset epoch beats an unknown (None) one regardless of pct,
+        // mirroring pick_best's primary key (unknown parses to i64::MAX).
         let order = ranked_order(vec![
-            ("noreset", data(Some(3), Some(30), None)),
+            ("noreset", data(Some(3), Some(80), None)),
             (
                 "hasreset",
                 data(Some(3), Some(30), Some("Jun 18 at 9pm (Asia/Seoul)")),

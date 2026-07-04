@@ -10,8 +10,8 @@ Cross-platform smart session manager for [Claude Code](https://claude.ai/code).
   directory;
 - **profile management** — multiple isolated Claude Code config homes
   (`CLAUDE_CONFIG_DIR`) with a one-command switcher;
-- **account scoring + auto-switch** — pick the least-saturated account to launch
-  under, and relaunch on a rate-limit hit;
+- **account scoring + auto-switch** — pick the viable account whose weekly
+  quota resets soonest, and relaunch on a rate-limit hit;
 - **usage metering** — a multi-profile usage table (opt-in; see *Hub*);
 - a **limit-detection hook** and a **relaunch/handoff loop**.
 
@@ -243,7 +243,7 @@ it skips the auto-pick entirely and always asks (and also forces the session
 picker). `--profile <name>` still wins over everything — explicit, no picking.
 **The picker is ordered by recommendation, not alphabetically:** rows are
 ranked exactly as the live scorer (`pick_best`) would choose — viable accounts
-first (highest `week_all.pct`, soonest-reset tie-break), saturated / session-limited
+first (soonest weekly reset; higher `week_all.pct` tie-break), saturated / session-limited
 / errored / no-data rows below — so the account auto-pick *would* have selected
 leads the list and is flagged with a **`★`** marker. Because the picker's cursor
 starts on the first row, **pressing Enter takes the recommendation**; you only

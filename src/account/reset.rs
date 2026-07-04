@@ -46,29 +46,16 @@ pub enum ResetParseError {
     Overflow,
 }
 
-/// Parse a `resets` string from the usage API into a UTC [`DateTime`].
-///
-/// Thin public wrapper that uses `Utc::now()` as the reference instant.
-/// For deterministic tests, use [`resets_to_epoch_at`] instead.
-///
-/// # Examples
-///
-/// ```ignore
-/// let dt = resets_to_epoch("Jun 4 at 9pm (Asia/Seoul)")?;
-/// ```
-pub fn resets_to_epoch(resets: &str) -> Result<DateTime<Utc>, ResetParseError> {
-    resets_to_epoch_at(resets, Utc::now())
-}
-
-/// Pure, deterministic core: parse `resets` relative to the given `now`.
+/// Parse a `resets` string from the usage API into a UTC [`DateTime`],
+/// relative to the given reference instant `now`.
 ///
 /// `now` is used for two purposes:
 /// 1. Supplying today's date when the input is a bare time (no date part).
 /// 2. The "already past?" test that triggers next-year rollover.
 ///
-/// This function is `pub` so that calling modules (e.g. `scoring`) can
-/// call it with a real `Utc::now()` without going through the thin wrapper.
-/// Tests inject a fixed instant for determinism.
+/// Calling modules (`scoring`, the hub-down picker) pass a real `Utc::now()`,
+/// captured once per pass so every profile's reset is ranked against the same
+/// instant. Tests inject a fixed instant for determinism.
 pub fn resets_to_epoch_at(
     resets: &str,
     now: DateTime<Utc>,
