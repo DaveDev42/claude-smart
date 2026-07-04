@@ -30,8 +30,9 @@
 #   - skip a profile if it is in "errors"
 #   - skip if session.pct >= CLAUDE_LIMIT_PCT            (default 99)
 #   - skip if week_all.pct >= CLAUDE_PICK_SATURATION_PCT (default 95)
-#   - among survivors: highest week_all.pct wins (drain the nearest-to-limit
-#     account first); ties broken by soonest reset.
+#   - among survivors: soonest week_all reset wins (budget on the account
+#     that refills first is the cheapest to spend; a known reset beats an
+#     unknown one); ties broken by highest week_all.pct.
 #
 # ── Three ways to source the facts ───────────────────────────────────────────
 # Pick ONE strategy below (A is simplest; C is the fully self-contained shape).

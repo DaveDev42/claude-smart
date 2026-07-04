@@ -75,8 +75,15 @@ pub struct Row {
     pub week_all_pct: Option<i64>,
     /// Weekly Sonnet quota pct, or `None` when absent.
     pub week_sonnet_pct: Option<i64>,
-    /// A human reset hint (the soonest meaningful `resets` string), or `None`.
-    pub resets: Option<String>,
+    /// The session (5h block) reset hint — a bare local time such as
+    /// `11:50pm (Asia/Seoul)` (the upstream `/usage` gauge never dates it), or
+    /// `None`.
+    pub session_resets: Option<String>,
+    /// The weekly (all tiers) reset hint — carries the date, e.g.
+    /// `Jul 9 at 9pm (Asia/Seoul)`, or `None`. Shown separately from the
+    /// session hint: collapsing the two into one column made a same-day 5h
+    /// reset read as the *weekly* reset.
+    pub week_all_resets: Option<String>,
     /// Classified status.
     pub status: Status,
     /// Error message when `status == Errored`.
@@ -175,7 +182,8 @@ fn join_one(
             session_pct: None,
             week_all_pct: None,
             week_sonnet_pct: None,
-            resets: None,
+            session_resets: None,
+            week_all_resets: None,
             status: Status::Errored,
             error: Some(err.clone()),
         };
@@ -186,13 +194,15 @@ fn join_one(
     let week_all_pct = pu.and_then(|p| p.week_all.as_ref()).map(|s| s.pct);
     let week_sonnet_pct = pu.and_then(|p| p.week_sonnet.as_ref()).map(|s| s.pct);
 
-    // Reset hint: prefer the session reset, else the weekly one.
-    let resets = pu.and_then(|p| {
-        p.session
-            .as_ref()
-            .and_then(|s| s.resets.clone())
-            .or_else(|| p.week_all.as_ref().and_then(|s| s.resets.clone()))
-    });
+    // Reset hints: session and weekly are separate facts — never collapse them
+    // into one field (a dateless session time masquerading as the weekly reset
+    // is exactly the misread the split exists to prevent).
+    let session_resets = pu
+        .and_then(|p| p.session.as_ref())
+        .and_then(|s| s.resets.clone());
+    let week_all_resets = pu
+        .and_then(|p| p.week_all.as_ref())
+        .and_then(|s| s.resets.clone());
 
     let has_any = session_pct.is_some() || week_all_pct.is_some() || week_sonnet_pct.is_some();
     let status = if !has_any {
@@ -213,7 +223,8 @@ fn join_one(
         session_pct,
         week_all_pct,
         week_sonnet_pct,
-        resets,
+        session_resets,
+        week_all_resets,
         status,
         error: None,
     }
@@ -250,7 +261,10 @@ pub fn render_table(report: &Report) -> String {
         return out;
     }
 
-    // Column widths (name column sizes to content, min 8).
+    // Column widths (name and both resets columns size to content; resets are
+    // capped so one pathological string cannot blow the table apart, and
+    // floored at the header width).
+    const RESETS_MAX_W: usize = 30;
     let name_w = report
         .rows
         .iter()
@@ -258,28 +272,45 @@ pub fn render_table(report: &Report) -> String {
         .max()
         .unwrap_or(8)
         .max(8);
+    let resets_w = |f: fn(&Row) -> Option<&str>| {
+        report
+            .rows
+            .iter()
+            .map(|r| f(r).unwrap_or("\u{2014}").chars().count())
+            .max()
+            .unwrap_or(0)
+            .clamp("RESETS(sess)".len(), RESETS_MAX_W)
+    };
+    let sess_w = resets_w(|r| r.session_resets.as_deref());
+    let week_w = resets_w(|r| r.week_all_resets.as_deref());
 
     out.push_str(&format!(
-        "{:<nw$}  {:>7}  {:>9}  {:>9}  {:<20}  {}\n",
+        "{:<nw$}  {:>7}  {:>9}  {:>9}  {:<sw$}  {:<ww$}  {}\n",
         "PROFILE",
         "SESSION",
         "WEEK(all)",
         "WK(sonnet)",
-        "RESETS",
+        "RESETS(sess)",
+        "RESETS(week)",
         "STATUS",
         nw = name_w,
+        sw = sess_w,
+        ww = week_w,
     ));
 
     for r in &report.rows {
         out.push_str(&format!(
-            "{:<nw$}  {:>7}  {:>9}  {:>9}  {:<20}  {}\n",
+            "{:<nw$}  {:>7}  {:>9}  {:>9}  {:<sw$}  {:<ww$}  {}\n",
             display_name(r),
             pct(r.session_pct),
             pct(r.week_all_pct),
             pct(r.week_sonnet_pct),
-            truncate(r.resets.as_deref().unwrap_or("\u{2014}"), 20),
+            truncate(r.session_resets.as_deref().unwrap_or("\u{2014}"), sess_w),
+            truncate(r.week_all_resets.as_deref().unwrap_or("\u{2014}"), week_w),
             status_cell(r),
             nw = name_w,
+            sw = sess_w,
+            ww = week_w,
         ));
     }
 
@@ -357,7 +388,8 @@ struct JsonRow<'a> {
     session_pct: Option<i64>,
     week_all_pct: Option<i64>,
     week_sonnet_pct: Option<i64>,
-    resets: Option<&'a str>,
+    session_resets: Option<&'a str>,
+    week_all_resets: Option<&'a str>,
     status: Status,
     error: Option<&'a str>,
 }
@@ -375,7 +407,8 @@ pub fn render_json(report: &Report) -> Result<String, serde_json::Error> {
                     session_pct: r.session_pct,
                     week_all_pct: r.week_all_pct,
                     week_sonnet_pct: r.week_sonnet_pct,
-                    resets: r.resets.as_deref(),
+                    session_resets: r.session_resets.as_deref(),
+                    week_all_resets: r.week_all_resets.as_deref(),
                     status: r.status,
                     error: r.error.as_deref(),
                 },
@@ -450,6 +483,34 @@ mod tests {
             by("errored-acct").error.as_deref(),
             Some("HTTP 401: no credentials")
         );
+    }
+
+    #[test]
+    fn resets_columns_are_separate_session_and_week_facts() {
+        let reg = registry(&["home", "work"]);
+        let u = sample_usage();
+        let report = build_report(&reg, Some(&u), true, None);
+
+        let by = |n: &str| report.rows.iter().find(|r| r.name == n).unwrap().clone();
+        // home carries both hints; they must land in their own fields.
+        assert_eq!(
+            by("home").session_resets.as_deref(),
+            Some("9pm (Asia/Seoul)")
+        );
+        assert_eq!(by("home").week_all_resets.as_deref(), Some("Jun 22"));
+        // work has a weekly hint but NO session hint — the weekly string must
+        // not leak into the session slot (and vice versa).
+        assert_eq!(by("work").session_resets, None);
+        assert_eq!(by("work").week_all_resets.as_deref(), Some("Jun 22"));
+
+        let table = render_table(&report);
+        assert!(table.contains("RESETS(sess)"), "table:\n{table}");
+        assert!(table.contains("RESETS(week)"), "table:\n{table}");
+        assert!(table.contains("9pm (Asia/Seoul)"), "table:\n{table}");
+        assert!(table.contains("Jun 22"), "table:\n{table}");
+        // work's missing session hint renders as the em-dash placeholder.
+        let work_line = table.lines().find(|l| l.starts_with("work")).unwrap();
+        assert!(work_line.contains('\u{2014}'), "work line: {work_line}");
     }
 
     #[test]
@@ -580,6 +641,18 @@ mod tests {
             serde_json::json!("near_limit")
         );
         assert_eq!(v["profiles"]["home"]["session_pct"], serde_json::json!(12));
+        assert_eq!(
+            v["profiles"]["home"]["session_resets"],
+            serde_json::json!("9pm (Asia/Seoul)")
+        );
+        assert_eq!(
+            v["profiles"]["home"]["week_all_resets"],
+            serde_json::json!("Jun 22")
+        );
+        assert_eq!(
+            v["profiles"]["work"]["session_resets"],
+            serde_json::json!(null)
+        );
         assert_eq!(
             v["profiles"]["errored-acct"]["status"],
             serde_json::json!("errored")

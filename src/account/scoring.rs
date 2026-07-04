@@ -1,19 +1,25 @@
 //! Account scoring: choose the best profile to launch under.
 //!
-//! Logic (spec §2 Account pick + scoring, shell source pick_account ~lines 883–971):
+//! Logic (spec §2 Account pick + scoring):
 //!
 //! 1. Build candidate rows: profiles NOT in errors{}, with a numeric week_all.pct.
-//! 2. Exclusions (in order, per shell lines 947–949):
+//! 2. Exclusions (in order):
 //!    - `session.pct >= LIMIT_PCT(99)` → skip (absent session.pct = -1, never fires).
 //!    - `week_all.pct >= SATURATION_PCT(95)` → skip.
-//! 3. Among the survivors, choose the one with the HIGHEST week_all.pct (shell lines
-//!    955–961: `pct > best_pct` wins; `pct == best_pct` → soonest reset epoch wins
-//!    — a known epoch beats unknown, a smaller epoch beats a larger one).
-//! 4. `include_current = false` (reactive / hook): skip the current profile entirely
-//!    (shell line 942–944).
+//! 3. Among the survivors, choose the one whose weekly reset returns SOONEST:
+//!    a known `week_all.resets` epoch beats an unknown one, and a smaller
+//!    (sooner) epoch beats a larger one. Ties (equal epoch, or all epochs
+//!    unknown) break to the HIGHER week_all.pct, then to the first candidate
+//!    in name order. Rationale: budget spent on the account that refills first
+//!    is the cheapest budget — drain that account, keep the later-resetting
+//!    ones in reserve.
+//!    (Policy changed post-0.2.11: the retired shell source — pick_account,
+//!    claude-smart-helper.sh.j2 lines 883–971 — drained highest-pct-first with
+//!    a soonest-reset tie-break; the primary and secondary keys are now
+//!    swapped.)
+//! 4. `include_current = false` (reactive / hook): skip the current profile entirely.
 //! 5. `include_current = true` (proactive / fresh csm): current competes; if the
-//!    winner is current → return `Ok(None)` so the caller keeps it with no switch
-//!    (shell lines 967–969).
+//!    winner is current → return `Ok(None)` so the caller keeps it with no switch.
 //! 6. No viable candidate → `Err(ScoringError::AllSaturated)`.
 //!
 //! Env overrides: `CLAUDE_LIMIT_PCT` / `CLAUDE_PICK_SATURATION_PCT` (spec §2).
@@ -23,7 +29,7 @@ use std::env;
 
 use chrono::{DateTime, Utc};
 
-use crate::account::reset::resets_to_epoch;
+use crate::account::reset::resets_to_epoch_at;
 use crate::usage::{FetchError, UsageData};
 
 // ─── constants ────────────────────────────────────────────────────────────────
@@ -190,8 +196,10 @@ pub type ScoringResult = Result<Option<String>, ScoringError>;
 /// leaving for the freshest-known best, even on slightly stale numbers, is the
 /// safer choice. See [`pick_best`] / [`pick_best_gated`].
 ///
-/// # Shell source
-/// `pick_account` in `claude-smart-helper.sh.j2` lines 883–971.
+/// # Ranking
+/// Soonest known weekly reset first; ties break to higher week_all.pct, then
+/// name order (see the module doc — this diverges from the retired shell
+/// source, which ranked highest-pct-first).
 ///
 /// Production callers go through [`pick_account`](crate::account::pick_account)
 /// → [`pick_best_gated`]; this gate-on convenience wrapper is the documented
@@ -288,68 +296,48 @@ pub fn pick_best_at(
         })
         .collect();
 
-    // Shell lines 939–962: iterate rows, apply exclusion gates, track best.
+    // Iterate rows, apply exclusion gates, track best.
     let mut best_name: Option<&str> = None;
-    let mut best_pct: i64 = i64::MIN;
-    let mut best_epoch: Option<i64> = None;
+    let mut best_key: (i64, i64) = (i64::MAX, i64::MAX);
 
-    // Sort by name for deterministic tie-break behavior in tests (HashMap order is
-    // non-deterministic; the shell source reads jq output which may also vary).
-    // The tie-break logic is epoch-based (from the data), so stable naming order
-    // ensures tests with equal pcts and equal/absent epochs are reproducible.
+    // Sort by name for deterministic tie-break behavior (HashMap order is
+    // non-deterministic). The rank key is data-derived (epoch, pct), so stable
+    // naming order ensures full ties are reproducible: the strictly-smaller
+    // comparison below keeps the first name among fully-tied candidates.
     candidates.sort_by(|a, b| a.name.cmp(b.name));
 
     for c in &candidates {
-        // Reactive (hook) mode: never target the current profile (shell lines 941–943).
+        // Reactive (hook) mode: never target the current profile.
         if !include_current && !current_profile.is_empty() && c.name == current_profile {
             continue;
         }
 
-        // Session-limit gate: session.pct >= LIMIT_PCT → skip (shell line 947).
+        // Session-limit gate: session.pct >= LIMIT_PCT → skip.
         // -1 (absent) is < 99 so it intentionally passes.
         if c.session_pct >= lim {
             continue;
         }
 
-        // Saturation gate: week_all.pct >= SATURATION_PCT → skip (shell line 949).
+        // Saturation gate: week_all.pct >= SATURATION_PCT → skip.
         if c.week_pct >= sat {
             continue;
         }
 
-        // Compute reset epoch for tie-breaking (shell line 950).
-        // resets_to_epoch failures are treated as "unknown" (None), matching shell
-        // behavior where `resets_to_epoch` prints nothing on parse failure.
-        let epoch: Option<i64> = c
+        // Rank key, smaller wins: (weekly reset epoch, negated week pct).
+        // Primary: SOONEST weekly reset — parse failures / absent resets become
+        // i64::MAX so a known epoch always beats an unknown one. Secondary:
+        // higher week_all.pct (drain the fuller of two same-reset accounts).
+        // Parsed against the same `now` as the staleness gate for determinism.
+        let epoch: i64 = c
             .resets
-            .and_then(|r| resets_to_epoch(r).ok())
-            .map(|dt| dt.timestamp());
+            .and_then(|r| resets_to_epoch_at(r, now).ok())
+            .map(|dt| dt.timestamp())
+            .unwrap_or(i64::MAX);
+        let key = (epoch, -c.week_pct);
 
-        // First viable candidate (shell lines 951–953).
-        if best_name.is_none() {
+        if best_name.is_none() || key < best_key {
             best_name = Some(c.name);
-            best_pct = c.week_pct;
-            best_epoch = epoch;
-            continue;
-        }
-
-        // Higher pct wins (shell lines 955–956).
-        if c.week_pct > best_pct {
-            best_name = Some(c.name);
-            best_pct = c.week_pct;
-            best_epoch = epoch;
-        } else if c.week_pct == best_pct {
-            // Equal pct → soonest reset epoch wins (shell lines 957–960).
-            // A known epoch beats unknown; a smaller epoch (sooner) beats a larger.
-            let new_wins = match (epoch, best_epoch) {
-                (Some(_), None) => true,       // known beats unknown
-                (Some(e), Some(be)) => e < be, // smaller (sooner) wins
-                _ => false,                    // unknown doesn't beat known or equal unknown
-            };
-            if new_wins {
-                best_name = Some(c.name);
-                best_pct = c.week_pct;
-                best_epoch = epoch;
-            }
+            best_key = key;
         }
     }
 
@@ -487,8 +475,7 @@ mod tests {
 
     // ─── basic pick ──────────────────────────────────────────────────────────
 
-    /// Shell behavior: among two healthy profiles, pick the one with the
-    /// HIGHER week_all.pct (drain the account nearest its ceiling first).
+    /// A saturated profile is excluded; the remaining healthy one wins.
     #[test]
     fn one_saturated_one_healthy_picks_healthy() {
         let mut profiles = HashMap::new();
@@ -501,9 +488,91 @@ mod tests {
         assert_eq!(result.as_deref(), Some("healthy"));
     }
 
-    /// Higher week_pct profile is picked even when both are healthy.
+    /// Fixed reference instant for reset-epoch ranking tests: noon UTC on
+    /// Jun 17 2026 (= 9pm KST), matching the `reset.rs` test convention.
+    fn ranking_now() -> chrono::DateTime<Utc> {
+        Utc.with_ymd_and_hms(2026, 6, 17, 12, 0, 0).unwrap()
+    }
+
+    /// PRIMARY key: the account whose weekly reset returns soonest wins, even
+    /// against a much higher week_all.pct. Budget on the account that refills
+    /// first is the cheapest to spend.
     #[test]
-    fn picks_highest_week_pct() {
+    fn sooner_reset_beats_higher_pct() {
+        let mut profiles = HashMap::new();
+        // "fresh" barely used but resets later (Jun 20).
+        profiles.insert(
+            "fresh".to_string(),
+            make_profile(Some(0), 0, Some("Jun 20 at 9pm (Asia/Seoul)")),
+        );
+        // "burning" heavily used but resets sooner (Jun 18).
+        profiles.insert(
+            "burning".to_string(),
+            make_profile(Some(5), 70, Some("Jun 18 at 9pm (Asia/Seoul)")),
+        );
+        let data = make_data(profiles);
+        let result = pick_best_at(&data, "", false, true, ranking_now()).unwrap();
+        assert_eq!(result.as_deref(), Some("burning"));
+    }
+
+    /// Regression for the two-account shape that motivated the policy flip:
+    /// `heavy` is the more-used account (week 31%) but resets LATER (Jul 9);
+    /// `light` is barely used (week 0%) but resets SOONER (Jul 8). The old
+    /// highest-pct-first rule kept draining `heavy`; the new rule drains
+    /// `light` (soonest refill = cheapest budget). `now` sits before both
+    /// resets so no year-rollover perturbs the ordering. Names are neutral
+    /// (the no_private_names guard forbids real profile literals here).
+    #[test]
+    fn sooner_resetting_account_wins_over_more_used_one() {
+        use chrono::TimeZone;
+        let now = Utc.with_ymd_and_hms(2026, 7, 4, 12, 0, 0).unwrap();
+        let mut profiles = HashMap::new();
+        profiles.insert(
+            "heavy".to_string(),
+            make_profile(Some(27), 31, Some("Jul 9 at 8:59pm (Asia/Seoul)")),
+        );
+        profiles.insert(
+            "light".to_string(),
+            make_profile(Some(0), 0, Some("Jul 8 at 6pm (Asia/Seoul)")),
+        );
+        let data = make_data(profiles);
+        // Proactive launch already on `heavy`: the sooner-resetting `light`
+        // must be recommended as a switch, not silently kept.
+        let result = pick_best_at(&data, "heavy", true, true, now).unwrap();
+        assert_eq!(result.as_deref(), Some("light"));
+    }
+
+    /// A known weekly reset epoch beats an unknown one regardless of pct.
+    #[test]
+    fn known_reset_beats_unknown_regardless_of_pct() {
+        let mut profiles = HashMap::new();
+        profiles.insert("noreset".to_string(), make_profile(Some(5), 70, None));
+        profiles.insert(
+            "hasreset".to_string(),
+            make_profile(Some(5), 10, Some("Jun 20 at 9pm (Asia/Seoul)")),
+        );
+        let data = make_data(profiles);
+        let result = pick_best_at(&data, "", false, true, ranking_now()).unwrap();
+        assert_eq!(result.as_deref(), Some("hasreset"));
+    }
+
+    /// Equal reset epoch → the HIGHER week_all.pct wins (drain the fuller of
+    /// two accounts whose budgets refill at the same instant).
+    #[test]
+    fn equal_reset_higher_pct_wins() {
+        let mut profiles = HashMap::new();
+        let resets = Some("Jun 18 at 9pm (Asia/Seoul)");
+        profiles.insert("low".to_string(), make_profile(Some(5), 30, resets));
+        profiles.insert("high".to_string(), make_profile(Some(5), 70, resets));
+        let data = make_data(profiles);
+        let result = pick_best_at(&data, "", false, true, ranking_now()).unwrap();
+        assert_eq!(result.as_deref(), Some("high"));
+    }
+
+    /// SECONDARY key fallback: when no candidate has a parseable reset, the
+    /// higher week_pct profile is picked (the pre-0.3 primary key).
+    #[test]
+    fn no_resets_picks_highest_week_pct() {
         let mut profiles = HashMap::new();
         // "low" at 30%, "high" at 70%
         profiles.insert("low".to_string(), make_profile(Some(5), 30, None));
@@ -513,11 +582,11 @@ mod tests {
         assert_eq!(result.as_deref(), Some("high"));
     }
 
-    // ─── tie-break by reset epoch ─────────────────────────────────────────────
+    // ─── full-tie fallback (equal epoch + equal pct) ──────────────────────────
 
-    /// Equal week_pct, both with no resets string → both epochs are None → tie
-    /// is broken by alphabetical candidate order (first alphabetically wins).
-    /// This validates the tie-break code path without calling resets_to_epoch.
+    /// Equal week_pct, both with no resets string → both epochs are unknown →
+    /// the full tie is broken by alphabetical candidate order (first wins).
+    /// This validates the tie-break code path without calling the reset parser.
     #[test]
     fn tiebreak_no_resets_alphabetical_first_wins() {
         let mut profiles = HashMap::new();
