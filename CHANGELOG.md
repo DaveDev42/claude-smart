@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.12](https://github.com/DaveDev42/claude-smart/compare/v0.2.11...v0.2.12) (2026-07-04)
+
+
+### Features
+
+* rank account pick by soonest weekly reset, split usage RESETS column ([#16](https://github.com/DaveDev42/claude-smart/issues/16)) ([5e212ab](https://github.com/DaveDev42/claude-smart/commit/5e212abe7d285e064842428c5286f91decbf7820))
+
 ## [0.2.11](https://github.com/DaveDev42/claude-smart/compare/v0.2.10...v0.2.11) (2026-06-30)
 
 
