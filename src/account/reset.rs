@@ -336,10 +336,8 @@ fn parse_12h_time(s: &str) -> Option<NaiveTime> {
     // Must end with "am" or "pm" (already lowercased by inject_minutes).
     let (stem, is_pm) = if let Some(stem) = s.strip_suffix("pm") {
         (stem, true)
-    } else if let Some(stem) = s.strip_suffix("am") {
-        (stem, false)
     } else {
-        return None;
+        (s.strip_suffix("am")?, false)
     };
 
     let colon = stem.find(':')?;
@@ -649,7 +647,7 @@ mod tests {
         for (name, num) in expected {
             assert_eq!(parse_month(name), Some(num), "month={name}");
             // Also test title case.
-            let title = format!("{}{}", &name[..1].to_uppercase(), &name[1..]);
+            let title = format!("{}{}", name[..1].to_uppercase(), &name[1..]);
             assert_eq!(parse_month(&title), Some(num), "month={title}");
         }
         assert_eq!(parse_month("xyz"), None);
