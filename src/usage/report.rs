@@ -106,6 +106,10 @@ pub struct Report {
     pub no_usage: bool,
     /// Top-level capture timestamp from the hub, when present.
     pub captured_at: Option<String>,
+    /// Which model tier the `week_fable_pct` column actually measures, as
+    /// reported by the hub (e.g. `"Fable"`). `None` when the hub predates the
+    /// field or sent no label; the column then falls back to its baked-in name.
+    pub week_model_label: Option<String>,
 }
 
 // ─── pure core: join ─────────────────────────────────────────────────────────
@@ -164,7 +168,26 @@ pub fn build_report(
         configured,
         no_usage,
         captured_at: usage.and_then(|u| u.captured_at.clone()),
+        week_model_label: tier_label(usage),
     }
+}
+
+/// The tier the per-model weekly column measures, e.g. `"Fable"`.
+///
+/// Taken from the hub rather than baked in here: Anthropic renames the
+/// separately-capped tier (the `claude /usage` row read "Sonnet only" until
+/// 2026-07 and "Fable" after), and a hardcoded header would go on advertising a
+/// tier that is no longer the one being metered — the same silent-staleness
+/// this field exists to end. Every profile scrapes the same tier, so the first
+/// label wins; sorted-name order keeps that pick stable across `HashMap`
+/// iteration orders.
+fn tier_label(usage: Option<&UsageData>) -> Option<String> {
+    let u = usage?;
+    let mut names: Vec<&str> = u.profiles.keys().map(String::as_str).collect();
+    names.sort_unstable();
+    names
+        .into_iter()
+        .find_map(|n| u.profiles[n].week_model_label.clone())
 }
 
 /// Join a single profile name against the usage blob.
@@ -284,23 +307,38 @@ pub fn render_table(report: &Report) -> String {
     let sess_w = resets_w(|r| r.session_resets.as_deref());
     let week_w = resets_w(|r| r.week_all_resets.as_deref());
 
+    // The per-model weekly column is headed with the tier the hub actually
+    // scraped, so a tier rename retitles the column instead of mislabelling it.
+    // Truncated because the label is free text off a TUI row, and floored at the
+    // legacy width so the table keeps its shape for the common short names.
+    const TIER_MAX_W: usize = 14;
+    let tier_head = format!(
+        "WK({})",
+        truncate(
+            report.week_model_label.as_deref().unwrap_or("fable"),
+            TIER_MAX_W
+        )
+    );
+    let tier_w = tier_head.chars().count().max(9);
+
     out.push_str(&format!(
-        "{:<nw$}  {:>7}  {:>9}  {:>9}  {:<sw$}  {:<ww$}  {}\n",
+        "{:<nw$}  {:>7}  {:>9}  {:>tw$}  {:<sw$}  {:<ww$}  {}\n",
         "PROFILE",
         "SESSION",
         "WEEK(all)",
-        "WK(fable)",
+        tier_head,
         "RESETS(sess)",
         "RESETS(week)",
         "STATUS",
         nw = name_w,
+        tw = tier_w,
         sw = sess_w,
         ww = week_w,
     ));
 
     for r in &report.rows {
         out.push_str(&format!(
-            "{:<nw$}  {:>7}  {:>9}  {:>9}  {:<sw$}  {:<ww$}  {}\n",
+            "{:<nw$}  {:>7}  {:>9}  {:>tw$}  {:<sw$}  {:<ww$}  {}\n",
             display_name(r),
             pct(r.session_pct),
             pct(r.week_all_pct),
@@ -309,6 +347,7 @@ pub fn render_table(report: &Report) -> String {
             truncate(r.week_all_resets.as_deref().unwrap_or("\u{2014}"), week_w),
             status_cell(r),
             nw = name_w,
+            tw = tier_w,
             sw = sess_w,
             ww = week_w,
         ));
@@ -379,6 +418,8 @@ struct JsonReport<'a> {
     captured_at: Option<&'a str>,
     stale_secs: Option<u64>,
     configured: bool,
+    /// Which tier every row's `week_fable_pct` measures, per the hub.
+    week_model_label: Option<&'a str>,
     profiles: std::collections::BTreeMap<&'a str, JsonRow<'a>>,
 }
 
@@ -420,6 +461,7 @@ pub fn render_json(report: &Report) -> Result<String, serde_json::Error> {
         captured_at: report.captured_at.as_deref(),
         stale_secs: report.stale_secs,
         configured: report.configured,
+        week_model_label: report.week_model_label.as_deref(),
         profiles,
     };
     serde_json::to_string_pretty(&wire)
@@ -604,6 +646,99 @@ mod tests {
         // Old (7m): stale header present.
         let stale = render_table(&build_report(&reg, Some(&u), true, Some(420)));
         assert!(stale.contains("hub data is 7m old"), "stale:\n{stale}");
+    }
+
+    /// A single-profile blob carrying an explicit tier label, as the hub sends
+    /// since `parse-usage.py` started reporting which row it scraped.
+    fn labelled_usage(label: &str) -> UsageData {
+        serde_json::from_str(&format!(
+            r#"{{
+              "captured_at": "2026-07-26T07:00:00Z",
+              "profiles": {{
+                "home": {{
+                  "session": {{"pct": 12}},
+                  "week_all": {{"pct": 34}},
+                  "week_fable": {{"pct": 80}},
+                  "week_model_label": "{label}"
+                }}
+              }}
+            }}"#
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn tier_column_is_headed_with_the_hub_reported_tier() {
+        let reg = registry(&["home"]);
+        let u = labelled_usage("Fable");
+        let report = build_report(&reg, Some(&u), true, None);
+        assert_eq!(report.week_model_label.as_deref(), Some("Fable"));
+        let table = render_table(&report);
+        assert!(table.contains("WK(Fable)"), "table:\n{table}");
+        // And the label reaches `--json` consumers too.
+        let json = render_json(&report).unwrap();
+        assert!(json.contains("\"week_model_label\": \"Fable\""), "{json}");
+    }
+
+    #[test]
+    fn tier_column_falls_back_when_hub_sends_no_label() {
+        // Pre-label hubs (and cache files they wrote) omit the field entirely;
+        // the column keeps its baked-in name rather than rendering `WK()`.
+        let reg = registry(&["home", "work"]);
+        let u = sample_usage();
+        let report = build_report(&reg, Some(&u), true, None);
+        assert_eq!(report.week_model_label, None);
+        assert!(render_table(&report).contains("WK(fable)"));
+    }
+
+    #[test]
+    fn renamed_tier_retitles_the_column_and_keeps_it_aligned() {
+        // The whole point of the field: when Anthropic meters a different tier,
+        // the header follows the data instead of lying about it — and the wider
+        // header must widen the column, not shove later columns out of line.
+        let reg = registry(&["home"]);
+        let u = labelled_usage("Sonnet only");
+        let report = build_report(&reg, Some(&u), true, None);
+        let table = render_table(&report);
+        assert!(table.contains("WK(Sonnet only)"), "table:\n{table}");
+        assert!(!table.contains("WK(fable)"), "stale label:\n{table}");
+
+        let mut lines = table.lines();
+        let header = lines.next().unwrap();
+        let row = lines.next().unwrap();
+        // STATUS is the one unpadded column, so equal start offsets prove the
+        // widened tier column moved every intervening column consistently.
+        assert_eq!(
+            header.chars().count() - "STATUS".len(),
+            row.chars().count() - status_cell(&report.rows[0]).chars().count(),
+            "columns misaligned:\n{table}"
+        );
+    }
+
+    #[test]
+    fn tier_label_pick_is_deterministic_and_bounded() {
+        // Sorted-name order, so a `HashMap` reshuffle cannot flip the header.
+        let u: UsageData = serde_json::from_str(
+            r#"{"profiles": {
+                 "zzz": {"week_all": {"pct": 1}, "week_model_label": "Zeta"},
+                 "aaa": {"week_all": {"pct": 1}, "week_model_label": "Alpha"}
+               }}"#,
+        )
+        .unwrap();
+        let reg = registry(&["aaa", "zzz"]);
+        for _ in 0..8 {
+            let report = build_report(&reg, Some(&u), true, None);
+            assert_eq!(report.week_model_label.as_deref(), Some("Alpha"));
+        }
+
+        // A pathological label is truncated, never left to blow the table apart.
+        let long = labelled_usage("Supercalifragilistic");
+        let table = render_table(&build_report(&registry(&["home"]), Some(&long), true, None));
+        let header = table.lines().next().unwrap();
+        assert!(
+            header.contains("WK(Supercalifrag\u{2026})"),
+            "header: {header}"
+        );
     }
 
     #[test]

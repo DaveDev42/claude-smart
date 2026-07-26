@@ -437,6 +437,7 @@ mod tests {
             session: session_pct.map(|p| make_section(p, None)),
             week_all: Some(make_section(week_pct, resets)),
             week_fable: None,
+            week_model_label: None,
             session_stats: vec![],
         }
     }
@@ -678,6 +679,7 @@ mod tests {
             session: session_pct.map(|p| make_section(p, None)),
             week_all: None,
             week_fable: None,
+            week_model_label: None,
             session_stats: vec![],
         }
     }
@@ -909,6 +911,7 @@ mod tests {
             session: Some(make_section(5, None)),
             week_all: None,
             week_fable: None,
+            week_model_label: None,
             session_stats: vec![],
         };
         profiles.insert("no_week_all".to_string(), pu);

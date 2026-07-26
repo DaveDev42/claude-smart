@@ -11,6 +11,7 @@
 //!       "session":     { "pct": <int>, "resets": <string|null> } | null,
 //!       "week_all":    { "pct": <int>, "resets": <string|null> } | null,
 //!       "week_fable":  { "pct": <int>, "resets": <string|null> } | null,
+//!       "week_model_label": "<string>" | null,
 //!       "session_stats": ["<string>", ...]
 //!     }
 //!   },
@@ -81,6 +82,13 @@ pub struct ProfileUsage {
     /// `None` when absent or null.
     #[serde(default)]
     pub week_fable: Option<UsageSection>,
+
+    /// Which tier `week_fable` was actually scraped from, verbatim from the
+    /// `claude /usage` row (e.g. `"Fable"`). The hub derives this instead of
+    /// assuming a name, so a tier rename relabels the column rather than
+    /// leaving it advertising a tier that is no longer metered.
+    #[serde(default)]
+    pub week_model_label: Option<String>,
 
     /// Raw stat strings from the hub (e.g. token counts).  Optional; not used
     /// for scoring but preserved for debugging.
