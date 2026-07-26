@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.13](https://github.com/DaveDev42/claude-smart/compare/v0.2.12...v0.2.13) (2026-07-26)
+
+
+### Bug Fixes
+
+* **usage:** track the Fable weekly cap, not the retired Sonnet one ([96f4e4c](https://github.com/DaveDev42/claude-smart/commit/96f4e4ca27918e2a76fc291119db7f0c7c5a9cab))
+
 ## [0.2.12](https://github.com/DaveDev42/claude-smart/compare/v0.2.11...v0.2.12) (2026-07-04)
 
 
