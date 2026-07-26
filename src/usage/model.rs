@@ -10,7 +10,7 @@
 //!       "captured_at": "<ISO-8601>",
 //!       "session":     { "pct": <int>, "resets": <string|null> } | null,
 //!       "week_all":    { "pct": <int>, "resets": <string|null> } | null,
-//!       "week_sonnet": { "pct": <int>, "resets": <string|null> } | null,
+//!       "week_fable":  { "pct": <int>, "resets": <string|null> } | null,
 //!       "session_stats": ["<string>", ...]
 //!     }
 //!   },
@@ -19,11 +19,19 @@
 //! ```
 //!
 //! Design choices (spec mandated):
-//! - Each section (`session`/`week_all`/`week_sonnet`) is `Option<UsageSection>`.
+//! - Each section (`session`/`week_all`/`week_fable`) is `Option<UsageSection>`.
 //!   `parse-usage.py` returns `None` for an absent section → serde null → `None`.
 //! - `resets` inside a present section is `Option<String>` (may be null).
 //! - `errors` key is absent when all profiles succeeded → `Option<HashMap<…>>`.
 //! - `#[serde(default)]` throughout for forward-compatible tolerance.
+//!
+//! `week_fable` is the *separately-capped model tier*, whose name tracks
+//! whichever tier Anthropic meters on its own — the `claude /usage` row was
+//! "Current week (Sonnet only)" until 2026-07 and is "Current week (Fable)"
+//! now. The key must stay in lockstep with the producer
+//! (`dave-environment shared/claude-code-usage/parse-usage.py`): `serde(default)`
+//! means a producer-side rename does not error here, it silently reads `None`
+//! forever.
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -69,10 +77,10 @@ pub struct ProfileUsage {
     #[serde(default)]
     pub week_all: Option<UsageSection>,
 
-    /// Weekly Sonnet-tier quota.
+    /// Weekly per-model-tier quota (currently Fable).
     /// `None` when absent or null.
     #[serde(default)]
-    pub week_sonnet: Option<UsageSection>,
+    pub week_fable: Option<UsageSection>,
 
     /// Raw stat strings from the hub (e.g. token counts).  Optional; not used
     /// for scoring but preserved for debugging.
@@ -82,7 +90,7 @@ pub struct ProfileUsage {
 
 // ─── per-section ──────────────────────────────────────────────────────────────
 
-/// A single usage quota section (session, week_all, or week_sonnet).
+/// A single usage quota section (session, week_all, or week_fable).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UsageSection {
     /// Percentage consumed (0–100; may exceed 100 on burst).
@@ -123,7 +131,7 @@ mod tests {
 
     /// A representative `.usage-cache.json` payload with:
     /// - `home`: all three sections present with real values
-    /// - `work`: `week_sonnet` absent (null), `session.resets` null
+    /// - `work`: `week_fable` absent (null), `session.resets` null
     /// - `errors`: one errored profile
     /// - top-level `captured_at` present
     const SAMPLE_CACHE_JSON: &str = r#"
@@ -140,7 +148,7 @@ mod tests {
             "pct": 31,
             "resets": "Jun 18 at 9pm (Asia/Seoul)"
           },
-          "week_sonnet": {
+          "week_fable": {
             "pct": 15,
             "resets": "Jun 18 at 9pm (Asia/Seoul)"
           },
@@ -156,7 +164,7 @@ mod tests {
             "pct": 67,
             "resets": "Jun 20 at 8:20pm (Asia/Seoul)"
           },
-          "week_sonnet": null,
+          "week_fable": null,
           "session_stats": []
         }
       },
@@ -191,16 +199,16 @@ mod tests {
             Some("Jun 18 at 9pm (Asia/Seoul)")
         );
 
-        let week_sonnet = home.week_sonnet.as_ref().expect("home.week_sonnet");
-        assert_eq!(week_sonnet.pct, 15);
+        let week_fable = home.week_fable.as_ref().expect("home.week_fable");
+        assert_eq!(week_fable.pct, 15);
 
         assert_eq!(home.session_stats.len(), 2);
 
-        // work profile — week_sonnet is null → None
+        // work profile — week_fable is null → None
         let work = data.profiles.get("work").expect("work profile");
         assert!(
-            work.week_sonnet.is_none(),
-            "work.week_sonnet should be None (null in JSON)"
+            work.week_fable.is_none(),
+            "work.week_fable should be None (null in JSON)"
         );
         // session.resets is null → None
         let esess = work.session.as_ref().expect("work.session");
@@ -227,7 +235,7 @@ mod tests {
             "errors should be None when key absent"
         );
         let p = data.profiles.get("home").expect("home");
-        assert!(p.week_sonnet.is_none());
+        assert!(p.week_fable.is_none());
     }
 
     #[test]

@@ -18,7 +18,7 @@
 //! table matches what the picker would refuse to launch under:
 //! - `Errored`  — the profile is in `UsageData.errors`.
 //! - `NoData`   — registered, but absent from the hub (or no sections).
-//! - `NearLimit`— any of session/week_all/week_sonnet pct ≥ `WARN_PCT`.
+//! - `NearLimit`— any of session/week_all/week_fable pct ≥ `WARN_PCT`.
 //! - `Ok`       — otherwise.
 //!
 //! # Spec reference
@@ -73,8 +73,8 @@ pub struct Row {
     pub session_pct: Option<i64>,
     /// Weekly (all tiers) quota pct, or `None` when absent.
     pub week_all_pct: Option<i64>,
-    /// Weekly Sonnet quota pct, or `None` when absent.
-    pub week_sonnet_pct: Option<i64>,
+    /// Weekly per-model-tier (Fable) quota pct, or `None` when absent.
+    pub week_fable_pct: Option<i64>,
     /// The session (5h block) reset hint — a bare local time such as
     /// `11:50pm (Asia/Seoul)` (the upstream `/usage` gauge never dates it), or
     /// `None`.
@@ -181,7 +181,7 @@ fn join_one(
             registered,
             session_pct: None,
             week_all_pct: None,
-            week_sonnet_pct: None,
+            week_fable_pct: None,
             session_resets: None,
             week_all_resets: None,
             status: Status::Errored,
@@ -192,7 +192,7 @@ fn join_one(
     let pu = usage.and_then(|u| u.profiles.get(name));
     let session_pct = pu.and_then(|p| p.session.as_ref()).map(|s| s.pct);
     let week_all_pct = pu.and_then(|p| p.week_all.as_ref()).map(|s| s.pct);
-    let week_sonnet_pct = pu.and_then(|p| p.week_sonnet.as_ref()).map(|s| s.pct);
+    let week_fable_pct = pu.and_then(|p| p.week_fable.as_ref()).map(|s| s.pct);
 
     // Reset hints: session and weekly are separate facts — never collapse them
     // into one field (a dateless session time masquerading as the weekly reset
@@ -204,10 +204,10 @@ fn join_one(
         .and_then(|p| p.week_all.as_ref())
         .and_then(|s| s.resets.clone());
 
-    let has_any = session_pct.is_some() || week_all_pct.is_some() || week_sonnet_pct.is_some();
+    let has_any = session_pct.is_some() || week_all_pct.is_some() || week_fable_pct.is_some();
     let status = if !has_any {
         Status::NoData
-    } else if [session_pct, week_all_pct, week_sonnet_pct]
+    } else if [session_pct, week_all_pct, week_fable_pct]
         .into_iter()
         .flatten()
         .any(|p| p >= WARN_PCT)
@@ -222,7 +222,7 @@ fn join_one(
         registered,
         session_pct,
         week_all_pct,
-        week_sonnet_pct,
+        week_fable_pct,
         session_resets,
         week_all_resets,
         status,
@@ -289,7 +289,7 @@ pub fn render_table(report: &Report) -> String {
         "PROFILE",
         "SESSION",
         "WEEK(all)",
-        "WK(sonnet)",
+        "WK(fable)",
         "RESETS(sess)",
         "RESETS(week)",
         "STATUS",
@@ -304,7 +304,7 @@ pub fn render_table(report: &Report) -> String {
             display_name(r),
             pct(r.session_pct),
             pct(r.week_all_pct),
-            pct(r.week_sonnet_pct),
+            pct(r.week_fable_pct),
             truncate(r.session_resets.as_deref().unwrap_or("\u{2014}"), sess_w),
             truncate(r.week_all_resets.as_deref().unwrap_or("\u{2014}"), week_w),
             status_cell(r),
@@ -387,7 +387,7 @@ struct JsonRow<'a> {
     registered: bool,
     session_pct: Option<i64>,
     week_all_pct: Option<i64>,
-    week_sonnet_pct: Option<i64>,
+    week_fable_pct: Option<i64>,
     session_resets: Option<&'a str>,
     week_all_resets: Option<&'a str>,
     status: Status,
@@ -406,7 +406,7 @@ pub fn render_json(report: &Report) -> Result<String, serde_json::Error> {
                     registered: r.registered,
                     session_pct: r.session_pct,
                     week_all_pct: r.week_all_pct,
-                    week_sonnet_pct: r.week_sonnet_pct,
+                    week_fable_pct: r.week_fable_pct,
                     session_resets: r.session_resets.as_deref(),
                     week_all_resets: r.week_all_resets.as_deref(),
                     status: r.status,
@@ -450,12 +450,12 @@ mod tests {
                 "home": {
                   "session": {"pct": 12, "resets": "9pm (Asia/Seoul)"},
                   "week_all": {"pct": 34, "resets": "Jun 22"},
-                  "week_sonnet": {"pct": 8}
+                  "week_fable": {"pct": 8}
                 },
                 "work": {
                   "session": {"pct": 40},
                   "week_all": {"pct": 96, "resets": "Jun 22"},
-                  "week_sonnet": null
+                  "week_fable": null
                 },
                 "ghost": {
                   "session": {"pct": 3},

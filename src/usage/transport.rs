@@ -821,7 +821,7 @@ mod tests {
         "work": {
           "session":  { "pct": 5, "resets": null },
           "week_all": { "pct": 67, "resets": "Jun 20 at 8:20pm (Asia/Seoul)" },
-          "week_sonnet": null
+          "week_fable": null
         }
       },
       "errors": { "broken": "HTTP 401" }
