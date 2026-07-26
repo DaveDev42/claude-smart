@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.14](https://github.com/DaveDev42/claude-smart/compare/v0.2.13...v0.2.14) (2026-07-26)
+
+
+### Bug Fixes
+
+* **usage:** label the weekly tier column from the hub, not a constant ([2bd1085](https://github.com/DaveDev42/claude-smart/commit/2bd108581f923c4035246c96e25d6a1b90d38fdd))
+
 ## [0.2.13](https://github.com/DaveDev42/claude-smart/compare/v0.2.12...v0.2.13) (2026-07-26)
 
 
