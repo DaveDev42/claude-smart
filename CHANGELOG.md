@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.15](https://github.com/DaveDev42/claude-smart/compare/v0.2.14...v0.2.15) (2026-08-05)
+
+
+### Features
+
+* restore -n/--new to skip the session picker ([0743a3b](https://github.com/DaveDev42/claude-smart/commit/0743a3b3496a931503e290790e73352e367b9175))
+
 ## [0.2.14](https://github.com/DaveDev42/claude-smart/compare/v0.2.13...v0.2.14) (2026-07-26)
 
 
