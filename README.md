@@ -54,6 +54,7 @@ csm run [csm-flags] [-- claude...]   smart launcher (session + account + relaunc
   -i, --interactive                  manual pick: force account + session pickers
   --no-pick                          keep current profile, no scoring
   -A, --pick-account                 force an account pick this launch (overrides --no-pick)
+  -n, --new                          start a fresh session (skip the session picker)
   -c, --continue                     resume newest free session
   # default: ALWAYS opens the session picker (new / continue / pick existing) so the
   #   choice is never made silently, and auto-picks the best account by usage; if

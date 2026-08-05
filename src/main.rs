@@ -160,6 +160,9 @@ fn print_help() {
     println!("  --profile <name>                     launch under this profile (skip all picking)");
     println!("  -i, --interactive                    manual pick: force account + session pickers");
     println!("  --no-pick                            keep current profile, no scoring");
+    println!(
+        "  -n, --new                            start a fresh session (skip the session picker)"
+    );
     println!("  -c, --continue                       resume newest free session");
     println!("  (default: always opens the session picker — new / continue / pick existing —");
     println!("   and auto-picks the best account by usage; opens the account picker when usage");
@@ -308,6 +311,9 @@ fn cmd_run(args: &[OsString]) -> anyhow::Result<()> {
                 }
             },
         }
+    } else if flags.new {
+        // `-n`/`--new`: explicit fresh session, no picker.
+        SessionResolution::Fresh(newuuid())
     } else if flags.interactive {
         // `-i`/`--interactive`: open session picker.
         match resolve_session_via_picker(&cwd)? {
@@ -324,7 +330,7 @@ fn cmd_run(args: &[OsString]) -> anyhow::Result<()> {
             None => SessionResolution::Fresh(newuuid()),
         }
     } else {
-        // Default: 0 → fresh, 1 → auto-resume, 2+ → picker.
+        // Default (no explicit flag): always open the session picker.
         match resolve_session_default(&cwd)? {
             Some(res) => res,
             None => {
@@ -1872,6 +1878,16 @@ mod tests {
         let parsed = parser::parse(rest);
         assert!(parsed.flags.continue_);
         assert_eq!(parsed.flags.profile.as_deref(), Some("work"));
+        assert!(parsed.passthru.is_empty());
+    }
+
+    #[test]
+    fn parser_run_new_flag() {
+        let a = argv(&["csm", "run", "--new", "--profile=x"]);
+        let rest = &a[2..];
+        let parsed = parser::parse(rest);
+        assert!(parsed.flags.new);
+        assert_eq!(parsed.flags.profile.as_deref(), Some("x"));
         assert!(parsed.passthru.is_empty());
     }
 

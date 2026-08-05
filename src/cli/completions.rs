@@ -41,6 +41,9 @@ pub enum CompletionsSubcmd {
         /// Force interactive TTY mode.
         #[arg(short = 'i', long)]
         interactive: bool,
+        /// Start a fresh session (skip the session picker).
+        #[arg(short = 'n', long)]
+        new: bool,
         /// Continue the newest free session.
         #[arg(short = 'c', long)]
         continue_: bool,

@@ -6,8 +6,8 @@
 //! about; everything else accumulates in `passthru`.
 //!
 //! Implements spec §2 "Arg parsing" in full:
-//! - Consumed-internally flags: `-i`/`--interactive`, `-c`/`--continue`,
-//!   `-A`/`--pick-account`, `--no-pick`, `-r`/`--resume`,
+//! - Consumed-internally flags: `-i`/`--interactive`, `-n`/`--new`,
+//!   `-c`/`--continue`, `-A`/`--pick-account`, `--no-pick`, `-r`/`--resume`,
 //!   `--permission-mode`, `--effort`, `--model`, `--session-id`, `--profile`.
 //! - **Equals-form (N7):** `--resume=<id>`, `--permission-mode=<m>`,
 //!   `--effort=<e>`, `--model=<m>`, `--session-id=<id>`, `--profile=<p>`.
@@ -56,6 +56,7 @@ pub enum ResumeArg {
 /// Reproduces the local variables at `claude-smart.zsh` lines 116–118:
 /// ```zsh
 /// local want_picker=false want_continue=false pick_account=false no_pick=false
+/// local want_new=false
 /// local resume_id="" o_mode="" o_effort="" o_model="" o_session="" o_profile=""
 /// ```
 #[derive(Debug, Default, PartialEq)]
@@ -65,6 +66,9 @@ pub struct Flags {
     /// opens the session picker. `--profile <p>` still wins. (`want_picker=true`
     /// in the zsh source — which forced only the session picker.)
     pub interactive: bool,
+    /// `-n` / `--new` — start a fresh session, skip the session picker.
+    /// (`want_new=true` in the zsh source)
+    pub new: bool,
     /// `-c` / `--continue` — continue the newest free session.
     /// (`want_continue=true` in the zsh source)
     pub continue_: bool,
@@ -144,6 +148,10 @@ pub fn parse(args: &[OsString]) -> ParsedArgs {
         // zsh lines 123–127
         if s == "-i" || s == "--interactive" {
             flags.interactive = true;
+            continue;
+        }
+        if s == "-n" || s == "--new" {
+            flags.new = true;
             continue;
         }
         if s == "-c" || s == "--continue" {
@@ -318,25 +326,18 @@ mod tests {
         assert!(!r.flags.no_pick);
     }
 
-    /// `-n` / `--new` was removed: the session picker's `[ start a new session ]`
-    /// row replaces it. The token now falls through to passthru (claude has no
-    /// `-n`, so this is harmless) instead of being consumed by csm.
     #[test]
-    fn parse_new_short_now_passes_through() {
+    fn parse_new_short() {
         let r = parse(&os_args(&["-n"]));
-        assert_eq!(r.passthru, os_args(&["-n"]));
-    }
-
-    #[test]
-    fn parse_new_long_now_passes_through() {
-        let r = parse(&os_args(&["--new"]));
-        assert_eq!(r.passthru, os_args(&["--new"]));
+        assert!(r.flags.new);
+        assert!(!r.flags.interactive);
     }
 
     #[test]
     fn parse_continue_short() {
         let r = parse(&os_args(&["-c"]));
         assert!(r.flags.continue_);
+        assert!(!r.flags.new);
     }
 
     #[test]
@@ -359,6 +360,13 @@ mod tests {
     fn parse_interactive_long() {
         let r = parse(&os_args(&["--interactive"]));
         assert!(r.flags.interactive);
+        assert!(r.passthru.is_empty());
+    }
+
+    #[test]
+    fn parse_new_long() {
+        let r = parse(&os_args(&["--new"]));
+        assert!(r.flags.new);
         assert!(r.passthru.is_empty());
     }
 
