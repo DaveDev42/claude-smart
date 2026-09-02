@@ -11,6 +11,8 @@ mod reaper;
 mod session;
 mod sidecar;
 mod statusline;
+#[cfg(test)]
+mod testenv;
 mod usage;
 
 use std::ffi::OsString;
@@ -188,8 +190,13 @@ fn print_help() {
         "  csm config set launch-command <cmd>...   launch <cmd> instead of `claude` (e.g. happy)"
     );
     println!("  csm config unset launch-command      revert to launching `claude`\n");
-    println!("USAGE METERING");
-    println!("  csm usage [--json] [--no-fetch]      multi-profile usage table (offline-aware)\n");
+    println!("USAGE METERING (local, per profile)");
+    println!(
+        "  csm usage [--json] [--no-fetch] [--refresh]   multi-profile usage table (offline-aware)"
+    );
+    println!(
+        "  csm usage capture                    read statusLine stdin, merge into the store\n"
+    );
     println!("OTHER");
     println!("  csm pick-account [<cur>] [--include-current]   scoring → winner profile");
     println!("  csm scan [<cwd>]                     session TSV for the picker");
@@ -279,6 +286,14 @@ fn cmd_run(args: &[OsString]) -> anyhow::Result<()> {
             }
         }
     };
+
+    // Surface 4b (design spec "맛이 간 프로필은 로그인하라고 경고" §csm run 실행
+    // 시점): print every profile's dead-credential warning, right after the
+    // pick is resolved and regardless of what got picked (a cancelled pick
+    // already returned above — this only runs on a launch that is actually
+    // going ahead). Reads the CACHED UsageData only — no network — so a dead
+    // token can never slow down or fail a launch.
+    print_launch_attention_warnings(&profile_dir, &profiles);
 
     // ── 3. Resolve session id ──────────────────────────────────────────────────
     // A picker path may yield `None` = the user pressed Escape → cancel the launch.
@@ -501,6 +516,74 @@ fn derive_current_profile_name(profiles: &account::ProfileMap) -> String {
         .unwrap_or_else(|| profiles.default_name())
 }
 
+/// Reverse-lookup `dir` in `profiles` to a profile name, falling back to the
+/// directory's basename with a `.claude.` prefix stripped (mirrors
+/// `derive_current_profile_name`'s fallback, but keyed off an explicit `dir`
+/// — the resolved launch target — rather than `$CLAUDE_CONFIG_DIR`).
+fn profile_name_for_dir(dir: &Path, profiles: &account::ProfileMap) -> String {
+    let dir_str = dir.to_string_lossy();
+    if let Some((name, _)) = profiles.iter().find(|(_, d)| *d == dir_str.as_ref()) {
+        return name.to_owned();
+    }
+    dir.file_name()
+        .and_then(|n| n.to_str())
+        .map(|n| n.strip_prefix(".claude.").unwrap_or(n).to_owned())
+        .unwrap_or_else(|| profiles.default_name())
+}
+
+/// Pure core of surface 4b: every stderr line the launch-time credential
+/// warning prints, from a cached `UsageData` + which profile is about to
+/// launch. No I/O — the real clock/cache-read live only in
+/// `print_launch_attention_warnings`, so this is fully unit-testable.
+///
+/// Deliberately `(&UsageData, &str, DateTime<Utc>) -> Vec<String>` rather
+/// than the design spec's plain `&UsageData -> Vec<String>` — `now` is
+/// needed to compute a fresh relative age (never baked into the cached data;
+/// see `report::Attention`'s doc), and `current_profile` is needed to decide
+/// whether the extra "current profile needs login" line applies. Documented
+/// deviation, consistent with `report::render_table`/`attention_lines`
+/// gaining the same `now` parameter for the same reason.
+fn launch_attention_lines(
+    data: &usage::UsageData,
+    current_profile: &str,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut names: Vec<&String> = data.profiles.keys().collect();
+    names.sort();
+    for name in names {
+        if let Some(attention) = &data.profiles[name].attention {
+            out.extend(usage::report::attention_block_lines(name, attention, now));
+        }
+    }
+    if let Some(attention) = data
+        .profiles
+        .get(current_profile)
+        .and_then(|pu| pu.attention.as_ref())
+    {
+        if attention.kind == usage::model::AttentionKind::NeedsLogin {
+            out.push(format!(
+                "csm: warning: current profile '{current_profile}' needs login — claude will show /login"
+            ));
+        }
+    }
+    out
+}
+
+/// I/O shell for surface 4b: read the cache (best-effort, no network), derive
+/// the launching profile's name, and print every resulting line to stderr.
+/// Silently does nothing when there's no cache to read — a missing/unreadable
+/// cache is not itself something a launch should warn about.
+fn print_launch_attention_warnings(profile_dir: &Path, profiles: &account::ProfileMap) {
+    let Some(data) = read_usage_cache() else {
+        return;
+    };
+    let current = profile_name_for_dir(profile_dir, profiles);
+    for line in launch_attention_lines(&data, &current, chrono::Utc::now()) {
+        eprintln!("{line}");
+    }
+}
+
 /// Proactive account pick with hub-down picker fallback (spec §4a).
 ///
 /// Returns `Ok(Some(dir))` with the resolved profile directory, or `Ok(None)`
@@ -661,11 +744,17 @@ fn account_row_rank(
     let week_pct = data.week_all_pct.unwrap();
     // Soonest weekly reset epoch first → i64::MAX when unknown so known beats
     // unknown. Higher week_all.pct next → negate so smaller sorts first.
+    // Prefers the machine-native `resets_at` epoch (carried straight through
+    // from the local collector) over re-parsing the `resets` display string —
+    // same precedence as `UsageSection::reset_instant` / `scoring::pick_best_at`.
     let epoch = data
-        .resets
-        .as_deref()
-        .and_then(|r| account::reset::resets_to_epoch_at(r, now).ok())
-        .map(|dt| dt.timestamp())
+        .resets_at
+        .or_else(|| {
+            data.resets
+                .as_deref()
+                .and_then(|r| account::reset::resets_to_epoch_at(r, now).ok())
+                .map(|dt| dt.timestamp())
+        })
         .unwrap_or(i64::MAX);
     (0, epoch, -week_pct, name.to_owned())
 }
@@ -675,16 +764,10 @@ fn account_row_rank(
 fn build_account_rows(profiles: &account::ProfileMap) -> Vec<picker::account::AccountRow> {
     use picker::account::{AccountRow, StaleProfileData};
 
-    // Try the smart-dir cache first.
+    // Read the smart-dir cache (the positive TTL cache `usage::fetch` writes
+    // from local collection).
     let cache_path = paths::usage_cache();
     let (cache_mtime, cache_json) = load_stale_cache(&cache_path);
-
-    // Hub-local fallback: when running ON the configured hub, read its own cache.
-    let (cache_mtime, cache_json) = if cache_json.is_none() && is_hub_local_machine() {
-        load_stale_cache(&paths::hub_local_cache())
-    } else {
-        (cache_mtime, cache_json)
-    };
 
     let (cache_profiles, cache_errors) = parse_cache_sections(&cache_json);
 
@@ -711,6 +794,7 @@ fn build_account_rows(profiles: &account::ProfileMap) -> Vec<picker::account::Ac
                     session_pct: None,
                     week_all_pct: None,
                     resets: None,
+                    resets_at: None,
                     error: Some(err.clone()),
                 }
             } else if let Some(pu) = cache_profiles.get(&profile) {
@@ -718,6 +802,7 @@ fn build_account_rows(profiles: &account::ProfileMap) -> Vec<picker::account::Ac
                     session_pct: pu.session_pct,
                     week_all_pct: pu.week_all_pct,
                     resets: pu.resets.clone(),
+                    resets_at: pu.resets_at,
                     error: None,
                 }
             } else {
@@ -725,6 +810,7 @@ fn build_account_rows(profiles: &account::ProfileMap) -> Vec<picker::account::Ac
                     session_pct: None,
                     week_all_pct: None,
                     resets: None,
+                    resets_at: None,
                     error: None,
                 }
             };
@@ -762,6 +848,10 @@ struct CacheProfileEntry {
     session_pct: Option<i64>,
     week_all_pct: Option<i64>,
     resets: Option<String>,
+    /// Machine-native reset epoch (`week_all.resets_at`), when the cache was
+    /// written by the local collector. Preferred over re-parsing `resets` —
+    /// see `account_row_rank`.
+    resets_at: Option<i64>,
 }
 
 /// Load a usage cache JSON file; returns `(Option<mtime_secs>, Option<Value>)`.
@@ -780,7 +870,8 @@ fn load_stale_cache(path: &std::path::Path) -> (Option<u64>, Option<serde_json::
 /// Parse `profiles` and `errors` from the usage cache JSON.
 ///
 /// Cache shape (spec §4a):
-///   `profiles[<name>].session.pct`, `.week_all.pct`, `.week_all.resets`
+///   `profiles[<name>].session.pct`, `.week_all.pct`, `.week_all.resets`,
+///   `.week_all.resets_at`
 ///   `errors[<name>]` = error string
 fn parse_cache_sections(
     json: &Option<serde_json::Value>,
@@ -823,6 +914,11 @@ fn parse_cache_sections(
                 .and_then(|w| w.get("resets"))
                 .and_then(|r| r.as_str())
                 .map(str::to_owned);
+            let resets_at = pu
+                .get("week_all")
+                .and_then(|w| w.as_object())
+                .and_then(|w| w.get("resets_at"))
+                .and_then(|r| r.as_i64());
 
             profiles.insert(
                 name.clone(),
@@ -830,25 +926,13 @@ fn parse_cache_sections(
                     session_pct,
                     week_all_pct,
                     resets,
+                    resets_at,
                 },
             );
         }
     }
 
     (profiles, errors)
-}
-
-/// `true` when this machine **is** the configured usage hub (hub-local
-/// reconciliation: read the hub's own cache directly). Driven by the same
-/// `CLAUDE_HUB_HOSTNAME` env contract as `usage::transport::is_hub_local`, so
-/// no machine name is compiled into the binary. Always false when unset/empty.
-fn is_hub_local_machine() -> bool {
-    match usage::hub_hostname() {
-        Some(hub) => statusline::hostname()
-            .map(|h| h.eq_ignore_ascii_case(&hub))
-            .unwrap_or(false),
-        None => false,
-    }
 }
 
 /// `true` when both stdin and stdout are terminals — mirrors zsh `[[ -t 0 && -t 1 ]]`.
@@ -1391,55 +1475,105 @@ fn describe_diagnosis(diag: &provision::ProfileDiagnosis, dir: &Path) -> String 
 
 // ─── usage ───────────────────────────────────────────────────────────────────
 
-/// `csm usage [--json] [--no-fetch]`
+/// Hard cap on how much of `csm usage capture`'s stdin (a statusLine JSON
+/// payload) we will ever read. StatusLine payloads are small (a few KB at
+/// most); this is purely a defensive ceiling against a misconfigured or
+/// hostile pipe feeding an unbounded stream — see [`read_stdin_capped`].
+const CAPTURE_STDIN_CAP_BYTES: u64 = 256 * 1024;
+
+/// `csm usage [--json] [--no-fetch] [--refresh]` / `csm usage capture`
 ///
-/// Multi-profile usage table joining the registry with the hub's usage blob.
-/// Offline-aware: serves the stale positive cache with an age header when the
-/// hub is unreachable; prints a "disabled" message (registry still shown) when
-/// metering env is unset. `--no-fetch` reads only the cache (never touches the
-/// network) for fast scripted reads.
+/// Multi-profile usage table joining the registry with the local per-profile
+/// usage store. Offline-aware: serves the stale positive cache with an age
+/// header when local collection is unreachable (no credentials, no network).
+/// `--no-fetch` reads only the cache (never touches credentials/network) for
+/// fast scripted reads; `--refresh` bypasses the cache and every profile's own
+/// store-record TTL, forcing a live re-probe of each profile.
+///
+/// `csm usage capture` is the statusLine-stdin capture path (see
+/// [`cmd_usage_capture`]) — a distinct subverb, not a flag.
 fn cmd_usage(args: &[OsString]) -> anyhow::Result<()> {
     use usage::report;
 
+    // `csm usage capture` is checked first so the bare positional never falls
+    // into the flag loop below (it takes no flags of its own).
+    if args.first().map(|a| a.to_string_lossy()).as_deref() == Some("capture") {
+        return cmd_usage_capture();
+    }
+
     let mut json = false;
     let mut no_fetch = false;
+    let mut refresh = false;
     for a in args {
         match a.to_string_lossy().as_ref() {
             "--json" => json = true,
             "--no-fetch" => no_fetch = true,
+            "--refresh" => refresh = true,
             "-h" | "--help" => {
-                println!("usage: csm usage [--json] [--no-fetch]");
-                println!("  --json      emit the joined registry∪hub view as JSON");
-                println!("  --no-fetch  read only the local cache (no network)");
+                println!("usage: csm usage [--json] [--no-fetch] [--refresh]");
+                println!("       csm usage capture");
+                println!("  --json      emit the joined registry∪local view as JSON");
+                println!("  --no-fetch  read only the local cache (no live collection)");
+                println!(
+                    "  --refresh   bypass the cache and every profile's own TTL; re-probe live"
+                );
+                println!(
+                    "  capture     read statusLine JSON from stdin, merge into the local store"
+                );
                 return Ok(());
             }
-            other => anyhow::bail!("csm usage: unknown flag '{other}' (try --json | --no-fetch)"),
+            other => anyhow::bail!(
+                "csm usage: unknown flag '{other}' (try --json | --no-fetch | --refresh | capture)"
+            ),
         }
     }
 
     let profiles =
         account::ProfileMap::load().context("csm usage: failed to load profiles.json")?;
-    let configured = usage::is_configured();
+    // "Configured" now simply means the registry isn't empty — local
+    // collection needs no separate opt-in env (unlike the retired hub
+    // transports, which required two site-specific env vars to name the hub).
+    let configured = !profiles.is_empty();
 
     // Resolve usage data + freshness. `--no-fetch` reads the cache directly;
+    // `--refresh` forces fetch_with(true) (cache + per-profile TTL bypass);
     // otherwise fetch() runs the full resilience ladder (which itself prefers
-    // a fresh cache before any network).
+    // a fresh cache before any live collection).
+    // Staleness age is derived from the DATA's own per-profile `captured_at`
+    // timestamps (`oldest_profile_age_secs` — the age of the least-fresh
+    // served profile), never from `.usage-cache.json`'s file mtime.
+    // `write_positive_cache` refreshes that mtime on every non-total-failure
+    // `fetch_with` call — including a round where every profile was
+    // `ServeStale`-served from a days-old store record — so the file's mtime
+    // no longer reflects how old the served numbers actually are; the "⚠
+    // usage data is Nm old" banner would otherwise be unreachable for exactly
+    // the offline/expired-token case it exists to surface.
     let (data, stale_secs) = if !configured {
         (None, None)
     } else if no_fetch {
-        let age = usage::cache_age_secs();
-        (read_usage_cache(), age)
+        let cached = read_usage_cache();
+        let stale = cached
+            .as_ref()
+            .and_then(|d| usage::local::oldest_profile_age_secs(d, chrono::Utc::now()));
+        (cached, stale)
     } else {
-        match usage::fetch() {
+        let fetch_result = if refresh {
+            usage::fetch_with(true)
+        } else {
+            usage::fetch()
+        };
+        match fetch_result {
             Ok(d) => {
-                // fetch() may have served a cached blob; surface its age so an
-                // offline serve is labeled stale. Hub-local serves are fresh
-                // (age ~0), so the stale header self-suppresses below 60s.
-                (Some(d), usage::cache_age_secs())
+                let stale = usage::local::oldest_profile_age_secs(&d, chrono::Utc::now());
+                (Some(d), stale)
             }
             Err(_) => {
-                // Hub unreachable — degrade to the last-known cache, if any.
-                (read_usage_cache(), usage::cache_age_secs())
+                // Local collection unreachable — degrade to the last-known cache, if any.
+                let cached = read_usage_cache();
+                let stale = cached
+                    .as_ref()
+                    .and_then(|d| usage::local::oldest_profile_age_secs(d, chrono::Utc::now()));
+                (cached, stale)
             }
         }
     };
@@ -1449,7 +1583,7 @@ fn cmd_usage(args: &[OsString]) -> anyhow::Result<()> {
     if json {
         println!("{}", report::render_json(&rpt)?);
     } else {
-        print!("{}", report::render_table(&rpt));
+        print!("{}", report::render_table(&rpt, chrono::Utc::now()));
     }
     Ok(())
 }
@@ -1460,6 +1594,34 @@ fn cmd_usage(args: &[OsString]) -> anyhow::Result<()> {
 fn read_usage_cache() -> Option<usage::UsageData> {
     let raw = std::fs::read_to_string(paths::usage_cache()).ok()?;
     serde_json::from_str(&raw).ok()
+}
+
+/// `csm usage capture` — read a statusLine JSON payload from stdin and merge
+/// its `rate_limits` into the active profile's local usage store record (see
+/// `usage::local::record_statusline_payload`).
+///
+/// This is meant to run silently as a fire-and-forget tail of a
+/// `statusline-command.sh`/`.ps1` (e.g. `printf '%s' "$input" | csm usage
+/// capture &`), so it swallows every error — a malformed/partial payload, an
+/// unresolvable profile, an unset `CLAUDE_CONFIG_DIR`, a throttled write — and
+/// unconditionally prints nothing and exits 0. A statusLine command that fires
+/// roughly once a second must never let a transient capture failure surface
+/// as prompt noise or a non-zero exit.
+fn cmd_usage_capture() -> anyhow::Result<()> {
+    let raw = read_stdin_capped(CAPTURE_STDIN_CAP_BYTES);
+    let _ = usage::local::record_statusline_payload(&raw);
+    Ok(())
+}
+
+/// Read stdin up to `max_bytes`, lossily decoding as UTF-8. Never blocks past
+/// EOF-or-cap; a payload larger than the cap is silently truncated (the
+/// caller — a JSON parse — will simply fail on truncated input, which is
+/// treated as a no-op by every caller here).
+fn read_stdin_capped(max_bytes: u64) -> String {
+    use std::io::Read;
+    let mut buf = Vec::new();
+    let _ = std::io::stdin().take(max_bytes).read_to_end(&mut buf);
+    String::from_utf8_lossy(&buf).into_owned()
 }
 
 // ─── pick-account ──────────────────────────────────────────────────────────────
@@ -2134,7 +2296,7 @@ mod tests {
             "profiles": {
                 "home": {
                     "session": { "pct": 3 },
-                    "week_all": { "pct": 32, "resets": "Jun 18 at 9pm (Asia/Seoul)" }
+                    "week_all": { "pct": 32, "resets": "Jun 18 at 9pm (Asia/Seoul)", "resets_at": 1_781_000_000_i64 }
                 },
                 "work": {
                     "session": null,
@@ -2153,8 +2315,13 @@ mod tests {
             profiles["home"].resets.as_deref(),
             Some("Jun 18 at 9pm (Asia/Seoul)")
         );
+        assert_eq!(profiles["home"].resets_at, Some(1_781_000_000));
         assert!(profiles["work"].session_pct.is_none());
         assert_eq!(profiles["work"].week_all_pct, Some(80));
+        assert_eq!(
+            profiles["work"].resets_at, None,
+            "resets_at absent in cache JSON must parse as None"
+        );
         assert_eq!(errors["broken"], "no credentials");
     }
 
@@ -2272,6 +2439,24 @@ mod tests {
             session_pct: session,
             week_all_pct: week,
             resets: resets.map(|s| s.to_owned()),
+            resets_at: None,
+            error: None,
+        }
+    }
+
+    /// Like [`data`] but with an explicit `resets_at` epoch, for tests that
+    /// pin the epoch-preferred ranking.
+    fn data_with_epoch(
+        session: Option<i64>,
+        week: Option<i64>,
+        resets: Option<&str>,
+        resets_at: Option<i64>,
+    ) -> StaleProfileData {
+        StaleProfileData {
+            session_pct: session,
+            week_all_pct: week,
+            resets: resets.map(|s| s.to_owned()),
+            resets_at,
             error: None,
         }
     }
@@ -2309,6 +2494,31 @@ mod tests {
     }
 
     #[test]
+    fn resets_at_epoch_preferred_over_resets_string() {
+        // "sooner" carries a `resets_at` epoch well before "later"'s parsed
+        // reset date, but a `resets` STRING that would fail to parse at all —
+        // `resets_at` must still win, mirroring
+        // `UsageSection::reset_instant`'s own precedence.
+        let sooner_epoch = rank_now().timestamp() + 1_000;
+        let order = ranked_order(vec![
+            (
+                "later",
+                data(Some(2), Some(70), Some("Jun 20 at 9pm (Asia/Seoul)")),
+            ),
+            (
+                "sooner",
+                data_with_epoch(
+                    Some(5),
+                    Some(10),
+                    Some("not a valid reset string"),
+                    Some(sooner_epoch),
+                ),
+            ),
+        ]);
+        assert_eq!(order, vec!["sooner", "later"]);
+    }
+
+    #[test]
     fn viable_no_resets_higher_week_pct_leads() {
         // Both viable with unknown resets → falls back to the higher
         // week_all.pct (pick_best's secondary key). It must be row 0.
@@ -2325,6 +2535,7 @@ mod tests {
             session_pct: None,
             week_all_pct: None,
             resets: None,
+            resets_at: None,
             error: Some("no credentials".to_owned()),
         };
         let order = ranked_order(vec![
@@ -2362,5 +2573,132 @@ mod tests {
             ),
         ]);
         assert_eq!(order, vec!["hasreset", "noreset"]);
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════
+    // Launch-time credential warnings (design spec "맛이 간 프로필은 로그인하라고
+    // 경고" §csm run 실행 시점) — `launch_attention_lines`/`profile_name_for_dir`.
+    // ══════════════════════════════════════════════════════════════════════════
+
+    fn attention_now() -> chrono::DateTime<chrono::Utc> {
+        use chrono::TimeZone;
+        chrono::Utc.with_ymd_and_hms(2026, 9, 2, 0, 0, 0).unwrap()
+    }
+
+    fn profile_with_attention(kind: usage::model::AttentionKind) -> usage::model::ProfileUsage {
+        usage::model::ProfileUsage {
+            attention: Some(usage::model::Attention {
+                kind,
+                message: match kind {
+                    usage::model::AttentionKind::NeedsLogin => "credentials expired".to_string(),
+                    usage::model::AttentionKind::NeedsRefresh => "access token expired".to_string(),
+                },
+                action: match kind {
+                    usage::model::AttentionKind::NeedsLogin => {
+                        "CLAUDE_CONFIG_DIR=/Users/example/.claude.work claude auth login"
+                            .to_string()
+                    }
+                    usage::model::AttentionKind::NeedsRefresh => "csm --profile home".to_string(),
+                },
+                since_epoch: Some(attention_now().timestamp() - 3600),
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn profile_name_for_dir_reverse_looks_up_registry() {
+        let profiles = account::ProfileMap(std::collections::HashMap::from([(
+            "work".to_string(),
+            "/Users/example/.claude.work".to_string(),
+        )]));
+        assert_eq!(
+            profile_name_for_dir(Path::new("/Users/example/.claude.work"), &profiles),
+            "work"
+        );
+    }
+
+    #[test]
+    fn profile_name_for_dir_falls_back_to_basename_strip() {
+        let profiles = account::ProfileMap(std::collections::HashMap::new());
+        assert_eq!(
+            profile_name_for_dir(Path::new("/Users/example/.claude.home"), &profiles),
+            "home"
+        );
+    }
+
+    #[test]
+    fn launch_attention_lines_empty_when_nothing_needs_attention() {
+        let data = usage::UsageData::default();
+        assert!(launch_attention_lines(&data, "home", attention_now()).is_empty());
+    }
+
+    #[test]
+    fn launch_attention_lines_includes_every_attentive_profile_sorted() {
+        let mut profiles = std::collections::HashMap::new();
+        profiles.insert(
+            "work".to_string(),
+            profile_with_attention(usage::model::AttentionKind::NeedsLogin),
+        );
+        profiles.insert(
+            "home".to_string(),
+            profile_with_attention(usage::model::AttentionKind::NeedsRefresh),
+        );
+        let data = usage::UsageData {
+            profiles,
+            ..Default::default()
+        };
+        // Neither "other" nor a healthy profile is the current one, so no
+        // extra "current profile needs login" line.
+        let lines = launch_attention_lines(&data, "other", attention_now());
+        assert_eq!(
+            lines.len(),
+            4,
+            "two 2-line blocks, sorted by name: {lines:#?}"
+        );
+        assert!(lines[0].starts_with("\u{26a0} home:"), "{lines:#?}");
+        assert!(lines[2].starts_with("\u{26a0} work:"), "{lines:#?}");
+        assert!(
+            !lines.iter().any(|l| l.contains("current profile")),
+            "current profile isn't in the map at all: {lines:#?}"
+        );
+    }
+
+    #[test]
+    fn launch_attention_lines_adds_extra_line_when_current_profile_needs_login() {
+        let mut profiles = std::collections::HashMap::new();
+        profiles.insert(
+            "work".to_string(),
+            profile_with_attention(usage::model::AttentionKind::NeedsLogin),
+        );
+        let data = usage::UsageData {
+            profiles,
+            ..Default::default()
+        };
+        let lines = launch_attention_lines(&data, "work", attention_now());
+        assert_eq!(
+            lines.last().unwrap(),
+            "csm: warning: current profile 'work' needs login — claude will show /login"
+        );
+    }
+
+    #[test]
+    fn launch_attention_lines_no_extra_line_when_current_profile_only_needs_refresh() {
+        // NeedsRefresh is not a login-blocking state — launching under it IS
+        // the fix — so it must never get the "/login" extra line.
+        let mut profiles = std::collections::HashMap::new();
+        profiles.insert(
+            "home".to_string(),
+            profile_with_attention(usage::model::AttentionKind::NeedsRefresh),
+        );
+        let data = usage::UsageData {
+            profiles,
+            ..Default::default()
+        };
+        let lines = launch_attention_lines(&data, "home", attention_now());
+        assert!(
+            !lines.iter().any(|l| l.contains("current profile")),
+            "{lines:#?}"
+        );
     }
 }

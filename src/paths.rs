@@ -122,15 +122,29 @@ pub fn config_json() -> PathBuf {
         .join("config.json")
 }
 
-/// Hub-local usage limits cache (read directly when this machine IS the hub —
-/// the `CLAUDE_HUB_HOSTNAME` fast path).
-/// `$HOME/claude-code-usage/cache/usage-limits.json`
-pub fn hub_local_cache() -> PathBuf {
-    dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join("claude-code-usage")
-        .join("cache")
-        .join("usage-limits.json")
+// ─── local usage collection (src/usage/local/) ─────────────────────────────────
+
+/// `<smart_dir>/usage/` — per-profile local usage-collection records
+/// (`usage::local::store`). One JSON file per profile so the statusline
+/// recorder's frequent writes to the *active* profile's file never race the
+/// fetch-all writer's writes to every OTHER profile's file — only same-profile
+/// writers can collide, and that collision is an accepted last-writer-wins
+/// (see the local-collection design spec, "스토어 레코드").
+pub fn usage_store_dir() -> PathBuf {
+    smart_dir_no_create().join("usage")
+}
+
+/// `<smart_dir>/usage/<profile>.json` — one profile's local usage record.
+///
+/// `profile` MUST already be validated via
+/// [`crate::account::profiles::ProfileMap::is_valid_name`] before it reaches
+/// here — like every other constructor in this module, this function is a
+/// pure path builder with no sanitization of its own. A profile name pulled
+/// from an external source (statusline stdin's `CLAUDE_CONFIG_DIR` reverse
+/// lookup) is the caller's responsibility to gate; an unchecked name could
+/// otherwise escape the `usage/` directory via `..` or a path separator.
+pub fn usage_store(profile: &str) -> PathBuf {
+    usage_store_dir().join(format!("{profile}.json"))
 }
 
 // ─── scan index path ──────────────────────────────────────────────────────────
@@ -379,6 +393,31 @@ mod tests {
         assert!(
             s.ends_with("config.json"),
             "config_json must end with config.json: {s}"
+        );
+    }
+
+    #[test]
+    fn usage_store_dir_is_under_smart_dir() {
+        let d = usage_store_dir();
+        let s = d.to_string_lossy();
+        assert!(
+            s.contains("smart"),
+            "usage_store_dir should be under smart_dir: {s}"
+        );
+        assert!(
+            s.ends_with("usage"),
+            "usage_store_dir should end with 'usage': {s}"
+        );
+    }
+
+    #[test]
+    fn usage_store_path_includes_profile_name() {
+        let p = usage_store("home");
+        let s = p.to_string_lossy();
+        assert!(s.ends_with("home.json"), "got: {s}");
+        assert!(
+            s.contains(&*usage_store_dir().to_string_lossy()),
+            "usage_store(profile) should live under usage_store_dir(): {s}"
         );
     }
 

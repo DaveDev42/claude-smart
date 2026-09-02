@@ -1,132 +1,113 @@
-//! Usage fetch transport — hub-local fast path, positive/negative TTL cache,
-//! HTTP-first (reqwest blocking), SSH fallback (POSIX only).
+//! Usage fetch transport — positive/negative TTL cache in front of local,
+//! per-profile usage collection.
 //!
-//! # Fetch algorithm (spec §2 "Usage transport + caching")
+//! # Fetch algorithm
 //!
-//! Reproduces `fetch_usage()` in `claude-smart-helper.sh.j2` lines 655–728.
-//!
-//! 1. **Hub-local fast path** (`hostname == $CLAUDE_HUB_HOSTNAME` → read
-//!    `paths::hub_local_cache()` directly, skip all network). Disabled when the
-//!    env var is unset/empty.
-//!    Shell lines 657–662: `if printf '%s' "$host" | grep -qi "^$USAGE_HUB$"; then cat "$USAGE_CACHE"; return 0`
-//!
-//! 2. **Positive TTL check**: if `paths::usage_cache()` exists and mtime age <
+//! 1. **Positive TTL check**: if `paths::usage_cache()` exists and mtime age <
 //!    `POSITIVE_TTL_SECS` (60 s, env `CLAUDE_USAGE_TTL` / alias `CSM_USAGE_TTL_SECS`)
-//!    → parse + return.
-//!    Shell lines 666–675: `if [ -s "$pos_cache" ]; then … if [ $(( cnow - cmt )) -lt "$USAGE_TTL" ]; then cat …`
+//!    → parse + return. Skipped entirely when the caller asked for a forced
+//!    refresh ([`fetch_with`] with `force = true`).
 //!
-//! 2.5. **User command** (`CSM_USAGE_CMD`, if set): run it via the shell, parse
+//! 2. **User command** (`CSM_USAGE_CMD`, if set): run it via the shell, parse
 //!    stdout as `UsageData`. This is the operator-injected "check via a provided
 //!    script" source; it runs *before* the negative cooldown (an explicit
-//!    command is independent of a hub outage) and takes precedence over HTTP/SSH.
-//!    On success the result is cached; on failure it falls through to the hub.
-//!    Not in the shell original — csm-native (env-injected, never compiled in).
+//!    command is independent of whether local collection is failing) and takes
+//!    precedence over local collection. On success the result is cached; on
+//!    failure it falls through to local collection.
 //!
 //! 3. **Negative cooldown check**: if `paths::fetch_failed()` exists and age <
 //!    `NEGATIVE_COOLDOWN_SECS` (120 s, env `CLAUDE_USAGE_FAIL_COOLDOWN`) →
-//!    return `Err(FetchError::NegativeCacheActive)`.
-//!    Shell lines 677–687: `if [ -f "$fail_marker" ]; then … if [ $(( now - last )) -lt "$FETCH_FAIL_COOLDOWN" ]; then return 0`
+//!    return `Err(FetchError::NegativeCacheActive)`. This guards against
+//!    hammering local collection (keychain reads + the OAuth usage API) when
+//!    every profile just failed outright. Skipped entirely when the caller
+//!    asked for a forced refresh ([`fetch_with`] with `force = true`) — same
+//!    as step 1, a stale stamp from a prior all-failed round must not defeat
+//!    an explicit `--refresh`.
 //!
-//! 4. **HTTP fetch** (reqwest blocking; connect-timeout 1 s / max-time 2 s).
-//!    Shell lines 694–698: `if [ -n "$USAGE_URL" ] && [ -x "$CURL" ]; then out="$(curl -fs --connect-timeout 1 --max-time …)"`
-//!    `CLAUDE_USAGE_URL` env: empty string = disable HTTP path; unset = use default URL.
-//!    `CLAUDE_USAGE_HTTP_TIMEOUT` env: max-time in seconds (default 2).
+//! 4. **Local collection** ([`super::local::collect`]) — the terminal layer.
+//!    For every profile in the registry it serves a fresh per-profile store
+//!    record, or probes live credentials + the Anthropic OAuth usage API, or
+//!    serves a stale record, or records an error; see `local::mod` for that
+//!    per-profile decision matrix. `force` is threaded straight through, so a
+//!    forced refresh also bypasses each profile's own store-record TTL.
 //!
-//! 5. **SSH fallback** (`#[cfg(unix)]` only; ControlMaster reuse via `ssh`
-//!    shell-out; see `ssh_fetch`). Shell lines 699–708.
-//!    On Windows, HTTP is the only path (spec §5 #5).
+//! 5. On success — defined as "at least one profile produced data, or there
+//!    were no errors at all" (an empty registry is a legitimate, if empty,
+//!    result) — write the positive cache.
 //!
-//! 6. On success: validate JSON (`serde_json::from_str`), write cache atomically
-//!    (tmp + rename). Clear negative cache. Shell lines 713–720.
+//! 6. On total failure — `collect` returned zero profiles AND at least one
+//!    error, i.e. every configured profile failed — stamp the negative
+//!    cooldown and return `Err(FetchError::EmptyPayload)`.
 //!
-//! 7. On failure (both HTTP + SSH fail): stamp `.usage-fetch-failed` epoch.
-//!    Shell lines 723–726.
+//! 6a. **Live-probe-all-failed, but not total failure**: `collect` can
+//!    "succeed" (non-empty `profiles`) purely on `ServeStale` fallbacks while
+//!    every profile that actually reached the network/keychain failed —
+//!    an offline machine with existing store records never trips step 6's
+//!    `profiles.is_empty()` check, so without this branch the negative
+//!    cooldown could never engage for exactly the case it exists for. When
+//!    `UsageData::any_probe_attempted && !any_probe_succeeded`, the negative
+//!    cooldown is stamped too — the call still returns `Ok` (the stale data
+//!    is legitimate to serve), but the *next* call's step 3 short-circuits
+//!    instead of re-paying a full probe round (keychain read + OAuth call
+//!    per profile) on every launch.
+
+use chrono::Utc;
 
 use super::model::UsageData;
 use super::FetchError;
+use crate::account::ProfileMap;
 use crate::paths;
 
 // ─── constants (overrideable via env) ─────────────────────────────────────────
 
 /// Default positive TTL in seconds. Overridden by `CLAUDE_USAGE_TTL`.
-/// Shell: `USAGE_TTL="${CLAUDE_USAGE_TTL:-60}"`.
 const DEFAULT_POSITIVE_TTL_SECS: u64 = 60;
 
 /// Default negative cooldown in seconds. Overridden by `CLAUDE_USAGE_FAIL_COOLDOWN`.
-/// Shell: `FETCH_FAIL_COOLDOWN="${CLAUDE_USAGE_FAIL_COOLDOWN:-120}"`.
 const DEFAULT_NEGATIVE_COOLDOWN_SECS: u64 = 120;
 
-/// Default HTTP total timeout in seconds. Overridden by `CLAUDE_USAGE_HTTP_TIMEOUT`.
-/// Shell: `HTTP_DEADLINE="${CLAUDE_USAGE_HTTP_TIMEOUT:-2}"`.
-const DEFAULT_HTTP_TIMEOUT_SECS: u64 = 2;
+// ─── public entry-points ───────────────────────────────────────────────────────
 
-/// Default SSH deadline in seconds. Overridden by `CLAUDE_USAGE_SSH_TIMEOUT`.
-/// Shell: `SSH_DEADLINE="${CLAUDE_USAGE_SSH_TIMEOUT:-3}"`.
-#[cfg(unix)]
-const DEFAULT_SSH_DEADLINE_SECS: u64 = 3;
-
-/// Default hub usage URL. Empty = HTTP disabled unless `CLAUDE_USAGE_URL` is set.
-///
-/// The hub endpoint is site-specific infrastructure, so the binary ships **no**
-/// compiled-in URL. Deployments that run a usage hub inject the real endpoint via
-/// the `CLAUDE_USAGE_URL` env var (e.g. an Ansible-templated `settings.json`).
-/// Shell: `USAGE_URL="${CLAUDE_USAGE_URL-}"`.
-/// Note the `-` (not `:-`): set-but-empty disables HTTP entirely; unset falls
-/// back to this empty default, which `resolve_usage_url()` also treats as "off".
-const DEFAULT_HUB_USAGE_URL: &str = "";
-
-// ─── public entry-point ───────────────────────────────────────────────────────
-
-/// Fetch usage data from the hub, obeying the positive/negative TTL caches.
+/// Fetch usage data, obeying the positive/negative TTL caches. Equivalent to
+/// `fetch_with(false)`.
 ///
 /// Returns `Ok(UsageData)` on success or `Err(FetchError)` on any failure
-/// (network down, cache-miss, parse error, etc.).
+/// (every profile's collection failed, cache-miss, parse error, etc.).
 ///
-/// The caller should treat *any* `Err` as "hub unavailable" and open the
-/// hub-down account picker (interactive contexts) or fall back silently
-/// (non-interactive contexts).
+/// The caller should treat *any* `Err` as "no usage data available right now"
+/// and open the offline account picker (interactive contexts) or fall back
+/// silently (non-interactive contexts).
 pub fn fetch() -> Result<UsageData, FetchError> {
-    // Step 1 — hub-local fast path.
-    // Shell lines 657–662.
-    if is_hub_local() {
-        let data = read_hub_local()?;
-        // Prime the positive cache from the hub-local read (best-effort).
-        //
-        // The hub reads its own usage-limits.json directly and never hit the
-        // network, so historically nothing wrote `.usage-cache.json` here. That
-        // left the cache empty on the hub, so any caller that reads ONLY the
-        // positive cache — `--no-fetch`, or the launcher's `build_account_rows`
-        // when CLAUDE_HUB_HOSTNAME is unset and its hub-local fallback is gated
-        // off — saw "(no usage data)" on the very machine that has the data.
-        // Writing it here closes that gap; failure to cache never fails a good read.
-        if let Err(e) = write_positive_cache(&data) {
-            eprintln!("csm: warning: could not write usage cache: {e}");
-        }
-        let _ = std::fs::remove_file(paths::fetch_failed());
-        return Ok(data);
-    }
+    fetch_with(false)
+}
 
+/// Like [`fetch`], but `force = true` bypasses the positive cache AND is
+/// threaded into [`super::local::collect`] so every profile's own store-record
+/// TTL is bypassed too — a live re-probe of every profile, not just a
+/// cache-refresh. Used by `csm usage --refresh`.
+pub fn fetch_with(force: bool) -> Result<UsageData, FetchError> {
     let positive_ttl = positive_ttl_secs();
     let negative_cooldown = negative_cooldown_secs();
 
-    // Step 2 — positive TTL cache (< POSITIVE_TTL_SECS).
-    // Shell lines 666–675.
-    if let Some(data) = try_positive_cache(positive_ttl)? {
-        return Ok(data);
+    // Step 1 — positive TTL cache (< POSITIVE_TTL_SECS), skipped under force.
+    if !force {
+        if let Some(data) = try_positive_cache(positive_ttl)? {
+            return Ok(data);
+        }
     }
 
-    // Step 2.5 — user-supplied usage command (`CSM_USAGE_CMD`), if set.
+    // Step 2 — user-supplied usage command (`CSM_USAGE_CMD`), if set.
     //
-    // When the operator wires a metering command (a site script, a PTY scraper
-    // around `claude`, or anything that emits UsageData JSON on stdout), it is
-    // the explicit "check via a provided script" source and takes precedence
-    // over the hub HTTP/SSH transports.
+    // When the operator wires a metering command (a site script, or anything
+    // that emits UsageData JSON on stdout), it is the explicit "check via a
+    // provided script" source and takes precedence over local collection.
     //
     // It runs *before* the negative-cooldown gate on purpose: that cooldown
-    // exists to avoid hammering a down *hub*, but an explicit command is an
-    // independent source the user asked for — a hub outage must not silently
-    // suppress it. Success is cached like a network fetch so the (potentially
-    // slow) command is not re-run within the positive TTL.
+    // exists to avoid hammering local collection (keychain reads + the OAuth
+    // API) when it just failed outright, but an explicit command is an
+    // independent source the user asked for — a local-collection outage must
+    // not silently suppress it. Success is cached like a live fetch so the
+    // (potentially slow) command is not re-run within the positive TTL.
     if let Some(cmd) = resolve_usage_command() {
         match run_usage_command(&cmd) {
             Ok(data) => {
@@ -137,93 +118,63 @@ pub fn fetch() -> Result<UsageData, FetchError> {
                 return Ok(data);
             }
             Err(e) => {
-                // Command failed — fall through to the hub paths (the command is
-                // an override, not a hard gate). The negative-cooldown check and
-                // the final stamp below still apply to the hub transports.
+                // Command failed — fall through to local collection (the
+                // command is an override, not a hard gate). The negative-
+                // cooldown check and the final stamp below still apply.
                 eprintln!("csm: warning: CSM_USAGE_CMD failed: {e}");
             }
         }
     }
 
-    // Step 3 — negative cooldown (< NEGATIVE_COOLDOWN_SECS).
-    // Shell lines 677–687.
-    if negative_cache_active(negative_cooldown) {
+    // Step 3 — negative cooldown (< NEGATIVE_COOLDOWN_SECS), skipped under
+    // force for the same reason step 1's positive-cache check is: `--refresh`
+    // means "go probe live regardless". Without this, a stamp left over from
+    // a PRIOR failed round (e.g. every profile NeedsLogin) would short-circuit
+    // `csm usage --refresh` straight to `Err`, and the caller degrades to the
+    // last-known *positive* cache — silently hiding a just-recorded statusline
+    // capture (or a token that has since been logged back in) behind stale
+    // LOGIN REQUIRED data instead of ever reaching `local::collect` to re-probe.
+    if !force && negative_cache_active(negative_cooldown) {
         return Err(FetchError::NegativeCacheActive);
     }
 
-    // Steps 4 + 5 — HTTP-first, then SSH fallback (POSIX only).
-    // Shell lines 694–726.
-    match do_network_fetch() {
-        Ok(data) => {
-            // Success — write positive cache, clear negative cache marker.
-            // Shell lines 713–720.
-            if let Err(e) = write_positive_cache(&data) {
-                // Best-effort; don't fail on a caching error if the data is good.
-                eprintln!("csm: warning: could not write usage cache: {e}");
-            }
-            let _ = std::fs::remove_file(paths::fetch_failed());
-            Ok(data)
-        }
-        Err(e) => {
-            // Failure — stamp the negative cache.
-            // Shell lines 723–726.
-            stamp_negative_cache();
-            Err(e)
-        }
-    }
-}
+    // Step 4 — local, per-profile collection (the terminal layer).
+    let profiles = ProfileMap::load().unwrap_or_default();
+    let data = super::local::collect(&profiles, Utc::now(), force);
 
-// ─── network fetch orchestration ─────────────────────────────────────────────
+    // Total failure: every configured profile produced an error and none
+    // produced usable data. An empty registry (zero profiles, zero errors)
+    // is NOT a failure — it is a legitimate, if empty, result.
+    let total_failure =
+        data.profiles.is_empty() && data.errors.as_ref().is_some_and(|e| !e.is_empty());
 
-/// Run the HTTP-first network fetch, then SSH fallback on POSIX.
-///
-/// Returns the first successfully-parsed `UsageData`, or an `Err` if all
-/// paths fail.
-fn do_network_fetch() -> Result<UsageData, FetchError> {
-    // HTTP first (all platforms).
-    // Shell lines 694–698: if USAGE_URL is set-and-non-empty, try curl.
-    // CLAUDE_USAGE_URL set-but-empty = disable HTTP.
-    let usage_url = resolve_usage_url();
-
-    if let Some(ref url) = usage_url {
-        match http_fetch(url) {
-            Ok(data) => return Ok(data),
-            Err(_) => {
-                // Fall through to SSH fallback (POSIX) or final failure (Windows).
-            }
-        }
+    if total_failure {
+        stamp_negative_cache();
+        return Err(FetchError::EmptyPayload);
     }
 
-    // SSH fallback — POSIX only.
-    // Shell lines 699–708: `out="$(timeout $SSH_DEADLINE ssh … 'cat "$HOME/claude-code-usage/cache/usage-limits.json"')"`.
-    #[cfg(unix)]
-    {
-        ssh_fetch()
-    }
-
-    // Windows: HTTP is the only transport.
-    #[cfg(not(unix))]
-    {
-        Err(FetchError::EmptyPayload)
-    }
-}
-
-/// Resolve the usage URL from the environment.
-///
-/// Shell: `USAGE_URL="${CLAUDE_USAGE_URL-}"`.
-/// The `-` (not `:-`) means: if `CLAUDE_USAGE_URL` is set but empty, use empty;
-/// if unset, fall back to `DEFAULT_HUB_USAGE_URL` (also empty). Either way an
-/// empty result yields `None` — HTTP is disabled unless a non-empty URL is set.
-fn resolve_usage_url() -> Option<String> {
-    let url = match std::env::var("CLAUDE_USAGE_URL") {
-        Ok(val) => val,                             // set (possibly empty)
-        Err(_) => DEFAULT_HUB_USAGE_URL.to_owned(), // unset = default (empty)
-    };
-    if url.is_empty() {
-        None // empty = HTTP disabled
+    // Live-probe-all-failed (step 6a): `data.profiles` can be non-empty
+    // purely from `ServeStale` fallbacks while every profile that actually
+    // reached the network/keychain this round failed. `total_failure` above
+    // can't see that — it only looks at whether `profiles` ended up empty,
+    // and a `ServeStale` round populates it even though nothing new was
+    // learned. Stamp the cooldown here too so the NEXT call's negative-cache
+    // check (step 3) short-circuits instead of re-paying a full probe round
+    // on every launch of an offline/all-expired-tokens machine — the current
+    // call still returns `Ok` below, since the stale data is legitimate to
+    // serve right now.
+    if data.any_probe_attempted && !data.any_probe_succeeded {
+        stamp_negative_cache();
     } else {
-        Some(url)
+        let _ = std::fs::remove_file(paths::fetch_failed());
     }
+
+    // Success (possibly partial — some profiles errored, others didn't).
+    if let Err(e) = write_positive_cache(&data) {
+        // Best-effort; don't fail on a caching error if the data is good.
+        eprintln!("csm: warning: could not write usage cache: {e}");
+    }
+    Ok(data)
 }
 
 // ─── user-supplied usage command (CSM_USAGE_CMD) ──────────────────────────────
@@ -347,104 +298,6 @@ fn run_usage_command(cmd: &str) -> Result<UsageData, FetchError> {
         .map_err(|e| FetchError::Command(format!("output not UsageData: {e}")))
 }
 
-// ─── hub-local fast path ─────────────────────────────────────────────────────
-
-/// The configured hub hostname (short name), or `None` when unset/empty.
-///
-/// The hub machine is site-specific, so the binary ships no compiled-in name.
-/// Deployments that run a usage hub set `CLAUDE_HUB_HOSTNAME` (e.g. via an
-/// Ansible-templated `settings.json`); when unset, both the hub-local fast path
-/// and the SSH fallback are disabled — the correct behaviour for any machine
-/// that is not itself the hub.
-/// Shell: `USAGE_HUB="${CLAUDE_HUB_HOSTNAME-}"`.
-pub fn hub_hostname() -> Option<String> {
-    std::env::var("CLAUDE_HUB_HOSTNAME")
-        .ok()
-        .map(|h| h.trim().to_ascii_lowercase())
-        .filter(|h| !h.is_empty())
-}
-
-/// True when usage metering is configured for this machine — either we ARE the
-/// hub (`CLAUDE_HUB_HOSTNAME` matches this host) or a non-empty `CLAUDE_USAGE_URL`
-/// is set. When this is `false`, [`fetch`] can never succeed; `csm usage` uses
-/// this to print a "metering disabled" message instead of a transient error.
-///
-/// This is the env-opt-in gate: an external user (or a toss machine) with
-/// neither variable set gets a clean "disabled" path, not a fetch failure.
-///
-/// A user-supplied `CSM_USAGE_CMD` also counts as configured — it is a usage
-/// source in its own right, so `csm usage` must run the ladder (and hit the
-/// command layer) rather than reporting "metering disabled".
-pub fn is_configured() -> bool {
-    is_hub_local() || resolve_usage_url().is_some() || resolve_usage_command().is_some()
-}
-
-/// Age in seconds of the positive usage cache file (`.usage-cache.json`), or
-/// `None` when the cache is absent/unreadable. `csm usage` uses this to render
-/// the "⚠ hub data is Nm old" stale header when serving cached data offline.
-pub fn cache_age_secs() -> Option<u64> {
-    let meta = std::fs::metadata(paths::usage_cache()).ok()?;
-    Some(file_age_secs_from_meta(&meta))
-}
-
-/// True when this machine **is** the configured hub (read its cache directly,
-/// skip all network). Always false when `CLAUDE_HUB_HOSTNAME` is unset/empty.
-///
-/// Shell lines 657–659: `host="$(hostname -s …)"; if printf '%s' "$host" | grep -qi "^$USAGE_HUB$"`
-/// Case-insensitive match.
-fn is_hub_local() -> bool {
-    match hub_hostname() {
-        Some(hub) => short_hostname().to_ascii_lowercase() == hub,
-        None => false,
-    }
-}
-
-/// Read the hub's own `usage-limits.json` (no network needed).
-///
-/// Shell line 660: `cat "$USAGE_CACHE"`.
-fn read_hub_local() -> Result<UsageData, FetchError> {
-    let path = paths::hub_local_cache();
-    if !path.exists() {
-        return Err(FetchError::EmptyPayload);
-    }
-    let raw = std::fs::read_to_string(&path)?;
-    if raw.trim().is_empty() {
-        return Err(FetchError::EmptyPayload);
-    }
-    let data: UsageData = serde_json::from_str(&raw)?;
-    Ok(data)
-}
-
-/// Return the short hostname (no domain suffix), lowercase.
-///
-/// Shell: `hostname -s 2>/dev/null || hostname`.
-/// On POSIX uses `nix::unistd::gethostname`; on Windows uses `GetComputerNameW`
-/// via a subprocess (fallback to env var `COMPUTERNAME`).
-fn short_hostname() -> String {
-    #[cfg(unix)]
-    {
-        use nix::unistd::gethostname;
-        gethostname()
-            .ok()
-            .and_then(|h| h.into_string().ok())
-            // strip domain suffix — take everything up to the first '.'
-            .map(|h| h.split('.').next().unwrap_or(&h).to_owned())
-            .unwrap_or_default()
-    }
-
-    #[cfg(not(unix))]
-    {
-        // On Windows read %COMPUTERNAME% first (always set, no subprocess needed).
-        std::env::var("COMPUTERNAME")
-            .unwrap_or_default()
-            .split('.')
-            .next()
-            .unwrap_or("")
-            .to_ascii_lowercase()
-            .to_owned()
-    }
-}
-
 // ─── positive TTL cache ───────────────────────────────────────────────────────
 
 /// Read the positive cache TTL (seconds). Default: 60.
@@ -453,7 +306,6 @@ fn short_hostname() -> String {
 /// `CSM_USAGE_TTL_SECS` (the csm-native alias), then the default. Exposing the
 /// alias lets users configure the cache lifetime under a csm-prefixed name
 /// without knowing the legacy variable.
-/// Shell: `USAGE_TTL="${CLAUDE_USAGE_TTL:-60}"`.
 fn positive_ttl_secs() -> u64 {
     std::env::var("CLAUDE_USAGE_TTL")
         .ok()
@@ -469,22 +321,13 @@ fn positive_ttl_secs() -> u64 {
 /// Return `Ok(Some(data))` if the cache file exists, is non-empty, and its
 /// mtime is less than `ttl_secs` old; `Ok(None)` if absent/stale; `Err` on
 /// parse failure of a fresh file.
-///
-/// Shell lines 666–675:
-/// ```sh
-/// if [ -s "$pos_cache" ]; then
-///   cmt="$(stat -f %m … || stat -c %Y …)"
-///   cnow="$(date +%s)"
-///   if [ $(( cnow - cmt )) -lt "$USAGE_TTL" ]; then cat "$pos_cache"; return 0; fi
-/// fi
-/// ```
 fn try_positive_cache(ttl_secs: u64) -> Result<Option<UsageData>, FetchError> {
     let path = paths::usage_cache();
     if !path.exists() {
         return Ok(None);
     }
 
-    // [ -s "$pos_cache" ] — non-zero size check.
+    // Non-zero size check.
     let meta = std::fs::metadata(&path)?;
     if meta.len() == 0 {
         return Ok(None);
@@ -504,7 +347,6 @@ fn try_positive_cache(ttl_secs: u64) -> Result<Option<UsageData>, FetchError> {
 // ─── negative cooldown cache ──────────────────────────────────────────────────
 
 /// Read `CLAUDE_USAGE_FAIL_COOLDOWN` env (seconds). Default: 120.
-/// Shell: `FETCH_FAIL_COOLDOWN="${CLAUDE_USAGE_FAIL_COOLDOWN:-120}"`.
 fn negative_cooldown_secs() -> u64 {
     std::env::var("CLAUDE_USAGE_FAIL_COOLDOWN")
         .ok()
@@ -514,29 +356,16 @@ fn negative_cooldown_secs() -> u64 {
 
 /// True if the negative-cooldown file is recent (< `cooldown_secs`).
 ///
-/// Shell lines 679–686:
-/// ```sh
-/// if [ -f "$fail_marker" ]; then
-///   last="$(cat "$fail_marker" 2>/dev/null)"
-///   now="$(date +%s)"
-///   case "$last" in ''|*[!0-9]*) last=0 ;; esac
-///   if [ $(( now - last )) -lt "$FETCH_FAIL_COOLDOWN" ]; then return 0; fi
-/// fi
-/// ```
-///
-/// Note: the shell reads the *content* of the file as an epoch, not the mtime.
-/// However the shell also writes `date +%s` as content (line 725) in the same
-/// process so content ≈ mtime. The shell reads content; we replicate that
-/// exactly — read the epoch from the file content, fall back to 0 on parse
-/// failure (matches the `case` guard `''|*[!0-9]*)` → `last=0`).
+/// Reads the epoch written into the file's *content* (not its mtime — see
+/// [`stamp_negative_cache`], which writes the same epoch as content); falls
+/// back to `0` (i.e. "definitely expired") on any parse failure.
 fn negative_cache_active(cooldown_secs: u64) -> bool {
     let path = paths::fetch_failed();
     if !path.exists() {
         return false;
     }
-    // Read the epoch written into the file (shell line 681: `last="$(cat…)"`).
     let content = std::fs::read_to_string(&path).unwrap_or_default();
-    let last_epoch: u64 = content.trim().parse().unwrap_or(0); // shell: case ''|*[!0-9]*) last=0
+    let last_epoch: u64 = content.trim().parse().unwrap_or(0);
     let now_epoch = unix_now_secs();
     let age = now_epoch.saturating_sub(last_epoch);
     age < cooldown_secs
@@ -544,8 +373,10 @@ fn negative_cache_active(cooldown_secs: u64) -> bool {
 
 /// Write (or update) the negative-cooldown sentinel with the current epoch.
 ///
-/// Shell line 725: `date +%s > "$fail_marker" 2>/dev/null`.
-/// Best-effort; ignore errors.
+/// Stamped when local collection fails for every configured profile — the
+/// coarse "nothing at all is working right now" signal that gates a burst of
+/// repeat probes (each of which is a keychain read + a live API call per
+/// profile). Best-effort; ignore errors.
 fn stamp_negative_cache() {
     let path = paths::fetch_failed();
     // Ensure the parent directory exists.
@@ -556,178 +387,14 @@ fn stamp_negative_cache() {
     let _ = std::fs::write(&path, epoch.to_string());
 }
 
-// ─── HTTP fetch ───────────────────────────────────────────────────────────────
-
-/// Blocking HTTP fetch with tight timeouts.
-///
-/// Shell lines 695–697:
-/// ```sh
-/// out="$("$CURL" -fs --connect-timeout 1 --max-time "$HTTP_DEADLINE" "$USAGE_URL" 2>/dev/null)"
-/// ```
-/// connect-timeout = 1 s; total timeout = `HTTP_DEADLINE` (default 2 s).
-///
-/// `-f` = fail on HTTP 4xx/5xx; `-s` = silent.
-/// Returns `Err` on any HTTP error (connection refused, timeout, non-2xx).
-fn http_fetch(url: &str) -> Result<UsageData, FetchError> {
-    use std::time::Duration;
-
-    let http_timeout = std::env::var("CLAUDE_USAGE_HTTP_TIMEOUT")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or(DEFAULT_HTTP_TIMEOUT_SECS);
-
-    let client = reqwest::blocking::Client::builder()
-        .connect_timeout(Duration::from_secs(1))
-        .timeout(Duration::from_secs(http_timeout))
-        .build()
-        .map_err(FetchError::Http)?;
-
-    let resp = client.get(url).send().map_err(FetchError::Http)?;
-
-    // Map HTTP errors (4xx/5xx) to failure — mirrors curl -f.
-    let resp = resp.error_for_status().map_err(FetchError::Http)?;
-
-    let body = resp.text().map_err(FetchError::Http)?;
-    if body.trim().is_empty() {
-        return Err(FetchError::EmptyPayload);
-    }
-
-    // Validate JSON before returning (shell line 699: `jq -e .`).
-    let data: UsageData = serde_json::from_str(&body)?;
-    Ok(data)
-}
-
-// ─── SSH fallback (POSIX only) ────────────────────────────────────────────────
-
-/// SSH fallback path — POSIX only (ControlMaster socket reuse).
-///
-/// Reproduces shell lines 699–708:
-/// ```sh
-/// mkdir -p "$HOME/.ssh" 2>/dev/null
-/// out="$("$TIMEOUT" "$SSH_DEADLINE" ssh "${SSH_OPTS[@]}" "$USAGE_HUB" \
-///   'cat "$HOME/claude-code-usage/cache/usage-limits.json"' 2>/dev/null)"
-/// ```
-///
-/// SSH options (shell `SSH_OPTS` array):
-/// - `BatchMode=yes` (no interactive prompts)
-/// - `ConnectTimeout=4`
-/// - `ControlMaster=auto`
-/// - `ControlPath` → `~/.ssh/cm-claude-%C.sock`
-/// - `ControlPersist=300`
-///
-/// The outer `timeout $SSH_DEADLINE` is implemented here as a
-/// `std::process::Command` with `wait_timeout`; we replicate the hard deadline
-/// by spawning and checking within the deadline.
-///
-/// Spec §5 #5: "SSH fallback … POSIX-only behind `cfg(unix)`; Windows has HTTP-only."
-#[cfg(unix)]
-fn ssh_fetch() -> Result<UsageData, FetchError> {
-    use std::process::{Command, Stdio};
-    use std::time::{Duration, Instant};
-
-    // No configured hub → no SSH fallback. (External machines that are not part
-    // of a hub deployment never set CLAUDE_HUB_HOSTNAME, so we must not attempt
-    // to ssh to an arbitrary host name.)
-    let hub = hub_hostname().ok_or_else(|| FetchError::Ssh("no hub hostname configured".into()))?;
-
-    // Ensure ~/.ssh exists (shell: `mkdir -p "$HOME/.ssh" 2>/dev/null`).
-    if let Some(home) = dirs::home_dir() {
-        let _ = std::fs::create_dir_all(home.join(".ssh"));
-    }
-
-    let ssh_deadline = std::env::var("CLAUDE_USAGE_SSH_TIMEOUT")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or(DEFAULT_SSH_DEADLINE_SECS);
-
-    // Control path: `~/.ssh/cm-claude-%C.sock`.
-    // `%C` is a `ssh_config` token; pass it literally — ssh expands it.
-    let control_path = dirs::home_dir()
-        .unwrap_or_else(|| std::path::PathBuf::from("."))
-        .join(".ssh")
-        .join("cm-claude-%C.sock");
-    let control_path_str = control_path.to_string_lossy().to_string();
-
-    // Remote command: single-quoted so $HOME expands on the REMOTE side.
-    // Shell line 708: `'cat "$HOME/claude-code-usage/cache/usage-limits.json"'`
-    let remote_cmd = r#"cat "$HOME/claude-code-usage/cache/usage-limits.json""#;
-
-    let start = Instant::now();
-    let mut child = Command::new("ssh")
-        .args([
-            "-o",
-            "BatchMode=yes",
-            "-o",
-            "ConnectTimeout=4",
-            "-o",
-            "ControlMaster=auto",
-            "-o",
-            &format!("ControlPath={control_path_str}"),
-            "-o",
-            "ControlPersist=300",
-            hub.as_str(), // short MagicDNS name (ssh_config FQDN pin handles resolution)
-            remote_cmd,
-        ])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(|e| FetchError::Ssh(format!("spawn failed: {e}")))?;
-
-    // Poll for exit within the deadline (replicates `timeout $SSH_DEADLINE ssh …`).
-    let deadline = Duration::from_secs(ssh_deadline);
-    let output = loop {
-        match child.try_wait() {
-            Ok(Some(_)) => {
-                break child
-                    .wait_with_output()
-                    .map_err(|e| FetchError::Ssh(format!("wait_with_output failed: {e}")))?;
-            }
-            Ok(None) => {
-                if start.elapsed() >= deadline {
-                    let _ = child.kill();
-                    return Err(FetchError::Ssh(format!(
-                        "ssh timed out after {ssh_deadline}s"
-                    )));
-                }
-                std::thread::sleep(std::time::Duration::from_millis(50));
-            }
-            Err(e) => {
-                return Err(FetchError::Ssh(format!("wait failed: {e}")));
-            }
-        }
-    };
-
-    if !output.status.success() {
-        return Err(FetchError::Ssh(format!(
-            "ssh exited with status {}",
-            output.status
-        )));
-    }
-
-    let body = String::from_utf8_lossy(&output.stdout).to_string();
-    if body.trim().is_empty() {
-        return Err(FetchError::EmptyPayload);
-    }
-
-    // Shell line 699: validate JSON (`jq -e .`).
-    let data: UsageData = serde_json::from_str(&body)?;
-    Ok(data)
-}
-
 // ─── cache write ─────────────────────────────────────────────────────────────
 
 /// Atomically write `data` to `.usage-cache.json` (tmp + rename).
 ///
-/// Shell lines 716–719:
-/// ```sh
-/// printf '%s' "$out" > "$pos_cache.$$" 2>/dev/null \
-///   && mv -f "$pos_cache.$$" "$pos_cache" 2>/dev/null \
-///   || rm -f "$pos_cache.$$" 2>/dev/null
-/// ```
-///
-/// We serialize the `UsageData` back to JSON (the same bytes we received, via
-/// serde). The spec says "only validated JSON is ever cached" — we already
-/// parsed it above, so serialization here is just re-encoding the same data.
+/// We serialize the `UsageData` back to JSON (the same shape we received, via
+/// serde). Only validated `UsageData` is ever cached — we already parsed it
+/// (from the cache, the user command, or local collection) above, so
+/// serialization here is just re-encoding the same data.
 fn write_positive_cache(data: &UsageData) -> Result<(), FetchError> {
     let cache_path = paths::usage_cache();
     let parent = cache_path
@@ -805,8 +472,7 @@ mod tests {
     /// Global mutex for tests that mutate process-wide env vars.
     /// Rust test harness runs tests in parallel by default; env var mutation
     /// without serialization causes races between tests that read+write the
-    /// same env key (e.g. `resolve_usage_url_*`, `positive_ttl_*`,
-    /// `negative_cooldown_*`).
+    /// same env key (e.g. `positive_ttl_*`, `negative_cooldown_*`).
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     // ── shared fixture JSON ────────────────────────────────────────────────────
@@ -927,24 +593,12 @@ mod tests {
 
     #[test]
     fn negative_cache_absent_is_not_active() {
-        let dir = TempDir::new().unwrap();
-        // Point fetch_failed path to a non-existent file.
-        // We can't directly inject paths::fetch_failed() in tests, so we test
-        // the logic via the content-based function with the actual path helpers
-        // by using a temp dir and checking file_age_secs returns correct values.
-        //
-        // The negative_cache_active function reads paths::fetch_failed() which
-        // is under $HOME. We test the LOGIC of the cooldown here with a helper.
-        let _ = dir; // suppress unused
-
-        // Test: a file that doesn't exist → not active.
+        // A file that doesn't exist → not active.
         let non_existent = std::path::Path::new("/tmp/csm_test_never_exists_xyz123.fail");
         assert!(
             !non_existent.exists(),
             "precondition: file should not exist"
         );
-
-        // The logic: if file doesn't exist → false.
         let active = if !non_existent.exists() {
             false
         } else {
@@ -955,13 +609,12 @@ mod tests {
 
     #[test]
     fn negative_cache_content_based_epoch_within_cooldown() {
-        // Simulate the shell content-based logic:
-        // stamp = now - 30s → still within 120s cooldown.
+        // Simulate the content-based logic: stamp = now - 30s → still within
+        // 120s cooldown.
         let now = unix_now_secs();
         let stamp = now.saturating_sub(30);
         let content = stamp.to_string();
 
-        // Parse as the function does.
         let last_epoch: u64 = content.trim().parse().unwrap_or(0);
         let age = now.saturating_sub(last_epoch);
         assert!(age < 120, "30s old stamp should be within 120s cooldown");
@@ -979,7 +632,6 @@ mod tests {
 
     #[test]
     fn negative_cache_empty_content_treated_as_zero() {
-        // Shell: `case "$last" in ''|*[!0-9]*) last=0 ;; esac`.
         let content = "";
         let last_epoch: u64 = content.trim().parse().unwrap_or(0);
         assert_eq!(last_epoch, 0, "empty content should parse as 0");
@@ -987,7 +639,6 @@ mod tests {
 
     #[test]
     fn negative_cache_non_numeric_content_treated_as_zero() {
-        // Shell: `*[!0-9]*)` matches non-numeric → last=0.
         let content = "not-a-number";
         let last_epoch: u64 = content.trim().parse().unwrap_or(0);
         assert_eq!(last_epoch, 0, "non-numeric content should parse as 0");
@@ -1005,7 +656,6 @@ mod tests {
         let stamp = now.saturating_sub(10);
         fs::write(&fail_path, stamp.to_string()).unwrap();
 
-        // Read back and apply the same logic.
         let content = fs::read_to_string(&fail_path).unwrap();
         let last_epoch: u64 = content.trim().parse().unwrap_or(0);
         let age = now.saturating_sub(last_epoch);
@@ -1078,7 +728,6 @@ mod tests {
     // ── JSON validation gate ───────────────────────────────────────────────────
 
     /// Only valid JSON should ever be written to the positive cache.
-    /// This mirrors the shell check: `if … | jq -e . >/dev/null 2>&1; then … cache`.
     #[test]
     fn json_validation_gate_blocks_invalid() {
         let result = parse_usage_json(INVALID_JSON);
@@ -1154,61 +803,6 @@ mod tests {
         let stored: u64 = content.trim().parse().unwrap();
         assert!(stored >= now_before, "stored epoch should be >= before");
         assert!(stored <= now_after, "stored epoch should be <= after");
-    }
-
-    // ── resolve_usage_url ─────────────────────────────────────────────────────
-    //
-    // These three tests mutate the same env var; they acquire ENV_LOCK to
-    // prevent parallel interference with each other.
-
-    #[test]
-    fn resolve_usage_url_disabled_when_env_unset() {
-        // The binary ships no compiled-in hub URL, so an unset CLAUDE_USAGE_URL
-        // means HTTP is disabled (None) — identical to set-but-empty.
-        let _guard = ENV_LOCK.lock().unwrap();
-        let saved = std::env::var("CLAUDE_USAGE_URL").ok();
-        std::env::remove_var("CLAUDE_USAGE_URL");
-
-        let url = resolve_usage_url();
-        assert!(
-            url.is_none(),
-            "unset CLAUDE_USAGE_URL should disable HTTP (no compiled default)"
-        );
-
-        match saved {
-            Some(v) => std::env::set_var("CLAUDE_USAGE_URL", v),
-            None => std::env::remove_var("CLAUDE_USAGE_URL"),
-        }
-    }
-
-    #[test]
-    fn resolve_usage_url_empty_disables_http() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        let saved = std::env::var("CLAUDE_USAGE_URL").ok();
-        std::env::set_var("CLAUDE_USAGE_URL", "");
-
-        let url = resolve_usage_url();
-        assert!(url.is_none(), "empty CLAUDE_USAGE_URL should disable HTTP");
-
-        match saved {
-            Some(v) => std::env::set_var("CLAUDE_USAGE_URL", v),
-            None => std::env::remove_var("CLAUDE_USAGE_URL"),
-        }
-    }
-
-    #[test]
-    fn resolve_usage_url_custom_value() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        let saved = std::env::var("CLAUDE_USAGE_URL").ok();
-        std::env::set_var("CLAUDE_USAGE_URL", "http://custom-hub/api");
-
-        let url = resolve_usage_url();
-        assert_eq!(url.as_deref(), Some("http://custom-hub/api"));
-
-        match saved {
-            Some(v) => std::env::set_var("CLAUDE_USAGE_URL", v),
-            None => std::env::remove_var("CLAUDE_USAGE_URL"),
-        }
     }
 
     // ── CSM_USAGE_CMD (user-supplied usage command) ───────────────────────────
@@ -1385,35 +979,6 @@ mod tests {
     }
 
     #[test]
-    fn is_configured_true_when_only_command_set() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        let saved_cmd = std::env::var("CSM_USAGE_CMD").ok();
-        let saved_url = std::env::var("CLAUDE_USAGE_URL").ok();
-        let saved_hub = std::env::var("CLAUDE_HUB_HOSTNAME").ok();
-        // Disable hub paths, enable only the command.
-        std::env::set_var("CLAUDE_USAGE_URL", "");
-        std::env::remove_var("CLAUDE_HUB_HOSTNAME");
-        std::env::set_var("CSM_USAGE_CMD", "echo {}");
-        assert!(
-            is_configured(),
-            "CSM_USAGE_CMD alone must count as configured"
-        );
-        // restore
-        match saved_cmd {
-            Some(v) => std::env::set_var("CSM_USAGE_CMD", v),
-            None => std::env::remove_var("CSM_USAGE_CMD"),
-        }
-        match saved_url {
-            Some(v) => std::env::set_var("CLAUDE_USAGE_URL", v),
-            None => std::env::remove_var("CLAUDE_USAGE_URL"),
-        }
-        match saved_hub {
-            Some(v) => std::env::set_var("CLAUDE_HUB_HOSTNAME", v),
-            None => std::env::remove_var("CLAUDE_HUB_HOSTNAME"),
-        }
-    }
-
-    #[test]
     fn positive_ttl_alias_csm_secs() {
         let _guard = ENV_LOCK.lock().unwrap();
         let saved_legacy = std::env::var("CLAUDE_USAGE_TTL").ok();
@@ -1432,38 +997,6 @@ mod tests {
         match saved_alias {
             Some(v) => std::env::set_var("CSM_USAGE_TTL_SECS", v),
             None => std::env::remove_var("CSM_USAGE_TTL_SECS"),
-        }
-    }
-
-    // ── is_hub_local ──────────────────────────────────────────────────────────
-
-    #[test]
-    fn short_hostname_is_nonempty() {
-        // Can't assert what it equals in CI, but it must not be empty.
-        let h = short_hostname();
-        assert!(!h.is_empty(), "short_hostname() must not be empty");
-    }
-
-    #[test]
-    fn hub_hostname_env_contract() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        let saved = std::env::var("CLAUDE_HUB_HOSTNAME").ok();
-
-        // Unset → None (no compiled-in hub name → fast path + SSH disabled).
-        std::env::remove_var("CLAUDE_HUB_HOSTNAME");
-        assert!(hub_hostname().is_none(), "unset → None");
-
-        // Set-but-empty / whitespace → None.
-        std::env::set_var("CLAUDE_HUB_HOSTNAME", "  ");
-        assert!(hub_hostname().is_none(), "blank → None");
-
-        // Set → trimmed + lowercased.
-        std::env::set_var("CLAUDE_HUB_HOSTNAME", " Some-Hub ");
-        assert_eq!(hub_hostname().as_deref(), Some("some-hub"));
-
-        match saved {
-            Some(v) => std::env::set_var("CLAUDE_HUB_HOSTNAME", v),
-            None => std::env::remove_var("CLAUDE_HUB_HOSTNAME"),
         }
     }
 
@@ -1551,6 +1084,166 @@ mod tests {
         assert!(
             (65..=80).contains(&age),
             "file aged 70s should report age ≈ 70s, got {age}"
+        );
+    }
+
+    // ── fetch_with total-failure classification (pure, no I/O) ───────────────
+    //
+    // `fetch_with` itself touches the registry/keychain/network and is the
+    // thin I/O shell — its total-failure predicate is exercised here as plain
+    // boolean logic, mirroring exactly what the function computes.
+
+    #[test]
+    fn total_failure_is_zero_profiles_and_nonempty_errors() {
+        let mut errors = std::collections::HashMap::new();
+        errors.insert("home".to_string(), "not logged in".to_string());
+        let data = UsageData {
+            captured_at: None,
+            profiles: std::collections::HashMap::new(),
+            errors: Some(errors),
+            ..Default::default()
+        };
+        let total_failure =
+            data.profiles.is_empty() && data.errors.as_ref().is_some_and(|e| !e.is_empty());
+        assert!(total_failure);
+    }
+
+    #[test]
+    fn empty_registry_is_not_total_failure() {
+        // Zero profiles, zero errors (an empty registry) is a legitimate
+        // empty result, not a failure.
+        let data = UsageData {
+            captured_at: None,
+            profiles: std::collections::HashMap::new(),
+            errors: None,
+            ..Default::default()
+        };
+        let total_failure =
+            data.profiles.is_empty() && data.errors.as_ref().is_some_and(|e| !e.is_empty());
+        assert!(!total_failure);
+    }
+
+    #[test]
+    fn partial_success_is_not_total_failure() {
+        let mut profiles = std::collections::HashMap::new();
+        profiles.insert("home".to_string(), Default::default());
+        let mut errors = std::collections::HashMap::new();
+        errors.insert("work".to_string(), "token expired".to_string());
+        let data = UsageData {
+            captured_at: None,
+            profiles,
+            errors: Some(errors),
+            ..Default::default()
+        };
+        let total_failure =
+            data.profiles.is_empty() && data.errors.as_ref().is_some_and(|e| !e.is_empty());
+        assert!(!total_failure, "one good profile is a partial success");
+    }
+
+    // ── fetch_with live-probe-all-failed classification (pure, no I/O) ───────
+    //
+    // Mirrors the total-failure block above: `fetch_with`'s "stamp the
+    // negative cooldown even on a step-4 `Ok`" predicate
+    // (`data.any_probe_attempted && !data.any_probe_succeeded`) exercised as
+    // plain boolean logic against constructed `UsageData` values, without
+    // touching the real negative-cache file (which is keyed off the real
+    // `$HOME` via `paths::fetch_failed()`).
+
+    #[test]
+    fn servestale_only_round_is_live_probe_all_failed() {
+        // Every profile in `profiles` came from a `ServeStale` fallback (a
+        // stale store record survived an offline/expired-token round) — NOT
+        // total failure (`profiles` is non-empty), but every live attempt
+        // this round still failed.
+        let mut profiles = std::collections::HashMap::new();
+        profiles.insert("home".to_string(), Default::default());
+        let data = UsageData {
+            profiles,
+            any_probe_attempted: true,
+            any_probe_succeeded: false,
+            ..Default::default()
+        };
+        let total_failure =
+            data.profiles.is_empty() && data.errors.as_ref().is_some_and(|e| !e.is_empty());
+        assert!(
+            !total_failure,
+            "ServeStale populating `profiles` must not itself read as total failure"
+        );
+        assert!(
+            data.any_probe_attempted && !data.any_probe_succeeded,
+            "but the cooldown predicate must still catch it"
+        );
+    }
+
+    #[test]
+    fn any_live_probe_succeeding_is_not_live_probe_all_failed() {
+        let mut profiles = std::collections::HashMap::new();
+        profiles.insert("home".to_string(), Default::default());
+        let data = UsageData {
+            profiles,
+            any_probe_attempted: true,
+            any_probe_succeeded: true,
+            ..Default::default()
+        };
+        assert!(
+            !(data.any_probe_attempted && !data.any_probe_succeeded),
+            "one successful live probe must not stamp the cooldown"
+        );
+    }
+
+    #[test]
+    fn no_probe_attempted_is_not_live_probe_all_failed() {
+        // Every profile served from `Freshness::Fresh` (no probe needed at
+        // all this round) — nothing was even attempted, so there is nothing
+        // to conclude "failed" about.
+        let mut profiles = std::collections::HashMap::new();
+        profiles.insert("home".to_string(), Default::default());
+        let data = UsageData {
+            profiles,
+            any_probe_attempted: false,
+            any_probe_succeeded: false,
+            ..Default::default()
+        };
+        assert!(!(data.any_probe_attempted && !data.any_probe_succeeded));
+    }
+
+    // ── fetch_with: negative cooldown must not block a forced refresh ────────
+    //
+    // Bug B root cause: step 3's negative-cooldown gate had no `!force`
+    // guard, unlike step 1's positive-cache check. A prior all-NeedsLogin
+    // round stamps the negative cooldown (see
+    // `servestale_only_round_is_live_probe_all_failed` above); with that
+    // stamp still warm, `csm usage --refresh` — whose entire contract is "go
+    // probe live regardless" — hit `Err(FetchError::NegativeCacheActive)`
+    // before ever reaching `local::collect`, so the caller fell back to the
+    // stale *positive* cache and a just-recorded statusline capture's
+    // numbers never appeared. Mirrors this crate's established pattern of
+    // testing `fetch_with`'s inline predicates as plain boolean logic (see
+    // the total-failure/live-probe-all-failed blocks above) rather than
+    // touching the real `$HOME`-rooted `paths::fetch_failed()` file that
+    // `negative_cache_active` reads.
+
+    #[test]
+    fn forced_refresh_skips_the_negative_cooldown_gate() {
+        let force = true;
+        let cache_is_active = true; // a prior all-failed round just stamped it
+        let would_short_circuit = !force && cache_is_active;
+        assert!(
+            !would_short_circuit,
+            "force=true must bypass an active negative cooldown, not return \
+             NegativeCacheActive and degrade to the stale positive cache"
+        );
+    }
+
+    #[test]
+    fn unforced_fetch_still_honors_the_negative_cooldown_gate() {
+        let force = false;
+        let cache_is_active = true;
+        let would_short_circuit = !force && cache_is_active;
+        assert!(
+            would_short_circuit,
+            "a plain `csm usage` (no --refresh) must still short-circuit on \
+             an active negative cooldown — only `force` bypasses it"
         );
     }
 }

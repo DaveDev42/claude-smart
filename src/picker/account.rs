@@ -41,6 +41,11 @@ pub struct StaleProfileData {
     /// Raw reset string as stored in cache (e.g. `"Jun 18 at 9pm (Asia/Seoul)"`).
     /// `None` if absent/null.
     pub resets: Option<String>,
+    /// Machine-native reset epoch (`week_all.resets_at`), when the cache was
+    /// written by the local collector. `None` for an older cache that predates
+    /// the field, or when the section itself is absent. Ranking prefers this
+    /// over re-parsing `resets` — see `main::account_row_rank`.
+    pub resets_at: Option<i64>,
     /// Error string if the cache recorded an error for this profile.
     pub error: Option<String>,
 }
@@ -336,6 +341,7 @@ mod tests {
             session_pct: None,
             week_all_pct: None,
             resets: None,
+            resets_at: None,
             error: Some("no credentials".to_string()),
         };
         let d = render_display(&data, Some("stale 4m ago"));
@@ -349,6 +355,7 @@ mod tests {
             session_pct: None,
             week_all_pct: None,
             resets: None,
+            resets_at: None,
             error: None,
         };
         let d = render_display(&data, None);
@@ -361,6 +368,7 @@ mod tests {
             session_pct: Some(3),
             week_all_pct: Some(32),
             resets: Some("Jun 18 9pm".to_string()),
+            resets_at: None,
             error: None,
         };
         let d = render_display(&data, Some("stale 4m ago"));
@@ -376,6 +384,7 @@ mod tests {
             session_pct: Some(50),
             week_all_pct: None,
             resets: None,
+            resets_at: None,
             error: None,
         };
         let d = render_display(&data, None);
@@ -396,6 +405,7 @@ mod tests {
             session_pct: Some(10),
             week_all_pct: Some(20),
             resets: None,
+            resets_at: None,
             error: None,
         };
         let row = AccountRow::build("home", &data, Some(old_mtime), false);
@@ -418,6 +428,7 @@ mod tests {
             session_pct: None,
             week_all_pct: None,
             resets: None,
+            resets_at: None,
             error: Some("no credentials".to_string()),
         };
         let row = AccountRow::build("work", &data, None, false);

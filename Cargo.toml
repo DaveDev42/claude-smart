@@ -66,11 +66,25 @@ thiserror = "1"   # library-style errors in session/account/usage (UsageError, F
 nucleo-matcher = "0.3"
 crossterm      = "0.28"
 
-# ─── HTTP transport (usage fetch HTTP-first path, all 4 machines) ─────────────
+# ─── local usage collection (src/usage/local/) ────────────────────────────────
+# derive the macOS Keychain service name Claude Code itself uses:
+# "Claude Code-credentials-" + sha256(NFC(config_dir)).hex[..8]
+sha2 = "0.10"
+# NFC-normalize the config-dir string before hashing (creds::service_name) —
+# Claude Code hashes the NFC form, so a path with combining-character
+# sequences must match byte-for-byte or the derived service name misses.
+unicode-normalization = "0.1"
+# resolve this machine's local IANA zone for display::format_resets's
+# "Sep 3 at 8:59pm (Asia/Seoul)" rendering (also pulled in transitively via
+# chrono-tz, but local/display.rs calls this crate directly).
+iana-time-zone = "0.1"
+
+# ─── HTTP transport (local usage collection: Anthropic's OAuth usage API) ────
 # rustls-tls (not native-tls): native-tls drags in system OpenSSL on Linux, which
 # breaks cross-compile + adds a build-time libssl dep on the WSL target; rustls is
-# pure-Rust and builds cleanly on all 4 targets (darwin/linux/windows-msvc). The hub
-# endpoint is plain HTTP over Tailscale Serve, so TLS trust-store nuance is moot here.
+# pure-Rust and builds cleanly on all 4 targets (darwin/linux/windows-msvc). The
+# only endpoint this hits is Anthropic's own HTTPS API (api.anthropic.com), so
+# rustls's bundled webpki roots are all the trust store this needs.
 [dependencies.reqwest]
 version          = "0.12"
 default-features = false

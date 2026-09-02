@@ -219,7 +219,7 @@ pub fn classify(input: &HookInput, owner_dir: &Path) -> anyhow::Result<Decision>
 
     // ── 3. Detect (two-tier + malformed) ─────────────────────────────────────
     // Shell: limit-switch.sh.j2 lines 184-226
-    // Tier-1 is local (no network), tier-2 uses the hub cache.
+    // Tier-1 is local (no network), tier-2 uses the local usage cache.
 
     let (limited_msg, limited) = {
         // Tier-1 — transcript tail (local, instant)
@@ -228,7 +228,7 @@ pub fn classify(input: &HookInput, owner_dir: &Path) -> anyhow::Result<Decision>
         if let Some(msg) = t1 {
             (msg, true)
         } else {
-            // Tier-2 — usage pct from hub cache
+            // Tier-2 — usage pct from local cache
             // Shell: limit-switch.sh.j2 lines 205-221
             let t2 = detect_usage_threshold(owner_dir);
             if let Some(msg) = t2 {

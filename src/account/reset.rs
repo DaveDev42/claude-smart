@@ -1,6 +1,7 @@
 //! Parse the `resets` string from the usage API into a UTC Unix epoch.
 //!
-//! Input forms (from `parse-usage.py` / the hub's `/cc-usage/api/data/limits`):
+//! Input forms (from the local usage collector's display formatting,
+//! `usage::local::display::format_resets`):
 //!
 //! - `"9pm (Asia/Seoul)"`            — time-only, implied current or next day
 //! - `"8:20pm (Asia/Seoul)"`         — time with minutes, implied day

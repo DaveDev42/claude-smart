@@ -35,9 +35,13 @@ It is consumed by the **private** `dave-environment` Ansible repo (the operator'
   editor: pure `apply_edit_action` + thin `run_interactive`), `platform.rs`
   (`apply_global`: launchctl/HKCU floor).
 - `src/usage/` — `model.rs` (`UsageData` serde), `transport.rs` (`fetch()` —
-  5-layer resilience ladder: hub-local → positive TTL cache → negative cooldown
-  → HTTP → SSH[unix]), `report.rs` (`csm usage`: pure `build_report` +
-  `render_table`/`render_json`).
+  positive TTL cache → `CSM_USAGE_CMD` → negative cooldown → `local::collect`),
+  `report.rs` (`csm usage`: pure `build_report` + `render_table`/`render_json`),
+  `local/` (the collector: `mod.rs` orchestrates per-profile fresh/stale/probe
+  resolution, `creds.rs` reads each profile's own Claude Code OAuth credentials
+  read-only, `api.rs` calls Anthropic's `/api/oauth/usage`, `store.rs` persists
+  `<smart-dir>/usage/<profile>.json`, `statusline.rs` merges the statusLine
+  stdin capture, `display.rs` formats reset times).
 - `src/session/`, `src/picker/`, `src/hook/`, `src/sidecar/`, `src/platform/`,
   `src/statusline.rs`, `src/paths.rs` — session scan/index, in-process fuzzy
   picker (nucleo + crossterm), the Stop/SubagentStop/SessionEnd hook, sidecar
@@ -74,10 +78,11 @@ Run `/verify` before every commit (test + clippy + leak guard, in one pass).
 1. **Public crate ships ZERO private identifiers.** No operator tailnet suffix,
    hub/host names, account-profile names, real home paths, or personal email —
    anywhere under `src/`, **including `#[cfg(test)]` fixtures**. Examples use
-   neutral placeholders (`work`, `home`, `/Users/example`, `Acme-…`). The hub is
-   reached only via the env contract `CLAUDE_USAGE_URL` + `CLAUDE_HUB_HOSTNAME`
-   (both empty/unset = disabled), and any host-naming convention is injected via
-   `CSM_HOST_REPLACE` — never compiled in. Profile names come from `ProfileMap`
+   neutral placeholders (`work`, `home`, `/Users/example`, `Acme-…`). Usage data
+   comes from Anthropic's own OAuth usage API. There is no hub, and the only
+   endpoint is `https://api.anthropic.com` (overridable via `CSM_USAGE_API_BASE`
+   for tests); any host-naming convention is injected via `CSM_HOST_REPLACE`,
+   never compiled in. Profile names come from `ProfileMap`
    (the registry), never literals. `cargo test` runs `tests/no_private_names.rs`,
    which scans every line of `src/` and fails on any leak (its forbidden list is
    assembled from fragments so the guard file itself stays clean).
@@ -128,8 +133,10 @@ crates.io login), then Trusted Publishing is registered and an OIDC job re-added
 
 ## Don't touch / out of scope
 
-- The **hub-side data source** is NOT in this repo — it lives in `dave-environment`
-  (`shared/claude-code-usage/`). `csm` only *consumes* `/cc-usage/api/data/limits`.
+- There is no hub-side data source anymore. `csm` collects usage locally per
+  profile (`src/usage/local/`) from Anthropic's own OAuth usage API. The retired
+  hub scrape (`dave-environment`, `shared/claude-code-usage/`) is out of scope
+  here; `csm` no longer consumes `/cc-usage/api/data/limits`.
 - dave-environment deployment glue (Brewfile/winget/Ansible shims) lives there,
   not here. Changes that span both repos: do the crate side here, note the
   companion edits for dave-environment separately.

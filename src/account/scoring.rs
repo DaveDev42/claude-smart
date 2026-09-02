@@ -29,7 +29,7 @@ use std::env;
 
 use chrono::{DateTime, Utc};
 
-use crate::account::reset::resets_to_epoch_at;
+use crate::usage::model::UsageSection;
 use crate::usage::{FetchError, UsageData};
 
 // ─── constants ────────────────────────────────────────────────────────────────
@@ -66,12 +66,15 @@ fn saturation_pct() -> i64 {
 }
 
 /// Default max age, in seconds, of the usage data that account auto-pick will
-/// still trust. The hub re-scrapes `limits` every 30 min (and the cc-sync
-/// freshness alert pages at the same horizon), so data older than this means
-/// the hub's scrape has stalled — the percentages no longer reflect reality and
-/// auto-picking on them can route into an account that is actually over its
-/// limit. Override via `CLAUDE_USAGE_MAX_AGE` (alias `CSM_USAGE_MAX_AGE_SECS`).
-/// `0` disables the gate entirely (trust any age).
+/// still trust. Each profile is captured locally on this machine — a live
+/// OAuth API probe (per-profile TTL `CSM_USAGE_PROFILE_TTL`, default 300s) or
+/// a statusline-stdin merge — so data this old means local collection itself
+/// has stalled for a while (no successful probe, and no statusline capture
+/// either) across the whole registry, not just one profile. Data older than
+/// this means the percentages no longer reflect reality and auto-picking on
+/// them can route into an account that is actually over its limit. Override
+/// via `CLAUDE_USAGE_MAX_AGE` (alias `CSM_USAGE_MAX_AGE_SECS`). `0` disables
+/// the gate entirely (trust any age).
 pub const USAGE_MAX_AGE_SECS: u64 = 1800;
 
 /// Read the usage max-age gate (seconds) from the environment.
@@ -90,8 +93,9 @@ fn usage_max_age_secs() -> u64 {
 
 /// The freshest `captured_at` instant in `data`: the top-level field if
 /// present, else the newest per-profile `captured_at`. `None` when no timestamp
-/// anywhere parses (old cache files predate the field, or a non-hub source omit
-/// it). RFC-3339 / ISO-8601 with a `Z` or offset (e.g. `2026-06-17T07:13:19Z`).
+/// anywhere parses (old cache files predate the field, or a `CSM_USAGE_CMD`
+/// source omits it). RFC-3339 / ISO-8601 with a `Z` or offset (e.g.
+/// `2026-06-17T07:13:19Z`).
 fn newest_captured_at(data: &UsageData) -> Option<DateTime<Utc>> {
     fn parse(s: &str) -> Option<DateTime<Utc>> {
         DateTime::parse_from_rfc3339(s.trim())
@@ -267,7 +271,7 @@ pub fn pick_best_at(
         name: &'a str,
         week_pct: i64,
         session_pct: i64,
-        resets: Option<&'a str>,
+        week_all: Option<&'a UsageSection>,
     }
 
     let mut candidates: Vec<Candidate<'_>> = data
@@ -286,12 +290,11 @@ pub fn pick_best_at(
                 .as_ref()
                 .map(|s| s.pct)
                 .unwrap_or(ABSENT_SESSION_PCT);
-            let resets = pu.week_all.as_ref().and_then(|wa| wa.resets.as_deref());
             Some(Candidate {
                 name: name.as_str(),
                 week_pct,
                 session_pct,
-                resets,
+                week_all: pu.week_all.as_ref(),
             })
         })
         .collect();
@@ -327,10 +330,12 @@ pub fn pick_best_at(
         // Primary: SOONEST weekly reset — parse failures / absent resets become
         // i64::MAX so a known epoch always beats an unknown one. Secondary:
         // higher week_all.pct (drain the fuller of two same-reset accounts).
-        // Parsed against the same `now` as the staleness gate for determinism.
+        // `reset_instant` prefers the machine-native `resets_at` epoch and only
+        // falls back to re-parsing the `resets` display string when absent —
+        // resolved against the same `now` as the staleness gate for determinism.
         let epoch: i64 = c
-            .resets
-            .and_then(|r| resets_to_epoch_at(r, now).ok())
+            .week_all
+            .and_then(|s| s.reset_instant(now))
             .map(|dt| dt.timestamp())
             .unwrap_or(i64::MAX);
         let key = (epoch, -c.week_pct);
@@ -428,6 +433,7 @@ mod tests {
         UsageSection {
             pct,
             resets: resets.map(String::from),
+            resets_at: None,
         }
     }
 
@@ -439,6 +445,8 @@ mod tests {
             week_fable: None,
             week_model_label: None,
             session_stats: vec![],
+            source: None,
+            attention: None,
         }
     }
 
@@ -447,6 +455,7 @@ mod tests {
             captured_at: None,
             profiles,
             errors: None,
+            ..Default::default()
         }
     }
 
@@ -458,6 +467,7 @@ mod tests {
             captured_at: None,
             profiles,
             errors: Some(errors),
+            ..Default::default()
         }
     }
 
@@ -555,6 +565,45 @@ mod tests {
         let data = make_data(profiles);
         let result = pick_best_at(&data, "", false, true, ranking_now()).unwrap();
         assert_eq!(result.as_deref(), Some("hasreset"));
+    }
+
+    /// `resets_at` (the machine-native epoch the local collector computed)
+    /// wins even when the display string `resets` is garbage that would fail
+    /// to parse — mirrors `UsageSection::reset_instant`'s own precedence, and
+    /// pins that scoring reads the epoch through that helper rather than
+    /// re-parsing `resets` itself.
+    #[test]
+    fn resets_at_epoch_wins_over_unparseable_resets_string() {
+        let mut profiles = HashMap::new();
+        // "epoch_wins" has an unparseable resets string but a resets_at epoch
+        // that is SOONER than "string_only"'s correctly-parsed reset date —
+        // if scoring fell back to parsing `resets`, this candidate would sink
+        // to i64::MAX and lose; reading resets_at correctly makes it win.
+        let sooner_epoch = ranking_now().timestamp() + 1_000; // well before Jun 20
+        profiles.insert(
+            "epoch_wins".to_string(),
+            ProfileUsage {
+                captured_at: None,
+                session: Some(make_section(5, None)),
+                week_all: Some(UsageSection {
+                    pct: 70,
+                    resets: Some("not a valid reset string".to_string()),
+                    resets_at: Some(sooner_epoch),
+                }),
+                week_fable: None,
+                week_model_label: None,
+                session_stats: vec![],
+                source: None,
+                attention: None,
+            },
+        );
+        profiles.insert(
+            "string_only".to_string(),
+            make_profile(Some(5), 10, Some("Jun 20 at 9pm (Asia/Seoul)")),
+        );
+        let data = make_data(profiles);
+        let result = pick_best_at(&data, "", false, true, ranking_now()).unwrap();
+        assert_eq!(result.as_deref(), Some("epoch_wins"));
     }
 
     /// Equal reset epoch → the HIGHER week_all.pct wins (drain the fuller of
@@ -681,6 +730,8 @@ mod tests {
             week_fable: None,
             week_model_label: None,
             session_stats: vec![],
+            source: None,
+            attention: None,
         }
     }
 
@@ -780,6 +831,42 @@ mod tests {
             result.as_deref(),
             Some("healthy"),
             "errored profile must be excluded"
+        );
+    }
+
+    /// A NeedsLogin profile (design spec "맛이 간 프로필은 로그인하라고 경고") —
+    /// dead credentials, recorded in `errors` per `local::mod`'s exclusion
+    /// mechanism — must never be picked even when it carries the best numbers
+    /// in the whole registry. Launching under it would just land the user on
+    /// Claude Code's `/login` screen.
+    #[test]
+    fn needs_login_profile_with_best_numbers_is_not_picked() {
+        let mut profiles = HashMap::new();
+        // "dead" has by far the best (lowest) week_pct, but its credentials
+        // are dead — it still carries an `attention` + stale numbers (the
+        // report/footer surfaces still need something to render), yet must
+        // be excluded from scoring via `errors`.
+        let mut dead = make_profile(Some(1), 2, None);
+        dead.attention = Some(crate::usage::model::Attention {
+            kind: crate::usage::model::AttentionKind::NeedsLogin,
+            message: "credentials expired".to_string(),
+            action: "CLAUDE_CONFIG_DIR=/Users/example/.claude.dead claude auth login".to_string(),
+            since_epoch: Some(1_756_000_000),
+        });
+        profiles.insert("dead".to_string(), dead);
+        // "healthy" has worse numbers but usable credentials.
+        profiles.insert("healthy".to_string(), make_profile(Some(50), 60, None));
+        let mut errors = HashMap::new();
+        errors.insert(
+            "dead".to_string(),
+            "credentials expired — login required".to_string(),
+        );
+        let data = make_data_with_errors(profiles, errors);
+        let result = pick_best(&data, "", false).unwrap();
+        assert_eq!(
+            result.as_deref(),
+            Some("healthy"),
+            "a needs_login profile must never be auto-picked, regardless of its numbers"
         );
     }
 
@@ -913,6 +1000,8 @@ mod tests {
             week_fable: None,
             week_model_label: None,
             session_stats: vec![],
+            source: None,
+            attention: None,
         };
         profiles.insert("no_week_all".to_string(), pu);
         profiles.insert("has_week_all".to_string(), make_profile(Some(5), 40, None));
@@ -957,6 +1046,7 @@ mod tests {
             captured_at: Some(captured_at.to_string()),
             profiles,
             errors: None,
+            ..Default::default()
         }
     }
 
@@ -1035,6 +1125,7 @@ mod tests {
             captured_at: None,
             profiles,
             errors: None,
+            ..Default::default()
         };
         let now = at("2026-06-29T12:05:00Z");
         let result = pick_best_at(&data, "main", false, true, now).unwrap();
@@ -1083,6 +1174,7 @@ mod tests {
             captured_at: Some("2026-06-29T12:04:00Z".to_string()), // fresh top-level
             profiles,
             errors: None,
+            ..Default::default()
         };
         let now = at("2026-06-29T12:05:00Z");
         let result = pick_best_at(&data, "main", false, true, now).unwrap();

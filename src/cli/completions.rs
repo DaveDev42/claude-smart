@@ -121,15 +121,20 @@ pub enum CompletionsSubcmd {
         verb: Option<ConfigVerb>,
     },
 
-    /// Multi-profile usage table (registry ∪ hub), offline-aware.
+    /// Multi-profile usage table (registry∪local view), offline-aware.
     #[command(name = "usage")]
     Usage {
-        /// Emit the joined registry∪hub view as JSON.
+        /// Emit the joined registry∪local view as JSON.
         #[arg(long)]
         json: bool,
         /// Read only the local cache (no network).
         #[arg(long)]
         no_fetch: bool,
+        /// Bypass the cache and every profile's own TTL; re-probe live.
+        #[arg(long)]
+        refresh: bool,
+        #[command(subcommand)]
+        verb: Option<UsageVerb>,
     },
 
     /// Pick the best account to launch under.
@@ -204,6 +209,15 @@ pub enum CompletionsSubcmd {
     /// Print a fresh lowercase UUID v4 (used as --session-id on cold launch).
     #[command(name = "newuuid")]
     Newuuid,
+}
+
+/// `csm usage <verb>` — the statusLine-stdin capture subverb, distinct from
+/// `csm usage`'s own flags (`--json`/`--no-fetch`/`--refresh`).
+#[derive(clap::Subcommand)]
+pub enum UsageVerb {
+    /// Read statusLine JSON from stdin, merge into the local store.
+    #[command(name = "capture")]
+    Capture,
 }
 
 /// `csm profiles <verb>` — registry management verbs.
@@ -388,6 +402,29 @@ mod tests {
                 "zsh completions missing subcommand {sub:?}"
             );
         }
+    }
+
+    // ── `csm usage`'s own surface (--refresh, capture) is represented ─────────
+    //
+    // Regression coverage: the `Usage` variant's fields previously lagged
+    // `main.rs::cmd_usage`'s real flags, so `csm usage --ref<TAB>` and `csm
+    // usage cap<TAB>` silently offered nothing. `zsh_completions_include_all_subcommands`
+    // above only checks top-level subcommand names, so it alone would not
+    // have caught that drift.
+
+    #[test]
+    fn zsh_completions_include_usage_refresh_flag_and_capture_subverb() {
+        let mut buf = Vec::new();
+        generate(Shell::Zsh, &mut buf);
+        let out = String::from_utf8_lossy(&buf);
+        assert!(
+            out.contains("refresh"),
+            "zsh completions missing `csm usage --refresh`"
+        );
+        assert!(
+            out.contains("capture"),
+            "zsh completions missing `csm usage capture`"
+        );
     }
 
     // ── generate is idempotent (called twice produces the same output) ────────

@@ -1,11 +1,17 @@
 #!/usr/bin/env sh
 # usage-collector.sh — a reference CSM_USAGE_CMD for claude-smart (`csm`).
 #
+# `csm` collects usage locally by default (each profile's own Claude Code
+# OAuth credentials → Anthropic's usage API; see the README's "Usage
+# metering" section). `CSM_USAGE_CMD` is an override: when set, `csm` calls
+# this command instead, after the positive cache and before local collection.
+#
 # `csm` calls this command, reads its stdout, and expects a single UsageData
-# JSON object (the same shape the hub serves). `csm` does the SCORING and the
-# account choice itself (src/account/scoring.rs) — this script only reports the
-# FACTS (each profile's current session/week usage). You do NOT pick a profile
-# here; you just describe every profile's usage and let csm decide.
+# JSON object (the same shape local collection produces). `csm` does the
+# SCORING and the account choice itself (src/account/scoring.rs); this
+# script only reports the FACTS (each profile's current session/week usage).
+# You do NOT pick a profile here; you just describe every profile's usage and
+# let csm decide.
 #
 #   export CSM_USAGE_CMD="$HOME/path/to/usage-collector.sh"
 #   export CSM_USAGE_CMD_TIMEOUT=10     # seconds (default 10); hard deadline
@@ -39,9 +45,12 @@
 #
 # IMPORTANT: there is NO reliable `claude` CLI command that emits these gauges.
 # `claude -p`/`/usage` does NOT print the session/week percentages in
-# non-interactive mode, so a plain `claude -p` recipe will NOT work. The usage
-# numbers must come from a source that actually has them — a hub endpoint, a
-# cache file your own tooling writes, or an API you maintain.
+# non-interactive mode, so a plain `claude -p` recipe will NOT work. csm's own
+# built-in collector already solves this by calling Anthropic's OAuth usage
+# API directly with each profile's stored credentials, so you only need a
+# custom command like this one for exotic setups: a shared cache your own
+# tooling maintains, a proxy through infrastructure you already run, or a
+# source other than the per-profile credentials csm reads by default.
 set -eu
 
 # ── Strategy A: proxy an existing hub HTTP endpoint ──────────────────────────

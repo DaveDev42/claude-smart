@@ -11,6 +11,21 @@
 //! the rendered status line; `run()` emits this segment alone (with a trailing
 //! newline) for the dormant / testing use-case.
 //!
+//! ## Piggyback statusLine capture (local usage collection)
+//!
+//! Claude Code's own `statusLine` command runs with the full statusLine JSON
+//! (which carries `rate_limits` for the *active* profile, refreshed roughly
+//! once a second) on stdin — a shell prompt or manual invocation, by contrast,
+//! inherits a TTY stdin with nothing on it. `run()` tells the two apart with
+//! `stdin().is_terminal()`: when stdin is NOT a terminal (the statusLine case),
+//! it reads stdin (capped, see [`CAPTURE_STDIN_CAP_BYTES`]) and feeds it to
+//! [`usage::local::record_statusline_payload`] best-effort — every error is
+//! swallowed, since a malformed/partial payload must never turn the segment
+//! this command exists to print into an error. `CSM_STATUSLINE_NO_CAPTURE=1`
+//! (or `true`) disables the read entirely, e.g. for a caller that pipes
+//! something else into a piped, non-interactive `csm statusline` and does not
+//! want its stdin consumed for capture.
+//!
 //! ### Profile resolution
 //!
 //! 1. Take the **basename** of `$CLAUDE_CONFIG_DIR`.
@@ -42,11 +57,20 @@
 //! | no registry | `Laptop` |
 
 use std::ffi::OsString;
+use std::io::IsTerminal;
 use std::path::Path;
 
 use anyhow::Result;
 
+use crate::usage;
+
 // ─── Public entry point ───────────────────────────────────────────────────────
+
+/// Hard cap on how much of a piggybacked statusLine stdin payload `run()` will
+/// ever read — mirrors `main::CAPTURE_STDIN_CAP_BYTES`; kept as a separate
+/// constant since `csm usage capture` and `csm statusline` are different
+/// entry points that happen to share the same defensive ceiling.
+const CAPTURE_STDIN_CAP_BYTES: u64 = 256 * 1024;
 
 /// Subcommand handler: print `<profile>@<host>` (or just `<host>`) to stdout.
 ///
@@ -62,10 +86,85 @@ use anyhow::Result;
 ///   esac
 /// fi
 /// ```
+///
+/// Also piggybacks the statusLine-stdin usage capture (see the module doc)
+/// before rendering: when stdin is not a terminal and the capture gate is not
+/// disabled, stdin is read and handed to
+/// [`usage::local::record_statusline_payload`], best-effort. This never
+/// affects the printed segment or the exit code — a capture failure is
+/// invisible to whatever renders this command's output in the prompt.
 pub fn run(_args: &[OsString]) -> Result<()> {
+    if should_capture_stdin() {
+        let raw = read_stdin_capped(CAPTURE_STDIN_CAP_BYTES);
+        let _ = usage::local::record_statusline_payload(&raw);
+    }
     let segment = render_segment()?;
     println!("{segment}");
     Ok(())
+}
+
+/// `true` when `run()` should read stdin for the piggyback capture: stdin is
+/// not a terminal (a real TTY-backed shell-prompt invocation never has a
+/// payload to read) AND `CSM_STATUSLINE_NO_CAPTURE` is not `1`/`true`.
+///
+/// Split from `run()` so the env-gate logic is testable without needing to
+/// control the process's actual stdin.
+fn should_capture_stdin() -> bool {
+    if std::io::stdin().is_terminal() {
+        return false;
+    }
+    !capture_disabled_by_env()
+}
+
+/// `true` iff `CSM_STATUSLINE_NO_CAPTURE` is set to `1` or `true` (any case).
+fn capture_disabled_by_env() -> bool {
+    match std::env::var("CSM_STATUSLINE_NO_CAPTURE") {
+        Ok(v) => matches!(v.trim(), "1" | "true" | "True" | "TRUE"),
+        Err(_) => false,
+    }
+}
+
+/// Hard deadline on the piggybacked stdin read (see [`read_stdin_capped`]).
+/// The statusLine case (this command's actual reason to read stdin at all)
+/// writes its payload and closes stdin essentially immediately; this is
+/// generous for that case while still bounding the failure mode below.
+const CAPTURE_STDIN_DEADLINE: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// Read stdin up to `max_bytes`, lossily decoding as UTF-8, bounded by
+/// [`CAPTURE_STDIN_DEADLINE`] as well as `max_bytes`.
+///
+/// The byte cap alone does not bound *time*: `should_capture_stdin`'s gate is
+/// "stdin is not a terminal", which is broader than "invoked as a statusLine
+/// command" — a caller that runs `csm statusline` with an inherited pipe it
+/// does not itself own (e.g. `producer | while read -r line; do prompt="$(csm
+/// statusline)"; done`) hands this a stdin that may deliver under `max_bytes`
+/// and never close, and a plain `read_to_end` would then block forever,
+/// hanging the caller's loop. The read runs on a background thread instead;
+/// this function waits only up to the deadline and returns whatever arrived
+/// (empty string on timeout — `record_statusline_payload` treats that as a
+/// no-op, same as any other unusable payload). The spawned thread is not
+/// joined on timeout — nothing here can force a blocking `Read` to return
+/// early — but it is harmless to leak until the process exits shortly after
+/// this call returns (`run()` prints the segment next and returns).
+///
+/// Mirrors `main::read_stdin_capped`'s byte-cap contract; duplicated rather
+/// than shared because `main` is a binary crate root, not a library other
+/// modules import from.
+fn read_stdin_capped(max_bytes: u64) -> String {
+    use std::io::Read;
+    use std::sync::mpsc;
+
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = std::io::stdin().take(max_bytes).read_to_end(&mut buf);
+        let _ = tx.send(buf);
+    });
+
+    match rx.recv_timeout(CAPTURE_STDIN_DEADLINE) {
+        Ok(buf) => String::from_utf8_lossy(&buf).into_owned(),
+        Err(_) => String::new(),
+    }
 }
 
 /// Compute the `<profile>@<host>` (or bare `<host>`) segment.
@@ -276,8 +375,12 @@ mod tests {
     use super::*;
     use std::sync::Mutex;
 
-    // Serialise all tests that touch CLAUDE_CONFIG_DIR (process-global env var).
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
+    // Serialise all tests that touch CLAUDE_CONFIG_DIR (process-global env
+    // var) — shared across module boundaries with `usage::local`'s own
+    // CLAUDE_CONFIG_DIR-mutating tests, since a module-local lock cannot
+    // protect against a different module's test interleaving on the same
+    // process-global variable. See `crate::testenv` for why.
+    use crate::testenv::CLAUDE_CONFIG_DIR_ENV_LOCK as ENV_LOCK;
 
     /// Set `CLAUDE_CONFIG_DIR`, call `current_profile()`, then restore original.
     fn profile_with_dir(dir: &str) -> String {
@@ -639,5 +742,36 @@ mod tests {
         let _guard = ENV_LOCK.lock().unwrap();
         std::env::remove_var("IS_PERSONAL_MACHINE");
         assert!(is_personal_machine());
+    }
+
+    // ── capture_disabled_by_env (CSM_STATUSLINE_NO_CAPTURE gate) ─────────────
+
+    static CAPTURE_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn capture_disabled_by_env_unset_is_false() {
+        let _guard = CAPTURE_ENV_LOCK.lock().unwrap();
+        std::env::remove_var("CSM_STATUSLINE_NO_CAPTURE");
+        assert!(!capture_disabled_by_env());
+    }
+
+    #[test]
+    fn capture_disabled_by_env_recognizes_1_and_true() {
+        let _guard = CAPTURE_ENV_LOCK.lock().unwrap();
+        for v in ["1", "true", "True", "TRUE"] {
+            std::env::set_var("CSM_STATUSLINE_NO_CAPTURE", v);
+            assert!(capture_disabled_by_env(), "{v} should disable capture");
+        }
+        std::env::remove_var("CSM_STATUSLINE_NO_CAPTURE");
+    }
+
+    #[test]
+    fn capture_disabled_by_env_rejects_other_values() {
+        let _guard = CAPTURE_ENV_LOCK.lock().unwrap();
+        for v in ["0", "false", "yes", ""] {
+            std::env::set_var("CSM_STATUSLINE_NO_CAPTURE", v);
+            assert!(!capture_disabled_by_env(), "{v} should not disable capture");
+        }
+        std::env::remove_var("CSM_STATUSLINE_NO_CAPTURE");
     }
 }
