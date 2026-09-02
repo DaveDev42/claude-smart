@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.3.0](https://github.com/DaveDev42/claude-smart/compare/v0.2.15...v0.3.0) (2026-09-02)
+
+
+### ⚠ BREAKING CHANGES
+
+* **usage:** the hub fetch paths are removed. CLAUDE_USAGE_URL, CLAUDE_HUB_HOSTNAME, CLAUDE_USAGE_HTTP_TIMEOUT, and CLAUDE_USAGE_SSH_TIMEOUT no longer do anything. Usage comes only from the local cache, CSM_USAGE_CMD if set, and local per-profile collection.
+
+### Features
+
+* **usage:** collect per-profile usage locally — drop the hub, warn on dead credentials ([6f34045](https://github.com/DaveDev42/claude-smart/commit/6f34045e2cee8276759545a5154b2e5f44b3cb92))
+
 ## [0.2.15](https://github.com/DaveDev42/claude-smart/compare/v0.2.14...v0.2.15) (2026-08-05)
 
 
