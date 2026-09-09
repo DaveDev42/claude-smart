@@ -28,7 +28,10 @@ It is consumed by the **private** `dave-environment` Ansible repo (the operator'
   flags forward verbatim), `completions.rs` (clap tree used ONLY for
   `csm completions`, never to parse real argv).
 - `src/account/` — `profiles.rs` (`ProfileMap` = the registry authority),
-  `scoring.rs` (pick-best thresholds: `LIMIT_PCT=99`, `SATURATION_PCT=95`),
+  `scoring.rs` (pick-best thresholds: `LIMIT_PCT=99`, `SATURATION_PCT=95`;
+  `is_viable_pcts` is the ONE viability predicate over session / week_all /
+  week_fable — `pick_best_at`, `main::account_row_rank`, and the hook's target
+  pick all route through it; never add a second inline threshold check),
   `reset.rs`, `mod.rs` (`pick_account`, `current_usage`).
 - `src/cas/` — profile switcher: `mod.rs` (`Op` enum, `eval_emit` for the shell
   shim contract, `manage_emit` for registry verbs), `edit.rs` (interactive
@@ -44,7 +47,10 @@ It is consumed by the **private** `dave-environment` Ansible repo (the operator'
   stdin capture, `display.rs` formats reset times).
 - `src/session/`, `src/picker/`, `src/hook/`, `src/sidecar/`, `src/platform/`,
   `src/statusline.rs`, `src/paths.rs` — session scan/index, in-process fuzzy
-  picker (nucleo + crossterm), the Stop/SubagentStop/SessionEnd hook, sidecar
+  picker (nucleo + crossterm), the Stop/SubagentStop/SessionEnd hook (tier-2
+  usage-% is the operative detector; tier-1 transcript-text is dormant because
+  Claude Code writes no limit notice into transcripts — see `hook/detect.rs`
+  module doc), sidecar
   store, OS launch/relaunch/proc checks, statusline, canonical state paths.
 - `src/provision.rs` — profile provisioning SSOT: `ensure_profile_provisioned`
   (dir + `plugins/` → `~/.claude.shared/plugins` symlink) and the read-only

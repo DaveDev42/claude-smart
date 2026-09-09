@@ -46,6 +46,16 @@ pub struct StaleProfileData {
     /// the field, or when the section itself is absent. Ranking prefers this
     /// over re-parsing `resets` — see `main::account_row_rank`.
     pub resets_at: Option<i64>,
+    /// Weekly PER-MODEL-TIER (`week_fable`) usage percentage, or `None` when
+    /// this profile carries no model-scoped weekly cap. `main::account_row_rank`
+    /// treats a `Some(pct) >= SATURATION_PCT` reading the same as a saturated
+    /// `week_all_pct` (see `scoring::is_viable_pcts`) — `None` never
+    /// constrains viability.
+    pub week_fable_pct: Option<i64>,
+    /// Machine-native reset epoch for the `week_fable` section
+    /// (`week_fable.resets_at`), when known. `None` when absent (no cap for
+    /// this profile, or an older cache record).
+    pub week_fable_resets_at: Option<i64>,
     /// Error string if the cache recorded an error for this profile.
     pub error: Option<String>,
 }
@@ -154,6 +164,11 @@ fn render_display(data: &StaleProfileData, stale: Option<&str>) -> String {
     }
     if let Some(pct) = data.week_all_pct {
         parts.push(format!("week {pct}%"))
+    }
+    // Model-scoped weekly cap — only shown when this profile actually carries
+    // one; `None` means no such limit for it (see `StaleProfileData` doc).
+    if let Some(pct) = data.week_fable_pct {
+        parts.push(format!("model {pct}%"))
     }
     if let Some(ref resets) = data.resets {
         parts.push(format!("resets {resets}"));
@@ -342,6 +357,8 @@ mod tests {
             week_all_pct: None,
             resets: None,
             resets_at: None,
+            week_fable_pct: None,
+            week_fable_resets_at: None,
             error: Some("no credentials".to_string()),
         };
         let d = render_display(&data, Some("stale 4m ago"));
@@ -356,6 +373,8 @@ mod tests {
             week_all_pct: None,
             resets: None,
             resets_at: None,
+            week_fable_pct: None,
+            week_fable_resets_at: None,
             error: None,
         };
         let d = render_display(&data, None);
@@ -369,6 +388,8 @@ mod tests {
             week_all_pct: Some(32),
             resets: Some("Jun 18 9pm".to_string()),
             resets_at: None,
+            week_fable_pct: None,
+            week_fable_resets_at: None,
             error: None,
         };
         let d = render_display(&data, Some("stale 4m ago"));
@@ -385,6 +406,8 @@ mod tests {
             week_all_pct: None,
             resets: None,
             resets_at: None,
+            week_fable_pct: None,
+            week_fable_resets_at: None,
             error: None,
         };
         let d = render_display(&data, None);
@@ -406,6 +429,8 @@ mod tests {
             week_all_pct: Some(20),
             resets: None,
             resets_at: None,
+            week_fable_pct: None,
+            week_fable_resets_at: None,
             error: None,
         };
         let row = AccountRow::build("home", &data, Some(old_mtime), false);
@@ -429,6 +454,8 @@ mod tests {
             week_all_pct: None,
             resets: None,
             resets_at: None,
+            week_fable_pct: None,
+            week_fable_resets_at: None,
             error: Some("no credentials".to_string()),
         };
         let row = AccountRow::build("work", &data, None, false);

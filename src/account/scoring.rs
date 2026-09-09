@@ -3,16 +3,29 @@
 //! Logic (spec §2 Account pick + scoring):
 //!
 //! 1. Build candidate rows: profiles NOT in errors{}, with a numeric week_all.pct.
-//! 2. Exclusions (in order):
+//! 2. Exclusions (in order) — see [`is_viable_pcts`], the SINGLE viability
+//!    authority every caller (this module's own ranking, the hub-down
+//!    picker's `main::account_row_rank`) routes through:
 //!    - `session.pct >= LIMIT_PCT(99)` → skip (absent session.pct = -1, never fires).
 //!    - `week_all.pct >= SATURATION_PCT(95)` → skip.
+//!    - `week_fable.pct >= SATURATION_PCT(95)` → skip, when `week_fable` is
+//!      present. `week_fable` is the model-scoped weekly cap (whichever tier
+//!      the API reports under `kind=weekly_scoped`, labelled by
+//!      `week_model_label`) — it follows the SAME rule as `week_all` because
+//!      it is itself a weekly cap. `None` (no such limit returned for this
+//!      profile) does NOT constrain viability — only a present, saturated
+//!      reading does.
 //! 3. Among the survivors, choose the one whose weekly reset returns SOONEST:
-//!    a known `week_all.resets` epoch beats an unknown one, and a smaller
-//!    (sooner) epoch beats a larger one. Ties (equal epoch, or all epochs
-//!    unknown) break to the HIGHER week_all.pct, then to the first candidate
-//!    in name order. Rationale: budget spent on the account that refills first
-//!    is the cheapest budget — drain that account, keep the later-resetting
-//!    ones in reserve.
+//!    a known reset epoch beats an unknown one, and a smaller (sooner) epoch
+//!    beats a larger one. The epoch compared is the LATER of `week_all`'s and
+//!    `week_fable`'s reset (when both are known) — a viable candidate is, by
+//!    construction, under neither cap, but it is only genuinely "fresh" again
+//!    once BOTH weekly windows have rolled over, so the binding constraint on
+//!    ranking is whichever of the two resets later. Ties (equal epoch, or all
+//!    epochs unknown) break to the HIGHER week_all.pct, then to the first
+//!    candidate in name order. Rationale: budget spent on the account that
+//!    refills first is the cheapest budget — drain that account, keep the
+//!    later-resetting ones in reserve.
 //!    (Policy changed post-0.2.11: the retired shell source — pick_account,
 //!    claude-smart-helper.sh.j2 lines 883–971 — drained highest-pct-first with
 //!    a soonest-reset tie-break; the primary and secondary keys are now
@@ -23,6 +36,8 @@
 //! 6. No viable candidate → `Err(ScoringError::AllSaturated)`.
 //!
 //! Env overrides: `CLAUDE_LIMIT_PCT` / `CLAUDE_PICK_SATURATION_PCT` (spec §2).
+//! Both overrides apply to `week_fable` too — it reuses the same
+//! `SATURATION_PCT` constant/override as `week_all`, never a separate knob.
 
 use std::collections::HashMap;
 use std::env;
@@ -131,6 +146,54 @@ fn data_too_stale_at(data: &UsageData, max_age_secs: u64, now: DateTime<Utc>) ->
     let age = now.signed_duration_since(captured);
     // Negative age (captured_at in the future — clock skew) is not "stale".
     age.num_seconds() > max_age_secs as i64
+}
+
+// ─── the single viability authority ────────────────────────────────────────
+
+/// The ONE viability predicate: `true` when a profile with these three raw
+/// percentages is a legitimate pick candidate.
+///
+/// This is the single authority for "is this profile viable" — [`pick_best_at`]
+/// (below) and `main::account_row_rank` (the hub-down/stale-cache picker rows)
+/// both route through it rather than each hand-rolling the same three checks,
+/// so a profile whose model-scoped weekly cap is exhausted is skipped
+/// everywhere a pick or a recommendation is made, not just in one of the two
+/// code paths.
+///
+/// - `session_pct >= LIMIT_PCT` → not viable. Callers encode "no session
+///   data" as [`ABSENT_SESSION_PCT`] (-1), which is always `< LIMIT_PCT` and
+///   so never trips this gate.
+/// - `week_all_pct` present and `>= SATURATION_PCT` → not viable.
+/// - `week_fable_pct` present and `>= SATURATION_PCT` → not viable. `None`
+///   (this profile carries no model-scoped weekly limit) does NOT constrain
+///   viability — absence is never treated as "limited".
+///
+/// Both thresholds are read from the environment on every call (`limit_pct()`
+/// / `saturation_pct()`), so a `CLAUDE_LIMIT_PCT`/`CLAUDE_PICK_SATURATION_PCT`
+/// override set mid-process (as the tests do) is honoured immediately — no
+/// caller needs to re-read the env itself.
+pub fn is_viable_pcts(
+    session_pct: i64,
+    week_all_pct: Option<i64>,
+    week_fable_pct: Option<i64>,
+) -> bool {
+    let lim = limit_pct();
+    let sat = saturation_pct();
+
+    if session_pct >= lim {
+        return false;
+    }
+    if let Some(w) = week_all_pct {
+        if w >= sat {
+            return false;
+        }
+    }
+    if let Some(f) = week_fable_pct {
+        if f >= sat {
+            return false;
+        }
+    }
+    true
 }
 
 // ─── public error + result types ─────────────────────────────────────────────
@@ -251,9 +314,6 @@ pub fn pick_best_at(
         return Err(ScoringError::NoUsableData);
     }
 
-    let lim = limit_pct();
-    let sat = saturation_pct();
-
     // Candidates: profiles present in data.profiles, NOT in errors{}.
     // Build (name, week_all_pct, session_pct, resets_str) tuples.
     // Shell lines 924–934: jq emits profile name, week_all.pct, session.pct(-1 absent),
@@ -271,7 +331,9 @@ pub fn pick_best_at(
         name: &'a str,
         week_pct: i64,
         session_pct: i64,
+        week_fable_pct: Option<i64>,
         week_all: Option<&'a UsageSection>,
+        week_fable: Option<&'a UsageSection>,
     }
 
     let mut candidates: Vec<Candidate<'_>> = data
@@ -294,7 +356,9 @@ pub fn pick_best_at(
                 name: name.as_str(),
                 week_pct,
                 session_pct,
+                week_fable_pct: pu.week_fable.as_ref().map(|s| s.pct),
                 week_all: pu.week_all.as_ref(),
+                week_fable: pu.week_fable.as_ref(),
             })
         })
         .collect();
@@ -315,29 +379,37 @@ pub fn pick_best_at(
             continue;
         }
 
-        // Session-limit gate: session.pct >= LIMIT_PCT → skip.
-        // -1 (absent) is < 99 so it intentionally passes.
-        if c.session_pct >= lim {
-            continue;
-        }
-
-        // Saturation gate: week_all.pct >= SATURATION_PCT → skip.
-        if c.week_pct >= sat {
+        // Viability gate: session/week_all/week_fable, all through the single
+        // authority — see `is_viable_pcts`'s doc.
+        if !is_viable_pcts(c.session_pct, Some(c.week_pct), c.week_fable_pct) {
             continue;
         }
 
         // Rank key, smaller wins: (weekly reset epoch, negated week pct).
         // Primary: SOONEST weekly reset — parse failures / absent resets become
-        // i64::MAX so a known epoch always beats an unknown one. Secondary:
+        // i64::MAX so a known epoch always beats an unknown one. The epoch
+        // compared is the LATER of week_all's and week_fable's reset (when
+        // both are known): a viable candidate is under neither cap, but it is
+        // only fully "fresh" once BOTH weekly windows have rolled over, so
+        // that later reset is the binding constraint on ranking. Secondary:
         // higher week_all.pct (drain the fuller of two same-reset accounts).
         // `reset_instant` prefers the machine-native `resets_at` epoch and only
         // falls back to re-parsing the `resets` display string when absent —
         // resolved against the same `now` as the staleness gate for determinism.
-        let epoch: i64 = c
+        let week_all_epoch = c
             .week_all
             .and_then(|s| s.reset_instant(now))
-            .map(|dt| dt.timestamp())
-            .unwrap_or(i64::MAX);
+            .map(|dt| dt.timestamp());
+        let week_fable_epoch = c
+            .week_fable
+            .and_then(|s| s.reset_instant(now))
+            .map(|dt| dt.timestamp());
+        let epoch: i64 = match (week_all_epoch, week_fable_epoch) {
+            (Some(a), Some(f)) => a.max(f),
+            (Some(a), None) => a,
+            (None, Some(f)) => f,
+            (None, None) => i64::MAX,
+        };
         let key = (epoch, -c.week_pct);
 
         if best_name.is_none() || key < best_key {
@@ -381,17 +453,15 @@ pub fn current_usage_pcts(data: &UsageData, profile: &str) -> Option<(i64, i64)>
 /// Helper: is a profile excluded from candidacy?
 ///
 /// Returns `true` when the profile should be skipped in scoring:
-/// - present in `errors` map,
-/// - `session.pct >= LIMIT_PCT` (env-overridable), or
-/// - `week_all.pct >= SATURATION_PCT` (env-overridable).
+/// - present in `errors` map, or
+/// - not viable per [`is_viable_pcts`] (session/week_all/week_fable — see its
+///   doc for the exact per-dimension rule).
 ///
 /// Used by tests to assert individual exclusion conditions independently.
-/// Test-isolation helper: the production scorer inlines the same three checks.
+/// Test-isolation helper: the production scorer's own gate is the same
+/// `is_viable_pcts` call, applied inline in `pick_best_at`.
 #[allow(dead_code)]
 pub fn is_excluded(data: &UsageData, profile: &str) -> bool {
-    let lim = limit_pct();
-    let sat = saturation_pct();
-
     if let Some(errors) = &data.errors {
         if errors.contains_key(profile) {
             return true;
@@ -404,13 +474,10 @@ pub fn is_excluded(data: &UsageData, profile: &str) -> bool {
             .as_ref()
             .map(|s| s.pct)
             .unwrap_or(ABSENT_SESSION_PCT);
-        if session_pct >= lim {
+        let week_all_pct = pu.week_all.as_ref().map(|s| s.pct);
+        let week_fable_pct = pu.week_fable.as_ref().map(|s| s.pct);
+        if !is_viable_pcts(session_pct, week_all_pct, week_fable_pct) {
             return true;
-        }
-        if let Some(wa) = &pu.week_all {
-            if wa.pct >= sat {
-                return true;
-            }
         }
     }
 
@@ -447,6 +514,22 @@ mod tests {
             session_stats: vec![],
             source: None,
             attention: None,
+        }
+    }
+
+    /// Like [`make_profile`] but also carries a `week_fable` section —
+    /// `fable_pct: None` means "no model-scoped weekly cap for this profile"
+    /// (must not constrain viability); `Some(pct)` sets its reading.
+    fn make_profile_with_fable(
+        session_pct: Option<i64>,
+        week_pct: i64,
+        fable_pct: Option<i64>,
+        fable_resets: Option<&str>,
+    ) -> ProfileUsage {
+        ProfileUsage {
+            week_fable: fable_pct.map(|p| make_section(p, fable_resets)),
+            week_model_label: fable_pct.map(|_| "Fable".to_string()),
+            ..make_profile(session_pct, week_pct, None)
         }
     }
 
@@ -911,6 +994,170 @@ mod tests {
         assert_eq!(result.as_deref(), Some("no_session"));
     }
 
+    // ─── model-scoped weekly (week_fable) gate ────────────────────────────────
+
+    /// `is_viable_pcts` sanity: the three dimensions in isolation and combined.
+    #[test]
+    fn is_viable_pcts_dimensions() {
+        // Healthy across the board.
+        assert!(is_viable_pcts(10, Some(50), Some(50)));
+        // week_fable absent → does not constrain viability.
+        assert!(is_viable_pcts(10, Some(50), None));
+        // week_fable saturated → not viable, even though session/week_all are fine.
+        assert!(!is_viable_pcts(10, Some(50), Some(SATURATION_PCT)));
+        // week_fable just under the threshold → still viable.
+        assert!(is_viable_pcts(10, Some(50), Some(SATURATION_PCT - 1)));
+        // session limited → not viable regardless of the weekly dimensions.
+        assert!(!is_viable_pcts(LIMIT_PCT, Some(0), None));
+    }
+
+    /// A profile whose model-scoped weekly cap (week_fable) is fully
+    /// exhausted (100%) must be excluded from picking even though its session
+    /// and week_all readings are perfectly healthy (R2).
+    #[test]
+    fn fable_saturated_excludes_even_with_healthy_session_and_week_all() {
+        let mut profiles = HashMap::new();
+        profiles.insert(
+            "fable_capped".to_string(),
+            make_profile_with_fable(Some(5), 10, Some(100), None),
+        );
+        profiles.insert(
+            "healthy".to_string(),
+            make_profile_with_fable(Some(5), 10, None, None),
+        );
+        let data = make_data(profiles);
+        let result = pick_best(&data, "other", false).unwrap();
+        assert_eq!(
+            result.as_deref(),
+            Some("healthy"),
+            "a fable-saturated profile must never be picked, even with a healthy session/week_all"
+        );
+    }
+
+    /// `week_fable: None` (this profile carries no model-scoped weekly limit
+    /// at all) must NOT be treated as limited — it stays a normal candidate.
+    #[test]
+    fn fable_none_is_viable() {
+        let mut profiles = HashMap::new();
+        profiles.insert(
+            "no_fable_cap".to_string(),
+            make_profile_with_fable(Some(5), 10, None, None),
+        );
+        let data = make_data(profiles);
+        let result = pick_best(&data, "", false).unwrap();
+        assert_eq!(result.as_deref(), Some("no_fable_cap"));
+    }
+
+    /// `week_fable.pct` just under `SATURATION_PCT` (94%) must still be viable
+    /// — the threshold is `>=`, not `>`.
+    #[test]
+    fn fable_just_under_saturation_is_viable() {
+        let mut profiles = HashMap::new();
+        profiles.insert(
+            "almost_capped".to_string(),
+            make_profile_with_fable(Some(5), 10, Some(SATURATION_PCT - 1), None),
+        );
+        let data = make_data(profiles);
+        let result = pick_best(&data, "", false).unwrap();
+        assert_eq!(result.as_deref(), Some("almost_capped"));
+    }
+
+    /// `week_fable.pct == SATURATION_PCT` (95%) must be excluded — same `>=`
+    /// rule as `week_all`, reusing the exact constant (no new hardcoded number).
+    #[test]
+    fn fable_at_saturation_is_excluded() {
+        let mut profiles = HashMap::new();
+        profiles.insert(
+            "capped".to_string(),
+            make_profile_with_fable(Some(5), 10, Some(SATURATION_PCT), None),
+        );
+        profiles.insert(
+            "healthy".to_string(),
+            make_profile_with_fable(Some(5), 10, None, None),
+        );
+        let data = make_data(profiles);
+        let result = pick_best(&data, "other", false).unwrap();
+        assert_eq!(result.as_deref(), Some("healthy"));
+    }
+
+    /// Two profiles differ ONLY in their fable saturation — the uncapped one
+    /// must be picked. Isolates the fable dimension from session/week_all/reset
+    /// ordering (both share identical session, week_all, and reset string).
+    #[test]
+    fn only_fable_difference_uncapped_wins() {
+        let mut profiles = HashMap::new();
+        let resets = Some("Jun 20 at 9pm (Asia/Seoul)");
+        profiles.insert(
+            "fable_capped".to_string(),
+            make_profile_with_fable(Some(5), 30, Some(99), resets),
+        );
+        profiles.insert(
+            "fable_ok".to_string(),
+            make_profile_with_fable(Some(5), 30, Some(20), resets),
+        );
+        let data = make_data(profiles);
+        let result = pick_best_at(&data, "", false, true, ranking_now()).unwrap();
+        assert_eq!(
+            result.as_deref(),
+            Some("fable_ok"),
+            "the profile whose model-scoped weekly cap is NOT saturated must win"
+        );
+    }
+
+    /// A CURRENT profile that is fable-capped must be treated as limited: in
+    /// reactive mode (`include_current=false`, mirroring the hook) it must
+    /// never be re-selected, and the only OTHER candidate wins.
+    #[test]
+    fn fable_capped_current_is_skipped_in_reactive_mode() {
+        let mut profiles = HashMap::new();
+        profiles.insert(
+            "current".to_string(),
+            make_profile_with_fable(Some(2), 5, Some(100), None),
+        );
+        profiles.insert(
+            "alt".to_string(),
+            make_profile_with_fable(Some(5), 10, None, None),
+        );
+        let data = make_data(profiles);
+        let result = pick_best(&data, "current", false).unwrap();
+        assert_eq!(result.as_deref(), Some("alt"));
+    }
+
+    /// Ranking: when both `week_all` and `week_fable` resets are known for a
+    /// viable candidate, the LATER of the two is the binding constraint —
+    /// mirrors `main::account_row_rank`'s identical `max()` rule.
+    #[test]
+    fn ranking_uses_later_of_week_all_and_fable_reset() {
+        let mut profiles = HashMap::new();
+        // "early_all_late_fable": week_all resets Jun 18, but its (healthy)
+        // fable cap resets later, Jun 25 — the effective epoch is Jun 25.
+        profiles.insert(
+            "early_all_late_fable".to_string(),
+            make_profile_with_fable(Some(5), 10, Some(20), Some("Jun 25 at 9pm (Asia/Seoul)")),
+        );
+        {
+            let p = profiles.get_mut("early_all_late_fable").unwrap();
+            p.week_all = Some(make_section(10, Some("Jun 18 at 9pm (Asia/Seoul)")));
+        }
+        // "flat_jun20": both dimensions reset Jun 20 — effective epoch Jun 20,
+        // sooner than the other candidate's effective Jun 25 → this one wins.
+        profiles.insert(
+            "flat_jun20".to_string(),
+            make_profile_with_fable(Some(5), 10, Some(20), Some("Jun 20 at 9pm (Asia/Seoul)")),
+        );
+        {
+            let p = profiles.get_mut("flat_jun20").unwrap();
+            p.week_all = Some(make_section(10, Some("Jun 20 at 9pm (Asia/Seoul)")));
+        }
+        let data = make_data(profiles);
+        let result = pick_best_at(&data, "", false, true, ranking_now()).unwrap();
+        assert_eq!(
+            result.as_deref(),
+            Some("flat_jun20"),
+            "the candidate whose LATER (binding) dimension resets sooner must win"
+        );
+    }
+
     // ─── is_excluded helper ───────────────────────────────────────────────────
 
     #[test]
@@ -943,6 +1190,28 @@ mod tests {
     fn is_excluded_healthy_is_false() {
         let mut profiles = HashMap::new();
         profiles.insert("p".to_string(), make_profile(Some(5), 50, None));
+        let data = make_data(profiles);
+        assert!(!is_excluded(&data, "p"));
+    }
+
+    #[test]
+    fn is_excluded_for_fable_saturated() {
+        let mut profiles = HashMap::new();
+        profiles.insert(
+            "p".to_string(),
+            make_profile_with_fable(Some(5), 10, Some(SATURATION_PCT), None),
+        );
+        let data = make_data(profiles);
+        assert!(is_excluded(&data, "p"));
+    }
+
+    #[test]
+    fn is_excluded_fable_none_is_false() {
+        let mut profiles = HashMap::new();
+        profiles.insert(
+            "p".to_string(),
+            make_profile_with_fable(Some(5), 10, None, None),
+        );
         let data = make_data(profiles);
         assert!(!is_excluded(&data, "p"));
     }

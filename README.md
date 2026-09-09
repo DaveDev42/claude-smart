@@ -10,7 +10,8 @@ Cross-platform smart session manager for [Claude Code](https://claude.ai/code).
   directory;
 - **profile management** — multiple isolated Claude Code config homes
   (`CLAUDE_CONFIG_DIR`) with a one-command switcher;
-- **account scoring + auto-switch** — pick the viable account whose weekly
+- **account scoring + auto-switch** — pick the viable account (session,
+  weekly, and model-scoped weekly caps all under threshold) whose weekly
   quota resets soonest, and relaunch on a rate-limit hit;
 - **usage metering**: a multi-profile usage table, collected locally per
   profile (see *Usage metering*);
@@ -315,9 +316,10 @@ cases too: it skips the auto-pick entirely and always asks (and also forces
 the session picker). `--profile <name>` still wins over everything: explicit,
 no picking. **The picker is ordered by recommendation, not
 alphabetically:** rows are ranked exactly as the live scorer (`pick_best`)
-would choose: viable accounts first (soonest weekly reset; higher
-`week_all.pct` tie-break), then saturated / session-limited / errored /
-no-data rows below. The row the account auto-pick *would* have selected
+would choose: viable accounts first (no cap over its threshold, see *What
+counts as a viable account* below; soonest weekly reset, then higher
+`week_all.pct`), then saturated / session-limited / errored / no-data rows
+below. Rows that carry a model-scoped weekly reading show it as `model NN%`. The row the account auto-pick *would* have selected
 leads the list and is flagged with a **`★`** marker. Because the picker's
 cursor starts on the first row, **pressing Enter takes the recommendation**;
 you only need to move when you want a different one. (When every account is
@@ -325,6 +327,39 @@ saturated / errored / dataless there is no recommendation, so no row gets
 the `★`.) Pressing **Escape / Ctrl-C in any picker cancels the launch
 entirely** (`csm` exits without starting `claude`). It does not silently
 fall through to a default.
+
+### What counts as a viable account
+
+Anthropic reports up to three usage windows per account, and `csm` weighs all
+three wherever it picks or ranks a profile:
+
+| Window | Field | Not viable when |
+|---|---|---|
+| 5-hour session | `session` | `>= 99%` (`CLAUDE_LIMIT_PCT`) |
+| weekly, all models | `week_all` | `>= 95%` (`CLAUDE_PICK_SATURATION_PCT`) |
+| weekly, one model tier | `week_fable` (tier name from the API, shown as the table's tier column) | `>= 95%` (same variable) |
+
+A profile the API reports no model-scoped window for is simply not
+constrained by that dimension; absence is never read as "limited". One
+predicate (`scoring::is_viable_pcts`) makes this call for the launch-time
+auto-pick, `csm pick-account`, the account picker's ordering, and the Stop
+hook's relaunch target, so an account whose model-scoped weekly cap is
+exhausted is skipped everywhere even while its session and all-model weekly
+readings look healthy.
+
+**Reactive switch while a session is running.** The `csm hook`
+Stop/SubagentStop/SessionEnd hook reads the running profile's three
+percentages and, when any one is at or over `CLAUDE_LIMIT_PCT` (99), asks the
+scorer for the best other viable profile and writes a relaunch sentinel so
+the `csm run` supervisor restarts `claude` under it (subject to the usual
+guards: `CLAUDE_AUTO_SWITCH`, the per-session cooldown, hop cap, and a live
+supervisor). Transcript-text detection is kept as a fallback, but Claude Code
+does not currently write usage-limit notices into transcripts, so the
+percentage check is what actually fires. Session and all-model weekly
+percentages also refresh through the statusline capture; the model-scoped
+weekly percentage refreshes only when the per-profile usage-API probe runs
+(`CSM_USAGE_PROFILE_TTL`, default 300s), so a model-scoped cap can take up to
+about five minutes to trigger a switch.
 
 ### Custom usage command (`CSM_USAGE_CMD`)
 

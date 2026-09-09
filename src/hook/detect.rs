@@ -20,9 +20,29 @@
 //! Tier-1: `limit-in-tail` — last 12 transcript records contain an
 //!   `isApiErrorMessage`-flagged entry matching the limit-banner regex, within 900 s.
 //!   Reproduces `limit_in_tail()` from `claude-smart-helper.sh.j2` lines 770–786.
+//!   The banner-shape match is structural (no model name is ever compared), so it
+//!   would fire the same way for the session limit, the all-model weekly limit,
+//!   or a model-scoped weekly limit (the `week_fable` dimension).
+//!   STATUS (2026-09): dormant. Claude Code does not write a usage-limit notice
+//!   into the transcript JSONL in any record type (checked across ~6.8k
+//!   transcripts: zero `isApiErrorMessage` limit banners, zero assistant/system
+//!   limit notices — the limit is surfaced only in the TUI and through the
+//!   usage API / statusline `rate_limits`). This tier has never been observed
+//!   to fire and is kept only as harmless defense-in-depth should a future
+//!   Claude Code start writing such records. Tier-2 is the operative reactive
+//!   detector; do not rely on tier-1.
 //!
-//! Tier-2: `current-usage` thresholding — session% or week_all% at or above limits.
-//!   Reproduces the tier-2 block from `limit-switch.sh.j2` lines 205–221.
+//! Tier-2: `current-usage` thresholding — session%, week_all%, or the
+//!   model-scoped week_fable% at or above limits (all three dimensions, same
+//!   `LIMIT_PCT` threshold; `week_fable` absent ⇒ that dimension never fires).
+//!   Reproduces the tier-2 block from `limit-switch.sh.j2` lines 205–221, extended
+//!   with the week_fable dimension the shell source predates.
+//!   Freshness: session%/week_all% are also refreshed by the statusline capture,
+//!   but the statusline `rate_limits` payload carries no model-scoped window, so
+//!   week_fable% is only as fresh as the last per-profile usage-API probe
+//!   (`CSM_USAGE_PROFILE_TTL`, default 300 s). A model-scoped cap can therefore
+//!   take up to ~5 min to be noticed here — a data-freshness bound, not a
+//!   detection gap.
 //!
 //! Tier-3 (malformed-in-tail): 4-conjunct Opus-4.8 tool-call fingerprint within 180 s.
 //!   Reproduces `malformed_in_tail()` from `claude-smart-helper.sh.j2` lines 812–829.
@@ -293,9 +313,14 @@ pub fn classify(input: &HookInput, owner_dir: &Path) -> anyhow::Result<Decision>
         /*include_current=*/ false,
         /*apply_stale_gate=*/ false,
     );
-    let target_profile = match target_result {
-        Ok(Some(name)) => name,
-        Ok(None) | Err(_) => {
+    // Single viability authority: `resolve_target_from_pick` is a pure pass-through
+    // over `account::pick_account_gated`'s verdict — the hook never recomputes or
+    // second-guesses which profile is viable. Whatever `scoring::pick_best`
+    // excludes (session-limited, week_all-saturated, or — once fable-aware —
+    // week_fable-saturated) can therefore never come back as a relaunch target.
+    let target_profile = match resolve_target_from_pick(target_result) {
+        Some(name) => name,
+        None => {
             // No viable target (all saturated/errored, or fetch miss)
             // Shell: limit-switch.sh.j2 lines 274-286
             let detect_path = paths::detected(sid);
@@ -492,14 +517,21 @@ pub(crate) fn limit_in_tail_impl(
         if text.is_empty() {
             continue;
         }
-        // Must match limit-banner pattern (case-insensitive)
-        // Shell jq: `test("hit your .*limit|usage limit|limit reached"; "i")`
+        // Must match limit-banner pattern (case-insensitive).
+        // Base shell jq: `test("hit your .*limit|usage limit|limit reached"; "i")`.
+        // Generalized here (structurally, never on a model name) to also catch a
+        // model-scoped weekly banner phrased with "reached" instead of "hit", or
+        // as a bare "weekly limit" mention — the same shapes Anthropic uses for
+        // the session/all-model banners, just with a different noun in between.
         let tl = text.to_ascii_lowercase();
-        if !tl.contains("hit your") || !tl.contains("limit") {
-            // Try the other patterns too
-            if !tl.contains("usage limit") && !tl.contains("limit reached") {
-                continue;
-            }
+        let has_hit_phrase =
+            (tl.contains("hit your") || tl.contains("reached your")) && tl.contains("limit");
+        if !has_hit_phrase
+            && !tl.contains("usage limit")
+            && !tl.contains("limit reached")
+            && !tl.contains("weekly limit")
+        {
+            continue;
         }
         // Recency check: timestamp within window_secs of now
         // Shell: `((.timestamp // "") | sub("\\.[0-9]+Z$"; "Z")) | try fromdateiso8601 catch 0`
@@ -514,27 +546,66 @@ pub(crate) fn limit_in_tail_impl(
 }
 
 /// Tier-2: query the usage cache for the owning profile and check whether
-/// session% or week_all% is at or above the configured threshold.
+/// session%, week_all%, or the model-scoped week_fable% is at or above the
+/// configured threshold.
 ///
-/// Returns `Some(description)` if thresholds are exceeded, `None` otherwise.
+/// Returns `Some(description)` if any dimension is exceeded, `None` otherwise.
 ///
-/// Reproduces the tier-2 block from `limit-switch.sh.j2` lines 205-221.
+/// I/O shell: fetches the fleet's [`crate::usage::UsageData`] once and hands the
+/// three raw pcts to the pure [`usage_threshold_hit`] decision core (invariant:
+/// pure core + thin I/O shell). `week_fable_pct` is `None` when the profile
+/// carries no model-scoped weekly cap (e.g. `week_fable` is absent) — that
+/// dimension then never constrains the verdict.
+///
+/// Reproduces the tier-2 block from `limit-switch.sh.j2` lines 205-221, extended
+/// with the week_fable dimension (never a hardcoded model name — the fleet's
+/// `week_fable` field name is what's fixed, the model it measures is data,
+/// carried separately in `week_model_label`).
 fn detect_usage_threshold(owner_dir: &Path) -> Option<String> {
     let profile = owner_dir_to_profile_name(owner_dir);
-    let (session_pct, week_pct) = crate::account::current_usage(&profile)?;
+    let data = crate::usage::fetch().ok()?;
+    let (session_pct, week_pct) = data.current_usage(&profile)?;
+    let week_fable_pct = data
+        .profiles
+        .get(&profile)
+        .and_then(|pu| pu.week_fable.as_ref())
+        .map(|s| s.pct);
 
     let limit_pct = std::env::var("CLAUDE_LIMIT_PCT")
         .ok()
         .and_then(|s| s.parse::<i64>().ok())
         .unwrap_or(LIMIT_PCT);
 
-    // Shell: limit-switch.sh.j2 lines 215-219
-    // Defensive: threshold only on non-negative integers (session=-1 = unknown → skip)
+    usage_threshold_hit(session_pct, week_pct, week_fable_pct, limit_pct)
+}
+
+/// Pure decision core for tier-2: given the three usage-pct dimensions and the
+/// threshold, decide whether a limit was hit.
+///
+/// Shell: limit-switch.sh.j2 lines 215-219 (session/week_all only — week_fable
+/// is a Rust-side addition, same rule: threshold only on non-negative integers,
+/// so absent-as-`-1` never fires, and `None` — no model-scoped cap at all for
+/// this profile — never fires either).
+///
+/// Checked in order: session, then week_all, then week_fable (first hit wins;
+/// order only affects which description string comes back, not whether one
+/// does).
+pub(crate) fn usage_threshold_hit(
+    session_pct: i64,
+    week_pct: i64,
+    week_fable_pct: Option<i64>,
+    limit_pct: i64,
+) -> Option<String> {
     if session_pct >= 0 && session_pct >= limit_pct {
         return Some(format!("session {session_pct}%"));
     }
     if week_pct >= 0 && week_pct >= limit_pct {
         return Some(format!("week_all {week_pct}%"));
+    }
+    if let Some(fable_pct) = week_fable_pct {
+        if fable_pct >= 0 && fable_pct >= limit_pct {
+            return Some(format!("week_fable {fable_pct}%"));
+        }
     }
     None
 }
@@ -706,6 +777,26 @@ fn extract_timestamp_epoch(v: &serde_json::Value) -> i64 {
         dt.timestamp()
     } else {
         0
+    }
+}
+
+/// Resolve the relaunch target from an `account::pick_account`-family scoring
+/// result — the single point where classify() decides "who do we switch to".
+///
+/// `Ok(Some(name))` → `name` IS the target; this function never recomputes,
+/// re-ranks, or filters it — whatever viability rule `scoring::pick_best`
+/// applies (session/week_all/week_fable) is the ONLY rule that ever runs.
+/// `Ok(None)` (no-op winner, not expected with `include_current=false` but
+/// handled defensively) or `Err(_)` (all saturated / fetch failed) → `None`,
+/// meaning no viable target: the caller must fall back to notify-only rather
+/// than writing a sentinel that would relaunch into a capped or unknown
+/// profile.
+pub(crate) fn resolve_target_from_pick(
+    result: crate::account::scoring::ScoringResult,
+) -> Option<String> {
+    match result {
+        Ok(Some(name)) => Some(name),
+        Ok(None) | Err(_) => None,
     }
 }
 
@@ -1453,5 +1544,199 @@ mod tests {
     fn timestamp_epoch_empty_returns_zero() {
         let v = serde_json::json!({"timestamp": ""});
         assert_eq!(extract_timestamp_epoch(&v), 0);
+    }
+
+    // ── usage_threshold_hit (pure tier-2 core, R1/R3 week_fable dimension) ────
+
+    /// session at/over the threshold fires, regardless of week_all/week_fable.
+    #[test]
+    fn usage_threshold_hit_session_capped() {
+        let hit = usage_threshold_hit(99, 10, Some(5), 99);
+        assert_eq!(hit.as_deref(), Some("session 99%"));
+    }
+
+    /// week_all at/over the threshold fires when session is healthy.
+    #[test]
+    fn usage_threshold_hit_week_all_capped() {
+        let hit = usage_threshold_hit(10, 99, None, 99);
+        assert_eq!(hit.as_deref(), Some("week_all 99%"));
+    }
+
+    /// week_fable (the model-scoped weekly cap) at/over the threshold fires
+    /// even when session and week_all are both healthy — this is the R1/R2 gap:
+    /// a profile whose model-scoped weekly cap alone is exhausted must still be
+    /// detected as limited.
+    #[test]
+    fn usage_threshold_hit_week_fable_capped() {
+        let hit = usage_threshold_hit(10, 20, Some(99), 99);
+        assert_eq!(hit.as_deref(), Some("week_fable 99%"));
+    }
+
+    /// week_fable == None (profile has no model-scoped cap at all) must never
+    /// be treated as "limited" — the dimension simply does not constrain the
+    /// verdict when the API returned no such limit for this profile.
+    #[test]
+    fn usage_threshold_hit_week_fable_none_does_not_fire() {
+        let hit = usage_threshold_hit(10, 20, None, 99);
+        assert!(
+            hit.is_none(),
+            "None week_fable must not be treated as capped"
+        );
+    }
+
+    /// week_fable present but under the threshold (e.g. 94% against a 99%
+    /// limit) must not fire — only None is exempt, not "close but under".
+    #[test]
+    fn usage_threshold_hit_week_fable_under_threshold_does_not_fire() {
+        let hit = usage_threshold_hit(10, 20, Some(94), 99);
+        assert!(
+            hit.is_none(),
+            "week_fable under the threshold must not fire"
+        );
+    }
+
+    /// All three dimensions healthy → no hit.
+    #[test]
+    fn usage_threshold_hit_all_healthy_no_hit() {
+        let hit = usage_threshold_hit(10, 20, Some(30), 99);
+        assert!(hit.is_none());
+    }
+
+    /// Absent session (-1 sentinel) never fires on its own, even at a
+    /// nominally "over threshold" negative value — mirrors the pre-existing
+    /// session/week_all absent-encoding rule, now also proven for week_fable
+    /// interacting with the other two dimensions in the same call.
+    #[test]
+    fn usage_threshold_hit_absent_session_and_fable_skip_to_week_all() {
+        let hit = usage_threshold_hit(-1, 99, Some(-1), 99);
+        assert_eq!(
+            hit.as_deref(),
+            Some("week_all 99%"),
+            "absent session must not mask a real week_all hit"
+        );
+    }
+
+    /// week_fable is checked last: a capped session or week_all is reported
+    /// first even when week_fable is ALSO capped (description reflects the
+    /// first true dimension, viability is the same either way).
+    #[test]
+    fn usage_threshold_hit_session_reported_before_fable() {
+        let hit = usage_threshold_hit(99, 10, Some(99), 99);
+        assert_eq!(hit.as_deref(), Some("session 99%"));
+    }
+
+    // ── resolve_target_from_pick (single viability authority pass-through) ────
+
+    /// A viable winner from pick_account passes straight through as the target.
+    #[test]
+    fn resolve_target_passes_through_viable_winner() {
+        let result: crate::account::scoring::ScoringResult = Ok(Some("work".to_string()));
+        assert_eq!(resolve_target_from_pick(result).as_deref(), Some("work"));
+    }
+
+    /// `Ok(None)` (no-op winner) resolves to no target — classify() must fall
+    /// back to notify-only, never fabricate a target of its own.
+    #[test]
+    fn resolve_target_none_on_no_op_winner() {
+        let result: crate::account::scoring::ScoringResult = Ok(None);
+        assert!(resolve_target_from_pick(result).is_none());
+    }
+
+    /// `Err(AllSaturated)` — every profile is session/week_all/week_fable
+    /// capped — resolves to no target. This is the case a fable-only-capped
+    /// fleet (every account healthy on session/week_all but exhausted on the
+    /// model-scoped weekly cap) must land in once `scoring::pick_best`
+    /// excludes on week_fable: classify() must NOT write a relaunch sentinel
+    /// pointing at a capped profile — it must fall back to notify-only.
+    #[test]
+    fn resolve_target_none_on_all_saturated_err() {
+        let result: crate::account::scoring::ScoringResult =
+            Err(crate::account::scoring::ScoringError::AllSaturated);
+        assert!(
+            resolve_target_from_pick(result).is_none(),
+            "an all-saturated verdict must never produce a relaunch target"
+        );
+    }
+
+    /// `Err(FetchFailed)` also resolves to no target (fetch miss, not a
+    /// verdict at all — same fallback as AllSaturated).
+    #[test]
+    fn resolve_target_none_on_fetch_failed_err() {
+        let result: crate::account::scoring::ScoringResult =
+            Err(crate::account::scoring::ScoringError::FetchFailed(
+                crate::usage::FetchError::NegativeCacheActive,
+            ));
+        assert!(resolve_target_from_pick(result).is_none());
+    }
+
+    // ── tier-1 pattern: model-scoped weekly banner shapes (generic, no model name) ─
+
+    /// A weekly-scoped banner phrased with "reached your ... limit" (rather
+    /// than "hit your") must still be detected — the model-scoped weekly cap
+    /// message may not share the session banner's exact wording, but the
+    /// pattern match is structural (never keyed to a model name).
+    #[test]
+    fn limit_in_tail_detects_reached_your_phrasing() {
+        let base_now: i64 = 1_718_000_000;
+        let banner =
+            "You've reached your weekly limit for this session's model tier · resets Mon 9am";
+        let line = make_transcript_line(true, banner, -100, base_now);
+
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        {
+            use std::io::Write;
+            writeln!(f, "{line}").unwrap();
+        }
+
+        let result = limit_in_tail_impl(f.path(), 12, 900, base_now);
+        assert!(
+            result.is_some(),
+            "'reached your ... limit' phrasing should be detected"
+        );
+    }
+
+    /// A bare "weekly limit" mention — with none of "hit your"/"reached
+    /// your"/"usage limit"/"limit reached" present — is also detected: covers
+    /// a terser model-scoped weekly banner shape. The model tier name (data,
+    /// e.g. "Fable") never has to appear in the pattern itself.
+    #[test]
+    fn limit_in_tail_detects_bare_weekly_limit_phrasing() {
+        let base_now: i64 = 1_718_000_000;
+        let banner = "Your weekly limit for Fable is used up for this week. Resets Monday.";
+        let line = make_transcript_line(true, banner, -100, base_now);
+
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        {
+            use std::io::Write;
+            writeln!(f, "{line}").unwrap();
+        }
+
+        let result = limit_in_tail_impl(f.path(), 12, 900, base_now);
+        assert!(
+            result.is_some(),
+            "bare 'weekly limit' phrasing should be detected"
+        );
+    }
+
+    /// Sanity: the generalized pattern still does NOT fire on unrelated text
+    /// that merely mentions "weekly" or "limit" separately without any of the
+    /// recognized banner shapes.
+    #[test]
+    fn limit_in_tail_still_skips_unrelated_weekly_mention() {
+        let base_now: i64 = 1_718_000_000;
+        let banner = "Here's your weekly summary. No caps were exceeded.";
+        let line = make_transcript_line(true, banner, -100, base_now);
+
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        {
+            use std::io::Write;
+            writeln!(f, "{line}").unwrap();
+        }
+
+        let result = limit_in_tail_impl(f.path(), 12, 900, base_now);
+        assert!(
+            result.is_none(),
+            "unrelated weekly summary text must not trigger a false positive"
+        );
     }
 }

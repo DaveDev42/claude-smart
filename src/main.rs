@@ -590,7 +590,12 @@ fn print_launch_attention_warnings(profile_dir: &Path, profiles: &account::Profi
 /// when the hub-down picker was cancelled (Escape / Ctrl-C) — the caller aborts.
 ///
 /// Pick guard (mirrors zsh `claude-smart.zsh` lines 204-209, 316-323):
-/// - `pick_account(current, include_current=true)` → scoring pick.
+/// - `pick_account(current, include_current=true)` → scoring pick, which
+///   weighs all THREE usage dimensions (session, week_all, and the
+///   model-scoped weekly `week_fable`) through `scoring::is_viable_pcts` — a
+///   current profile whose `week_fable` is saturated is treated as limited
+///   just like a session- or week_all-limited one, so this proactively picks
+///   a switch away from it (R2).
 /// - `Err(FetchFailed)` (hub down) or `Err(NoUsableData)` (fetch ok but no
 ///   scorable usage) + interactive → hub-down account picker (§4a).
 /// - same errors + non-interactive → silent fail-safe to current.
@@ -712,13 +717,24 @@ fn run_account_picker(
 /// recommended profile (the one `pick_best` would auto-select when the hub is up)
 /// leads, and the user can just press Enter.
 ///
+/// Viability is delegated to `scoring::is_viable_pcts` — the SINGLE viability
+/// authority also used by `pick_best_at` — rather than a second hand-rolled
+/// check, so a row whose model-scoped weekly cap (`week_fable_pct`) is
+/// saturated sinks exactly like one whose `session_pct`/`week_all_pct` is.
+///
 /// Returns a sort key where SMALLER sorts first:
-/// - `0` bucket = viable candidate (no error, has week_all.pct, session.pct < LIMIT,
-///   week_all.pct < SATURATION). Within it, SOONER weekly reset epoch ranks
-///   first (`i64::MAX` when unknown, so a known reset beats an unknown one),
-///   then HIGHER week_all.pct (negated), matching `pick_best`'s ranking.
-/// - `1` bucket = everything else (saturated, session-limited, errored, or no data),
-///   ordered by name for stability.
+/// - `0` bucket = viable candidate (no error, has week_all.pct, and
+///   `is_viable_pcts(session_pct, week_all_pct, week_fable_pct)` is `true` —
+///   i.e. none of session/week_all/week_fable is at or over its threshold).
+///   Within it, SOONER effective weekly reset epoch ranks first (`i64::MAX`
+///   when unknown, so a known reset beats an unknown one), then HIGHER
+///   week_all.pct (negated), matching `pick_best`'s ranking. The "effective"
+///   epoch is the LATER of `week_all`'s and `week_fable`'s reset (when both
+///   are known) — mirrors `pick_best_at`'s identical rule (see its doc): a
+///   viable row is under neither cap, but only fully fresh once BOTH weekly
+///   windows have rolled over.
+/// - `1` bucket = everything else (saturated on any of the three dimensions,
+///   session-limited, errored, or no data), ordered by name for stability.
 ///
 /// `name` is the final tie-break so ordering is deterministic. `now` is the
 /// reference instant for reset-string parsing — callers pass `Utc::now()`
@@ -728,13 +744,12 @@ fn account_row_rank(
     data: &picker::account::StaleProfileData,
     now: chrono::DateTime<chrono::Utc>,
 ) -> (u8, i64, i64, String) {
-    use account::scoring::{ABSENT_SESSION_PCT, LIMIT_PCT, SATURATION_PCT};
+    use account::scoring::{is_viable_pcts, ABSENT_SESSION_PCT};
 
     let session_pct = data.session_pct.unwrap_or(ABSENT_SESSION_PCT);
     let viable = data.error.is_none()
         && data.week_all_pct.is_some()
-        && session_pct < LIMIT_PCT
-        && data.week_all_pct.unwrap() < SATURATION_PCT;
+        && is_viable_pcts(session_pct, data.week_all_pct, data.week_fable_pct);
 
     if !viable {
         // Non-viable rows sink to the bottom, ordered by name.
@@ -742,20 +757,29 @@ fn account_row_rank(
     }
 
     let week_pct = data.week_all_pct.unwrap();
-    // Soonest weekly reset epoch first → i64::MAX when unknown so known beats
-    // unknown. Higher week_all.pct next → negate so smaller sorts first.
-    // Prefers the machine-native `resets_at` epoch (carried straight through
-    // from the local collector) over re-parsing the `resets` display string —
-    // same precedence as `UsageSection::reset_instant` / `scoring::pick_best_at`.
-    let epoch = data
-        .resets_at
-        .or_else(|| {
-            data.resets
-                .as_deref()
-                .and_then(|r| account::reset::resets_to_epoch_at(r, now).ok())
-                .map(|dt| dt.timestamp())
-        })
-        .unwrap_or(i64::MAX);
+    // Soonest EFFECTIVE weekly reset epoch first → i64::MAX when unknown so
+    // known beats unknown. Higher week_all.pct next → negate so smaller sorts
+    // first. Each dimension prefers its machine-native `resets_at` epoch
+    // (carried straight through from the local collector) over re-parsing the
+    // `resets` display string — same precedence as
+    // `UsageSection::reset_instant` / `scoring::pick_best_at`. `week_fable`
+    // carries no display-string fallback here (only `resets_at`) — a minor,
+    // deliberate asymmetry: the hub-down picker's cache read never needed a
+    // fable resets STRING before this field existed, and the epoch is what
+    // ranking actually consumes.
+    let week_all_epoch = data.resets_at.or_else(|| {
+        data.resets
+            .as_deref()
+            .and_then(|r| account::reset::resets_to_epoch_at(r, now).ok())
+            .map(|dt| dt.timestamp())
+    });
+    let week_fable_epoch = data.week_fable_resets_at;
+    let epoch = match (week_all_epoch, week_fable_epoch) {
+        (Some(a), Some(f)) => a.max(f),
+        (Some(a), None) => a,
+        (None, Some(f)) => f,
+        (None, None) => i64::MAX,
+    };
     (0, epoch, -week_pct, name.to_owned())
 }
 
@@ -795,6 +819,8 @@ fn build_account_rows(profiles: &account::ProfileMap) -> Vec<picker::account::Ac
                     week_all_pct: None,
                     resets: None,
                     resets_at: None,
+                    week_fable_pct: None,
+                    week_fable_resets_at: None,
                     error: Some(err.clone()),
                 }
             } else if let Some(pu) = cache_profiles.get(&profile) {
@@ -803,6 +829,8 @@ fn build_account_rows(profiles: &account::ProfileMap) -> Vec<picker::account::Ac
                     week_all_pct: pu.week_all_pct,
                     resets: pu.resets.clone(),
                     resets_at: pu.resets_at,
+                    week_fable_pct: pu.week_fable_pct,
+                    week_fable_resets_at: pu.week_fable_resets_at,
                     error: None,
                 }
             } else {
@@ -811,6 +839,8 @@ fn build_account_rows(profiles: &account::ProfileMap) -> Vec<picker::account::Ac
                     week_all_pct: None,
                     resets: None,
                     resets_at: None,
+                    week_fable_pct: None,
+                    week_fable_resets_at: None,
                     error: None,
                 }
             };
@@ -852,6 +882,11 @@ struct CacheProfileEntry {
     /// written by the local collector. Preferred over re-parsing `resets` —
     /// see `account_row_rank`.
     resets_at: Option<i64>,
+    /// Weekly PER-MODEL-TIER (`week_fable`) usage percentage, or `None` when
+    /// this profile carries no model-scoped weekly cap.
+    week_fable_pct: Option<i64>,
+    /// Machine-native reset epoch for `week_fable` (`week_fable.resets_at`).
+    week_fable_resets_at: Option<i64>,
 }
 
 /// Load a usage cache JSON file; returns `(Option<mtime_secs>, Option<Value>)`.
@@ -919,6 +954,16 @@ fn parse_cache_sections(
                 .and_then(|w| w.as_object())
                 .and_then(|w| w.get("resets_at"))
                 .and_then(|r| r.as_i64());
+            let week_fable_pct = pu
+                .get("week_fable")
+                .and_then(|w| w.as_object())
+                .and_then(|w| w.get("pct"))
+                .and_then(|p| p.as_i64());
+            let week_fable_resets_at = pu
+                .get("week_fable")
+                .and_then(|w| w.as_object())
+                .and_then(|w| w.get("resets_at"))
+                .and_then(|r| r.as_i64());
 
             profiles.insert(
                 name.clone(),
@@ -927,6 +972,8 @@ fn parse_cache_sections(
                     week_all_pct,
                     resets,
                     resets_at,
+                    week_fable_pct,
+                    week_fable_resets_at,
                 },
             );
         }
@@ -1630,6 +1677,11 @@ fn read_stdin_capped(max_bytes: u64) -> String {
 ///
 /// Prints the winner profile name to stdout, or nothing on no-op.
 /// Exits 1 on fetch failure.
+///
+/// Routes through `account::pick_account` → `scoring::pick_best_at`, which
+/// scores on all three usage dimensions (session, week_all, and the
+/// model-scoped weekly `week_fable`) — a profile whose `week_fable` is
+/// saturated is skipped exactly like a session- or week_all-limited one (R2).
 fn cmd_pick_account(args: &[OsString]) -> anyhow::Result<()> {
     let mut current = String::new();
     let mut include_current = false;
@@ -2440,7 +2492,23 @@ mod tests {
             week_all_pct: week,
             resets: resets.map(|s| s.to_owned()),
             resets_at: None,
+            week_fable_pct: None,
+            week_fable_resets_at: None,
             error: None,
+        }
+    }
+
+    /// Like [`data`] but also carrying a `week_fable_pct` reading (`None` =
+    /// no model-scoped weekly cap for this profile).
+    fn data_with_fable(
+        session: Option<i64>,
+        week: Option<i64>,
+        resets: Option<&str>,
+        fable_pct: Option<i64>,
+    ) -> StaleProfileData {
+        StaleProfileData {
+            week_fable_pct: fable_pct,
+            ..data(session, week, resets)
         }
     }
 
@@ -2457,6 +2525,8 @@ mod tests {
             week_all_pct: week,
             resets: resets.map(|s| s.to_owned()),
             resets_at,
+            week_fable_pct: None,
+            week_fable_resets_at: None,
             error: None,
         }
     }
@@ -2536,6 +2606,8 @@ mod tests {
             week_all_pct: None,
             resets: None,
             resets_at: None,
+            week_fable_pct: None,
+            week_fable_resets_at: None,
             error: Some("no credentials".to_owned()),
         };
         let order = ranked_order(vec![
@@ -2573,6 +2645,92 @@ mod tests {
             ),
         ]);
         assert_eq!(order, vec!["hasreset", "noreset"]);
+    }
+
+    // ── model-scoped weekly (week_fable) gate ──────────────────────────────
+    // account_row_rank must sink a fable-saturated row exactly like a
+    // session- or week_all-saturated one (R2/R3): it routes through the same
+    // `scoring::is_viable_pcts` authority `pick_best_at` uses.
+
+    #[test]
+    fn fable_saturated_row_sinks_below_viable() {
+        let order = ranked_order(vec![
+            (
+                "fable_capped",
+                data_with_fable(Some(5), Some(10), None, Some(100)),
+            ),
+            ("healthy", data_with_fable(Some(5), Some(10), None, None)),
+        ]);
+        assert_eq!(
+            order,
+            vec!["healthy", "fable_capped"],
+            "a fable-saturated row must sink even with healthy session/week_all"
+        );
+    }
+
+    #[test]
+    fn fable_none_row_stays_viable() {
+        // week_fable_pct: None (no model-scoped cap for this profile) must not
+        // sink the row — it stays in the viable (bucket 0) group.
+        let order = ranked_order(vec![(
+            "only",
+            data_with_fable(Some(5), Some(10), None, None),
+        )]);
+        assert_eq!(order, vec!["only"]);
+    }
+
+    #[test]
+    fn fable_just_under_saturation_stays_viable() {
+        use account::scoring::SATURATION_PCT;
+        let order = ranked_order(vec![(
+            "almost",
+            data_with_fable(Some(5), Some(10), None, Some(SATURATION_PCT - 1)),
+        )]);
+        assert_eq!(order, vec!["almost"]);
+    }
+
+    #[test]
+    fn only_fable_difference_uncapped_row_leads() {
+        // Two rows identical except for fable saturation — the uncapped one
+        // must rank first (row 0, what Enter selects).
+        let resets = Some("Jun 20 at 9pm (Asia/Seoul)");
+        let order = ranked_order(vec![
+            (
+                "fable_capped",
+                data_with_fable(Some(5), Some(30), resets, Some(99)),
+            ),
+            (
+                "fable_ok",
+                data_with_fable(Some(5), Some(30), resets, Some(20)),
+            ),
+        ]);
+        assert_eq!(order, vec!["fable_ok", "fable_capped"]);
+    }
+
+    #[test]
+    fn effective_epoch_uses_later_of_week_all_and_fable_reset() {
+        // Mirrors `scoring::ranking_uses_later_of_week_all_and_fable_reset`:
+        // the LATER of the two known reset epochs is the binding constraint.
+        let sooner_fable_epoch = rank_now().timestamp() + 1_000; // well before Jun 20
+        let later_all_epoch = rank_now().timestamp() + 10_000; // still before Jun 20
+
+        // "flat": both dimensions resolve to the SAME (later) epoch as
+        // "mixed"'s effective (max) epoch, but via week_all directly, so this
+        // pins the max() computation rather than tying on a single field.
+        let mixed = StaleProfileData {
+            week_fable_resets_at: Some(sooner_fable_epoch),
+            ..data_with_epoch(Some(5), Some(10), None, Some(later_all_epoch))
+        };
+        let sooner_flat = StaleProfileData {
+            week_fable_resets_at: Some(sooner_fable_epoch),
+            ..data_with_epoch(Some(5), Some(30), None, Some(sooner_fable_epoch))
+        };
+        let order = ranked_order(vec![("mixed", mixed), ("sooner_flat", sooner_flat)]);
+        assert_eq!(
+            order,
+            vec!["sooner_flat", "mixed"],
+            "the row whose LATER (binding) dimension resets sooner must lead"
+        );
     }
 
     // ══════════════════════════════════════════════════════════════════════════
