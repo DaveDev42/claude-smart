@@ -78,14 +78,21 @@ const DEFAULT_NEGATIVE_COOLDOWN_SECS: u64 = 120;
 /// and open the offline account picker (interactive contexts) or fall back
 /// silently (non-interactive contexts).
 pub fn fetch() -> Result<UsageData, FetchError> {
-    fetch_with(false)
+    fetch_with(false, false)
 }
 
 /// Like [`fetch`], but `force = true` bypasses the positive cache AND is
 /// threaded into [`super::local::collect`] so every profile's own store-record
 /// TTL is bypassed too — a live re-probe of every profile, not just a
 /// cache-refresh. Used by `csm usage --refresh`.
-pub fn fetch_with(force: bool) -> Result<UsageData, FetchError> {
+///
+/// `refresh_oauth` is threaded straight through to
+/// [`super::local::collect`], where it permits a gated access-token refresh
+/// for a profile whose token has expired and under which no live Claude Code
+/// session exists (see `local::refresh`). Only `csm usage --refresh-oauth` /
+/// `CSM_OAUTH_REFRESH=1` sets it; [`fetch`] passes `false`, so every other
+/// caller keeps today's read-only behavior.
+pub fn fetch_with(force: bool, refresh_oauth: bool) -> Result<UsageData, FetchError> {
     let positive_ttl = positive_ttl_secs();
     let negative_cooldown = negative_cooldown_secs();
 
@@ -140,7 +147,7 @@ pub fn fetch_with(force: bool) -> Result<UsageData, FetchError> {
 
     // Step 4 — local, per-profile collection (the terminal layer).
     let profiles = ProfileMap::load().unwrap_or_default();
-    let data = super::local::collect(&profiles, Utc::now(), force);
+    let data = super::local::collect(&profiles, Utc::now(), force, refresh_oauth);
 
     // Total failure: every configured profile produced an error and none
     // produced usable data. An empty registry (zero profiles, zero errors)

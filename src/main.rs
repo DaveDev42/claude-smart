@@ -1566,7 +1566,8 @@ fn describe_diagnosis(diag: &provision::ProfileDiagnosis, dir: &Path) -> String 
 /// hostile pipe feeding an unbounded stream — see [`read_stdin_capped`].
 const CAPTURE_STDIN_CAP_BYTES: u64 = 256 * 1024;
 
-/// `csm usage [--json] [--no-fetch] [--refresh]` / `csm usage capture`
+/// `csm usage [--json] [--no-fetch] [--refresh] [--refresh-oauth]` /
+/// `csm usage capture`
 ///
 /// Multi-profile usage table joining the registry with the local per-profile
 /// usage store. Offline-aware: serves the stale positive cache with an age
@@ -1574,6 +1575,13 @@ const CAPTURE_STDIN_CAP_BYTES: u64 = 256 * 1024;
 /// `--no-fetch` reads only the cache (never touches credentials/network) for
 /// fast scripted reads; `--refresh` bypasses the cache and every profile's own
 /// store-record TTL, forcing a live re-probe of each profile.
+///
+/// `--refresh-oauth` (or `CSM_OAUTH_REFRESH=1`) is the headless-collector
+/// opt-in: it permits `usage::local::refresh` to mint a new access token for
+/// a profile whose own has expired while no Claude Code session is running
+/// under it. It is resolved here and threaded explicitly down the fetch
+/// chain, so no other entry point (statusline, picker, sidecar, hook) can
+/// ever trigger a credential write.
 ///
 /// `csm usage capture` is the statusLine-stdin capture path (see
 /// [`cmd_usage_capture`]) — a distinct subverb, not a flag.
@@ -1589,18 +1597,25 @@ fn cmd_usage(args: &[OsString]) -> anyhow::Result<()> {
     let mut json = false;
     let mut no_fetch = false;
     let mut refresh = false;
+    let mut refresh_oauth = false;
     for a in args {
         match a.to_string_lossy().as_ref() {
             "--json" => json = true,
             "--no-fetch" => no_fetch = true,
             "--refresh" => refresh = true,
+            "--refresh-oauth" => refresh_oauth = true,
             "-h" | "--help" => {
-                println!("usage: csm usage [--json] [--no-fetch] [--refresh]");
+                println!("usage: csm usage [--json] [--no-fetch] [--refresh] [--refresh-oauth]");
                 println!("       csm usage capture");
                 println!("  --json      emit the joined registry∪local view as JSON");
                 println!("  --no-fetch  read only the local cache (no live collection)");
                 println!(
                     "  --refresh   bypass the cache and every profile's own TTL; re-probe live"
+                );
+                println!("  --refresh-oauth  for headless collectors: refresh a profile's expired");
+                println!("              OAuth access token when no Claude Code session is running");
+                println!(
+                    "              under it (env CSM_OAUTH_REFRESH=1; not supported on macOS)"
                 );
                 println!(
                     "  capture     read statusLine JSON from stdin, merge into the local store"
@@ -1608,10 +1623,13 @@ fn cmd_usage(args: &[OsString]) -> anyhow::Result<()> {
                 return Ok(());
             }
             other => anyhow::bail!(
-                "csm usage: unknown flag '{other}' (try --json | --no-fetch | --refresh | capture)"
+                "csm usage: unknown flag '{other}' (try --json | --no-fetch | --refresh | \
+                 --refresh-oauth | capture)"
             ),
         }
     }
+    // Flag OR env — resolved once, here, and passed down explicitly.
+    let refresh_oauth = refresh_oauth || usage::local::refresh::opt_in_from_env();
 
     let profiles =
         account::ProfileMap::load().context("csm usage: failed to load profiles.json")?;
@@ -1642,11 +1660,7 @@ fn cmd_usage(args: &[OsString]) -> anyhow::Result<()> {
             .and_then(|d| usage::local::oldest_profile_age_secs(d, chrono::Utc::now()));
         (cached, stale)
     } else {
-        let fetch_result = if refresh {
-            usage::fetch_with(true)
-        } else {
-            usage::fetch()
-        };
+        let fetch_result = usage::fetch_with(refresh, refresh_oauth);
         match fetch_result {
             Ok(d) => {
                 let stale = usage::local::oldest_profile_age_secs(&d, chrono::Utc::now());
