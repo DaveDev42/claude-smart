@@ -30,14 +30,18 @@
 //! # Detection tiers
 //!
 //! Tier-0: `stop_failure_limit` — `hook_event_name == "StopFailure" && error
-//!   == "rate_limit"`. This is the operative detector at the exact moment an
-//!   account hits a usage limit (5-hour session, weekly all-model, or a
-//!   model-scoped weekly cap): Claude Code's query loop runs the StopFailure
-//!   hook instead of Stop for that turn — fire-and-forget, not awaited, stdout/
-//!   exit code ignored, and skipped for subagent contexts — then parks the
-//!   prompt in its "Usage limit reached - continuing automatically when it
-//!   resets" auto-continue wait. Tier-1/2 never see that turn's Stop event at
-//!   all, so without tier-0 the hook simply does not run at the limit moment.
+//!   == "rate_limit"`. Fires when a 429 ends the turn: Claude Code's query
+//!   loop runs the StopFailure hook instead of Stop for that turn —
+//!   fire-and-forget, not awaited, stdout/exit code ignored, and skipped for
+//!   subagent contexts. Tier-1/2 never see that turn's Stop event at all.
+//!   CAVEAT (observed on Claude Code 2.1.270, 2026-09): a *subscription* cap
+//!   — the 5-hour session, weekly all-model, or model-scoped weekly limit,
+//!   whose 429 carries a reset time — does NOT end the turn. Claude Code shows
+//!   "Weekly limit reached · Retrying in 6h" and parks the turn in an internal
+//!   auto-retry wait; neither StopFailure nor Stop fires, so no hook runs at
+//!   all for the duration. The switch for that case comes from the statusline
+//!   tick instead (see "Statusline tick" below). Tier-0 stays correct for the
+//!   429s that do end the turn.
 //!   Requires the hook to be registered on the `StopFailure` event with
 //!   matcher `rate_limit` (a companion change outside this crate that adds
 //!   `csm hook --owner <dir>` as a StopFailure handler); until that
@@ -82,6 +86,21 @@
 //! Tier-3 (malformed-in-tail): 4-conjunct Opus-4.8 tool-call fingerprint within 180 s.
 //!   Reproduces `malformed_in_tail()` from `claude-smart-helper.sh.j2` lines 812–829.
 //!
+//! # Statusline tick (a second entry point, not a tier)
+//!
+//! [`crate::hook::run_from_statusline`] runs [`classify_with`] off `csm usage
+//! capture` — the statusLine wrapper pipes Claude Code's statusLine stdin into
+//! it about once a second, for as long as the session is alive, including
+//! while a turn is parked in the auto-retry wait above. The payload carries
+//! the session's own `rate_limits` (session + all-model weekly, off its own
+//! API responses) plus `session_id`/`cwd`/`transcript_path`; the recorder
+//! merges in the store's model-scoped weekly reading and [`statusline_limit`]
+//! reduces the three to the tier-2 test. A hit is handed to `classify_with`
+//! as `live_limit`, which takes it as limited + definitive at step 3 and runs
+//! every other step unchanged. Freshness is that of the tick itself for
+//! session/week_all and of the last usage-API probe for week_fable (same
+//! bound as tier-2).
+//!
 //! # Flow (mirrors limit-switch.sh.j2 exactly)
 //!
 //! 1. Kill-switches (env var, file marker, .switched marker).
@@ -99,7 +118,7 @@
 //! 8. If CLAUDE_AUTO_SWITCH_RELAUNCH != "1" → notify-only (deduped via .detected).
 //! 9. Managed-session gate: check .pid file.
 //! 10. Cooldown gate (noclobber .last-switch) — EXCEPT when `definitive` from
-//!     step 3: a tier-0 signal is never blocked by this cooldown (each
+//!     step 3: a tier-0 or statusline-tick signal is never blocked by this cooldown (each
 //!     csm-supervised session sharing a now-capped account gets its own
 //!     independent StopFailure and must be allowed to switch off it, not just
 //!     the first one to notice — see the step-9 comment in [`classify`]). The
@@ -257,7 +276,18 @@ pub fn parse_stdin() -> anyhow::Result<HookInput> {
     use std::io::Read as _;
     let mut buf = String::new();
     std::io::stdin().read_to_string(&mut buf)?;
-    let trimmed = buf.trim();
+    parse_input(&buf)
+}
+
+/// Parse one hook-shaped JSON document. Shared by [`parse_stdin`] and the
+/// statusline tick ([`crate::hook::run_from_statusline`]): Claude Code's
+/// statusLine stdin carries the same `session_id`/`cwd`/`transcript_path`
+/// keys as a hook event (plus `hook_event_name: "Status"`, `model`,
+/// `workspace`, `rate_limits`, ... which are ignored here), so one parser
+/// serves both. Whitespace-only input parses to an all-`None` value rather
+/// than an error.
+pub fn parse_input(raw: &str) -> anyhow::Result<HookInput> {
+    let trimmed = raw.trim();
     if trimmed.is_empty() {
         return Ok(HookInput {
             session_id: None,
@@ -293,6 +323,27 @@ pub fn parse_stdin() -> anyhow::Result<HookInput> {
 /// 11. Hop guard
 ///     → LimitSwitch
 pub fn classify(input: &HookInput, owner_dir: &Path) -> anyhow::Result<Decision> {
+    classify_with(input, owner_dir, None)
+}
+
+/// [`classify`] with a limit the caller has already established from evidence
+/// the hook stdin does not carry.
+///
+/// `live_limit = Some(msg)` is the statusline tick's case
+/// ([`crate::hook::run_from_statusline`]): the owning profile's live
+/// `rate_limits` reading crossed `CLAUDE_LIMIT_PCT`, and `msg` names the
+/// dimension (`"week_all 100%"`, ...). It short-circuits step 3 exactly like
+/// a tier-0 hit — limited, `definitive`, no transcript or usage-cache read —
+/// and is definitive for the same reason tier-0 is: it is that session's own
+/// account, read off its own API responses seconds ago, not a shared cache.
+/// Every other step (kill-switches, reason gate, target pick, relaunch
+/// switch, managed gate, cooldown, hop guard) applies unchanged. `None` is
+/// the ordinary hook path.
+pub fn classify_with(
+    input: &HookInput,
+    owner_dir: &Path,
+    live_limit: Option<&str>,
+) -> anyhow::Result<Decision> {
     use crate::paths;
 
     let sid = match &input.session_id {
@@ -342,9 +393,10 @@ pub fn classify(input: &HookInput, owner_dir: &Path) -> anyhow::Result<Decision>
     // cooldown-exception decision at step 9 (a definitive signal is never
     // throttled by the machine-wide cooldown — see `cooldown_should_block`).
 
-    let (limited_msg, limited, definitive) = match stop_failure_limit(input) {
-        StopFailureVerdict::Limit(msg) => (msg, true, true),
-        StopFailureVerdict::NotLimit => {
+    let (limited_msg, limited, definitive) = match (live_limit, stop_failure_limit(input)) {
+        (Some(msg), _) => (msg.to_string(), true, true),
+        (None, StopFailureVerdict::Limit(msg)) => (msg, true, true),
+        (None, StopFailureVerdict::NotLimit) => {
             // StopFailure for a non-limit API error (overloaded,
             // authentication_failed, invalid_request, ...). Not something to
             // switch accounts over — do nothing, and do NOT fall through to
@@ -353,7 +405,7 @@ pub fn classify(input: &HookInput, owner_dir: &Path) -> anyhow::Result<Decision>
             // unrelated false positive on the same turn.
             return Ok(Decision::Skip);
         }
-        StopFailureVerdict::NotApplicable => {
+        (None, StopFailureVerdict::NotApplicable) => {
             // Not a StopFailure event — fall through to the existing chain,
             // unchanged.
             // Tier-1 — transcript tail (local, instant)
@@ -788,6 +840,34 @@ fn detect_usage_threshold(owner_dir: &Path) -> Option<String> {
         .unwrap_or(LIMIT_PCT);
 
     usage_threshold_hit(session_pct, week_pct, week_fable_pct, limit_pct)
+}
+
+/// The statusline tick's limit test: reduce the profile's merged reading
+/// (this tick's `session`/`week_all` plus the store's carried-forward
+/// `week_fable`) to the same three-dimension check tier-2 uses. Absent
+/// `session`/`week_all` map to `-1` so they never fire, matching the shell
+/// contract [`usage_threshold_hit`] documents. Pure, so the tick's whole
+/// decision about *whether to even run `classify`* is unit-tested here.
+pub(crate) fn statusline_limit(usage: &crate::usage::model::ProfileUsage) -> Option<String> {
+    let limit_pct = std::env::var("CLAUDE_LIMIT_PCT")
+        .ok()
+        .and_then(|s| s.parse::<i64>().ok())
+        .unwrap_or(LIMIT_PCT);
+    statusline_limit_at(usage, limit_pct)
+}
+
+/// [`statusline_limit`] with the threshold passed in (the pure core).
+pub(crate) fn statusline_limit_at(
+    usage: &crate::usage::model::ProfileUsage,
+    limit_pct: i64,
+) -> Option<String> {
+    let pct = |s: &Option<crate::usage::model::UsageSection>| s.as_ref().map_or(-1, |s| s.pct);
+    usage_threshold_hit(
+        pct(&usage.session),
+        pct(&usage.week_all),
+        usage.week_fable.as_ref().map(|s| s.pct),
+        limit_pct,
+    )
 }
 
 /// Pure decision core for tier-2: given the three usage-pct dimensions and the
@@ -1306,6 +1386,65 @@ mod tests {
         );
         // transcript_path: null -> None
         assert!(input.transcript_path.is_none());
+    }
+
+    /// The statusline tick feeds `parse_input` Claude Code's statusLine stdin,
+    /// which is a superset of the hook shape: the three keys the switch needs
+    /// come through, `hook_event_name` reads "Status" (so tier-0 stays
+    /// NotApplicable), and the statusLine-only keys are ignored.
+    #[test]
+    fn parse_input_statusline_payload_shape() {
+        let json = r#"{
+            "hook_event_name": "Status",
+            "session_id": "01234567-89ab-cdef-0123-456789abcdef",
+            "transcript_path": "/Users/example/.claude.shared/projects/foo/01234567.jsonl",
+            "cwd": "/Users/example/Projects/foo",
+            "model": {"id": "claude-fable-5-1", "display_name": "Fable 5.1"},
+            "workspace": {"current_dir": "/Users/example/Projects/foo", "project_dir": "/Users/example/Projects/foo"},
+            "version": "2.1.270",
+            "output_style": {"name": "default"},
+            "cost": {"total_cost_usd": 0.0},
+            "context_window": {"total_input_tokens": 1, "context_window_size": 200000},
+            "rate_limits": {
+                "five_hour": {"used_percentage": 21.0, "resets_at": 1789398600},
+                "seven_day": {"used_percentage": 100.0, "resets_at": 1789646400}
+            }
+        }"#;
+        let input = parse_input(json).expect("statusline stdin parses as HookInput");
+        assert_eq!(
+            input.session_id.as_deref(),
+            Some("01234567-89ab-cdef-0123-456789abcdef")
+        );
+        assert_eq!(input.cwd.as_deref(), Some("/Users/example/Projects/foo"));
+        assert!(input.transcript_path.is_some());
+        assert_eq!(input.hook_event_name.as_deref(), Some("Status"));
+        assert!(input.reason.is_none());
+        assert!(matches!(
+            stop_failure_limit(&input),
+            StopFailureVerdict::NotApplicable
+        ));
+    }
+
+    #[test]
+    fn parse_input_blank_is_all_none() {
+        let input = parse_input("  \n").expect("blank input is not an error");
+        assert!(input.session_id.is_none());
+        assert!(input.hook_event_name.is_none());
+    }
+
+    #[test]
+    fn parse_input_garbage_is_error() {
+        assert!(parse_input("{not json").is_err());
+    }
+
+    /// `classify_with(.., Some(_))` still runs the session_id gate first: a
+    /// live limit with no session to act on is a Skip, not a switch attempt.
+    #[test]
+    fn classify_with_live_limit_but_no_session_id_is_skip() {
+        let input = parse_input(r#"{"cwd": "/Users/example/Projects/foo"}"#).unwrap();
+        let dir = tempfile::TempDir::new().unwrap();
+        let decision = classify_with(&input, dir.path(), Some("week_all 100%")).unwrap();
+        assert!(matches!(decision, Decision::Skip));
     }
 
     /// A realistic StopFailure(rate_limit) payload deserializes cleanly: the
@@ -1989,6 +2128,79 @@ mod tests {
     fn timestamp_epoch_empty_returns_zero() {
         let v = serde_json::json!({"timestamp": ""});
         assert_eq!(extract_timestamp_epoch(&v), 0);
+    }
+
+    // ── statusline_limit_at (the tick's pre-gate) ───────────────────────────
+
+    fn reading(
+        session: Option<i64>,
+        week_all: Option<i64>,
+        week_fable: Option<i64>,
+    ) -> crate::usage::model::ProfileUsage {
+        use crate::usage::model::UsageSection;
+        let sec = |pct: i64| UsageSection {
+            pct,
+            resets: None,
+            resets_at: None,
+        };
+        crate::usage::model::ProfileUsage {
+            session: session.map(sec),
+            week_all: week_all.map(sec),
+            week_fable: week_fable.map(sec),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn statusline_limit_at_all_healthy_is_none() {
+        assert_eq!(
+            statusline_limit_at(&reading(Some(21), Some(80), Some(90)), 99),
+            None
+        );
+    }
+
+    #[test]
+    fn statusline_limit_at_week_all_capped() {
+        // The live case: session fine, all-model weekly at 100.
+        assert_eq!(
+            statusline_limit_at(&reading(Some(21), Some(100), Some(100)), 99),
+            Some("week_all 100%".to_string())
+        );
+    }
+
+    #[test]
+    fn statusline_limit_at_session_capped_wins_over_week() {
+        assert_eq!(
+            statusline_limit_at(&reading(Some(99), Some(100), None), 99),
+            Some("session 99%".to_string())
+        );
+    }
+
+    #[test]
+    fn statusline_limit_at_week_fable_only_from_store() {
+        // statusLine stdin never carries the model-scoped window; it rides in
+        // from the store's carried-forward record and must still fire.
+        assert_eq!(
+            statusline_limit_at(&reading(Some(10), Some(60), Some(100)), 99),
+            Some("week_fable 100%".to_string())
+        );
+    }
+
+    #[test]
+    fn statusline_limit_at_absent_sections_never_fire() {
+        assert_eq!(statusline_limit_at(&reading(None, None, None), 99), None);
+        assert_eq!(
+            statusline_limit_at(&reading(None, None, Some(50)), 99),
+            None
+        );
+    }
+
+    #[test]
+    fn statusline_limit_at_honours_threshold() {
+        assert_eq!(
+            statusline_limit_at(&reading(Some(50), Some(10), None), 50),
+            Some("session 50%".to_string())
+        );
     }
 
     // ── usage_threshold_hit (pure tier-2 core, R1/R3 week_fable dimension) ────

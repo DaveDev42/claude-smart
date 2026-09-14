@@ -1694,7 +1694,9 @@ fn read_usage_cache() -> Option<usage::UsageData> {
 /// as prompt noise or a non-zero exit.
 fn cmd_usage_capture() -> anyhow::Result<()> {
     let raw = read_stdin_capped(CAPTURE_STDIN_CAP_BYTES);
-    let _ = usage::local::record_statusline_payload(&raw);
+    if let Ok(Some(capture)) = usage::local::record_statusline_payload(&raw) {
+        hook::run_from_statusline(&raw, &capture);
+    }
     Ok(())
 }
 

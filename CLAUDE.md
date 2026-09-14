@@ -48,12 +48,14 @@ It is consumed by the **private** `dave-environment` Ansible repo (the operator'
 - `src/session/`, `src/picker/`, `src/hook/`, `src/sidecar/`, `src/platform/`,
   `src/statusline.rs`, `src/paths.rs` — session scan/index, in-process fuzzy
   picker (nucleo + crossterm), the Stop/StopFailure/SubagentStop/SessionEnd
-  hook (tier-0 `StopFailure` with `error: "rate_limit"` is the operative
-  detector at the limit moment, because Claude Code fires it instead of Stop
-  when a usage limit ends the turn; tier-2 usage-% catches caps crossed during
-  a successful turn; tier-1 transcript-text is dormant because Claude Code
-  writes no limit notice into transcripts — see `hook/detect.rs` module doc),
-  sidecar
+  hook (tier-0 `StopFailure` with `error: "rate_limit"` fires when a 429 ends
+  the turn; tier-2 usage-% catches caps crossed during a successful turn;
+  tier-1 transcript-text is dormant because Claude Code writes no limit notice
+  into transcripts — see `hook/detect.rs` module doc). A subscription cap
+  fires NO hook at all (Claude Code parks the turn in an auto-retry wait), so
+  `hook::run_from_statusline` runs the same classification off the statusLine
+  tick (`csm usage capture` / `csm statusline`) — that is the operative switch
+  path for the weekly and model-scoped caps. Sidecar
   store, OS launch/relaunch/proc checks, statusline, canonical state paths.
 - `src/provision.rs` — profile provisioning SSOT: `ensure_profile_provisioned`
   (dir + `plugins/` → `~/.claude.shared/plugins` symlink) and the read-only

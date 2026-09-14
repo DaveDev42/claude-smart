@@ -707,7 +707,7 @@ pub fn oldest_profile_age_secs(data: &UsageData, now: DateTime<Utc>) -> Option<u
 /// session/week_all percentages, skip the write — the statusLine command can
 /// fire roughly once a second, and there is nothing to gain from rewriting
 /// the file every tick when nothing changed.
-pub fn record_statusline_payload(raw: &str) -> Result<bool, LocalError> {
+pub fn record_statusline_payload(raw: &str) -> Result<Option<StatuslineCapture>, LocalError> {
     let payload: statusline::StatuslinePayload = serde_json::from_str(raw)?;
 
     let Some(dir) = std::env::var("CLAUDE_CONFIG_DIR")
@@ -715,14 +715,14 @@ pub fn record_statusline_payload(raw: &str) -> Result<bool, LocalError> {
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
     else {
-        return Ok(false);
+        return Ok(None);
     };
 
     let Some(name) = resolve_profile_name(&dir) else {
-        return Ok(false);
+        return Ok(None);
     };
     if !ProfileMap::is_valid_name(&name) {
-        return Ok(false);
+        return Ok(None);
     }
 
     let now = Utc::now();
@@ -730,16 +730,40 @@ pub fn record_statusline_payload(raw: &str) -> Result<bool, LocalError> {
     let prior_usage = prior_rec.as_ref().and_then(|r| r.usage.as_ref());
 
     let Some(new_usage) = statusline::to_profile_usage(&payload, prior_usage, now) else {
-        return Ok(false);
+        return Ok(None);
     };
 
     if should_throttle(prior_usage, &new_usage, now) {
-        return Ok(false);
+        // Throttled: the store already holds this reading (written within
+        // the last 10 s); the reading itself is still current.
+        return Ok(Some(StatuslineCapture {
+            profile_dir: dir,
+            usage: new_usage,
+        }));
     }
 
     let new_rec = build_statusline_record(&name, new_usage, prior_rec.as_ref());
     store::save(&name, &new_rec)?;
-    Ok(true)
+    Ok(Some(StatuslineCapture {
+        profile_dir: dir,
+        usage: new_rec.usage.expect("record built from Some(usage)"),
+    }))
+}
+
+/// What one statusline tick learned, handed back to the caller so the
+/// limit-switch trigger (`hook::run_from_statusline`) can act on the same
+/// merged reading the store just received instead of re-reading a cache
+/// that may be up to a minute behind. `None` from
+/// [`record_statusline_payload`] means the tick carried nothing usable.
+#[derive(Debug, Clone)]
+pub struct StatuslineCapture {
+    /// `CLAUDE_CONFIG_DIR` as the tick saw it — the owning profile's dir,
+    /// the same value `csm hook --owner` receives.
+    pub profile_dir: String,
+    /// This tick's `session`/`week_all` merged with the store's carried-forward
+    /// `week_fable`/`week_model_label`. Returned whether or not the
+    /// identical-within-10-s throttle skipped the store write.
+    pub usage: ProfileUsage,
 }
 
 /// Build the `StoreRecord` a statusline capture writes. Pure (no I/O) so the
@@ -1502,7 +1526,7 @@ mod tests {
         let result = record_statusline_payload(
             r#"{"rate_limits": {"five_hour": {"used_percentage": 1.0}}}"#,
         );
-        assert!(!result.unwrap());
+        assert!(result.unwrap().is_none());
         if let Some(v) = saved {
             std::env::set_var("CLAUDE_CONFIG_DIR", v);
         }

@@ -239,6 +239,32 @@ fn now_epoch() -> i64 {
         .as_secs() as i64
 }
 
+/// Claim the `.switched` marker for `sid` *before* committing, for callers
+/// whose invocations overlap (`hook::run_from_statusline` — the statusline
+/// ticks about once a second and each runs as its own backgrounded process,
+/// so two of them can both reach `LimitSwitch` for the same session).
+/// `true` means this caller owns the switch; `false` means another one got
+/// there first and this caller must do nothing. [`commit_and_stop`]'s own
+/// step 3 then finds the marker present and leaves it alone. The hook path
+/// keeps its commit-then-mark order: one Stop event = one hook process.
+pub(crate) fn claim_switched(sid: &str) -> bool {
+    claim_marker(&crate::paths::switched(sid))
+}
+
+/// `create_new` the marker with the current epoch. `true` iff this call
+/// created it; any failure (already present, unwritable dir) is `false`.
+fn claim_marker(path: &Path) -> bool {
+    use std::fs::OpenOptions;
+    use std::io::Write as _;
+    match OpenOptions::new().write(true).create_new(true).open(path) {
+        Ok(mut f) => {
+            let _ = f.write_all(now_epoch().to_string().as_bytes());
+            true
+        }
+        Err(_) => false,
+    }
+}
+
 /// Write `content` to `path` only if the file does not already exist (noclobber semantics).
 /// Returns Ok(()) regardless of whether the write happened.
 fn write_noclobber(path: &Path, content: &str) -> anyhow::Result<()> {
@@ -268,6 +294,29 @@ mod tests {
     // The exe-basename name check (claude/node, case-insensitive, ends_with)
     // lives in `platform::proc_check` and is tested there; this module delegates
     // to `SysinfoProcCheck` rather than re-implementing it.
+
+    /// claim_marker: exactly one of two overlapping claimants wins, and the
+    /// loser sees `false` rather than an error — the statusline tick's
+    /// "only one tick commits" rule.
+    #[test]
+    fn claim_marker_first_caller_wins() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("sid.switched");
+        assert!(claim_marker(&path));
+        assert!(!claim_marker(&path));
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            content.parse::<i64>().is_ok(),
+            "marker holds an epoch: {content:?}"
+        );
+    }
+
+    #[test]
+    fn claim_marker_unwritable_dir_is_false() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("no-such-subdir").join("sid.switched");
+        assert!(!claim_marker(&path));
+    }
 
     /// write_noclobber: first write succeeds; second write is silently ignored.
     #[test]

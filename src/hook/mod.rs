@@ -15,6 +15,22 @@
 //! `--owner <dir>` is the CLAUDE_CONFIG_DIR of the profile that owns this hook instance.
 //! It is baked into the per-profile shim deployed by ansible; the hook uses it to locate
 //! the correct profile context.
+//!
+//! # Second entry point: the statusline tick
+//!
+//! [`run_from_statusline`] runs the same classification off `csm usage
+//! capture` (and the capture inside `csm statusline`). It exists because a
+//! subscription cap does not produce a hook event at all: when a request
+//! fails with a 429 that carries a reset time, Claude Code (observed on
+//! 2.1.270) neither ends the turn with `StopFailure` nor fires `Stop` — it
+//! shows "Weekly limit reached · Retrying in 6h" and parks the turn in an
+//! internal auto-retry wait, indefinitely. The only csm code that still runs
+//! while the turn is parked is the statusLine command, which Claude Code keeps
+//! invoking about once a second with the live `rate_limits` for the session's
+//! account. So the tick is where the switch has to happen. Its stdout is not a
+//! terminal (the statusLine wrapper discards it), so this path never emits the
+//! OSC 777 notification — the relaunched session's handoff prompt is the
+//! user-visible signal.
 
 pub mod detect;
 pub mod notify;
@@ -78,7 +94,7 @@ pub fn run(owner_dir: &Path) -> anyhow::Result<()> {
             notify::emit_osc777(message).unwrap_or(());
 
             let log_msg = format!(
-                "limit-switch sid={} to={} cwd={} hop={}",
+                "limit-switch sid={} to={} cwd={} born={}",
                 &sid[..sid.len().min(8)],
                 target_profile,
                 cwd,
@@ -92,4 +108,80 @@ pub fn run(owner_dir: &Path) -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+/// Entry point for the statusline tick. `raw` is the statusLine stdin JSON
+/// exactly as `csm usage capture` read it; `capture` is what
+/// [`crate::usage::local::record_statusline_payload`] just made of it.
+///
+/// Order of checks, cheapest first, because this runs about once a second
+/// for every live session:
+///
+/// 1. [`detect::statusline_limit`] over the merged reading — pure, no I/O.
+///    Almost every tick ends here.
+/// 2. Parse `raw` as a [`detect::HookInput`] (statusLine stdin carries the
+///    same `session_id`/`cwd`/`transcript_path` keys a hook event does).
+/// 3. [`detect::classify_with`] with the reading as a definitive live limit.
+///    Kill-switches, `.switched`, target pick, relaunch switch, managed gate,
+///    cooldown exception and hop guard all apply exactly as for the hook.
+/// 4. On `LimitSwitch`, claim `.switched` first ([`stop::claim_switched`] —
+///    ticks overlap; only one may commit), then [`stop::commit_and_stop`].
+///    If the commit fails the claim is released so the next tick retries.
+///
+/// Never returns an error and never writes to stdout/stderr: the capture
+/// this rides on is fire-and-forget and must stay that way. Outcomes are
+/// logged to `limit-switch.log` with `via=statusline`.
+pub fn run_from_statusline(raw: &str, capture: &crate::usage::local::StatuslineCapture) {
+    let Some(limit_msg) = detect::statusline_limit(&capture.usage) else {
+        return;
+    };
+    let Ok(input) = detect::parse_input(raw) else {
+        return;
+    };
+    let Some(sid) = input.session_id.clone().filter(|s| !s.is_empty()) else {
+        return;
+    };
+    let owner_dir = Path::new(&capture.profile_dir);
+    let Ok(decision) = detect::classify_with(&input, owner_dir, Some(&limit_msg)) else {
+        return;
+    };
+    let sid_short = &sid[..sid.len().min(8)];
+
+    match decision {
+        detect::Decision::Skip => {}
+
+        detect::Decision::NotifyOnly { ref message } => {
+            // Deduped by `.detected` inside classify, so this lands once per
+            // session, not once per second.
+            let log_msg = format!("notify-only sid={sid_short} msg={message} via=statusline");
+            let _ = notify::append_log(&sid, &log_msg, owner_dir);
+        }
+
+        detect::Decision::LimitSwitch {
+            message: _,
+            ref target_profile,
+            ref handoff,
+            ref cwd,
+            born,
+        } => {
+            if !stop::claim_switched(&sid) {
+                return;
+            }
+            let log_msg = format!(
+                "limit-switch sid={sid_short} to={target_profile} cwd={cwd} born={born} via=statusline"
+            );
+            let _ = notify::append_log(&sid, &log_msg, owner_dir);
+
+            if let Err(e) =
+                stop::commit_and_stop(sid.as_str(), target_profile, handoff, cwd, born, owner_dir)
+            {
+                let _ = notify::append_log(
+                    &sid,
+                    &format!("limit-switch sid={sid_short} commit failed: {e:#} via=statusline"),
+                    owner_dir,
+                );
+                let _ = std::fs::remove_file(crate::paths::switched(&sid));
+            }
+        }
+    }
 }

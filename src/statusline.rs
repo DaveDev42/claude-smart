@@ -26,6 +26,12 @@
 //! something else into a piped, non-interactive `csm statusline` and does not
 //! want its stdin consumed for capture.
 //!
+//! The same captured payload then drives the limit-switch trigger
+//! ([`crate::hook::run_from_statusline`]) after the segment has been printed,
+//! so a session whose account just hit a cap gets moved to another profile
+//! even when Claude Code fires no hook for it (see `hook/mod.rs`). Disabling
+//! the capture disables that trigger too.
+//!
 //! ### Profile resolution
 //!
 //! 1. Take the **basename** of `$CLAUDE_CONFIG_DIR`.
@@ -94,12 +100,22 @@ const CAPTURE_STDIN_CAP_BYTES: u64 = 256 * 1024;
 /// affects the printed segment or the exit code — a capture failure is
 /// invisible to whatever renders this command's output in the prompt.
 pub fn run(_args: &[OsString]) -> Result<()> {
-    if should_capture_stdin() {
+    let captured = if should_capture_stdin() {
         let raw = read_stdin_capped(CAPTURE_STDIN_CAP_BYTES);
-        let _ = usage::local::record_statusline_payload(&raw);
-    }
+        usage::local::record_statusline_payload(&raw)
+            .ok()
+            .flatten()
+            .map(|capture| (raw, capture))
+    } else {
+        None
+    };
     let segment = render_segment()?;
     println!("{segment}");
+    // The limit-switch trigger runs after the segment is out: it may end
+    // this very session, and the prompt should still have been drawn.
+    if let Some((raw, capture)) = captured {
+        crate::hook::run_from_statusline(&raw, &capture);
+    }
     Ok(())
 }
 
