@@ -1,5 +1,21 @@
 # Changelog
 
+## [0.3.1](https://github.com/DaveDev42/claude-smart/compare/v0.3.0...v0.3.1) (2026-09-14)
+
+
+### Features
+
+* **hook:** switch off a capped account from the statusline tick — Claude Code fires no hook for a subscription cap ([21d7ef2](https://github.com/DaveDev42/claude-smart/commit/21d7ef23761e9bb26f00bfcf0bcee7b66acaf95f))
+* **scoring:** weigh the model-scoped weekly cap in every pick and in the Stop hook ([da560bf](https://github.com/DaveDev42/claude-smart/commit/da560bf12cdb6c53cdc1990a9857a0090407279b))
+
+
+### Bug Fixes
+
+* **hook:** act on StopFailure(rate_limit) — the event Claude Code fires when a usage cap ends a turn ([ad2bc5c](https://github.com/DaveDev42/claude-smart/commit/ad2bc5cfc9a61d0980fb4e4b83d18061632c141a))
+* **proc-check:** match claude by name, exe, or argv[0] — the limit-switch kill-gate never passed ([28c9a34](https://github.com/DaveDev42/claude-smart/commit/28c9a344d3d2f4407198792d217ed7d33ac16256))
+* **relaunch:** re-apply the remembered --model/--effort/--permission-mode on a limit-switch hop ([0a88590](https://github.com/DaveDev42/claude-smart/commit/0a885904d43500691a1999fdd9a0f910e426546d))
+* **run:** forward explicit --permission-mode/--effort/--model to claude — they were parsed and then dropped ([98e64a4](https://github.com/DaveDev42/claude-smart/commit/98e64a4a1126ae93dd38b1560bb3881e524763ed))
+
 ## [0.3.0](https://github.com/DaveDev42/claude-smart/compare/v0.2.15...v0.3.0) (2026-09-02)
 
 
