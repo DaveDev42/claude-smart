@@ -3,8 +3,8 @@
 //! # Stdin contract (Claude Code hook spec)
 //!
 //! Claude Code writes a JSON object to the hook's stdin on every Stop/SubagentStop/
-//! SessionEnd event. The fields we care about (serde field names are the exact
-//! snake_case keys CC sends):
+//! SessionEnd/StopFailure event. The fields we care about (serde field names are
+//! the exact snake_case keys CC sends):
 //!
 //! ```json
 //! {
@@ -15,7 +15,40 @@
 //! }
 //! ```
 //!
+//! On a StopFailure event, `reason` is absent and three more fields appear
+//! instead (still all `Option` — see [`HookInput`]):
+//!
+//! ```json
+//! {
+//!   "session_id":      "01234567-...",
+//!   "hook_event_name": "StopFailure",
+//!   "error":           "rate_limit",
+//!   "error_details":   "free text from the API, optional"
+//! }
+//! ```
+//!
 //! # Detection tiers
+//!
+//! Tier-0: `stop_failure_limit` — `hook_event_name == "StopFailure" && error
+//!   == "rate_limit"`. This is the operative detector at the exact moment an
+//!   account hits a usage limit (5-hour session, weekly all-model, or a
+//!   model-scoped weekly cap): Claude Code's query loop runs the StopFailure
+//!   hook instead of Stop for that turn — fire-and-forget, not awaited, stdout/
+//!   exit code ignored, and skipped for subagent contexts — then parks the
+//!   prompt in its "Usage limit reached - continuing automatically when it
+//!   resets" auto-continue wait. Tier-1/2 never see that turn's Stop event at
+//!   all, so without tier-0 the hook simply does not run at the limit moment.
+//!   Requires the hook to be registered on the `StopFailure` event with
+//!   matcher `rate_limit` (a companion change outside this crate that adds
+//!   `csm hook --owner <dir>` as a StopFailure handler); until that
+//!   registration exists, no StopFailure payload ever reaches this process and
+//!   tier-1/2 remain the only detectors, as before. A StopFailure with any
+//!   OTHER `error` value (`overloaded`, `authentication_failed`,
+//!   `invalid_request`, ...) is a real API failure but not a usage limit —
+//!   `classify()` does nothing for it and does not fall through to tier-1/2/
+//!   malformed. Unlike tier-1/2, tier-0 is pure over the parsed stdin and does
+//!   zero I/O, so it has no freshness bound at all — it is data straight from
+//!   the failing request, not a cache.
 //!
 //! Tier-1: `limit-in-tail` — last 12 transcript records contain an
 //!   `isApiErrorMessage`-flagged entry matching the limit-banner regex, within 900 s.
@@ -30,7 +63,9 @@
 //!   usage API / statusline `rate_limits`). This tier has never been observed
 //!   to fire and is kept only as harmless defense-in-depth should a future
 //!   Claude Code start writing such records. Tier-2 is the operative reactive
-//!   detector; do not rely on tier-1.
+//!   detector for an ordinary Stop event; tier-0 is the operative detector at
+//!   the exact limit moment (once the StopFailure registration above exists).
+//!   Do not rely on tier-1.
 //!
 //! Tier-2: `current-usage` thresholding — session%, week_all%, or the
 //!   model-scoped week_fable% at or above limits (all three dimensions, same
@@ -51,14 +86,25 @@
 //!
 //! 1. Kill-switches (env var, file marker, .switched marker).
 //! 2. Reason gate → user_quit flag (doesn't exit yet — detection still runs).
-//! 3. Detect (tier-1 / tier-2 / malformed-in-tail).
+//! 3. Detect (tier-0 / tier-1 / tier-2 / malformed-in-tail). Tier-0 short-
+//!    circuits the other two outcomes: `NotLimit` → immediate `Skip` (a
+//!    non-limit StopFailure is never a limit, whatever tier-1/2 might say
+//!    from unrelated stale state); `Limit` → limited, `definitive = true`;
+//!    `NotApplicable` (not a StopFailure) → fall through to tier-1/2/malformed
+//!    exactly as before, `definitive = false`.
 //! 4. If not limited → exit (with user-quit log if user_quit).
 //! 5. If user_quit + limited → notify-only (deduped via .detected).
 //! 6. Pick target profile.
 //! 7. If no target → notify-only (deduped via .detected).
 //! 8. If CLAUDE_AUTO_SWITCH_RELAUNCH != "1" → notify-only (deduped via .detected).
 //! 9. Managed-session gate: check .pid file.
-//! 10. Cooldown gate (noclobber .last-switch).
+//! 10. Cooldown gate (noclobber .last-switch) — EXCEPT when `definitive` from
+//!     step 3: a tier-0 signal is never blocked by this cooldown (each
+//!     csm-supervised session sharing a now-capped account gets its own
+//!     independent StopFailure and must be allowed to switch off it, not just
+//!     the first one to notice — see the step-9 comment in [`classify`]). The
+//!     stamp is still refreshed/claimed best-effort either way, so pct-based
+//!     (tier-2) detections elsewhere keep today's throttle.
 //! 11. Hop guard.
 //!     → Decision::LimitSwitch { target_profile, handoff, cwd, born }.
 
@@ -68,11 +114,23 @@ use serde::Deserialize;
 
 // ─── stdin serde model ────────────────────────────────────────────────────────
 
-/// JSON object Claude Code writes to the hook's stdin on Stop/SubagentStop/SessionEnd.
+/// JSON object Claude Code writes to the hook's stdin on Stop/SubagentStop/
+/// SessionEnd/StopFailure.
 ///
 /// Field names match the exact keys Claude Code sends (snake_case, per CC hook spec).
 /// All fields are `Option` because the hook must exit 0 cleanly on a missing session_id;
 /// absent optional fields should degrade gracefully rather than hard-error.
+///
+/// The last three fields feed tier-0 (see the module doc's Tier-0 section).
+/// They deserialize leniently via [`lenient_opt_string`]: Claude Code's
+/// documented shape has them as strings, but a payload where one of them
+/// shows up as some other JSON type (an object, a number, ...) must still
+/// parse — the field just reads back as `None` rather than aborting the
+/// whole hook invocation.
+///
+/// Claude Code also sends `last_assistant_message` (the text of the model's
+/// last reply) on Stop, SubagentStop, and StopFailure. It is deliberately not
+/// deserialized, so no conversation text can end up in `limit-switch.log`.
 #[derive(Debug, Clone, Deserialize)]
 pub struct HookInput {
     /// Session UUID. Required for any action; exit 0 silently when absent.
@@ -87,6 +145,37 @@ pub struct HookInput {
 
     /// Path to the `.jsonl` transcript file for this session.
     pub transcript_path: Option<String>,
+
+    /// Event name: "Stop" | "SubagentStop" | "SessionEnd" | "StopFailure" | ...
+    /// Absent on hook payload shapes that predate this field (older fixtures,
+    /// and any event CC doesn't tag) — defaults to `None`, which tier-0 treats
+    /// as "not a StopFailure".
+    #[serde(default, deserialize_with = "lenient_opt_string")]
+    pub hook_event_name: Option<String>,
+
+    /// StopFailure only: the error-kind enum. Documented values include
+    /// "rate_limit", "overloaded", "authentication_failed",
+    /// "oauth_org_not_allowed", "account_on_hold", "verification_required",
+    /// "billing_error", "invalid_request", "model_not_found", server errors,
+    /// and "unknown".
+    #[serde(default, deserialize_with = "lenient_opt_string")]
+    pub error: Option<String>,
+
+    /// StopFailure only: free-text detail from the API, if any.
+    #[serde(default, deserialize_with = "lenient_opt_string")]
+    pub error_details: Option<String>,
+}
+
+/// Deserialize an optional string field leniently: missing, `null`, or any
+/// non-string JSON value (object, number, array, bool) becomes `None` instead
+/// of a hard parse error. Used for the StopFailure-only [`HookInput`] fields,
+/// whose exact shape is API free text we don't fully control.
+fn lenient_opt_string<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let v = serde_json::Value::deserialize(deserializer)?;
+    Ok(v.as_str().map(str::to_string))
 }
 
 // ─── decision type ────────────────────────────────────────────────────────────
@@ -175,6 +264,9 @@ pub fn parse_stdin() -> anyhow::Result<HookInput> {
             cwd: None,
             reason: None,
             transcript_path: None,
+            hook_event_name: None,
+            error: None,
+            error_details: None,
         });
     }
     let input: HookInput = serde_json::from_str(trimmed)?;
@@ -183,18 +275,21 @@ pub fn parse_stdin() -> anyhow::Result<HookInput> {
 
 /// Classify the hook event given the parsed input and the owner profile dir.
 ///
-/// Reproduces the full `limit-switch.sh.j2` flow exactly:
+/// Reproduces the full `limit-switch.sh.j2` flow exactly, plus a tier-0 step
+/// (StopFailure) the shell source predates:
 ///
 /// 1. Kill-switches (env, file, .switched marker)
 /// 2. Reason gate (user_quit flag — note: does NOT short-circuit yet, detection still runs)
-/// 3. Detect (tier-1 / tier-2 / malformed)
+/// 3. Detect (tier-0 StopFailure / tier-1 / tier-2 / malformed) — a tier-0
+///    `NotLimit` verdict exits immediately with `Skip`, bypassing tier-1/2/malformed
 /// 4. No limit signal → Skip
 /// 5. user_quit + limited → NotifyOnly (deduped via .detected)
 /// 6. Pick target profile (exclude current) via account::pick_account
 /// 7. No viable target → NotifyOnly (deduped via .detected)
 /// 8. CLAUDE_AUTO_SWITCH_RELAUNCH != "1" → NotifyOnly (deduped via .detected)
 /// 9. Managed-session gate (.pid file)
-/// 10. Machine-wide cooldown (noclobber .last-switch)
+/// 10. Machine-wide cooldown (noclobber .last-switch) — skipped when the tier-0
+///     signal was `definitive` (see `cooldown_should_block`)
 /// 11. Hop guard
 ///     → LimitSwitch
 pub fn classify(input: &HookInput, owner_dir: &Path) -> anyhow::Result<Decision> {
@@ -237,31 +332,51 @@ pub fn classify(input: &HookInput, owner_dir: &Path) -> anyhow::Result<Decision>
         .map(is_user_quit_reason)
         .unwrap_or(false);
 
-    // ── 3. Detect (two-tier + malformed) ─────────────────────────────────────
-    // Shell: limit-switch.sh.j2 lines 184-226
-    // Tier-1 is local (no network), tier-2 uses the local usage cache.
+    // ── 3. Detect (tier-0 StopFailure / tier-1 / tier-2 / malformed) ─────────
+    // Shell: limit-switch.sh.j2 lines 184-226 (tier-0 has no shell analogue —
+    // StopFailure is a hook event class the shell implementation predates).
+    // Tier-0 is pure over the already-parsed input (no I/O at all), tier-1 is
+    // local (transcript read), tier-2 uses the local usage cache.
+    //
+    // `definitive` tracks whether the signal came from tier-0: it feeds the
+    // cooldown-exception decision at step 9 (a definitive signal is never
+    // throttled by the machine-wide cooldown — see `cooldown_should_block`).
 
-    let (limited_msg, limited) = {
-        // Tier-1 — transcript tail (local, instant)
-        // Shell: limit-switch.sh.j2 lines 195-203
-        let t1 = detect_limit_in_tail(input);
-        if let Some(msg) = t1 {
-            (msg, true)
-        } else {
-            // Tier-2 — usage pct from local cache
-            // Shell: limit-switch.sh.j2 lines 205-221
-            let t2 = detect_usage_threshold(owner_dir);
-            if let Some(msg) = t2 {
-                (msg, true)
+    let (limited_msg, limited, definitive) = match stop_failure_limit(input) {
+        StopFailureVerdict::Limit(msg) => (msg, true, true),
+        StopFailureVerdict::NotLimit => {
+            // StopFailure for a non-limit API error (overloaded,
+            // authentication_failed, invalid_request, ...). Not something to
+            // switch accounts over — do nothing, and do NOT fall through to
+            // tier-1/2/malformed: those read transcript/usage-cache state
+            // that has nothing to do with this failure and could produce an
+            // unrelated false positive on the same turn.
+            return Ok(Decision::Skip);
+        }
+        StopFailureVerdict::NotApplicable => {
+            // Not a StopFailure event — fall through to the existing chain,
+            // unchanged.
+            // Tier-1 — transcript tail (local, instant)
+            // Shell: limit-switch.sh.j2 lines 195-203
+            let t1 = detect_limit_in_tail(input);
+            if let Some(msg) = t1 {
+                (msg, true, false)
             } else {
-                // Malformed-in-tail (only if no limit signal from tier-1 or tier-2)
-                // Note: in the shell this is in a separate hook (malformed-recover),
-                // but the helper has it in `malformed-in-tail`. We reproduce the check.
-                let m = detect_malformed_in_tail(input);
-                if let Some(msg) = m {
-                    (msg, true)
+                // Tier-2 — usage pct from local cache
+                // Shell: limit-switch.sh.j2 lines 205-221
+                let t2 = detect_usage_threshold(owner_dir);
+                if let Some(msg) = t2 {
+                    (msg, true, false)
                 } else {
-                    (String::new(), false)
+                    // Malformed-in-tail (only if no limit signal from tier-1 or tier-2)
+                    // Note: in the shell this is in a separate hook (malformed-recover),
+                    // but the helper has it in `malformed-in-tail`. We reproduce the check.
+                    let m = detect_malformed_in_tail(input);
+                    if let Some(msg) = m {
+                        (msg, true, false)
+                    } else {
+                        (String::new(), false, false)
+                    }
                 }
             }
         }
@@ -396,6 +511,20 @@ pub fn classify(input: &HookInput, owner_dir: &Path) -> anyhow::Result<Decision>
     // ── 9. Machine-wide cooldown (atomic noclobber claim) ─────────────────────
     // Shell: limit-switch.sh.j2 lines 355-367
     // Claim with noclobber; if fails, check if within cooldown window.
+    //
+    // Exception (Rust-side addition, no shell analogue): a definitive tier-0
+    // signal (StopFailure rate_limit) is never blocked by this cooldown. The
+    // cooldown exists to stop one runaway session from hammering the switch
+    // machinery on stale/borderline pct data; it was never meant to gate a
+    // SECOND session's own, independent, fresh confirmation that its account
+    // just hit a hard limit. Several csm-supervised sessions can share one
+    // account — when its model-scoped weekly cap saturates, every one of
+    // them gets its own StopFailure(rate_limit) on its next turn, and each
+    // must be allowed to switch off it rather than have all but the first be
+    // silently Skip'd and stranded in the auto-continue wait for days. We
+    // still call `check_and_claim_cooldown` unconditionally so the stamp gets
+    // refreshed/claimed best-effort — pct-based (tier-2) detections elsewhere
+    // keep today's throttle exactly.
     let smart_dir = paths::smart_dir()?;
     let last_switch_path = paths::last_switch();
     let cooldown_secs = std::env::var("CLAUDE_SWITCH_COOLDOWN")
@@ -403,9 +532,9 @@ pub fn classify(input: &HookInput, owner_dir: &Path) -> anyhow::Result<Decision>
         .and_then(|s| s.parse::<i64>().ok())
         .unwrap_or(LAST_SWITCH_COOLDOWN_SECS);
 
-    let cooldown_blocked = check_and_claim_cooldown(&last_switch_path, cooldown_secs);
+    let window_blocked = check_and_claim_cooldown(&last_switch_path, cooldown_secs);
     let _ = smart_dir; // ensure we called smart_dir for side effect
-    if cooldown_blocked {
+    if cooldown_should_block(definitive, window_blocked) {
         return Ok(Decision::Skip);
     }
 
@@ -445,6 +574,88 @@ pub fn classify(input: &HookInput, owner_dir: &Path) -> anyhow::Result<Decision>
 }
 
 // ─── detection tier implementations ──────────────────────────────────────────
+
+/// Maximum length, in characters, of the `error_details` snippet embedded in
+/// a tier-0 message. Keeps a possibly-large free-text API string out of logs
+/// and notify bodies.
+pub const STOP_FAILURE_DETAIL_MAX_CHARS: usize = 120;
+
+/// Outcome of the tier-0 StopFailure check.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum StopFailureVerdict {
+    /// `hook_event_name == "StopFailure" && error == "rate_limit"` — the
+    /// definitive, zero-latency usage-limit signal. Carries the
+    /// human-readable message to surface to the user/notify body.
+    Limit(String),
+    /// A StopFailure event with any OTHER `error` value. A real API failure,
+    /// but not a usage limit — classify() must do nothing (`Decision::Skip`)
+    /// rather than fall through to tier-1/2/malformed, which look at
+    /// transcript/usage-cache state unrelated to this specific failure.
+    NotLimit,
+    /// Not a StopFailure event at all (or `hook_event_name` absent, as on
+    /// every ordinary Stop/SubagentStop/SessionEnd payload) — tier-0 has no
+    /// opinion; classify() falls through to the tier-1/2/malformed chain.
+    NotApplicable,
+}
+
+/// Tier-0: does this event report a StopFailure whose `error` is
+/// `"rate_limit"`?
+///
+/// Pure over `&HookInput` — no I/O, no env reads. This is the operative
+/// detector at the exact moment an account hits a usage limit: Claude Code's
+/// query loop runs the StopFailure hook (fire-and-forget, not awaited) instead
+/// of Stop for that turn, before parking the prompt in its "Usage limit
+/// reached" auto-continue wait — see the module doc's Tier-0 section. Requires
+/// the hook to be registered on the `StopFailure` event with matcher
+/// `rate_limit` (a companion change outside this crate); if it isn't, this fn
+/// is simply never reached with a StopFailure payload and tier-1/2 remain the
+/// detectors, as today.
+pub(crate) fn stop_failure_limit(input: &HookInput) -> StopFailureVerdict {
+    if input.hook_event_name.as_deref() != Some("StopFailure") {
+        return StopFailureVerdict::NotApplicable;
+    }
+    if input.error.as_deref() != Some("rate_limit") {
+        return StopFailureVerdict::NotLimit;
+    }
+    let detail = input.error_details.as_deref().unwrap_or("");
+    let detail = single_line_truncate(detail, STOP_FAILURE_DETAIL_MAX_CHARS);
+    let msg = if detail.is_empty() {
+        "usage limit (StopFailure rate_limit)".to_string()
+    } else {
+        format!("usage limit (StopFailure rate_limit: {detail})")
+    };
+    StopFailureVerdict::Limit(msg)
+}
+
+/// Collapse newlines/tabs to spaces and truncate to at most `max_chars`
+/// **characters** (not bytes) — char-boundary safe, so multibyte UTF-8 input
+/// (Korean error text, emoji, ...) is never split mid-codepoint and can never
+/// panic, unlike a byte-index slice.
+fn single_line_truncate(s: &str, max_chars: usize) -> String {
+    s.chars()
+        .map(|c| {
+            if c == '\n' || c == '\r' || c == '\t' {
+                ' '
+            } else {
+                c
+            }
+        })
+        .take(max_chars)
+        .collect()
+}
+
+/// Pure decision: should the machine-wide cooldown block this switch?
+///
+/// A `definitive` (tier-0) signal is never blocked — see the step-9 comment
+/// in [`classify`] for why. Every other detection tier keeps today's
+/// behavior exactly: blocked iff the raw window check (`window_blocked`,
+/// from [`check_and_claim_cooldown`]) says so.
+pub(crate) fn cooldown_should_block(definitive: bool, window_blocked: bool) -> bool {
+    if definitive {
+        return false;
+    }
+    window_blocked
+}
 
 /// Tier-1: scan the last [`TIER1_TAIL_RECORDS`] lines of the transcript for an
 /// entry with `isApiErrorMessage: true` matching the limit-banner regex, within
@@ -1097,6 +1308,75 @@ mod tests {
         assert!(input.transcript_path.is_none());
     }
 
+    /// A realistic StopFailure(rate_limit) payload deserializes cleanly: the
+    /// tier-0 fields are populated and the unread `last_assistant_message` key
+    /// is ignored.
+    #[test]
+    fn hook_input_stop_failure_rate_limit_payload() {
+        let json = r#"{
+            "session_id": "01234567-89ab-cdef-0123-456789abcdef",
+            "transcript_path": "/Users/example/.claude.shared/projects/foo/01234567-89ab-cdef-0123-456789abcdef.jsonl",
+            "cwd": "/Users/example/Projects/github.com/foo",
+            "permission_mode": "default",
+            "hook_event_name": "StopFailure",
+            "error": "rate_limit",
+            "error_details": "5-hour limit reached, resets 21:00 Asia/Seoul",
+            "last_assistant_message": "Sure, let me check that for you."
+        }"#;
+        let input: HookInput =
+            serde_json::from_str(json).expect("deserialize StopFailure rate_limit payload");
+        assert_eq!(input.hook_event_name.as_deref(), Some("StopFailure"));
+        assert_eq!(input.error.as_deref(), Some("rate_limit"));
+        assert_eq!(
+            input.error_details.as_deref(),
+            Some("5-hour limit reached, resets 21:00 Asia/Seoul")
+        );
+        // A StopFailure payload carries no "reason" field.
+        assert!(input.reason.is_none());
+    }
+
+    /// An ordinary Stop payload (no StopFailure fields at all) still
+    /// deserializes exactly as before — the new fields default to `None`.
+    #[test]
+    fn hook_input_stop_payload_without_new_fields() {
+        let json = r#"{
+            "session_id": "01234567-89ab-cdef-0123-456789abcdef",
+            "cwd": "/Users/example/Projects/github.com/foo",
+            "reason": "stop",
+            "transcript_path": "/Users/example/.claude.shared/projects/foo/01234567-89ab-cdef-0123-456789abcdef.jsonl"
+        }"#;
+        let input: HookInput = serde_json::from_str(json).expect("deserialize plain Stop payload");
+        assert_eq!(input.reason.as_deref(), Some("stop"));
+        assert!(input.hook_event_name.is_none());
+        assert!(input.error.is_none());
+        assert!(input.error_details.is_none());
+    }
+
+    /// A malformed/unexpected StopFailure payload where `error` comes back as
+    /// a JSON object (not a string) must still deserialize — the lenient
+    /// deserializer treats the field as absent rather than erroring the whole
+    /// hook invocation.
+    #[test]
+    fn hook_input_stop_failure_error_as_object_is_lenient() {
+        let json = r#"{
+            "session_id": "01234567-89ab-cdef-0123-456789abcdef",
+            "hook_event_name": "StopFailure",
+            "error": {"code": "rate_limit", "nested": true},
+            "error_details": 42
+        }"#;
+        let input: HookInput =
+            serde_json::from_str(json).expect("lenient deserialize with object-shaped error");
+        assert_eq!(input.hook_event_name.as_deref(), Some("StopFailure"));
+        assert!(
+            input.error.is_none(),
+            "object-shaped error must deserialize to None, not error out"
+        );
+        assert!(
+            input.error_details.is_none(),
+            "number-shaped error_details must deserialize to None"
+        );
+    }
+
     // ── reason gate tests ──────────────────────────────────────────────────────
 
     /// Reason gate: user-quit reasons map to notify-only.
@@ -1456,6 +1736,145 @@ mod tests {
         }
     }
 
+    // ── stop_failure_limit (pure tier-0 detector) ──────────────────────────────
+
+    fn hook_input_stop_failure(error: Option<&str>, error_details: Option<&str>) -> HookInput {
+        HookInput {
+            session_id: Some("test-sid".to_string()),
+            cwd: None,
+            reason: None,
+            transcript_path: None,
+            hook_event_name: Some("StopFailure".to_string()),
+            error: error.map(str::to_string),
+            error_details: error_details.map(str::to_string),
+        }
+    }
+
+    /// StopFailure(rate_limit) with error_details → a definitive Limit verdict
+    /// whose message embeds the detail text.
+    #[test]
+    fn stop_failure_limit_rate_limit_hit() {
+        let input = hook_input_stop_failure(Some("rate_limit"), Some("resets 21:00 Asia/Seoul"));
+        let verdict = stop_failure_limit(&input);
+        match verdict {
+            StopFailureVerdict::Limit(msg) => {
+                assert!(msg.contains("rate_limit"), "message: {msg}");
+                assert!(msg.contains("resets 21:00 Asia/Seoul"), "message: {msg}");
+            }
+            other => panic!("expected Limit, got {other:?}"),
+        }
+    }
+
+    /// StopFailure(rate_limit) with no error_details → still a definitive
+    /// Limit verdict, just without a detail clause.
+    #[test]
+    fn stop_failure_limit_rate_limit_hit_no_details() {
+        let input = hook_input_stop_failure(Some("rate_limit"), None);
+        let verdict = stop_failure_limit(&input);
+        match verdict {
+            StopFailureVerdict::Limit(msg) => {
+                assert!(msg.contains("rate_limit"), "message: {msg}");
+            }
+            other => panic!("expected Limit, got {other:?}"),
+        }
+    }
+
+    /// StopFailure with any other error → NotLimit (do nothing; never falls
+    /// through to tier-1/2).
+    #[test]
+    fn stop_failure_limit_other_error_is_not_limit() {
+        for err in [
+            "overloaded",
+            "authentication_failed",
+            "oauth_org_not_allowed",
+            "account_on_hold",
+            "verification_required",
+            "billing_error",
+            "invalid_request",
+            "model_not_found",
+            "unknown",
+        ] {
+            let input = hook_input_stop_failure(Some(err), None);
+            assert_eq!(
+                stop_failure_limit(&input),
+                StopFailureVerdict::NotLimit,
+                "error={err} should be NotLimit"
+            );
+        }
+    }
+
+    /// StopFailure with `error` entirely absent (malformed/unexpected shape)
+    /// → NotLimit, not a panic and not a Limit.
+    #[test]
+    fn stop_failure_limit_missing_error_is_not_limit() {
+        let input = hook_input_stop_failure(None, None);
+        assert_eq!(stop_failure_limit(&input), StopFailureVerdict::NotLimit);
+    }
+
+    /// A non-StopFailure event (ordinary Stop) → NotApplicable, regardless of
+    /// what the error-shaped fields happen to hold.
+    #[test]
+    fn stop_failure_limit_non_stop_failure_is_not_applicable() {
+        let input = HookInput {
+            session_id: Some("test-sid".to_string()),
+            cwd: None,
+            reason: Some("stop".to_string()),
+            transcript_path: None,
+            hook_event_name: None,
+            error: None,
+            error_details: None,
+        };
+        assert_eq!(
+            stop_failure_limit(&input),
+            StopFailureVerdict::NotApplicable
+        );
+
+        // Even a Stop event where `error` happens to be "rate_limit" (should
+        // never happen, but tier-0 must key off hook_event_name, not error
+        // alone) is NotApplicable.
+        let input2 = hook_input_stop_failure(Some("rate_limit"), None);
+        let input2 = HookInput {
+            hook_event_name: Some("Stop".to_string()),
+            ..input2
+        };
+        assert_eq!(
+            stop_failure_limit(&input2),
+            StopFailureVerdict::NotApplicable
+        );
+    }
+
+    /// A long error_details string is truncated to
+    /// [`STOP_FAILURE_DETAIL_MAX_CHARS`] characters in the resulting message.
+    #[test]
+    fn stop_failure_limit_truncates_long_details() {
+        let long_detail = "x".repeat(500);
+        let input = hook_input_stop_failure(Some("rate_limit"), Some(&long_detail));
+        let StopFailureVerdict::Limit(msg) = stop_failure_limit(&input) else {
+            panic!("expected Limit verdict");
+        };
+        // The embedded detail is capped at STOP_FAILURE_DETAIL_MAX_CHARS chars.
+        let embedded_xs = msg.chars().filter(|c| *c == 'x').count();
+        assert_eq!(embedded_xs, STOP_FAILURE_DETAIL_MAX_CHARS);
+    }
+
+    /// Multibyte UTF-8 (Korean) error_details truncates on a char boundary
+    /// without panicking, and does not exceed the char cap.
+    #[test]
+    fn stop_failure_limit_truncates_multibyte_details_without_panic() {
+        // Each character here is a multibyte Korean syllable; repeat well
+        // past the truncation cap.
+        let long_detail = "사용량 한도에 도달했습니다 ".repeat(20);
+        let input = hook_input_stop_failure(Some("rate_limit"), Some(&long_detail));
+        let StopFailureVerdict::Limit(msg) = stop_failure_limit(&input) else {
+            panic!("expected Limit verdict");
+        };
+        // No panic getting here is the primary assertion; also sanity-check
+        // the message is non-empty and well-formed UTF-8 (guaranteed by
+        // `String`, but assert something meaningful was produced).
+        assert!(msg.contains("rate_limit"));
+        assert!(msg.chars().count() < long_detail.chars().count());
+    }
+
     // ── cooldown gate tests ────────────────────────────────────────────────────
 
     #[test]
@@ -1492,6 +1911,32 @@ mod tests {
 
         let blocked = check_and_claim_cooldown(&path, 300);
         assert!(!blocked, "should not be blocked outside cooldown window");
+    }
+
+    // ── cooldown_should_block (pure tier-0 cooldown-exception decision) ───────
+
+    /// A definitive (tier-0) signal is never blocked, even while the raw
+    /// window check says blocked — this is the whole point of the exception:
+    /// a second session sharing the same now-capped account must still be
+    /// allowed to switch, not stranded behind the first session's cooldown.
+    #[test]
+    fn cooldown_should_block_definitive_overrides_window_blocked() {
+        assert!(!cooldown_should_block(true, true));
+    }
+
+    /// A definitive signal is (trivially) also not blocked when the window
+    /// itself was not blocked.
+    #[test]
+    fn cooldown_should_block_definitive_and_window_open() {
+        assert!(!cooldown_should_block(true, false));
+    }
+
+    /// A non-definitive (tier-1/2/malformed) signal keeps today's behavior
+    /// exactly: blocked iff the window says blocked.
+    #[test]
+    fn cooldown_should_block_non_definitive_follows_window() {
+        assert!(cooldown_should_block(false, true));
+        assert!(!cooldown_should_block(false, false));
     }
 
     // ── sentinel hop increment test ────────────────────────────────────────────

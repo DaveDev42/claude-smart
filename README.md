@@ -84,8 +84,8 @@ csm completions {zsh|bash|pwsh}      shell completions
 ```
 
 > `csm` also recognizes a few **machine-interface** subcommands meant for
-> automation, not hand typing: `csm hook` (the Stop/SubagentStop/SessionEnd
-> limit-switch hook, wired from Claude Code `settings.json`), `csm cas` (the
+> automation, not hand typing: `csm hook` (the Stop/StopFailure/SubagentStop/
+> SessionEnd limit-switch hook, wired from Claude Code `settings.json`), `csm cas` (the
 > `eval`-shim contract behind the shell `cas` function), and `csm current-usage`
 > (a raw usage probe used by the shims). They work without a profile registry.
 
@@ -347,19 +347,38 @@ hook's relaunch target, so an account whose model-scoped weekly cap is
 exhausted is skipped everywhere even while its session and all-model weekly
 readings look healthy.
 
-**Reactive switch while a session is running.** The `csm hook`
-Stop/SubagentStop/SessionEnd hook reads the running profile's three
-percentages and, when any one is at or over `CLAUDE_LIMIT_PCT` (99), asks the
-scorer for the best other viable profile and writes a relaunch sentinel so
-the `csm run` supervisor restarts `claude` under it (subject to the usual
-guards: `CLAUDE_AUTO_SWITCH`, the per-session cooldown, hop cap, and a live
-supervisor). Transcript-text detection is kept as a fallback, but Claude Code
-does not currently write usage-limit notices into transcripts, so the
-percentage check is what actually fires. Session and all-model weekly
-percentages also refresh through the statusline capture; the model-scoped
-weekly percentage refreshes only when the per-profile usage-API probe runs
-(`CSM_USAGE_PROFILE_TTL`, default 300s), so a model-scoped cap can take up to
-about five minutes to trigger a switch.
+**Reactive switch while a session is running.** Register
+`csm hook --owner <profile-dir>` on Claude Code's `Stop`, `SubagentStop`,
+`SessionEnd`, and `StopFailure` hook events. When a request fails because the
+account hit a usage limit (session, weekly, or model-scoped weekly), Claude
+Code ends the turn with `StopFailure` and `error: "rate_limit"` instead of
+`Stop`, then waits for the limit to reset. `csm hook` takes that event as a
+definitive limit: it asks the scorer for the best other viable profile and
+writes a relaunch sentinel, and the `csm run` supervisor restarts
+`claude --resume` under that profile. Other `StopFailure` errors (overloaded,
+server errors, auth failures) are ignored. A matcher keeps the hook to the
+one case that matters:
+
+```json
+"StopFailure": [
+  { "matcher": "rate_limit",
+    "hooks": [ { "type": "command",
+                 "command": "csm hook --owner '/Users/example/.claude.work'" } ] }
+]
+```
+
+On `Stop` the hook compares the running profile's three percentages against
+`CLAUDE_LIMIT_PCT` (99) instead, which catches a cap crossed during a turn
+that still succeeded. Both paths honour `CLAUDE_AUTO_SWITCH`,
+`CLAUDE_AUTO_SWITCH_RELAUNCH`, the live-supervisor check, and the per-session
+hop cap. The machine-wide switch cooldown (`CLAUDE_SWITCH_COOLDOWN`) only
+throttles the percentage path, so several sessions sharing an exhausted
+account can all move off it. Transcript-text detection is kept as a fallback,
+but Claude Code does not currently write usage-limit notices into
+transcripts. The model-scoped weekly percentage refreshes only when the
+per-profile usage-API probe runs (`CSM_USAGE_PROFILE_TTL`, default 300s), so
+on the `Stop` path a model-scoped cap can take up to about five minutes to
+register. The `StopFailure` path does not depend on stored percentages.
 
 ### Custom usage command (`CSM_USAGE_CMD`)
 

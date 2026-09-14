@@ -47,10 +47,13 @@ It is consumed by the **private** `dave-environment` Ansible repo (the operator'
   stdin capture, `display.rs` formats reset times).
 - `src/session/`, `src/picker/`, `src/hook/`, `src/sidecar/`, `src/platform/`,
   `src/statusline.rs`, `src/paths.rs` — session scan/index, in-process fuzzy
-  picker (nucleo + crossterm), the Stop/SubagentStop/SessionEnd hook (tier-2
-  usage-% is the operative detector; tier-1 transcript-text is dormant because
-  Claude Code writes no limit notice into transcripts — see `hook/detect.rs`
-  module doc), sidecar
+  picker (nucleo + crossterm), the Stop/StopFailure/SubagentStop/SessionEnd
+  hook (tier-0 `StopFailure` with `error: "rate_limit"` is the operative
+  detector at the limit moment, because Claude Code fires it instead of Stop
+  when a usage limit ends the turn; tier-2 usage-% catches caps crossed during
+  a successful turn; tier-1 transcript-text is dormant because Claude Code
+  writes no limit notice into transcripts — see `hook/detect.rs` module doc),
+  sidecar
   store, OS launch/relaunch/proc checks, statusline, canonical state paths.
 - `src/provision.rs` — profile provisioning SSOT: `ensure_profile_provisioned`
   (dir + `plugins/` → `~/.claude.shared/plugins` symlink) and the read-only
