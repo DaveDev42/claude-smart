@@ -369,25 +369,20 @@ fn cmd_run(args: &[OsString]) -> anyhow::Result<()> {
     let sidecar_path = paths::sidecar(&session_id);
     let existing_sidecar = sidecar::read_sidecar(&sidecar_path).unwrap_or_default();
 
-    let mut cli: Vec<OsString> = Vec::new();
-    match &resolution {
-        SessionResolution::Fresh(sid) => {
-            cli.push(OsString::from("--session-id"));
-            cli.push(OsString::from(sid));
-        }
-        SessionResolution::Resume(sid) => {
-            cli.push(OsString::from("--resume"));
-            cli.push(OsString::from(sid));
-        }
+    let cli = launch_cli(&resolution, &existing_sidecar, flags, &parsed.passthru);
+
+    // Remember this invocation's explicit mode/effort/model so a later
+    // `csm -r <sid>` restores them (perfect-continue). Best-effort: a launch
+    // must never fail because the sidecar could not be written.
+    let explicit = sidecar::Sidecar {
+        permission_mode: flags.permission_mode.clone(),
+        effort: flags.effort.clone(),
+        model: flags.model.clone(),
+        ..Default::default()
+    };
+    if !explicit.sidecar_flags().is_empty() {
+        let _ = sidecar::merge_sidecar(&sidecar_path, &explicit);
     }
-
-    // Append sidecar flags (mode/effort/model from previous session).
-    // Explicit passthru flags override at the claude CLI level (last-wins).
-    let sc_flags = existing_sidecar.sidecar_flags();
-    cli.extend_from_slice(&sc_flags);
-
-    // Append the passthru args (user's own flags + initial prompt).
-    cli.extend_from_slice(&parsed.passthru);
 
     let spec = LaunchSpec {
         session_id,
@@ -400,6 +395,45 @@ fn cmd_run(args: &[OsString]) -> anyhow::Result<()> {
     // (Windows). Construct via Default so platform-specific changes are isolated.
     let launcher = <platform::PlatformLauncher as std::default::Default>::default();
     platform::relaunch::run_relaunch_loop(&launcher, &spec)
+}
+
+/// The claude CLI for a cold launch: the session verb, then mode/effort/model,
+/// then the user's passthrough args and initial prompt.
+///
+/// The flags this invocation was given win over the values the sidecar
+/// remembers from an earlier launch of the same session; a sidecar value is
+/// used only when the matching flag is absent. (Until this was factored out,
+/// `csm run` parsed `--permission-mode`/`--effort`/`--model` and then dropped
+/// them: only the sidecar's values ever reached claude.)
+fn launch_cli(
+    resolution: &SessionResolution,
+    remembered: &sidecar::Sidecar,
+    flags: &cli::parser::Flags,
+    passthru: &[OsString],
+) -> Vec<OsString> {
+    let mut cli: Vec<OsString> = Vec::new();
+    match resolution {
+        SessionResolution::Fresh(sid) => {
+            cli.push(OsString::from("--session-id"));
+            cli.push(OsString::from(sid));
+        }
+        SessionResolution::Resume(sid) => {
+            cli.push(OsString::from("--resume"));
+            cli.push(OsString::from(sid));
+        }
+    }
+    let effective = sidecar::Sidecar {
+        permission_mode: flags
+            .permission_mode
+            .clone()
+            .or_else(|| remembered.permission_mode.clone()),
+        effort: flags.effort.clone().or_else(|| remembered.effort.clone()),
+        model: flags.model.clone().or_else(|| remembered.model.clone()),
+        ..Default::default()
+    };
+    cli.extend(effective.sidecar_flags());
+    cli.extend_from_slice(passthru);
+    cli
 }
 
 // ─── session id resolution helpers ───────────────────────────────────────────
@@ -2439,18 +2473,118 @@ mod tests {
 
     /// The leading two CLI tokens (verb + id) main() builds for a resolution.
     fn launch_verb_and_id(res: &SessionResolution) -> (OsString, OsString) {
-        let mut cli: Vec<OsString> = Vec::new();
-        match res {
-            SessionResolution::Fresh(sid) => {
-                cli.push(OsString::from("--session-id"));
-                cli.push(OsString::from(sid));
-            }
-            SessionResolution::Resume(sid) => {
-                cli.push(OsString::from("--resume"));
-                cli.push(OsString::from(sid));
-            }
-        }
+        let cli = launch_cli(res, &Default::default(), &parse_flags(&[]), &[]);
         (cli[0].clone(), cli[1].clone())
+    }
+
+    /// Run the real `csm run` parser over `args` and return its flags.
+    fn parse_flags(args: &[&str]) -> cli::parser::Flags {
+        let os: Vec<OsString> = args.iter().map(OsString::from).collect();
+        cli::parser::parse(&os).flags
+    }
+
+    fn strs(cli: &[OsString]) -> Vec<String> {
+        cli.iter()
+            .map(|s| s.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    // ── launch_cli: explicit --permission-mode/--effort/--model reach claude ──
+    // Regression: `csm --model X` used to launch claude without `--model` at
+    // all, because the parsed flag was never put back on the CLI.
+
+    #[test]
+    fn launch_cli_forwards_explicit_flags_before_passthru() {
+        let res = SessionResolution::Fresh("11111111-2222-3333-4444-555555555555".to_owned());
+        let flags = parse_flags(&[
+            "--permission-mode",
+            "plan",
+            "--effort",
+            "high",
+            "--model",
+            "claude-x-1",
+        ]);
+        let passthru = [OsString::from("--settings"), OsString::from("s.json")];
+        let cli = launch_cli(&res, &Default::default(), &flags, &passthru);
+        assert_eq!(
+            strs(&cli),
+            [
+                "--session-id",
+                "11111111-2222-3333-4444-555555555555",
+                "--permission-mode",
+                "plan",
+                "--effort",
+                "high",
+                "--model",
+                "claude-x-1",
+                "--settings",
+                "s.json",
+            ]
+        );
+    }
+
+    #[test]
+    fn launch_cli_explicit_flag_wins_over_sidecar() {
+        let res = SessionResolution::Resume("aabd04a6-7a93-4f38-88cb-ff942f94d013".to_owned());
+        let remembered = sidecar::Sidecar {
+            model: Some("remembered-model".to_owned()),
+            effort: Some("low".to_owned()),
+            ..Default::default()
+        };
+        let flags = parse_flags(&["--model", "explicit-model"]);
+        let cli = strs(&launch_cli(&res, &remembered, &flags, &[]));
+        // The remembered effort still applies; the remembered model does not.
+        assert_eq!(
+            cli,
+            [
+                "--resume",
+                "aabd04a6-7a93-4f38-88cb-ff942f94d013",
+                "--effort",
+                "low",
+                "--model",
+                "explicit-model",
+            ]
+        );
+        assert!(!cli.iter().any(|t| t == "remembered-model"));
+    }
+
+    #[test]
+    fn launch_cli_uses_sidecar_when_no_flag_given() {
+        let res = SessionResolution::Resume("aabd04a6-7a93-4f38-88cb-ff942f94d013".to_owned());
+        let remembered = sidecar::Sidecar {
+            permission_mode: Some("acceptEdits".to_owned()),
+            ..Default::default()
+        };
+        let cli = strs(&launch_cli(&res, &remembered, &parse_flags(&[]), &[]));
+        assert_eq!(
+            cli,
+            [
+                "--resume",
+                "aabd04a6-7a93-4f38-88cb-ff942f94d013",
+                "--permission-mode",
+                "acceptEdits",
+            ]
+        );
+    }
+
+    #[test]
+    fn launch_cli_without_flags_or_sidecar_is_verb_and_passthru_only() {
+        let res = SessionResolution::Fresh("11111111-2222-3333-4444-555555555555".to_owned());
+        let passthru = [OsString::from("hello")];
+        let cli = strs(&launch_cli(
+            &res,
+            &Default::default(),
+            &parse_flags(&[]),
+            &passthru,
+        ));
+        assert_eq!(
+            cli,
+            [
+                "--session-id",
+                "11111111-2222-3333-4444-555555555555",
+                "hello"
+            ]
+        );
     }
 
     #[test]
