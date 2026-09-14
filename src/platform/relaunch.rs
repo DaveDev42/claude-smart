@@ -257,20 +257,35 @@ fn relaunch_loop(
         };
         profile_dir = next_dir;
 
-        // Build the next iteration's CLI: same sid, resume the session, carry the
-        // hop count forward, and inject the handoff prompt (unless suppressed).
-        cli = build_next_cli(&sid, &sentinel);
+        // Build the next iteration's CLI: same sid, resume the session, re-apply
+        // the launch flags the sidecar remembers, and inject the handoff prompt
+        // (unless suppressed).
+        let remembered = crate::sidecar::read_sidecar(&paths::sidecar(&sid)).unwrap_or_default();
+        cli = build_next_cli(&sid, &sentinel, &remembered);
     }
 }
 
 /// Build the claude CLI for the next relaunch hop: resume the same session,
-/// pass the handoff prompt (if any), and stamp the hop count so the hook can
-/// increment it again. Only used by the unix relaunch loop.
+/// re-apply the `--permission-mode`/`--effort`/`--model` the sidecar remembers
+/// for it, and pass the handoff prompt (if any). Only used by the unix
+/// relaunch loop.
+///
+/// The remembered flags matter because a switch is meant to continue the
+/// same work: a session launched as `csm --model <m>` that moves to another
+/// profile must come back up on `<m>`, not on that profile's default model.
+/// `csm run` persists explicit flags into the sidecar at launch precisely so
+/// this hop can read them back; positional passthrough (an initial prompt) is
+/// deliberately not carried, since `--resume` already has the conversation.
 #[cfg(not(windows))]
-fn build_next_cli(sid: &str, sentinel: &RelaunchSentinel) -> Vec<OsString> {
+fn build_next_cli(
+    sid: &str,
+    sentinel: &RelaunchSentinel,
+    remembered: &crate::sidecar::Sidecar,
+) -> Vec<OsString> {
     let mut cli: Vec<OsString> = Vec::new();
     cli.push(OsString::from("--resume"));
     cli.push(OsString::from(sid));
+    cli.extend(remembered.sidecar_flags());
     // The handoff prompt is the first turn after resume (e.g. "resume"). Empty =
     // suppressed (user already had a pending tail); pass nothing then.
     if !sentinel.handoff.is_empty() {
@@ -324,6 +339,70 @@ pub struct LaunchSpec {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(not(windows))]
+    fn sentinel(handoff: &str) -> RelaunchSentinel {
+        RelaunchSentinel {
+            session_id: "abc123".to_string(),
+            target_profile: "home".to_string(),
+            cwd: "/home/you/projects".to_string(),
+            handoff: handoff.to_string(),
+            hop: 1,
+            born: 1,
+        }
+    }
+
+    #[cfg(not(windows))]
+    fn strs(v: &[OsString]) -> Vec<String> {
+        v.iter().map(|s| s.to_string_lossy().into_owned()).collect()
+    }
+
+    /// The hop re-applies the sidecar's remembered launch flags between the
+    /// resume verb and the handoff prompt, so the switched session runs the
+    /// same model/effort/permission mode the user launched with.
+    #[cfg(not(windows))]
+    #[test]
+    fn build_next_cli_carries_remembered_flags() {
+        let remembered = crate::sidecar::Sidecar {
+            model: Some("some-model".to_string()),
+            effort: Some("high".to_string()),
+            permission_mode: Some("plan".to_string()),
+            ..Default::default()
+        };
+        let cli = build_next_cli("abc123", &sentinel("carry on"), &remembered);
+        assert_eq!(
+            strs(&cli),
+            [
+                "--resume",
+                "abc123",
+                "--permission-mode",
+                "plan",
+                "--effort",
+                "high",
+                "--model",
+                "some-model",
+                "carry on",
+            ]
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn build_next_cli_without_flags_is_resume_and_handoff() {
+        let cli = build_next_cli("abc123", &sentinel("carry on"), &Default::default());
+        assert_eq!(strs(&cli), ["--resume", "abc123", "carry on"]);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn build_next_cli_empty_handoff_passes_no_prompt() {
+        let remembered = crate::sidecar::Sidecar {
+            model: Some("some-model".to_string()),
+            ..Default::default()
+        };
+        let cli = build_next_cli("abc123", &sentinel(""), &remembered);
+        assert_eq!(strs(&cli), ["--resume", "abc123", "--model", "some-model"]);
+    }
 
     #[test]
     fn roundtrip_sentinel() {
