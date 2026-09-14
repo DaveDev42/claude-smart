@@ -79,6 +79,11 @@ unicode-normalization = "0.1"
 # chrono-tz, but local/display.rs calls this crate directly).
 iana-time-zone = "0.1"
 
+# Process-wide allocator (`#[global_allocator]` in src/main.rs). mimalloc builds
+# on all four release targets, including x86_64-pc-windows-msvc, where
+# tikv-jemallocator does not build at all.
+mimalloc = "0.1"
+
 # ─── HTTP transport (local usage collection: Anthropic's OAuth usage API) ────
 # rustls-tls (not native-tls): native-tls drags in system OpenSSL on Linux, which
 # breaks cross-compile + adds a build-time libssl dep on the WSL target; rustls is
@@ -126,3 +131,10 @@ pkg-fmt = "zip"
 
 [dev-dependencies]
 tempfile = "3"
+
+# Fat LTO + a single codegen unit: about 20% smaller stripped binary with no
+# measurable runtime change for csm's short-lived commands. The cost is a slower
+# release build on every target of the release matrix.
+[profile.release]
+lto           = "fat"
+codegen-units = 1

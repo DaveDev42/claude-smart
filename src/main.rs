@@ -15,6 +15,10 @@ mod statusline;
 mod testenv;
 mod usage;
 
+// Process-wide allocator: mimalloc on every target (see Cargo.toml).
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
