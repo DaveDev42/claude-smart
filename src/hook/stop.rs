@@ -14,8 +14,9 @@
 //!
 //! We stop **only** a session this loop manages. Both conditions must hold:
 //! - `<sid>.pid` exists and is parseable as `<pid> <born>`.
-//! - The recorded PID is a live process whose exe basename ends in `claude` or `node`
-//!   (case-insensitive, `.exe` stripped on Windows) — TOCTOU-tolerant via born check.
+//! - The recorded PID is a live process whose name, exe basename, or argv[0]
+//!   basename ends in `claude` or `node` (case-insensitive, `.exe` stripped) —
+//!   TOCTOU-tolerant via born check.
 //!
 //! If either gate fails the function returns `Ok(())` without stopping (notify already
 //! emitted by the caller — this degrades to notify-only).
@@ -188,8 +189,8 @@ fn stop_managed_process(sid: &str) -> anyhow::Result<()> {
 // ─── platform stop implementations ───────────────────────────────────────────
 
 /// Public wrapper for detect.rs to call without reimplementing the check.
-/// Returns true if `pid` is a live process whose exe basename ends with "claude" or "node"
-/// (case-insensitive; `.exe` stripped on Windows).
+/// Returns true if `pid` is a live process whose name, exe basename, or argv[0]
+/// basename ends with "claude" or "node" (case-insensitive; `.exe` stripped).
 ///
 /// Uses a targeted `sysinfo` refresh (never a full sweep) on every platform.
 pub fn check_is_live_claude_or_node(pid: u32) -> bool {
@@ -197,8 +198,8 @@ pub fn check_is_live_claude_or_node(pid: u32) -> bool {
 }
 
 fn is_live_claude_or_node(pid: u32) -> bool {
-    // Cross-platform: `SysinfoProcCheck` does a single-process refresh + exe()
-    // basename match (no `ps` spawn). Wired identically on macOS/Linux/Windows.
+    // Cross-platform: `SysinfoProcCheck` does a single-process refresh + a
+    // name/exe/argv[0] match (no `ps` spawn). Wired identically on every OS.
     use crate::platform::proc_check::ProcCheck;
     crate::platform::proc_check::SysinfoProcCheck::is_live_claude_or_node(pid)
 }

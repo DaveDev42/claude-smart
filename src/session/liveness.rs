@@ -7,16 +7,13 @@
 //!
 //! 1. Read `<smart_dir>/<sid>.pid` — one line `"<pid> <born>"`.
 //!    If the file is absent or unparseable → `false` (no managed process).
-//! 2. Verify that `pid` is a running process whose executable basename
-//!    (case-insensitive, `.exe` stripped on Windows) ends with `"claude"` or
-//!    `"node"`.
+//! 2. Verify that `pid` is a running process whose process name, exe
+//!    basename, or argv[0] basename (case-insensitive, `.exe` stripped) ends
+//!    with `"claude"` or `"node"`.
 //!
-//! The PID→comm check is delegated to the platform abstraction:
-//! - **macOS / Linux:** `PosixProcCheck` (`ps -o comm= -p <pid>` — never
-//!   `-o args=`, which would leak `CLAUDE_CONFIG_DIR` into logs).
-//! - **Windows / Linux (alternative):** `SysinfoProcCheck` (targeted
-//!   `sysinfo::refresh_process(Pid)` — never a full sweep on the hot Stop
-//!   path).
+//! The PID check is delegated to `PlatformProcCheck`, which is
+//! `SysinfoProcCheck` on every target: a targeted single-pid sysinfo refresh,
+//! never a full sweep on the hot Stop path. Nothing it reads is logged.
 //!
 //! TOCTOU note: the comm check is best-effort.  The caller may record `born`
 //! separately and perform a born-match guard for stricter safety (the relaunch
@@ -40,7 +37,7 @@ use crate::paths;
 /// - `<sid>.pid` absent,
 /// - `<sid>.pid` unparseable,
 /// - the recorded PID is not running,
-/// - the running process's comm does not end with `"claude"` or `"node"`.
+/// - the running process is not claude/node by name, exe, or argv[0].
 ///
 /// Never panics.
 pub fn sid_live(sid: &str) -> bool {
@@ -54,8 +51,8 @@ pub fn sid_live(sid: &str) -> bool {
         Some(p) => p,
         None => return false, // unparseable → not live
     };
-    // Delegate the PID→comm check to the compile-time platform impl
-    // (PosixProcCheck on unix, SysinfoProcCheck on Windows). `born` is read
+    // Delegate the PID check to `PlatformProcCheck` (`SysinfoProcCheck` on
+    // every target). `born` is read
     // for the relaunch loop's stricter born-match guard, not here.
     crate::platform::PlatformProcCheck::is_live_claude_or_node(pid)
 }

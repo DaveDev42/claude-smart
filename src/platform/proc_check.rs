@@ -9,8 +9,9 @@
 /// returns `true` (born-match guard in the relaunch loop).  This trait does NOT
 /// protect against PID recycling on its own.
 pub trait ProcCheck {
-    /// Returns `true` iff `pid` is running AND its exe basename (case-insensitive,
-    /// `.exe` stripped on Windows) ends with "claude" or "node".
+    /// Returns `true` iff `pid` is running AND its process name, exe basename,
+    /// or argv[0] basename (case-insensitive, `.exe` stripped) ends with
+    /// "claude" or "node". See `identity_matches` for why all three are checked.
     fn is_live_claude_or_node(pid: u32) -> bool;
 }
 
@@ -56,43 +57,75 @@ fn is_name_for(base: &str, launch: &[std::ffi::OsString]) -> bool {
     !name.is_empty() && name != "claude" && name != "node" && lower == name
 }
 
+/// Reduce a process name, exe path, or argv[0] to the bare basename
+/// [`is_name_for`] expects: the directory part dropped (either separator, so a
+/// Windows path reduces the same way on every host) and a trailing `.exe`
+/// stripped in any case.
+fn bare_basename(id: &str) -> &str {
+    let base = id.rsplit(['/', '\\']).next().unwrap_or(id);
+    let cut = base.len().saturating_sub(4);
+    match base.get(cut..) {
+        Some(ext) if ext.eq_ignore_ascii_case(".exe") => &base[..cut],
+        _ => base,
+    }
+}
+
+/// Pure identity seam: a process is "ours" iff ANY of its identifiers (process
+/// name, exe path, argv[0]), reduced to a bare basename, passes [`is_name_for`].
+///
+/// No single identifier is enough on its own. The native installer runs
+/// `claude` through a symlink to a versioned file
+/// (`~/.local/share/claude/versions/2.1.266`), so wherever the OS resolves that
+/// link for the exe path (Linux `/proc/<pid>/exe`, macOS `proc_pidpath`) the
+/// exe basename is a version string. The process name (`p_comm` on macOS,
+/// `/proc/<pid>/stat` comm on Linux, the image name on Windows) and argv[0]
+/// keep the `claude` it was launched as.
+fn identity_matches(ids: &[Option<&str>], launch: &[std::ffi::OsString]) -> bool {
+    ids.iter()
+        .flatten()
+        .any(|id| is_name_for(bare_basename(id), launch))
+}
+
 /// `SysinfoProcCheck` uses the `sysinfo` crate for a **targeted** single-process
 /// refresh (never `refresh_all()` — a full sweep stalls the hot Stop path on a
 /// busy Windows box).
 ///
 /// `platform/mod.rs` wires this as `PlatformProcCheck` on every target — sysinfo
-/// gives a targeted exe()-basename lookup on macOS, Linux/WSL, and Windows alike,
+/// gives a targeted name/exe/argv lookup on macOS, Linux/WSL, and Windows alike,
 /// so there is no external `ps` spawn and no per-OS proc-check code to maintain.
 pub struct SysinfoProcCheck;
 
 impl ProcCheck for SysinfoProcCheck {
     fn is_live_claude_or_node(pid: u32) -> bool {
-        use sysinfo::{Pid, ProcessRefreshKind, RefreshKind, System};
+        use sysinfo::{Pid, ProcessRefreshKind, System, UpdateKind};
 
+        // `System::new()` starts empty and `refresh_process_specifics` loads
+        // exactly this one pid, so the process table is never swept.
+        // `ProcessRefreshKind::new()` leaves exe and cmd unset (the name is
+        // always filled), so both are requested explicitly.
         let pid = Pid::from_u32(pid);
-        let mut sys = System::new_with_specifics(
-            RefreshKind::new().with_processes(ProcessRefreshKind::new()),
-        );
-        sys.refresh_processes_specifics(ProcessRefreshKind::new());
-
-        if let Some(proc) = sys.process(pid) {
-            if let Some(exe) = proc.exe() {
-                let stem = exe
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or("")
-                    // strip .exe for Windows paths
-                    .trim_end_matches(".exe");
-                return is_claude_or_node_name(stem);
-            }
+        let mut sys = System::new();
+        let kind = ProcessRefreshKind::new()
+            .with_exe(UpdateKind::OnlyIfNotSet)
+            .with_cmd(UpdateKind::OnlyIfNotSet);
+        if !sys.refresh_process_specifics(pid, kind) {
+            return false;
         }
-        false
+        let Some(proc_) = sys.process(pid) else {
+            return false;
+        };
+        let exe = proc_.exe().and_then(|p| p.to_str());
+        let argv0 = proc_.cmd().first().map(String::as_str);
+        identity_matches(
+            &[Some(proc_.name()), exe, argv0],
+            &crate::config::resolve_launch_command(),
+        )
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{is_claude_or_node_name, is_name_for};
+    use super::{bare_basename, identity_matches, is_claude_or_node_name, is_name_for};
     use std::ffi::OsString;
 
     /// Build a launch token vec for the pure-seam tests.
@@ -108,7 +141,7 @@ mod tests {
         // Stripped .exe (Windows): "claude.exe" → strip → "claude"
         assert!(is_claude_or_node_name("claude"));
         // Note: "claude-3" ends with "-3", NOT "claude" — correctly NOT matched.
-        // The comm/exe basename for real claude binaries is always "claude" or "node".
+        // The process name of a real claude is always "claude" or "node".
         assert!(!is_claude_or_node_name("claude-3"));
     }
 
@@ -180,5 +213,128 @@ mod tests {
         // Empty launch (defensive): falls back to claude/node-only matching.
         assert!(!is_name_for("happy", &launch(&[])));
         assert!(is_name_for("claude", &launch(&[])));
+    }
+
+    // ─── identity seam: process name / exe path / argv[0] ──────────────────────
+
+    #[test]
+    fn bare_basename_strips_dirs_and_exe_suffix() {
+        assert_eq!(bare_basename("claude"), "claude");
+        assert_eq!(bare_basename("/Users/example/.local/bin/claude"), "claude");
+        assert_eq!(
+            bare_basename(r"C:\Users\example\.local\bin\claude.exe"),
+            "claude"
+        );
+        assert_eq!(bare_basename("CLAUDE.EXE"), "CLAUDE");
+        assert_eq!(bare_basename("node.exe"), "node");
+        assert_eq!(bare_basename(""), "");
+        assert_eq!(bare_basename(".exe"), "");
+        // The 4-byte suffix window would split a multibyte char: left unchanged.
+        assert_eq!(bare_basename("ééx"), "ééx");
+    }
+
+    #[test]
+    fn native_installer_matches_despite_versioned_exe() {
+        // Where the OS resolves the installer's symlink, the exe basename is the
+        // version; the name and argv[0] still say claude.
+        let l = launch(&["claude"]);
+        let versioned = "/Users/example/.local/share/claude/versions/2.1.266";
+        assert!(identity_matches(
+            &[Some("claude"), Some(versioned), Some("claude")],
+            &l
+        ));
+        // The version-string exe on its own is never enough.
+        assert!(!identity_matches(&[None, Some(versioned), None], &l));
+        assert!(!identity_matches(
+            &[Some("2.1.266"), Some(versioned), None],
+            &l
+        ));
+    }
+
+    #[test]
+    fn any_single_identifier_is_enough() {
+        let l = launch(&["claude"]);
+        assert!(identity_matches(&[Some("claude"), None, None], &l));
+        assert!(identity_matches(
+            &[Some(""), Some("/usr/local/bin/node"), None],
+            &l
+        ));
+        assert!(identity_matches(
+            &[
+                Some("2.1.266"),
+                None,
+                Some("/home/example/.local/bin/claude")
+            ],
+            &l
+        ));
+        // Windows image names and paths, in any case.
+        assert!(identity_matches(&[Some("CLAUDE.EXE"), None, None], &l));
+        assert!(identity_matches(
+            &[Some(""), Some(r"C:\Program Files\nodejs\node.exe"), None],
+            &l
+        ));
+    }
+
+    #[test]
+    fn unrelated_process_never_matches() {
+        let l = launch(&["claude"]);
+        assert!(!identity_matches(
+            &[Some("zsh"), Some("/bin/zsh"), Some("-zsh")],
+            &l
+        ));
+        assert!(!identity_matches(&[None, None, None], &l));
+        assert!(!identity_matches(&[], &l));
+        // A directory named claude does not make what runs from it claude.
+        assert!(!identity_matches(
+            &[Some("python3"), Some("/opt/claude/bin/python3"), None],
+            &l
+        ));
+    }
+
+    #[test]
+    fn configured_launcher_matches_through_any_identifier() {
+        let l = launch(&["happy"]);
+        assert!(identity_matches(&[Some("happy"), None, None], &l));
+        assert!(identity_matches(
+            &[Some(""), None, Some("/usr/local/bin/happy")],
+            &l
+        ));
+        assert!(!identity_matches(
+            &[Some("bash"), Some("/bin/bash"), Some("bash")],
+            &l
+        ));
+    }
+
+    // ─── live sysinfo lookup ───────────────────────────────────────────────────
+
+    /// Regression test for the kill-gate: a process launched as `claude` through
+    /// a symlink (the native installer's layout) must be recognized. The refresh
+    /// used to leave `exe` unset and nothing else was checked, so this was
+    /// always `false` and no limit switch could stop a session.
+    #[cfg(unix)]
+    #[test]
+    fn live_symlinked_claude_is_recognized() {
+        use super::{ProcCheck, SysinfoProcCheck};
+
+        let dir = tempfile::tempdir().unwrap();
+        let link = dir.path().join("claude");
+        std::os::unix::fs::symlink("/bin/sleep", &link).unwrap();
+        let mut child = std::process::Command::new(&link).arg("30").spawn().unwrap();
+        let pid = child.id();
+        let live = SysinfoProcCheck::is_live_claude_or_node(pid);
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(live, "a live process launched as `claude` must pass");
+        assert!(
+            !SysinfoProcCheck::is_live_claude_or_node(pid),
+            "a reaped pid must not pass"
+        );
+    }
+
+    #[test]
+    fn live_unrelated_process_is_rejected() {
+        use super::{ProcCheck, SysinfoProcCheck};
+        // The test binary is live but named after the crate, not claude/node.
+        assert!(!SysinfoProcCheck::is_live_claude_or_node(std::process::id()));
     }
 }
