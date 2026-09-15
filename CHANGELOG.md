@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.2](https://github.com/DaveDev42/claude-smart/compare/v0.3.1...v0.3.2) (2026-09-15)
+
+
+### Features
+
+* **usage:** opt-in OAuth refresh for headless collectors — gated on expired access + no live session ([#22](https://github.com/DaveDev42/claude-smart/issues/22)) ([115c711](https://github.com/DaveDev42/claude-smart/commit/115c7118fd0f7a755e211115f84e1859599f0cbb))
+
 ## [0.3.1](https://github.com/DaveDev42/claude-smart/compare/v0.3.0...v0.3.1) (2026-09-14)
 
 
