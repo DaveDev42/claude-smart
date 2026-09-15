@@ -4,11 +4,21 @@
 //! everywhere else (and as the macOS fallback when the keychain entry is
 //! missing).
 //!
-//! **No `refresh_token` grant is performed here.** Refreshing rotates the
-//! token, and racing that rotation against Claude Code's own refresh can log
-//! the user out from under them. An expired token surfaces as
-//! [`CredError::Expired`]; the caller (`local::mod::collect`) falls back to
-//! the last stored reading rather than trying to mint a new one.
+//! **This read path never performs a `refresh_token` grant.** Refreshing
+//! rotates the token, and racing that rotation against Claude Code's own
+//! refresh can log the user out from under them. An expired token surfaces
+//! as [`CredError::Expired`]; the caller (`local::mod::collect`) falls back
+//! to the last stored reading rather than trying to mint a new one — that is
+//! still the default for every caller.
+//!
+//! The one exception lives in [`super::refresh`], not here: an explicitly
+//! opted-in headless collector (`csm usage --refresh-oauth` /
+//! `CSM_OAUTH_REFRESH=1`) may mint a new access token for a profile whose
+//! access token has expired while its refresh token is still alive — and
+//! only when no live Claude Code session exists for that profile, an
+//! exclusive lock is held, and the platform stores credentials in the file
+//! rather than the macOS Keychain. See that module's gate list. Nothing in
+//! this module writes.
 //!
 //! The access token is never logged, printed, or embedded in an error string
 //! anywhere in this module. [`OauthToken`] hand-writes its `Debug` impl to

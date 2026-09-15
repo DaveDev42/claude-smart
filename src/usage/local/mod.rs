@@ -26,6 +26,10 @@
 //! 2. **Cooldown?** `rec.cooldown_until > now` → serve the stale record
 //!    (rolled over) if one exists, else record an error. No probe attempted.
 //! 3. **Probe**: `creds::lookup(dir, now)` → on success, `api::fetch_usage`.
+//!    With the headless opt-in on ([`collect`]'s `refresh_oauth`),
+//!    an expired-but-refreshable lookup gets one gated refresh attempt in
+//!    between (see "Opt-in OAuth refresh" below) and, on success, the lookup
+//!    is re-run so the same tick collects.
 //!    Every terminal outcome (no creds, expired, unreadable, rate-limited,
 //!    unauthorized, other API failure, or success) collapses to an [`Event`],
 //!    and [`resolve`] — a pure function taking that `Event` plus whether a
@@ -48,6 +52,22 @@
 //! The access token never appears in any error string this module produces —
 //! `creds::OauthToken`'s `Debug` impl redacts it, and every error path here
 //! only ever carries a diagnostic message, never the token value.
+//!
+//! # Opt-in OAuth refresh (headless collectors)
+//!
+//! The default path stays strictly read-only: `csm` reads whatever access
+//! token Claude Code last stored and never rotates it. That leaves one
+//! deployment stranded — a headless host collecting for profiles no Claude
+//! Code ever runs under, where every profile permanently flips to
+//! NeedsRefresh 8h after login. [`collect`]'s `refresh_oauth`
+//! (from `csm usage --refresh-oauth` / `CSM_OAUTH_REFRESH=1`, and from
+//! nowhere else) lets [`probe`] mint a new access token for such a profile,
+//! but only when [`refresh`]'s gates all hold: expired access token, live
+//! refresh token, no live Claude Code session in the profile's own session
+//! registry, an exclusive lock, and a platform where the credential file —
+//! not the Keychain — is the live copy. A refusal or failure changes
+//! nothing: the profile resolves exactly as it does today (`CredsExpired` →
+//! [`Resolution::NeedsRefresh`]).
 //!
 //! # Dead-credential warnings (design spec "맛이 간 프로필은 로그인하라고 경고")
 //!
@@ -81,6 +101,7 @@
 pub mod api;
 pub mod creds;
 pub mod display;
+pub mod refresh;
 pub mod statusline;
 pub mod store;
 
@@ -383,7 +404,17 @@ fn roll_over_expired_sections(usage: &ProfileUsage, now: DateTime<Utc>) -> Profi
 /// on the pure [`resolve`]/[`check_freshness`]/[`roll_over_expired_sections`]
 /// functions above, since `collect` itself is the thin shell wiring them to
 /// real credentials/network/disk.
-pub fn collect(profiles: &ProfileMap, now: DateTime<Utc>, force: bool) -> UsageData {
+/// `refresh_oauth` — `csm usage --refresh-oauth` / `CSM_OAUTH_REFRESH=1`,
+/// threaded down from `main::cmd_usage` — permits [`probe`] to mint a new
+/// access token for a profile whose own has expired, under the gates in
+/// [`refresh`]. Every other entry point (statusline, picker, sidecar, hook)
+/// passes `false` and keeps today's strictly read-only behavior.
+pub fn collect(
+    profiles: &ProfileMap,
+    now: DateTime<Utc>,
+    force: bool,
+    refresh_oauth: bool,
+) -> UsageData {
     let ttl_secs = profile_ttl_secs();
     let rl_cooldown_secs = rate_limit_cooldown_secs();
     let base = api::resolve_base();
@@ -472,7 +503,7 @@ pub fn collect(profiles: &ProfileMap, now: DateTime<Utc>, force: bool) -> UsageD
             }
             Freshness::NeedsProbe => {
                 any_probe_attempted = true;
-                let event = probe(dir, now, &base);
+                let event = probe(name, dir, now, &base, refresh_oauth);
                 if matches!(event, Event::ApiOk(_)) {
                     any_probe_succeeded = true;
                 }
@@ -503,9 +534,46 @@ pub fn collect(profiles: &ProfileMap, now: DateTime<Utc>, force: bool) -> UsageD
 
 /// Run the live probe: credential lookup, then (on success) the API call.
 /// Collapses every real failure mode into an [`Event`] — the only place in
-/// this module that touches `creds`/`api`.
-fn probe(dir: &Path, now: DateTime<Utc>, base: &str) -> Event {
-    let token = match creds::lookup(dir, now) {
+/// this module that touches `creds`/`api`/`refresh`.
+///
+/// When `refresh_oauth` is set, an expired-but-refreshable lookup gets one
+/// gated refresh attempt ([`refresh::maybe_refresh`]) and, if it succeeds,
+/// the lookup is re-run so the very tick that refreshed also collects. With
+/// the flag unset — every caller but `csm usage --refresh-oauth` — the call
+/// returns on `refresh`'s first gate having touched nothing, so this path is
+/// behaviorally identical to before.
+fn probe(name: &str, dir: &Path, now: DateTime<Utc>, base: &str, refresh_oauth: bool) -> Event {
+    let mut lookup = creds::lookup(dir, now);
+    match refresh::maybe_refresh(dir, now, refresh_oauth, cred_state(&lookup)) {
+        refresh::RefreshOutcome::Refreshed { expires_in_secs } => {
+            let hours = (expires_in_secs as f64 / 3600.0).round() as i64;
+            eprintln!("csm: refreshed OAuth access token for profile {name} (valid ~{hours}h)");
+            // The file on disk now carries a fresh access token; re-read it
+            // rather than re-deriving one, so the token we send is exactly
+            // what the next reader will see. A failure here falls through to
+            // the same mapping as before (today's NeedsRefresh behavior).
+            lookup = creds::lookup(dir, now);
+        }
+        refresh::RefreshOutcome::Failed(msg) => {
+            eprintln!("csm: usage ({name}): OAuth refresh failed — {msg}");
+        }
+        refresh::RefreshOutcome::Unsupported => {
+            eprintln!(
+                "csm: usage ({name}): OAuth refresh skipped — {}",
+                refresh::SkipReason::UnsupportedPlatform.as_str()
+            );
+        }
+        refresh::RefreshOutcome::Skipped(reason) => {
+            if reason.is_diagnostic() {
+                eprintln!(
+                    "csm: usage ({name}): OAuth refresh skipped — {}",
+                    reason.as_str()
+                );
+            }
+        }
+    }
+
+    let token = match lookup {
         Ok(t) => t,
         Err(creds::CredError::NotFound) => return Event::NoCreds,
         Err(creds::CredError::Expired {
@@ -524,6 +592,26 @@ fn probe(dir: &Path, now: DateTime<Utc>, base: &str) -> Event {
         Err(api::ApiError::RateLimited) => Event::ApiRateLimited,
         Err(api::ApiError::Unauthorized) => Event::ApiUnauthorized,
         Err(e) => Event::ApiOther(e.to_string()),
+    }
+}
+
+/// Reduce a credential lookup to the only distinction [`refresh`]'s gate
+/// cares about (see [`refresh::CredState`]). An unreadable entry counts as
+/// `Unusable`: there is nothing trustworthy to refresh *from*.
+fn cred_state(lookup: &Result<creds::OauthToken, creds::CredError>) -> refresh::CredState {
+    match lookup {
+        Ok(_) => refresh::CredState::Live,
+        Err(creds::CredError::Expired {
+            refresh_alive: true,
+            ..
+        }) => refresh::CredState::Refreshable,
+        Err(creds::CredError::Expired {
+            refresh_alive: false,
+            ..
+        }) => refresh::CredState::RefreshDead,
+        Err(creds::CredError::NotFound) | Err(creds::CredError::Unreadable(_)) => {
+            refresh::CredState::Unusable
+        }
     }
 }
 
@@ -1015,6 +1103,47 @@ mod tests {
             resolve(false, event(), "home", "/x").0,
             Resolution::NeedsRefresh { .. }
         ));
+    }
+
+    // ── cred_state: the lookup → refresh-gate reduction ─────────────────────
+
+    #[test]
+    fn cred_state_of_a_usable_token_is_live() {
+        let ok = Ok(creds::OauthToken {
+            access_token: "tok_example".into(),
+            expires_at_ms: Some(2_000_000_000_000),
+            refresh_expires_at_ms: Some(3_000_000_000_000),
+            subscription_type: Some("pro".into()),
+        });
+        assert_eq!(cred_state(&ok), refresh::CredState::Live);
+    }
+
+    #[test]
+    fn cred_state_splits_expired_on_refresh_alive() {
+        let alive = Err(creds::CredError::Expired {
+            refresh_alive: true,
+            expired_at_ms: 1_756_000_000_000,
+        });
+        assert_eq!(cred_state(&alive), refresh::CredState::Refreshable);
+
+        let dead = Err(creds::CredError::Expired {
+            refresh_alive: false,
+            expired_at_ms: 1_756_000_000_000,
+        });
+        assert_eq!(cred_state(&dead), refresh::CredState::RefreshDead);
+    }
+
+    #[test]
+    fn cred_state_of_missing_or_unreadable_credentials_is_unusable() {
+        assert_eq!(
+            cred_state(&Err(creds::CredError::NotFound)),
+            refresh::CredState::Unusable
+        );
+        assert_eq!(
+            cred_state(&Err(creds::CredError::Unreadable("parse error".into()))),
+            refresh::CredState::Unusable,
+            "there is nothing trustworthy to refresh from"
+        );
     }
 
     #[test]
@@ -1696,7 +1825,7 @@ mod tests {
         map.insert("../evil".to_string(), "/tmp/does-not-matter".to_string());
         let profiles = ProfileMap(map);
 
-        let data = collect(&profiles, now(), false);
+        let data = collect(&profiles, now(), false, false);
 
         assert!(
             data.profiles.is_empty(),

@@ -165,8 +165,9 @@ pub fn fetch_usage(token: &str, base: &str) -> Result<OauthUsage, ApiError> {
 /// cleartext"), not a general URL validator: scheme, then the host portion of
 /// the authority (userinfo and port stripped, `[...]` IPv6-literal syntax
 /// unwrapped). A base that doesn't even parse as `scheme://authority` is
-/// rejected outright.
-fn validate_base(base: &str) -> Result<(), ApiError> {
+/// rejected outright. `pub(crate)` so [`super::refresh`] validates its own
+/// (env-overridable) token endpoint against exactly the same rule.
+pub(crate) fn validate_base(base: &str) -> Result<(), ApiError> {
     let Some((scheme, rest)) = base.split_once("://") else {
         return Err(ApiError::UnsafeBase(base.to_string()));
     };

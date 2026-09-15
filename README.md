@@ -73,7 +73,8 @@ csm profiles dir  [<name>]           print a profile's config dir
 csm profiles bootstrap [<name>|--all] provision a profile's env (dir + shared plugins)
 csm profiles doctor [--fix] [<name>|--all] diagnose/repair provisioning
 
-csm usage [--json] [--no-fetch] [--refresh]   multi-profile usage table (see Usage metering)
+csm usage [--json] [--no-fetch] [--refresh] [--refresh-oauth]
+                                     multi-profile usage table (see Usage metering)
 csm usage capture                    read statusLine stdin, merge into the store
 
 csm pick-account [<cur>] [--include-current]
@@ -226,14 +227,15 @@ OAuth credentials and calls Anthropic's usage API
   reads, so no separate login step and no prompt.
 - **Other platforms**: read from `<profile-dir>/.credentials.json`.
 
-This is **read-only**: `csm` never writes, refreshes, or rotates a token. It
-only reads the access token Claude Code already stored and asks the API for
-the current usage percentages. If a profile's token has expired, `csm` does
-not attempt a refresh itself (that would rotate the token and could race
+By default this is **read-only**: `csm` never writes, refreshes, or rotates a
+token. It only reads the access token Claude Code already stored and asks the
+API for the current usage percentages. If a profile's token has expired, `csm`
+does not attempt a refresh itself (that would rotate the token and could race
 Claude Code's own refresh, risking a surprise logout). Instead it serves the
 last-known value and warns you, with the exact command to run, everywhere you
 would see that profile: the usage table, the account picker, and the moment
-you launch under it. See *Dead or expired credentials* below.
+you launch under it. See *Dead or expired credentials* below. The one way to
+change that is the explicit opt-in in *Headless collectors* below.
 
 **Fetch order**, cheapest first:
 
@@ -278,18 +280,51 @@ only gets the hook-based paths.
 | `CSM_USAGE_PROFILE_TTL` | Seconds a profile's own store record is served without a live probe (default `300`). |
 | `CSM_USAGE_RATE_LIMIT_COOLDOWN` | Seconds to back off a profile after a 429 from the usage API (default `900`). |
 | `CSM_USAGE_API_BASE` | Override the usage API base URL (default `https://api.anthropic.com`). Mainly for tests. |
+| `CSM_OAUTH_REFRESH` | `1` enables the opt-in OAuth access-token refresh (same as `csm usage --refresh-oauth`). Default off. See *Headless collectors*. |
+| `CSM_OAUTH_TOKEN_URL` | Override the OAuth token endpoint used by that refresh (default `https://platform.claude.com/v1/oauth/token`). Mainly for tests; an override is announced on stderr. |
 | `CSM_STATUSLINE_NO_CAPTURE` | `1`/`true` disables the automatic statusline capture in `csm statusline`. |
 | `CLAUDE_USAGE_TTL` / `CSM_USAGE_TTL_SECS` | Positive-cache lifetime in seconds (default `60`). The legacy name wins if both are set. |
 | `CLAUDE_USAGE_FAIL_COOLDOWN` | Negative-cache cooldown in seconds after every profile fails at once (default `120`). |
 
 **Known limitation.** An idle profile you haven't run `claude` under in a
-while can have an expired access token. `csm` never refreshes a token itself,
-so it keeps showing the last values it collected (with window decay applied)
-until either Claude Code refreshes the token on its next run, or you log back
-in by hand. See *Dead or expired credentials* below for exactly what to run.
+while can have an expired access token. `csm` does not refresh a token unless
+you turn the opt-in on, so it keeps showing the last values it collected
+(with window decay applied) until either Claude Code refreshes the token on
+its next run, or you log back in by hand. See *Dead or expired credentials*
+below for exactly what to run.
 
 Use `csm usage --refresh` to bypass both the positive cache and every
 profile's own TTL and re-probe live (cooldowns are still respected).
+
+### Headless collectors (opt-in token refresh)
+
+An access token lives about 8 hours, and normally only a running Claude Code
+process mints a new one. On a headless host that collects usage for profiles
+no Claude Code ever runs under, every profile therefore goes stale 8 hours
+after login and stays that way.
+
+`csm usage --refresh-oauth` (or `CSM_OAUTH_REFRESH=1`) lets the collector mint
+a new access token itself. It applies to that command only: the statusline,
+the account picker, the sidecar and the hook never refresh, whatever the
+environment says. A refresh is attempted for a profile only when all of these
+hold:
+
+- the opt-in is on for this invocation;
+- the profile's access token has expired and its refresh token has not;
+- no live Claude Code session exists for the profile (its own
+  `<profile-dir>/sessions/*.json` registry is scanned, and a live `claude`
+  or `node` process there means `csm` stands down and lets Claude Code
+  refresh);
+- an exclusive lock file next to the credentials is free (60s staleness
+  takeover), so two collectors can't refresh the same profile at once;
+- the platform stores credentials in `<profile-dir>/.credentials.json`.
+  **macOS is not supported**: there the Keychain holds the live copy, so
+  `csm` reports the profile as unsupported and writes nothing.
+
+On success the credential file is rewritten atomically at mode `0600`, with
+every unrelated key preserved, and the same collection tick goes on to fetch
+usage with the new token. On any refusal or failure nothing is written and
+the profile behaves exactly as it does with the opt-in off.
 
 ### Dead or expired credentials
 

@@ -133,6 +133,10 @@ pub enum CompletionsSubcmd {
         /// Bypass the cache and every profile's own TTL; re-probe live.
         #[arg(long)]
         refresh: bool,
+        /// Headless collectors: refresh a profile's expired OAuth access
+        /// token when no Claude Code session is running under it.
+        #[arg(long)]
+        refresh_oauth: bool,
         #[command(subcommand)]
         verb: Option<UsageVerb>,
     },
@@ -212,7 +216,8 @@ pub enum CompletionsSubcmd {
 }
 
 /// `csm usage <verb>` — the statusLine-stdin capture subverb, distinct from
-/// `csm usage`'s own flags (`--json`/`--no-fetch`/`--refresh`).
+/// `csm usage`'s own flags (`--json`/`--no-fetch`/`--refresh`/
+/// `--refresh-oauth`).
 #[derive(clap::Subcommand)]
 pub enum UsageVerb {
     /// Read statusLine JSON from stdin, merge into the local store.
