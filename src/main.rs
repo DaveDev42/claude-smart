@@ -166,7 +166,7 @@ fn print_help() {
     println!("  csm profiles edit                    interactive editor (TTY)");
     println!("  csm profiles dir  [<name>]           print a profile's dir (default if omitted)");
     println!(
-        "  csm profiles bootstrap [<name>|--all] provision profile env (dir + shared plugins)"
+        "  csm profiles bootstrap [<name>|--all] provision profile env (dir + shared plugins/projects)"
     );
     println!("  csm profiles doctor [--fix] [<name>|--all] diagnose/repair provisioning\n");
     println!("CONFIG (csm's own — ~/.config/claude-smart/config.json)");
@@ -1390,9 +1390,10 @@ fn cmd_profiles(args: &[OsString]) -> anyhow::Result<()> {
 /// `csm profiles bootstrap [<name> | --all]`
 ///
 /// Stand up / repair the provisioning invariants for one profile (or every
-/// registered profile with `--all`): the dir exists and `plugins` is a symlink
-/// to the shared SSOT (`~/.claude.shared/plugins`). Idempotent — safe to re-run.
-/// With no args, bootstraps the current/default profile.
+/// registered profile with `--all`): the dir exists and `plugins`/`projects`
+/// are symlinks to their shared SSOTs (`~/.claude.shared/{plugins,projects}`).
+/// Idempotent — safe to re-run. With no args, bootstraps the current/default
+/// profile.
 fn cmd_profiles_bootstrap(rest: &[String]) -> anyhow::Result<()> {
     let profiles = account::ProfileMap::load()
         .context("csm profiles bootstrap: failed to load profiles.json")?;
@@ -1426,9 +1427,10 @@ fn cmd_profiles_bootstrap(rest: &[String]) -> anyhow::Result<()> {
         match provision::ensure_profile_provisioned(name, dir) {
             Ok(report) => {
                 println!(
-                    "bootstrap [{name}] {} → {}",
+                    "bootstrap [{name}] {} → plugins: {}; projects: {}",
                     dir.display(),
-                    describe_link(&report.plugins)
+                    describe_link(&report.plugins),
+                    describe_link(&report.projects)
                 );
             }
             Err(e) => {
@@ -1482,7 +1484,11 @@ fn cmd_profiles_doctor(rest: &[String]) -> anyhow::Result<()> {
         if fix {
             match provision::ensure_profile_provisioned(name, dir) {
                 Ok(report) => {
-                    println!("  → fixed: plugins {}", describe_link(&report.plugins));
+                    println!(
+                        "  → fixed: plugins {}; projects {}",
+                        describe_link(&report.plugins),
+                        describe_link(&report.projects)
+                    );
                 }
                 Err(e) => {
                     eprintln!("  → fix FAILED: {e}");
@@ -1511,32 +1517,65 @@ fn describe_link(outcome: &provision::LinkOutcome) -> String {
     }
 }
 
+/// One-line description of a single unhealthy [`provision::LinkState`] axis, or
+/// `None` when that axis is already healthy. `what` names the subdir
+/// (`"plugins"`/`"projects"`) and `real_dir_note` is the axis-specific
+/// consequence of it being a diverged per-profile dir.
+#[cfg(unix)]
+fn describe_link_state(
+    what: &str,
+    real_dir_note: &str,
+    state: &provision::LinkState,
+) -> Option<String> {
+    use provision::LinkState::*;
+    match state {
+        Ok => None,
+        Missing => Some(format!("{what} not linked (no entry)")),
+        RealDir => Some(format!("{what} is a per-profile dir ({real_dir_note})")),
+        WrongLink(t) => Some(format!(
+            "{what} symlinked to wrong target ({})",
+            t.display()
+        )),
+        NotADir => Some(format!("{what} is a file, not a dir/symlink")),
+    }
+}
+
 /// One-line description of an unhealthy [`provision::ProfileDiagnosis`].
 #[cfg(unix)]
 fn describe_diagnosis(diag: &provision::ProfileDiagnosis, dir: &Path) -> String {
-    use provision::PluginLinkState::*;
     if !diag.dir_exists {
         return format!("profile dir missing ({})", dir.display());
     }
-    match &diag.plugins {
-        Ok => "healthy".to_owned(),
-        Missing => "plugins not linked (no entry)".to_owned(),
-        RealDir => {
-            "plugins is a per-profile dir (causes marketplace cache-miss on switch)".to_owned()
-        }
-        WrongLink(t) => format!("plugins symlinked to wrong target ({})", t.display()),
-        NotADir => "plugins is a file, not a dir/symlink".to_owned(),
+    let parts: Vec<String> = [
+        describe_link_state(
+            "plugins",
+            "causes marketplace cache-miss on switch",
+            &diag.plugins,
+        ),
+        describe_link_state(
+            "projects",
+            "transcripts invisible to other profiles",
+            &diag.projects,
+        ),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    if parts.is_empty() {
+        "healthy".to_owned()
+    } else {
+        parts.join("; ")
     }
 }
 
 /// Non-unix: the symlink invariant is delegated to OS-native tooling, so the
-/// diagnosis carries no plugin detail to describe.
+/// diagnosis carries no link detail to describe.
 #[cfg(not(unix))]
 fn describe_diagnosis(diag: &provision::ProfileDiagnosis, dir: &Path) -> String {
     if !diag.dir_exists {
         format!("profile dir missing ({})", dir.display())
     } else {
-        "ok (plugin linking handled OS-side on this platform)".to_owned()
+        "ok (dir linking handled OS-side on this platform)".to_owned()
     }
 }
 

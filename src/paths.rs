@@ -161,18 +161,25 @@ pub fn scan_index_for(project_dir: &Path) -> PathBuf {
     smart_dir_no_create().join(format!("scan-meta-v2.{dir_name}.tsv"))
 }
 
-/// `$HOME/.claude.shared` — the shared config root. Transcripts/projects, the
-/// smart state dir, and the cross-profile plugin SSOT all live under here; per
-/// the same philosophy that already shares `projects/`, the plugin store is
-/// shared so every profile sees one marketplace cache (avoids the
-/// `cache-miss` that a per-`CLAUDE_CONFIG_DIR` plugin dir causes on switch).
+/// `$HOME/.claude.shared` — the shared config root. The smart state dir, the
+/// cross-profile plugin SSOT, and the cross-profile transcript SSOT all live
+/// under here: each profile dir's `plugins` and `projects` are symlinked here
+/// (see [`crate::provision::ensure_profile_provisioned`]) so every profile
+/// sees one marketplace cache (avoids the `cache-miss` a per-`CLAUDE_CONFIG_DIR`
+/// plugin dir causes on switch) and one session history regardless of which
+/// profile is active.
 pub fn shared_base_dir() -> PathBuf {
     dirs::home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join(".claude.shared")
 }
 
-/// `$HOME/.claude.shared/projects` — transcript projects base directory.
+/// `$HOME/.claude.shared/projects` — the single source of truth for Claude Code
+/// session transcripts shared across every profile. Each profile dir's
+/// `projects` is symlinked here so `csm`'s own session scanner/alias index
+/// (and any other reader of `<CLAUDE_CONFIG_DIR>/projects`) sees every
+/// profile's history no matter which `CLAUDE_CONFIG_DIR` is active. See
+/// [`crate::provision::ensure_profile_provisioned`].
 pub fn session_base_dir() -> PathBuf {
     shared_base_dir().join("projects")
 }

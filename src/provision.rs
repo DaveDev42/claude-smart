@@ -2,11 +2,13 @@
 //! depends on, idempotently.
 //!
 //! csm switches profiles by pointing `CLAUDE_CONFIG_DIR` at a per-profile dir
-//! (`~/.claude.<name>`). Claude Code stores plugins/marketplaces UNDER that dir,
-//! so a naked env swap gives each profile its own plugin store — and switching
-//! profiles then breaks the marketplace cache (`cache-miss`, "Run
-//! /reload-plugins"). Transcripts already escape this by living in the shared
-//! root (`~/.claude.shared/projects`); we extend the same philosophy to plugins.
+//! (`~/.claude.<name>`). Claude Code stores plugins/marketplaces AND session
+//! transcripts UNDER that dir, so a naked env swap gives each profile its own
+//! plugin store and its own transcript history — switching profiles then both
+//! breaks the marketplace cache (`cache-miss`, "Run /reload-plugins") and
+//! splits session history across profiles. We share both subdirs the same way:
+//! each profile's `plugins` and `projects` are symlinked to one SSOT under
+//! `~/.claude.shared/`.
 //!
 //! [`ensure_profile_provisioned`] is the single definition of "a provisioned
 //! profile". Every entry point that activates / launches / registers a profile
@@ -17,14 +19,18 @@
 //! 1. `D` exists.
 //! 2. `D/plugins` resolves to `~/.claude.shared/plugins` (the single SSOT), so
 //!    every profile shares one marketplace cache.
+//! 3. `D/projects` resolves to `~/.claude.shared/projects` (the single SSOT),
+//!    so every profile's session transcripts are visible regardless of which
+//!    profile is active (`csm`'s own session scanner and alias index depend on
+//!    this — see `session::scan`/`session::alias`).
 //!
 //! ## Platform
 //! POSIX uses `std::os::unix::fs::symlink`. On Windows, directory symlinks are
 //! privilege-gated and the relaunch loop is currently disabled there, so we make
 //! provisioning a no-op rather than fail — the Windows junction is delegated to
 //! OS-native tooling provisioned outside this crate (the operator's private
-//! deployment repo); csm treats it as a no-op. The plugin-sharing logic is
-//! unix-only for now.
+//! deployment repo); csm treats it as a no-op. The dir-sharing logic (plugins
+//! and projects alike) is unix-only for now.
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -37,6 +43,8 @@ use crate::paths;
 pub struct ProvisionReport {
     /// What the `plugins` link step did.
     pub plugins: LinkOutcome,
+    /// What the `projects` link step did.
+    pub projects: LinkOutcome,
 }
 
 /// What happened to a single symlink-to-shared step.
@@ -70,35 +78,35 @@ pub enum LinkOutcome {
 
 // ─── diagnosis (read-only; the `doctor` core) ──────────────────────────────────
 
-/// The state of a profile's `plugins` entry relative to the shared SSOT.
-/// Read-only classification — `doctor` reports it; `--fix` calls
-/// [`ensure_profile_provisioned`] to repair anything not [`Ok`](PluginLinkState::Ok).
+/// The state of a profile's `plugins` or `projects` entry relative to its
+/// shared SSOT. Read-only classification — `doctor` reports it; `--fix` calls
+/// [`ensure_profile_provisioned`] to repair anything not [`Ok`](LinkState::Ok).
 ///
 /// The non-`Ok` variants are only constructed by the unix `diagnose_profile_with`;
 /// the non-unix `diagnose_profile` always reports `Ok` (linking is OS-side), so
 /// they carry per-variant dead-code allows to stay warning-clean off unix.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum PluginLinkState {
-    /// `plugins` is a symlink to the shared SSOT — healthy.
+pub enum LinkState {
+    /// The entry is a symlink to the shared SSOT — healthy.
     Ok,
-    /// No `plugins` entry exists yet (will be created on provision).
+    /// No entry exists yet (will be created on provision).
     #[cfg_attr(not(unix), allow(dead_code))]
     Missing,
-    /// `plugins` is a real directory (per-profile store — the cache-miss cause).
+    /// The entry is a real directory (per-profile store, diverged from the SSOT).
     #[cfg_attr(not(unix), allow(dead_code))]
     RealDir,
-    /// `plugins` is a symlink, but to the wrong target.
+    /// The entry is a symlink, but to the wrong target.
     #[cfg_attr(not(unix), allow(dead_code))]
     WrongLink(PathBuf),
-    /// `plugins` is a regular file (or other non-dir) — unexpected.
+    /// The entry is a regular file (or other non-dir) — unexpected.
     #[cfg_attr(not(unix), allow(dead_code))]
     NotADir,
 }
 
-impl PluginLinkState {
-    /// Is the profile's plugin link already healthy (no action needed)?
+impl LinkState {
+    /// Is this entry's link already healthy (no action needed)?
     pub fn is_ok(&self) -> bool {
-        matches!(self, PluginLinkState::Ok)
+        matches!(self, LinkState::Ok)
     }
 }
 
@@ -108,52 +116,67 @@ pub struct ProfileDiagnosis {
     /// The profile dir exists on disk.
     pub dir_exists: bool,
     /// State of the `plugins` → shared SSOT link.
-    pub plugins: PluginLinkState,
+    pub plugins: LinkState,
+    /// State of the `projects` → shared SSOT link.
+    pub projects: LinkState,
 }
 
 impl ProfileDiagnosis {
     /// Is the profile fully provisioned (nothing for `--fix` to do)?
     pub fn is_healthy(&self) -> bool {
-        self.dir_exists && self.plugins.is_ok()
+        self.dir_exists && self.plugins.is_ok() && self.projects.is_ok()
     }
 }
 
-/// Diagnose profile `dir` against the production shared-plugins SSOT.
+/// Diagnose profile `dir` against the production shared plugins/projects SSOTs.
 #[cfg(unix)]
 pub fn diagnose_profile(dir: &Path) -> ProfileDiagnosis {
-    diagnose_profile_with(dir, &paths::shared_plugins_dir())
+    diagnose_profile_with(
+        dir,
+        &paths::shared_plugins_dir(),
+        &paths::session_base_dir(),
+    )
 }
 
-/// Non-unix: plugin linking is delegated to OS-native tooling, so the diagnosis
-/// reports only whether the profile dir exists and treats plugins as `Ok`.
+/// Non-unix: dir linking is delegated to OS-native tooling, so the diagnosis
+/// reports only whether the profile dir exists and treats both links as `Ok`.
 #[cfg(not(unix))]
 pub fn diagnose_profile(dir: &Path) -> ProfileDiagnosis {
     ProfileDiagnosis {
         dir_exists: dir.is_dir(),
-        plugins: PluginLinkState::Ok,
+        plugins: LinkState::Ok,
+        projects: LinkState::Ok,
     }
 }
 
-/// [`diagnose_profile`] with the SSOT injected (testable seam). Pure: only reads
-/// the filesystem, never mutates.
+/// Classify a single `link` against its expected `shared` SSOT target.
 #[cfg(unix)]
-pub fn diagnose_profile_with(dir: &Path, shared_plugins: &Path) -> ProfileDiagnosis {
-    let dir_exists = dir.is_dir();
-    let link = dir.join("plugins");
-    let plugins = match std::fs::symlink_metadata(&link) {
-        Ok(meta) if meta.file_type().is_symlink() => match std::fs::read_link(&link) {
-            Ok(target) if links_match(&target, &link, shared_plugins) => PluginLinkState::Ok,
-            Ok(target) => PluginLinkState::WrongLink(target),
-            Err(_) => PluginLinkState::WrongLink(PathBuf::new()),
+fn classify_link(link: &Path, shared: &Path) -> LinkState {
+    match std::fs::symlink_metadata(link) {
+        Ok(meta) if meta.file_type().is_symlink() => match std::fs::read_link(link) {
+            Ok(target) if links_match(&target, link, shared) => LinkState::Ok,
+            Ok(target) => LinkState::WrongLink(target),
+            Err(_) => LinkState::WrongLink(PathBuf::new()),
         },
-        Ok(meta) if meta.is_dir() => PluginLinkState::RealDir,
-        Ok(_) => PluginLinkState::NotADir,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => PluginLinkState::Missing,
-        Err(_) => PluginLinkState::NotADir,
-    };
+        Ok(meta) if meta.is_dir() => LinkState::RealDir,
+        Ok(_) => LinkState::NotADir,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => LinkState::Missing,
+        Err(_) => LinkState::NotADir,
+    }
+}
+
+/// [`diagnose_profile`] with both SSOTs injected (testable seam). Pure: only
+/// reads the filesystem, never mutates.
+#[cfg(unix)]
+pub fn diagnose_profile_with(
+    dir: &Path,
+    shared_plugins: &Path,
+    shared_projects: &Path,
+) -> ProfileDiagnosis {
     ProfileDiagnosis {
-        dir_exists,
-        plugins,
+        dir_exists: dir.is_dir(),
+        plugins: classify_link(&dir.join("plugins"), shared_plugins),
+        projects: classify_link(&dir.join("projects"), shared_projects),
     }
 }
 
@@ -166,16 +189,30 @@ pub fn diagnose_profile_with(dir: &Path, shared_plugins: &Path) -> ProfileDiagno
 /// literal). `name` is informational (kept for future per-name steps and for
 /// error context).
 pub fn ensure_profile_provisioned(name: &str, dir: &Path) -> io::Result<ProvisionReport> {
-    ensure_profile_provisioned_with(name, dir, &paths::shared_plugins_dir())
+    ensure_profile_provisioned_with(
+        name,
+        dir,
+        &paths::shared_plugins_dir(),
+        &paths::session_base_dir(),
+    )
 }
 
-/// [`ensure_profile_provisioned`] with the shared-plugins SSOT injected — the
+/// One `<profile>/<sub>` → SSOT link step, with the profile-scoped error
+/// context every provisioning failure carries.
+fn link_step(name: &str, dir: &Path, sub: &str, shared: &Path) -> io::Result<LinkOutcome> {
+    link_dir_to_shared(&dir.join(sub), shared)
+        .map_err(|e| io::Error::new(e.kind(), format!("provision[{name}]: {sub}: {e}")))
+}
+
+/// [`ensure_profile_provisioned`] with both shared SSOTs injected — the
 /// testable seam (mirrors `ProfileMap::default_name_with`). Production passes
-/// `paths::shared_plugins_dir()`; tests pass a tempdir path.
+/// `paths::shared_plugins_dir()`/`paths::session_base_dir()`; tests pass
+/// tempdir paths.
 pub fn ensure_profile_provisioned_with(
     name: &str,
     dir: &Path,
     shared_plugins: &Path,
+    shared_projects: &Path,
 ) -> io::Result<ProvisionReport> {
     // 1. The profile dir itself.
     std::fs::create_dir_all(dir).map_err(|e| {
@@ -185,11 +222,11 @@ pub fn ensure_profile_provisioned_with(
         )
     })?;
 
-    // 2. plugins → shared SSOT.
-    let plugins = link_dir_to_shared(&dir.join("plugins"), shared_plugins)
-        .map_err(|e| io::Error::new(e.kind(), format!("provision[{name}]: plugins: {e}")))?;
+    // 2. plugins → shared SSOT, then projects → shared SSOT.
+    let plugins = link_step(name, dir, "plugins", shared_plugins)?;
+    let projects = link_step(name, dir, "projects", shared_projects)?;
 
-    Ok(ProvisionReport { plugins })
+    Ok(ProvisionReport { plugins, projects })
 }
 
 /// Best-effort provisioning that never propagates an error — for the hot
@@ -352,6 +389,14 @@ mod tests {
         (td, link, shared)
     }
 
+    /// The two shared SSOT paths under `td`: `(plugins, projects)`.
+    fn shared_dirs(td: &tempfile::TempDir) -> (PathBuf, PathBuf) {
+        (
+            td.path().join("shared").join("plugins"),
+            td.path().join("shared").join("projects"),
+        )
+    }
+
     fn is_symlink_to(link: &Path, shared: &Path) -> bool {
         let meta = fs::symlink_metadata(link).unwrap();
         if !meta.file_type().is_symlink() {
@@ -459,85 +504,154 @@ mod tests {
         let td = tempfile::tempdir().unwrap();
         // Profile dir does NOT exist yet — provisioning must create it.
         let dir = td.path().join(".claude.example");
-        let shared = td.path().join("shared").join("plugins");
+        let (shared_plugins, shared_projects) = shared_dirs(&td);
         assert!(!dir.exists());
 
-        let report = ensure_profile_provisioned_with("example", &dir, &shared).unwrap();
+        let report =
+            ensure_profile_provisioned_with("example", &dir, &shared_plugins, &shared_projects)
+                .unwrap();
         assert!(dir.is_dir(), "profile dir must be created");
         assert_eq!(report.plugins, LinkOutcome::Created);
-        assert!(is_symlink_to(&dir.join("plugins"), &shared));
+        assert_eq!(report.projects, LinkOutcome::Created);
+        assert!(is_symlink_to(&dir.join("plugins"), &shared_plugins));
+        assert!(is_symlink_to(&dir.join("projects"), &shared_projects));
+        // Guard against a copy-paste bug linking both subdirs to the same SSOT.
+        assert_ne!(shared_plugins, shared_projects);
     }
 
     #[test]
     fn ensure_profile_is_idempotent() {
         let td = tempfile::tempdir().unwrap();
         let dir = td.path().join(".claude.example");
-        let shared = td.path().join("shared").join("plugins");
-        ensure_profile_provisioned_with("example", &dir, &shared).unwrap();
-        let again = ensure_profile_provisioned_with("example", &dir, &shared).unwrap();
+        let (shared_plugins, shared_projects) = shared_dirs(&td);
+        ensure_profile_provisioned_with("example", &dir, &shared_plugins, &shared_projects)
+            .unwrap();
+        let again =
+            ensure_profile_provisioned_with("example", &dir, &shared_plugins, &shared_projects)
+                .unwrap();
         assert_eq!(again.plugins, LinkOutcome::AlreadyLinked);
+        assert_eq!(again.projects, LinkOutcome::AlreadyLinked);
     }
 
-    #[test]
-    fn diagnose_classifies_each_state() {
+    /// Assert every prior state of the `sub` subdir is classified independently.
+    /// The OTHER subdir is always linked correctly, so `is_healthy()` reflects
+    /// only the axis under test.
+    fn assert_diagnoses_each_state(sub: &str) {
+        let other = if sub == "plugins" {
+            "projects"
+        } else {
+            "plugins"
+        };
         let td = tempfile::tempdir().unwrap();
-        let shared = td.path().join("shared").join("plugins");
-        fs::create_dir_all(&shared).unwrap();
+        let (shared_plugins, shared_projects) = shared_dirs(&td);
+        fs::create_dir_all(&shared_plugins).unwrap();
+        fs::create_dir_all(&shared_projects).unwrap();
+        let shared_for = |s: &str| {
+            if s == "plugins" {
+                shared_plugins.clone()
+            } else {
+                shared_projects.clone()
+            }
+        };
+        let axis = |d: &ProfileDiagnosis, s: &str| {
+            if s == "plugins" {
+                d.plugins.clone()
+            } else {
+                d.projects.clone()
+            }
+        };
+        let link_other = |dir: &Path| {
+            std::os::unix::fs::symlink(shared_for(other), dir.join(other)).unwrap();
+        };
 
-        // Missing: dir exists, no plugins entry.
+        // Missing: dir exists, no entry for `sub`.
         let missing = td.path().join(".claude.missing");
         fs::create_dir_all(&missing).unwrap();
-        let d = diagnose_profile_with(&missing, &shared);
+        link_other(&missing);
+        let d = diagnose_profile_with(&missing, &shared_plugins, &shared_projects);
         assert!(d.dir_exists);
-        assert_eq!(d.plugins, PluginLinkState::Missing);
+        assert_eq!(axis(&d, sub), LinkState::Missing);
         assert!(!d.is_healthy());
 
         // Healthy: correct symlink.
         let ok = td.path().join(".claude.ok");
         fs::create_dir_all(&ok).unwrap();
-        std::os::unix::fs::symlink(&shared, ok.join("plugins")).unwrap();
-        let d = diagnose_profile_with(&ok, &shared);
-        assert_eq!(d.plugins, PluginLinkState::Ok);
+        std::os::unix::fs::symlink(shared_for(sub), ok.join(sub)).unwrap();
+        link_other(&ok);
+        let d = diagnose_profile_with(&ok, &shared_plugins, &shared_projects);
+        assert_eq!(axis(&d, sub), LinkState::Ok);
         assert!(d.is_healthy());
 
-        // RealDir: per-profile plugins dir (the cache-miss cause).
+        // RealDir: per-profile dir (the cache-miss / split-history cause).
         let real = td.path().join(".claude.real");
-        fs::create_dir_all(real.join("plugins")).unwrap();
-        let d = diagnose_profile_with(&real, &shared);
-        assert_eq!(d.plugins, PluginLinkState::RealDir);
+        fs::create_dir_all(real.join(sub)).unwrap();
+        link_other(&real);
+        let d = diagnose_profile_with(&real, &shared_plugins, &shared_projects);
+        assert_eq!(axis(&d, sub), LinkState::RealDir);
         assert!(!d.is_healthy());
 
         // WrongLink: symlink to somewhere else.
         let wrong = td.path().join(".claude.wrong");
         fs::create_dir_all(&wrong).unwrap();
-        let other = td.path().join("other");
-        fs::create_dir_all(&other).unwrap();
-        std::os::unix::fs::symlink(&other, wrong.join("plugins")).unwrap();
-        let d = diagnose_profile_with(&wrong, &shared);
-        assert!(matches!(d.plugins, PluginLinkState::WrongLink(_)));
+        let elsewhere = td.path().join("elsewhere");
+        fs::create_dir_all(&elsewhere).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, wrong.join(sub)).unwrap();
+        link_other(&wrong);
+        let d = diagnose_profile_with(&wrong, &shared_plugins, &shared_projects);
+        assert!(matches!(axis(&d, sub), LinkState::WrongLink(_)));
         assert!(!d.is_healthy());
 
         // Dir absent entirely.
         let gone = td.path().join(".claude.gone");
-        let d = diagnose_profile_with(&gone, &shared);
+        let d = diagnose_profile_with(&gone, &shared_plugins, &shared_projects);
         assert!(!d.dir_exists);
+    }
+
+    #[test]
+    fn diagnose_classifies_each_state_plugins() {
+        assert_diagnoses_each_state("plugins");
+    }
+
+    #[test]
+    fn diagnose_classifies_each_state_projects() {
+        assert_diagnoses_each_state("projects");
+    }
+
+    #[test]
+    fn projects_real_dir_is_unhealthy_even_when_plugins_ok() {
+        let td = tempfile::tempdir().unwrap();
+        let (shared_plugins, shared_projects) = shared_dirs(&td);
+        fs::create_dir_all(&shared_plugins).unwrap();
+        let dir = td.path().join(".claude.real");
+        fs::create_dir_all(&dir).unwrap();
+        std::os::unix::fs::symlink(&shared_plugins, dir.join("plugins")).unwrap();
+        fs::create_dir_all(dir.join("projects")).unwrap();
+
+        let d = diagnose_profile_with(&dir, &shared_plugins, &shared_projects);
+        assert_eq!(d.plugins, LinkState::Ok);
+        assert_eq!(d.projects, LinkState::RealDir);
+        assert!(
+            !d.is_healthy(),
+            "a diverged projects dir must not be masked by a healthy plugins link"
+        );
     }
 
     #[test]
     fn diagnose_then_fix_makes_healthy() {
         let td = tempfile::tempdir().unwrap();
-        let shared = td.path().join("shared").join("plugins");
-        fs::create_dir_all(&shared).unwrap();
+        let (shared_plugins, shared_projects) = shared_dirs(&td);
+        fs::create_dir_all(&shared_plugins).unwrap();
+        fs::create_dir_all(&shared_projects).unwrap();
         let real = td.path().join(".claude.real");
         fs::create_dir_all(real.join("plugins")).unwrap();
+        fs::create_dir_all(real.join("projects")).unwrap();
 
-        assert_eq!(
-            diagnose_profile_with(&real, &shared).plugins,
-            PluginLinkState::RealDir
-        );
-        ensure_profile_provisioned_with("real", &real, &shared).unwrap();
+        let before = diagnose_profile_with(&real, &shared_plugins, &shared_projects);
+        assert_eq!(before.plugins, LinkState::RealDir);
+        assert_eq!(before.projects, LinkState::RealDir);
+        ensure_profile_provisioned_with("real", &real, &shared_plugins, &shared_projects).unwrap();
         assert!(
-            diagnose_profile_with(&real, &shared).is_healthy(),
+            diagnose_profile_with(&real, &shared_plugins, &shared_projects).is_healthy(),
             "fix must make the profile healthy"
         );
     }
@@ -545,16 +659,22 @@ mod tests {
     #[test]
     fn two_profiles_share_one_ssot() {
         let td = tempfile::tempdir().unwrap();
-        let shared = td.path().join("shared").join("plugins");
+        let (shared_plugins, shared_projects) = shared_dirs(&td);
         let a = td.path().join(".claude.a");
         let b = td.path().join(".claude.b");
-        ensure_profile_provisioned_with("a", &a, &shared).unwrap();
-        ensure_profile_provisioned_with("b", &b, &shared).unwrap();
-        // A file written through profile a's link is visible through profile b's.
+        ensure_profile_provisioned_with("a", &a, &shared_plugins, &shared_projects).unwrap();
+        ensure_profile_provisioned_with("b", &b, &shared_plugins, &shared_projects).unwrap();
+        // A file written through profile a's link is visible through profile b's,
+        // for both the plugins SSOT and the projects SSOT.
         fs::write(a.join("plugins").join("shared.json"), b"{}").unwrap();
         assert!(
             b.join("plugins").join("shared.json").exists(),
-            "both profiles must see the same SSOT"
+            "both profiles must see the same plugins SSOT"
+        );
+        fs::write(a.join("projects").join("transcript.json"), b"{}").unwrap();
+        assert!(
+            b.join("projects").join("transcript.json").exists(),
+            "both profiles must see the same projects SSOT"
         );
     }
 }

@@ -58,10 +58,11 @@ It is consumed by the **private** `dave-environment` Ansible repo (the operator'
   path for the weekly and model-scoped caps. Sidecar
   store, OS launch/relaunch/proc checks, statusline, canonical state paths.
 - `src/provision.rs` — profile provisioning SSOT: `ensure_profile_provisioned`
-  (dir + `plugins/` → `~/.claude.shared/plugins` symlink) and the read-only
-  `diagnose_profile` core behind `csm profiles doctor`. Called implicitly on
-  every launch/switch/register so csm maintains its own invariants; explicit
-  via `bootstrap`/`doctor`. Unix-only symlink (non-unix = OS-side junction).
+  (dir + `plugins/` → `~/.claude.shared/plugins` symlink + `projects/` →
+  `~/.claude.shared/projects` symlink) and the read-only `diagnose_profile`
+  core behind `csm profiles doctor`. Called implicitly on every
+  launch/switch/register so csm maintains its own invariants; explicit via
+  `bootstrap`/`doctor`. Unix-only symlink (non-unix = OS-side junction).
 - `tests/no_private_names.rs` — CI leak guard (recursively greps `src/`).
 - `.github/workflows/release-please.yml` — CI. (Design specs live in the private
   `dave-environment` repo, not here.)
