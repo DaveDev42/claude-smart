@@ -192,6 +192,25 @@ pub fn is_viable_pcts(
     true
 }
 
+/// The binding weekly reset epoch: the LATER of `week_all`'s and `week_fable`'s
+/// (a viable account is under neither cap but is only fully fresh once BOTH
+/// windows roll over). `i64::MAX` when neither is known, so a known reset
+/// always beats an unknown one.
+///
+/// Shared by [`pick_best_at`]'s ranking and `main::account_row_rank` (the
+/// stale-usage picker's rank), which resolve their `week_all`/`week_fable`
+/// epochs from different sources (`UsageSection::reset_instant` vs. the
+/// picker's cached `resets_at`/`resets` fields) but must apply the same
+/// later-of rule once resolved.
+pub fn effective_reset_epoch(week_all: Option<i64>, week_fable: Option<i64>) -> i64 {
+    match (week_all, week_fable) {
+        (Some(a), Some(f)) => a.max(f),
+        (Some(a), None) => a,
+        (None, Some(f)) => f,
+        (None, None) => i64::MAX,
+    }
+}
+
 // ─── public error + result types ─────────────────────────────────────────────
 
 /// Errors that `pick_best` can return.
@@ -399,12 +418,7 @@ pub fn pick_best_at(
             .week_fable
             .and_then(|s| s.reset_instant(now))
             .map(|dt| dt.timestamp());
-        let epoch: i64 = match (week_all_epoch, week_fable_epoch) {
-            (Some(a), Some(f)) => a.max(f),
-            (Some(a), None) => a,
-            (None, Some(f)) => f,
-            (None, None) => i64::MAX,
-        };
+        let epoch = effective_reset_epoch(week_all_epoch, week_fable_epoch);
         let key = (epoch, -c.week_pct);
 
         if best_name.is_none() || key < best_key {

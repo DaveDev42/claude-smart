@@ -768,7 +768,7 @@ fn account_row_rank(
     data: &picker::account::StaleProfileData,
     now: chrono::DateTime<chrono::Utc>,
 ) -> (u8, i64, i64, String) {
-    use account::scoring::{is_viable_pcts, ABSENT_SESSION_PCT};
+    use account::scoring::{effective_reset_epoch, is_viable_pcts, ABSENT_SESSION_PCT};
 
     let session_pct = data.session_pct.unwrap_or(ABSENT_SESSION_PCT);
     let viable = data.error.is_none()
@@ -798,12 +798,7 @@ fn account_row_rank(
             .map(|dt| dt.timestamp())
     });
     let week_fable_epoch = data.week_fable_resets_at;
-    let epoch = match (week_all_epoch, week_fable_epoch) {
-        (Some(a), Some(f)) => a.max(f),
-        (Some(a), None) => a,
-        (None, Some(f)) => f,
-        (None, None) => i64::MAX,
-    };
+    let epoch = effective_reset_epoch(week_all_epoch, week_fable_epoch);
     (0, epoch, -week_pct, name.to_owned())
 }
 
