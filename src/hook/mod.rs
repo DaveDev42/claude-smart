@@ -229,3 +229,350 @@ pub fn run_from_statusline(raw: &str, capture: &crate::usage::local::StatuslineC
         }
     }
 }
+
+// ─── tests ────────────────────────────────────────────────────────────────────
+//
+// `run` and `run_from_statusline` are the two process entry points; every
+// other test in this crate exercises the pure decision core
+// (`detect::classify_with`) directly. These tests instead drive the entry
+// points themselves, through the real env-var seams (`HOME` for
+// `paths::smart_dir()`, `CSM_USAGE_CMD` for the target-pick, and
+// `CLAUDE_SMART_CLAUDE_BIN` for the managed-session PID check), so a
+// regression in the glue between `classify_with` and its callers (the claim/
+// release ordering, the log-line `via` suffix, the early-return guards) shows
+// up here even though each piece it calls is separately unit-tested.
+//
+// No `actions_for(decision) -> Vec<Action>` unification: `run` and
+// `run_from_statusline` have materially different, ordering-sensitive
+// sequences (`claim_switched`/release-on-failure exists only in the
+// statusline path), so each gets its own direct coverage instead.
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::testenv::CLAUDE_CONFIG_DIR_ENV_LOCK as ENV_LOCK;
+    use crate::usage::local::StatuslineCapture;
+    use crate::usage::model::{ProfileUsage, UsageData, UsageSection};
+    use std::collections::HashMap;
+    use std::process::{Child, Command};
+
+    /// Everything one test needs torn down: restores `HOME`/`CSM_USAGE_CMD`/
+    /// `CLAUDE_SMART_CLAUDE_BIN` and kills the fake managed process (if any)
+    /// on drop, so a panicking assertion never leaks state into the next
+    /// test even though `ENV_LOCK`'s guard is dropped right along with it.
+    struct EnvFixture {
+        home: tempfile::TempDir,
+        prev_home: Option<std::ffi::OsString>,
+        prev_usage_cmd: Option<std::ffi::OsString>,
+        prev_launch_bin: Option<std::ffi::OsString>,
+        fake_proc: Option<Child>,
+    }
+
+    impl Drop for EnvFixture {
+        fn drop(&mut self) {
+            if let Some(mut child) = self.fake_proc.take() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+            match self.prev_home.take() {
+                Some(v) => std::env::set_var("HOME", v),
+                None => std::env::remove_var("HOME"),
+            }
+            match self.prev_usage_cmd.take() {
+                Some(v) => std::env::set_var("CSM_USAGE_CMD", v),
+                None => std::env::remove_var("CSM_USAGE_CMD"),
+            }
+            match self.prev_launch_bin.take() {
+                Some(v) => std::env::set_var("CLAUDE_SMART_CLAUDE_BIN", v),
+                None => std::env::remove_var("CLAUDE_SMART_CLAUDE_BIN"),
+            }
+        }
+    }
+
+    /// Point `HOME` (and so `paths::smart_dir()`) at a fresh temp dir, and
+    /// wire `CSM_USAGE_CMD` to hand `usage::fetch()` the given `UsageData`
+    /// verbatim (via `cat <tmpfile>`) instead of touching any real profile.
+    /// Caller must hold `ENV_LOCK` for the fixture's whole lifetime.
+    fn isolated_env(usage: &UsageData) -> EnvFixture {
+        let home = tempfile::tempdir().expect("tempdir");
+        let usage_json = serde_json::to_string(usage).expect("serialize UsageData");
+        let usage_file = home.path().join("usage-cmd.json");
+        std::fs::write(&usage_file, &usage_json).expect("write usage fixture");
+
+        let prev_home = std::env::var_os("HOME");
+        let prev_usage_cmd = std::env::var_os("CSM_USAGE_CMD");
+        let prev_launch_bin = std::env::var_os("CLAUDE_SMART_CLAUDE_BIN");
+
+        std::env::set_var("HOME", home.path());
+        std::env::set_var("CSM_USAGE_CMD", format!("cat {}", usage_file.display()));
+        std::env::remove_var("CLAUDE_SMART_CLAUDE_BIN");
+
+        EnvFixture {
+            home,
+            prev_home,
+            prev_usage_cmd,
+            prev_launch_bin,
+            fake_proc: None,
+        }
+    }
+
+    /// A `UsageData` with one viable target profile ("healthy", week_all 10%)
+    /// and no entry for the current profile at all — `pick_target` excludes
+    /// the current profile by name regardless, so its absence here is
+    /// equivalent to "saturated" for the purpose of these tests.
+    fn usage_with_one_viable_target() -> UsageData {
+        let mut profiles = HashMap::new();
+        profiles.insert(
+            "healthy".to_string(),
+            ProfileUsage {
+                week_all: Some(UsageSection {
+                    pct: 10,
+                    resets: None,
+                    resets_at: None,
+                }),
+                ..Default::default()
+            },
+        );
+        UsageData {
+            captured_at: None,
+            profiles,
+            errors: None,
+            ..Default::default()
+        }
+    }
+
+    /// A `UsageData` with no viable candidates at all (empty profile map) —
+    /// `pick_target` returns `None` regardless of the current profile.
+    fn usage_with_no_viable_target() -> UsageData {
+        UsageData {
+            captured_at: None,
+            profiles: HashMap::new(),
+            errors: None,
+            ..Default::default()
+        }
+    }
+
+    /// A `StatuslineCapture` whose merged reading trips `statusline_limit`
+    /// (week_all at/above `CLAUDE_LIMIT_PCT`) for `profile_dir`.
+    fn capped_capture(profile_dir: &str) -> StatuslineCapture {
+        StatuslineCapture {
+            profile_dir: profile_dir.to_string(),
+            usage: ProfileUsage {
+                week_all: Some(UsageSection {
+                    pct: 100,
+                    resets: None,
+                    resets_at: None,
+                }),
+                ..Default::default()
+            },
+        }
+    }
+
+    /// A `StatuslineCapture` whose reading is healthy on every dimension —
+    /// `statusline_limit` must return `None` for it.
+    fn healthy_capture(profile_dir: &str) -> StatuslineCapture {
+        StatuslineCapture {
+            profile_dir: profile_dir.to_string(),
+            usage: ProfileUsage {
+                session: Some(UsageSection {
+                    pct: 21,
+                    resets: None,
+                    resets_at: None,
+                }),
+                week_all: Some(UsageSection {
+                    pct: 40,
+                    resets: None,
+                    resets_at: None,
+                }),
+                ..Default::default()
+            },
+        }
+    }
+
+    /// Spawn a real, harmless `sleep` process and register it (via
+    /// `CLAUDE_SMART_CLAUDE_BIN=sleep`) as "managed" so `managed_session`'s
+    /// live-process check passes without needing an actual `claude`/`node`
+    /// binary on the test host. Writes `<sid>.pid` under `home`'s smart_dir
+    /// and stores the child on `fixture` so it is reaped on drop.
+    fn spawn_fake_managed_process(fixture: &mut EnvFixture, sid: &str) {
+        std::env::set_var("CLAUDE_SMART_CLAUDE_BIN", "sleep");
+        let child = Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn fake managed process");
+        let pid = child.pid();
+        fixture.fake_proc = Some(child);
+
+        let smart_dir = fixture.home.path().join(".claude.shared").join("smart");
+        std::fs::create_dir_all(&smart_dir).expect("create smart_dir");
+        std::fs::write(smart_dir.join(format!("{sid}.pid")), format!("{pid} 1000"))
+            .expect("write pid file");
+    }
+
+    trait ChildPid {
+        fn pid(&self) -> u32;
+    }
+    impl ChildPid for Child {
+        fn pid(&self) -> u32 {
+            std::process::Child::id(self)
+        }
+    }
+
+    // ── run_from_statusline: early-return guards ──────────────────────────────
+
+    #[test]
+    fn run_from_statusline_skips_when_statusline_limit_is_none() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let fixture = isolated_env(&usage_with_no_viable_target());
+        let capture = healthy_capture("/Users/example/.claude.home");
+
+        run_from_statusline(r#"{"session_id": "sid-healthy-0001"}"#, &capture);
+
+        // Nothing should have touched smart_dir at all — the function must
+        // return before any I/O when the merged reading is under threshold.
+        assert!(
+            !fixture
+                .home
+                .path()
+                .join(".claude.shared")
+                .join("smart")
+                .exists(),
+            "smart_dir must not be created when statusline_limit is None"
+        );
+    }
+
+    #[test]
+    fn run_from_statusline_skips_on_unparseable_raw() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let fixture = isolated_env(&usage_with_no_viable_target());
+        let capture = capped_capture("/Users/example/.claude.home");
+
+        run_from_statusline("{not json", &capture);
+
+        assert!(
+            !fixture
+                .home
+                .path()
+                .join(".claude.shared")
+                .join("smart")
+                .exists(),
+            "smart_dir must not be created when raw stdin fails to parse"
+        );
+    }
+
+    #[test]
+    fn run_from_statusline_skips_on_missing_session_id() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let fixture = isolated_env(&usage_with_no_viable_target());
+        let capture = capped_capture("/Users/example/.claude.home");
+
+        // Valid JSON, but no "session_id" key at all.
+        run_from_statusline(r#"{"cwd": "/Users/example/Projects/foo"}"#, &capture);
+
+        assert!(
+            !fixture
+                .home
+                .path()
+                .join(".claude.shared")
+                .join("smart")
+                .exists(),
+            "smart_dir must not be created when session_id is missing"
+        );
+    }
+
+    // ── run_from_statusline: NotifyOnly logs exactly once, via=statusline ─────
+
+    #[test]
+    fn run_from_statusline_notify_only_appends_one_log_line_with_via_suffix() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let fixture = isolated_env(&usage_with_no_viable_target());
+        let capture = capped_capture("/Users/example/.claude.limited");
+        let sid = "sid-notify-only-0001";
+
+        run_from_statusline(
+            &format!(r#"{{"session_id": "{sid}", "cwd": "/tmp/proj"}}"#),
+            &capture,
+        );
+
+        let log_path = fixture
+            .home
+            .path()
+            .join(".claude.shared")
+            .join("smart")
+            .join("limit-switch.log");
+        let content = std::fs::read_to_string(&log_path).expect("limit-switch.log written");
+        let lines: Vec<&str> = content.lines().collect();
+        assert_eq!(lines.len(), 1, "expected exactly one log line: {content:?}");
+        assert!(lines[0].contains("notify-only"), "line: {}", lines[0]);
+        assert!(
+            lines[0].contains(&format!("sid={}", sid_short(sid))),
+            "line: {}",
+            lines[0]
+        );
+        assert!(lines[0].contains("via=statusline"), "line: {}", lines[0]);
+    }
+
+    // ── run_from_statusline: claim/release around commit_and_stop ─────────────
+
+    #[test]
+    fn run_from_statusline_releases_claim_on_commit_failure() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let mut fixture = isolated_env(&usage_with_one_viable_target());
+        let sid = "sid-commit-fails-0001";
+        spawn_fake_managed_process(&mut fixture, sid);
+
+        // Force `commit_and_stop`'s `write_relaunch` step to fail: pre-create
+        // its target path as a directory, so the atomic tmp+rename onto it
+        // errors instead of replacing a file.
+        let relaunch_dir = fixture
+            .home
+            .path()
+            .join(".claude.shared")
+            .join("smart")
+            .join(format!("{sid}.relaunch"));
+        std::fs::create_dir_all(&relaunch_dir).expect("pre-create .relaunch as a directory");
+
+        let capture = capped_capture("/Users/example/.claude.limited");
+        run_from_statusline(
+            &format!(r#"{{"session_id": "{sid}", "cwd": "/tmp/proj"}}"#),
+            &capture,
+        );
+
+        let switched_path = fixture
+            .home
+            .path()
+            .join(".claude.shared")
+            .join("smart")
+            .join(format!("{sid}.switched"));
+        assert!(
+            !switched_path.exists(),
+            "a failed commit must release the .switched claim so the next tick retries"
+        );
+    }
+
+    // ── run: the hook contract's silent exit 0 ─────────────────────────────────
+
+    #[test]
+    fn run_exits_ok_without_session_id() {
+        // `run` reads real stdin via `detect::parse_stdin()`. Under `cargo
+        // test` stdin is not a live hook payload, so it reads to EOF as
+        // empty/blank input, which parses to an all-`None` `HookInput` —
+        // exactly the "no session_id" case the hook contract requires to
+        // exit 0 silently, with no smart_dir I/O at all.
+        let _guard = ENV_LOCK.lock().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let prev_home = std::env::var_os("HOME");
+        std::env::set_var("HOME", home.path());
+
+        let result = run(Path::new("/Users/example/.claude.home"));
+
+        match prev_home {
+            Some(v) => std::env::set_var("HOME", v),
+            None => std::env::remove_var("HOME"),
+        }
+
+        assert!(
+            result.is_ok(),
+            "hook contract: missing session_id exits Ok(())"
+        );
+    }
+}
