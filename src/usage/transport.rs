@@ -51,6 +51,8 @@
 //!    instead of re-paying a full probe round (keychain read + OAuth call
 //!    per profile) on every launch.
 
+use std::path::Path;
+
 use chrono::Utc;
 
 use super::model::UsageData;
@@ -152,10 +154,7 @@ pub fn fetch_with(force: bool, refresh_oauth: bool) -> Result<UsageData, FetchEr
     // Total failure: every configured profile produced an error and none
     // produced usable data. An empty registry (zero profiles, zero errors)
     // is NOT a failure — it is a legitimate, if empty, result.
-    let total_failure =
-        data.profiles.is_empty() && data.errors.as_ref().is_some_and(|e| !e.is_empty());
-
-    if total_failure {
+    if is_total_failure(&data) {
         stamp_negative_cache();
         return Err(FetchError::EmptyPayload);
     }
@@ -170,7 +169,7 @@ pub fn fetch_with(force: bool, refresh_oauth: bool) -> Result<UsageData, FetchEr
     // on every launch of an offline/all-expired-tokens machine — the current
     // call still returns `Ok` below, since the stale data is legitimate to
     // serve right now.
-    if data.any_probe_attempted && !data.any_probe_succeeded {
+    if is_live_probe_all_failed(&data) {
         stamp_negative_cache();
     } else {
         let _ = std::fs::remove_file(paths::fetch_failed());
@@ -182,6 +181,24 @@ pub fn fetch_with(force: bool, refresh_oauth: bool) -> Result<UsageData, FetchEr
         eprintln!("csm: warning: could not write usage cache: {e}");
     }
     Ok(data)
+}
+
+// ─── named failure predicates (pure, used by fetch_with's steps 6/6a) ────────
+
+/// True when local collection produced no usable data for any profile while
+/// at least one profile errored — every configured profile failed. An empty
+/// registry (zero profiles, zero errors) is NOT total failure; see the
+/// module doc, step 6.
+fn is_total_failure(data: &UsageData) -> bool {
+    data.profiles.is_empty() && data.errors.as_ref().is_some_and(|e| !e.is_empty())
+}
+
+/// True when at least one profile's live probe was attempted this round and
+/// none of them succeeded. `data.profiles` can still be non-empty here —
+/// purely from `ServeStale` fallbacks — which is exactly why this is a
+/// separate predicate from [`is_total_failure`]; see the module doc, step 6a.
+fn is_live_probe_all_failed(data: &UsageData) -> bool {
+    data.any_probe_attempted && !data.any_probe_succeeded
 }
 
 // ─── user-supplied usage command (CSM_USAGE_CMD) ──────────────────────────────
@@ -329,13 +346,18 @@ fn positive_ttl_secs() -> u64 {
 /// mtime is less than `ttl_secs` old; `Ok(None)` if absent/stale; `Err` on
 /// parse failure of a fresh file.
 fn try_positive_cache(ttl_secs: u64) -> Result<Option<UsageData>, FetchError> {
-    let path = paths::usage_cache();
+    try_positive_cache_at(&paths::usage_cache(), ttl_secs)
+}
+
+/// Path-injected core of [`try_positive_cache`] — the testable seam (same
+/// pattern as `usage/local/store.rs` and `provision.rs`).
+fn try_positive_cache_at(path: &Path, ttl_secs: u64) -> Result<Option<UsageData>, FetchError> {
     if !path.exists() {
         return Ok(None);
     }
 
     // Non-zero size check.
-    let meta = std::fs::metadata(&path)?;
+    let meta = std::fs::metadata(path)?;
     if meta.len() == 0 {
         return Ok(None);
     }
@@ -346,7 +368,7 @@ fn try_positive_cache(ttl_secs: u64) -> Result<Option<UsageData>, FetchError> {
     }
 
     // Fresh — parse and return.
-    let raw = std::fs::read_to_string(&path)?;
+    let raw = std::fs::read_to_string(path)?;
     let data: UsageData = serde_json::from_str(&raw)?;
     Ok(Some(data))
 }
@@ -367,11 +389,16 @@ fn negative_cooldown_secs() -> u64 {
 /// [`stamp_negative_cache`], which writes the same epoch as content); falls
 /// back to `0` (i.e. "definitely expired") on any parse failure.
 fn negative_cache_active(cooldown_secs: u64) -> bool {
-    let path = paths::fetch_failed();
+    negative_cache_active_at(&paths::fetch_failed(), cooldown_secs)
+}
+
+/// Path-injected core of [`negative_cache_active`] — the testable seam (same
+/// pattern as `usage/local/store.rs` and `provision.rs`).
+fn negative_cache_active_at(path: &Path, cooldown_secs: u64) -> bool {
     if !path.exists() {
         return false;
     }
-    let content = std::fs::read_to_string(&path).unwrap_or_default();
+    let content = std::fs::read_to_string(path).unwrap_or_default();
     let last_epoch: u64 = content.trim().parse().unwrap_or(0);
     let now_epoch = unix_now_secs();
     let age = now_epoch.saturating_sub(last_epoch);
@@ -385,13 +412,18 @@ fn negative_cache_active(cooldown_secs: u64) -> bool {
 /// repeat probes (each of which is a keychain read + a live API call per
 /// profile). Best-effort; ignore errors.
 fn stamp_negative_cache() {
-    let path = paths::fetch_failed();
+    stamp_negative_cache_at(&paths::fetch_failed());
+}
+
+/// Path-injected core of [`stamp_negative_cache`] — the testable seam (same
+/// pattern as `usage/local/store.rs` and `provision.rs`).
+fn stamp_negative_cache_at(path: &Path) {
     // Ensure the parent directory exists.
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
     let epoch = unix_now_secs();
-    let _ = std::fs::write(&path, epoch.to_string());
+    let _ = std::fs::write(path, epoch.to_string());
 }
 
 // ─── cache write ─────────────────────────────────────────────────────────────
@@ -403,10 +435,13 @@ fn stamp_negative_cache() {
 /// (from the cache, the user command, or local collection) above, so
 /// serialization here is just re-encoding the same data.
 fn write_positive_cache(data: &UsageData) -> Result<(), FetchError> {
-    let cache_path = paths::usage_cache();
-    let parent = cache_path
-        .parent()
-        .unwrap_or_else(|| std::path::Path::new("."));
+    write_positive_cache_at(&paths::usage_cache(), data)
+}
+
+/// Path-injected core of [`write_positive_cache`] — the testable seam (same
+/// pattern as `usage/local/store.rs` and `provision.rs`).
+fn write_positive_cache_at(cache_path: &Path, data: &UsageData) -> Result<(), FetchError> {
+    let parent = cache_path.parent().unwrap_or_else(|| Path::new("."));
     std::fs::create_dir_all(parent)?;
 
     // Write to a temp file in the same directory (same FS = atomic rename).
@@ -416,7 +451,7 @@ fn write_positive_cache(data: &UsageData) -> Result<(), FetchError> {
     std::fs::write(&tmp_path, &json_bytes)?;
 
     // Atomic rename (mv -f).
-    if let Err(e) = std::fs::rename(&tmp_path, &cache_path) {
+    if let Err(e) = std::fs::rename(&tmp_path, cache_path) {
         let _ = std::fs::remove_file(&tmp_path);
         return Err(FetchError::Io(e));
     }
@@ -606,49 +641,59 @@ mod tests {
             !non_existent.exists(),
             "precondition: file should not exist"
         );
-        let active = if !non_existent.exists() {
-            false
-        } else {
-            true // would read content
-        };
-        assert!(!active);
+        assert!(!negative_cache_active_at(non_existent, 120));
     }
 
     #[test]
     fn negative_cache_content_based_epoch_within_cooldown() {
-        // Simulate the content-based logic: stamp = now - 30s → still within
-        // 120s cooldown.
-        let now = unix_now_secs();
-        let stamp = now.saturating_sub(30);
-        let content = stamp.to_string();
+        // Stamp = now - 30s → still within 120s cooldown.
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join(".usage-fetch-failed");
+        let stamp = unix_now_secs().saturating_sub(30);
+        fs::write(&path, stamp.to_string()).unwrap();
 
-        let last_epoch: u64 = content.trim().parse().unwrap_or(0);
-        let age = now.saturating_sub(last_epoch);
-        assert!(age < 120, "30s old stamp should be within 120s cooldown");
+        assert!(
+            negative_cache_active_at(&path, 120),
+            "30s old stamp should be within 120s cooldown"
+        );
     }
 
     #[test]
     fn negative_cache_content_based_epoch_beyond_cooldown() {
         // Stamp = now - 200s → beyond 120s cooldown.
-        let now = unix_now_secs();
-        let stamp = now.saturating_sub(200);
-        let last_epoch: u64 = stamp.to_string().trim().parse().unwrap_or(0);
-        let age = now.saturating_sub(last_epoch);
-        assert!(age >= 120, "200s old stamp should be beyond 120s cooldown");
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join(".usage-fetch-failed");
+        let stamp = unix_now_secs().saturating_sub(200);
+        fs::write(&path, stamp.to_string()).unwrap();
+
+        assert!(
+            !negative_cache_active_at(&path, 120),
+            "200s old stamp should be beyond 120s cooldown"
+        );
     }
 
     #[test]
     fn negative_cache_empty_content_treated_as_zero() {
-        let content = "";
-        let last_epoch: u64 = content.trim().parse().unwrap_or(0);
-        assert_eq!(last_epoch, 0, "empty content should parse as 0");
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join(".usage-fetch-failed");
+        fs::write(&path, "").unwrap();
+
+        assert!(
+            !negative_cache_active_at(&path, 120),
+            "empty content should parse as epoch 0, far beyond any cooldown"
+        );
     }
 
     #[test]
     fn negative_cache_non_numeric_content_treated_as_zero() {
-        let content = "not-a-number";
-        let last_epoch: u64 = content.trim().parse().unwrap_or(0);
-        assert_eq!(last_epoch, 0, "non-numeric content should parse as 0");
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join(".usage-fetch-failed");
+        fs::write(&path, "not-a-number").unwrap();
+
+        assert!(
+            !negative_cache_active_at(&path, 120),
+            "non-numeric content should parse as epoch 0, far beyond any cooldown"
+        );
     }
 
     #[test]
@@ -657,32 +702,26 @@ mod tests {
         // correctly identifies it as active.
         let dir = TempDir::new().unwrap();
         let fail_path = dir.path().join(".usage-fetch-failed");
-
-        let now = unix_now_secs();
-        // Stamp = now - 10s (within 120s cooldown).
-        let stamp = now.saturating_sub(10);
+        let stamp = unix_now_secs().saturating_sub(10);
         fs::write(&fail_path, stamp.to_string()).unwrap();
 
-        let content = fs::read_to_string(&fail_path).unwrap();
-        let last_epoch: u64 = content.trim().parse().unwrap_or(0);
-        let age = now.saturating_sub(last_epoch);
-        assert!(age < 120, "10s old stamp should be within 120s cooldown");
+        assert!(
+            negative_cache_active_at(&fail_path, 120),
+            "10s old stamp should be within 120s cooldown"
+        );
     }
 
     #[test]
     fn negative_cache_roundtrip_expired_stamp() {
         let dir = TempDir::new().unwrap();
         let fail_path = dir.path().join(".usage-fetch-failed");
-
-        let now = unix_now_secs();
-        // Stamp = now - 150s (beyond 120s cooldown).
-        let stamp = now.saturating_sub(150);
+        let stamp = unix_now_secs().saturating_sub(150);
         fs::write(&fail_path, stamp.to_string()).unwrap();
 
-        let content = fs::read_to_string(&fail_path).unwrap();
-        let last_epoch: u64 = content.trim().parse().unwrap_or(0);
-        let age = now.saturating_sub(last_epoch);
-        assert!(age >= 120, "150s old stamp should be beyond 120s cooldown");
+        assert!(
+            !negative_cache_active_at(&fail_path, 120),
+            "150s old stamp should be beyond 120s cooldown"
+        );
     }
 
     // ── positive TTL cache (mtime-based) ──────────────────────────────────────
@@ -695,9 +734,11 @@ mod tests {
         let cache = dir.path().join(".usage-cache.json");
         fs::write(&cache, VALID_USAGE_JSON).unwrap();
 
-        let meta = fs::metadata(&cache).unwrap();
-        let age = file_age_secs_from_meta(&meta);
-        assert!(age < 5, "just-written file should have age < 5s, got {age}");
+        let result = try_positive_cache_at(&cache, 60);
+        assert!(
+            matches!(result, Ok(Some(_))),
+            "just-written file should be fresh for a 60s TTL, got {result:?}"
+        );
     }
 
     #[test]
@@ -708,11 +749,10 @@ mod tests {
         // Write a file dated 90 seconds ago — stale for the 60s TTL.
         write_aged_file(&cache, VALID_USAGE_JSON, 90);
 
-        let meta = fs::metadata(&cache).unwrap();
-        let age = file_age_secs_from_meta(&meta);
+        let result = try_positive_cache_at(&cache, 60);
         assert!(
-            age >= 60,
-            "file aged 90s should have age >= 60s (TTL), got {age}"
+            matches!(result, Ok(None)),
+            "file aged 90s should be stale for a 60s TTL, got {result:?}"
         );
     }
 
@@ -724,11 +764,10 @@ mod tests {
         // Write a file dated 30 seconds ago — fresh for the 60s TTL.
         write_aged_file(&cache, VALID_USAGE_JSON, 30);
 
-        let meta = fs::metadata(&cache).unwrap();
-        let age = file_age_secs_from_meta(&meta);
+        let result = try_positive_cache_at(&cache, 60);
         assert!(
-            age < 60,
-            "file aged 30s should have age < 60s (TTL), got {age}"
+            matches!(result, Ok(Some(_))),
+            "file aged 30s should be fresh for a 60s TTL, got {result:?}"
         );
     }
 
@@ -758,18 +797,16 @@ mod tests {
     fn write_positive_cache_writes_valid_json_atomically() {
         let dir = TempDir::new().unwrap();
         let cache_path = dir.path().join(".usage-cache.json");
-
-        // Override paths::usage_cache() is not possible without injection,
-        // but we can test the atomic-write logic directly.
         let data: UsageData = serde_json::from_str(VALID_USAGE_JSON).unwrap();
-        let json_bytes = serde_json::to_vec(&data).unwrap();
 
-        let tmp_path = dir.path().join(".usage-cache.json.testpid");
-        fs::write(&tmp_path, &json_bytes).unwrap();
-        fs::rename(&tmp_path, &cache_path).unwrap();
+        write_positive_cache_at(&cache_path, &data)
+            .expect("write_positive_cache_at should succeed");
 
-        // Verify the final file is valid.
+        // Verify the final file is valid and the temp file is gone.
         assert!(cache_path.exists(), "cache file should exist after write");
+        let tmp_path = dir
+            .path()
+            .join(format!(".usage-cache.json.{}", std::process::id()));
         assert!(!tmp_path.exists(), "tmp file should not exist after rename");
 
         let on_disk = fs::read_to_string(&cache_path).unwrap();
@@ -795,15 +832,11 @@ mod tests {
 
     #[test]
     fn stamp_and_read_negative_cache_via_tempdir() {
-        // We can't override global paths in tests, but we can test the
-        // stamp_negative_cache content-format assumption: content == epoch string.
         let now_before = unix_now_secs();
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("fail");
 
-        // Simulate what stamp_negative_cache does.
-        let epoch = unix_now_secs();
-        fs::write(&path, epoch.to_string()).unwrap();
+        stamp_negative_cache_at(&path);
         let now_after = unix_now_secs();
 
         let content = fs::read_to_string(&path).unwrap();
@@ -1110,9 +1143,7 @@ mod tests {
             errors: Some(errors),
             ..Default::default()
         };
-        let total_failure =
-            data.profiles.is_empty() && data.errors.as_ref().is_some_and(|e| !e.is_empty());
-        assert!(total_failure);
+        assert!(is_total_failure(&data));
     }
 
     #[test]
@@ -1125,9 +1156,7 @@ mod tests {
             errors: None,
             ..Default::default()
         };
-        let total_failure =
-            data.profiles.is_empty() && data.errors.as_ref().is_some_and(|e| !e.is_empty());
-        assert!(!total_failure);
+        assert!(!is_total_failure(&data));
     }
 
     #[test]
@@ -1142,9 +1171,10 @@ mod tests {
             errors: Some(errors),
             ..Default::default()
         };
-        let total_failure =
-            data.profiles.is_empty() && data.errors.as_ref().is_some_and(|e| !e.is_empty());
-        assert!(!total_failure, "one good profile is a partial success");
+        assert!(
+            !is_total_failure(&data),
+            "one good profile is a partial success"
+        );
     }
 
     // ── fetch_with live-probe-all-failed classification (pure, no I/O) ───────
@@ -1170,14 +1200,12 @@ mod tests {
             any_probe_succeeded: false,
             ..Default::default()
         };
-        let total_failure =
-            data.profiles.is_empty() && data.errors.as_ref().is_some_and(|e| !e.is_empty());
         assert!(
-            !total_failure,
+            !is_total_failure(&data),
             "ServeStale populating `profiles` must not itself read as total failure"
         );
         assert!(
-            data.any_probe_attempted && !data.any_probe_succeeded,
+            is_live_probe_all_failed(&data),
             "but the cooldown predicate must still catch it"
         );
     }
@@ -1193,7 +1221,7 @@ mod tests {
             ..Default::default()
         };
         assert!(
-            !(data.any_probe_attempted && !data.any_probe_succeeded),
+            !is_live_probe_all_failed(&data),
             "one successful live probe must not stamp the cooldown"
         );
     }
@@ -1211,7 +1239,7 @@ mod tests {
             any_probe_succeeded: false,
             ..Default::default()
         };
-        assert!(!(data.any_probe_attempted && !data.any_probe_succeeded));
+        assert!(!is_live_probe_all_failed(&data));
     }
 
     // ── fetch_with: negative cooldown must not block a forced refresh ────────
