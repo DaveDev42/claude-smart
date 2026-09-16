@@ -530,4 +530,38 @@ mod tests {
     fn hop_cap_constant() {
         assert_eq!(MAX_HOPS, 1, "MAX_HOPS must match legacy zsh MAX_HOPS=1");
     }
+
+    /// Cross-format contract: `Sidecar.hop` is written as a JSON STRING (source
+    /// site: `merge_sidecar_hop` in `hook/stop.rs`, mirroring the legacy zsh
+    /// `jq --arg` sidecar writer) while `RelaunchSentinel.hop` is written as a
+    /// JSON NUMBER (source site: this struct's `pub hop: i64` field, matching
+    /// the legacy zsh `write_relaunch` `jq --argjson` writer). Owner decision:
+    /// the `.relaunch` number-vs-string read tolerance stays — this test pins
+    /// what is *written*, not what is accepted on read.
+    #[test]
+    fn sidecar_hop_is_string_relaunch_hop_is_number() {
+        let sidecar = crate::sidecar::Sidecar {
+            hop: Some(serde_json::Value::String("2".to_string())),
+            ..Default::default()
+        };
+        let sidecar_json = serde_json::to_value(&sidecar).unwrap();
+        assert!(
+            sidecar_json["hop"].is_string(),
+            "sidecar hop must serialize as a JSON string, got {sidecar_json}"
+        );
+
+        let sentinel = RelaunchSentinel {
+            session_id: "abc123".to_string(),
+            target_profile: "home".to_string(),
+            cwd: "/home/you/projects".to_string(),
+            handoff: "resume".to_string(),
+            hop: 2,
+            born: 1,
+        };
+        let sentinel_json = serde_json::to_value(&sentinel).unwrap();
+        assert!(
+            sentinel_json["hop"].is_number(),
+            "relaunch sentinel hop must serialize as a JSON number, got {sentinel_json}"
+        );
+    }
 }
