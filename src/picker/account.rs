@@ -25,6 +25,7 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::picker::engine::{self, PickerOpts, PickerOutcome};
+use crate::usage::model::{Attention, AttentionKind};
 
 // ─── types ────────────────────────────────────────────────────────────────────
 
@@ -58,6 +59,13 @@ pub struct StaleProfileData {
     pub week_fable_resets_at: Option<i64>,
     /// Error string if the cache recorded an error for this profile.
     pub error: Option<String>,
+    /// This profile's `ProfileUsage::attention`, carried straight through
+    /// from the cache. In practice only [`AttentionKind::NeedsRefresh`]
+    /// reaches this field with `error` still `None` — a `NeedsLogin`
+    /// profile is always also recorded in `UsageData::errors` (see
+    /// `usage::local::mod`'s module doc), so [`render_display`] never needs
+    /// to render this alongside an error.
+    pub attention: Option<Attention>,
 }
 
 /// Star marker prefixed to the recommended row's display (what `pick_best`
@@ -172,6 +180,18 @@ fn render_display(data: &StaleProfileData, stale: Option<&str>) -> String {
     }
     if let Some(ref resets) = data.resets {
         parts.push(format!("resets {resets}"));
+    }
+    // Distinct annotation for a token that will silently self-heal on next
+    // use — NOT an error, so it renders alongside the usage numbers rather
+    // than replacing them the way `[error: …]` does above.
+    if matches!(
+        data.attention,
+        Some(Attention {
+            kind: AttentionKind::NeedsRefresh,
+            ..
+        })
+    ) {
+        parts.push("[needs refresh]".to_string());
     }
 
     if parts.is_empty() {
@@ -358,6 +378,7 @@ mod tests {
             week_fable_pct: None,
             week_fable_resets_at: None,
             error: Some("no credentials".to_string()),
+            attention: None,
         };
         let d = render_display(&data, Some("stale 4m ago"));
         assert!(d.starts_with("[error: no credentials]"), "got: {d}");
@@ -374,6 +395,7 @@ mod tests {
             week_fable_pct: None,
             week_fable_resets_at: None,
             error: None,
+            attention: None,
         };
         let d = render_display(&data, None);
         assert_eq!(d, "(no usage data)");
@@ -389,11 +411,38 @@ mod tests {
             week_fable_pct: None,
             week_fable_resets_at: None,
             error: None,
+            attention: None,
         };
         let d = render_display(&data, Some("stale 4m ago"));
         assert!(d.contains("session 3%"), "got: {d}");
         assert!(d.contains("week 32%"), "got: {d}");
         assert!(d.contains("resets Jun 18 9pm"), "got: {d}");
+        assert!(d.contains("stale 4m ago"), "got: {d}");
+    }
+
+    #[test]
+    fn render_display_needs_refresh_shown_alongside_usage() {
+        // A NeedsRefresh profile still carries usable percentages (the
+        // access token will self-heal on next use) — the annotation must
+        // render alongside them, not replace them the way `[error: …]` does.
+        let data = StaleProfileData {
+            session_pct: Some(3),
+            week_all_pct: Some(32),
+            resets: None,
+            resets_at: None,
+            week_fable_pct: None,
+            week_fable_resets_at: None,
+            error: None,
+            attention: Some(Attention {
+                kind: AttentionKind::NeedsRefresh,
+                message: "credentials expired".to_string(),
+                action: "csm --profile home".to_string(),
+                since_epoch: Some(1_000),
+            }),
+        };
+        let d = render_display(&data, Some("stale 4m ago"));
+        assert!(d.contains("session 3%"), "got: {d}");
+        assert!(d.contains("[needs refresh]"), "got: {d}");
         assert!(d.contains("stale 4m ago"), "got: {d}");
     }
 
@@ -407,6 +456,7 @@ mod tests {
             week_fable_pct: None,
             week_fable_resets_at: None,
             error: None,
+            attention: None,
         };
         let d = render_display(&data, None);
         assert!(d.contains("session 50%"), "got: {d}");
@@ -430,6 +480,7 @@ mod tests {
             week_fable_pct: None,
             week_fable_resets_at: None,
             error: None,
+            attention: None,
         };
         let row = AccountRow::build("home", &data, Some(old_mtime), false);
         assert_eq!(row.profile, "home");
@@ -455,6 +506,7 @@ mod tests {
             week_fable_pct: None,
             week_fable_resets_at: None,
             error: Some("no credentials".to_string()),
+            attention: None,
         };
         let row = AccountRow::build("work", &data, None, false);
         assert!(row.display.starts_with("work"), "got: {}", row.display);

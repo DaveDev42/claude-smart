@@ -857,6 +857,7 @@ fn build_account_rows(profiles: &account::ProfileMap) -> Vec<picker::account::Ac
                     week_fable_pct: None,
                     week_fable_resets_at: None,
                     error: Some(err),
+                    attention: None,
                 }
             } else if let Some(pu) = pu {
                 StaleProfileData {
@@ -867,6 +868,7 @@ fn build_account_rows(profiles: &account::ProfileMap) -> Vec<picker::account::Ac
                     week_fable_pct: pu.week_fable.as_ref().map(|s| s.pct),
                     week_fable_resets_at: pu.week_fable.as_ref().and_then(|s| s.resets_at),
                     error: None,
+                    attention: pu.attention.clone(),
                 }
             } else {
                 StaleProfileData {
@@ -877,6 +879,7 @@ fn build_account_rows(profiles: &account::ProfileMap) -> Vec<picker::account::Ac
                     week_fable_pct: None,
                     week_fable_resets_at: None,
                     error: None,
+                    attention: None,
                 }
             };
             (profile, data)
@@ -2547,6 +2550,7 @@ mod tests {
             week_fable_pct: None,
             week_fable_resets_at: None,
             error: None,
+            attention: None,
         }
     }
 
@@ -2580,6 +2584,7 @@ mod tests {
             week_fable_pct: None,
             week_fable_resets_at: None,
             error: None,
+            attention: None,
         }
     }
 
@@ -2661,6 +2666,7 @@ mod tests {
             week_fable_pct: None,
             week_fable_resets_at: None,
             error: Some("no credentials".to_owned()),
+            attention: None,
         };
         let order = ranked_order(vec![
             ("saturated", data(Some(5), Some(96), None)), // week >= 95 → not viable
@@ -2782,6 +2788,39 @@ mod tests {
             order,
             vec!["sooner_flat", "mixed"],
             "the row whose LATER (binding) dimension resets sooner must lead"
+        );
+    }
+
+    #[test]
+    fn needs_refresh_attention_does_not_change_rank_bucket() {
+        // A `NeedsRefresh` profile still has usable percentages, so it must
+        // stay in the viable bucket (0) exactly like a plain healthy row —
+        // `attention` only adds display information, it is not a viability
+        // input (see `account_row_rank`'s doc).
+        let plain = data(Some(5), Some(10), None);
+        let with_attention = StaleProfileData {
+            attention: Some(usage::model::Attention {
+                kind: usage::model::AttentionKind::NeedsRefresh,
+                message: "credentials expired".to_string(),
+                action: "csm --profile home".to_string(),
+                since_epoch: Some(1_000),
+            }),
+            ..data(Some(5), Some(10), None)
+        };
+        assert_eq!(
+            account_row_rank("home", &plain, rank_now()).0,
+            0,
+            "plain viable row must be bucket 0"
+        );
+        assert_eq!(
+            account_row_rank("home", &with_attention, rank_now()).0,
+            0,
+            "a NeedsRefresh row with usable percentages must stay bucket 0"
+        );
+        assert_eq!(
+            account_row_rank("home", &plain, rank_now()),
+            account_row_rank("home", &with_attention, rank_now()),
+            "attention must not change the rank tuple at all"
         );
     }
 
