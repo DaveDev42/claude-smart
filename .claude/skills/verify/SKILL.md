@@ -56,10 +56,11 @@ target dir the first time, so it is the slow one — that is expected.)
 
 ## Reporting
 
-- **PASS** — state the test count and the four steps in one line (e.g. "611 unit
-  + leak guard, clippy clean, fmt clean, windows-gnu clippy clean"). The change
-  is safe to commit. If step 4 was skipped, say **PASS (Windows unverified —
-  cross-target unavailable)** so the gap is visible.
+- **PASS** — state the test count and the four steps in one line (e.g. "N unit
+  + leak guard, clippy clean, fmt clean, windows-gnu clippy clean"). Read N from
+  the `cargo test` summary line; never copy the number from this example. The
+  change is safe to commit. If step 4 was skipped, say **PASS (Windows
+  unverified — cross-target unavailable)** so the gap is visible.
 - **FAIL** — name the failing step, paste the relevant failing lines (the assert
   message / clippy lint / fmt diff / Windows compile error), and STOP. Do not
   commit. Offer to fix. A Windows-only error still blocks the commit — it would
@@ -69,7 +70,7 @@ target dir the first time, so it is the slow one — that is expected.)
 
 - The leak guard enforces invariant #1 (no private identifiers anywhere in
   `src/`, including `#[cfg(test)]` fixtures). If it fails, an operator
-  account-profile name, hub/host name, real home path, tailnet suffix, or email
+  account-profile name, host name, real home path, tailnet suffix, or email
   literal leaked in — replace it with a neutral placeholder (`work`, `home`,
   `/Users/example`, `Acme-…`) or move it behind the registry/env contract.
   Never suppress the guard or weaken its forbidden list.
@@ -77,7 +78,8 @@ target dir the first time, so it is the slow one — that is expected.)
   the explicit pin documented in `CLAUDE.md` and re-run. The same pinned-cargo
   fallback applies to step 4 — `rustup target add` writes the `-gnu` std into
   that toolchain's target list, and the pinned `cargo` picks it up with
-  `--target x86_64-pc-windows-gnu`.
+  `--target x86_64-pc-windows-gnu`. `rustup target add` is allow-listed in
+  `.claude/settings.json`, so this step runs without a permission prompt.
 - Step 4 reproduces CI's `x86_64-pc-windows-msvc` job closely enough to catch
   compile/lint breakage, but it is not byte-identical (gnu vs msvc ABI, no final
   link). It is a strong pre-commit smoke test, not a replacement for the CI

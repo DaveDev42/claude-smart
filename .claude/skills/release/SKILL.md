@@ -74,8 +74,8 @@ version appears on crates.io.
 Manual publish is the fallback only (token issue, CI down, or a version CI
 skipped). When doing it by hand, verify hygiene first:
 ```sh
-cargo package --list   # must show LICENSE + README.md + src/; NO docs/ .github/
-                       # IN_PROGRESS.md CLAUDE.md .claude/ (the Cargo.toml exclude)
+cargo package --list   # must show LICENSE + README.md + src/; NO .github/
+                       # CLAUDE.md .claude/ (the Cargo.toml exclude)
 cargo publish --dry-run   # isolated build, safe
 cargo publish             # needs `cargo login` token; via `rustup run stable cargo …`
                           # if the cargo shim mis-parses the subcommand
