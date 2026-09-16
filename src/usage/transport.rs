@@ -535,43 +535,19 @@ mod tests {
     /// Write `content` to `path` and set its mtime to `now - age_secs` seconds
     /// ago so the TTL/freshness logic sees the desired age.
     ///
-    /// Uses `touch -t [[CC]YY]MMDDhhmm[.SS]` (BSD macOS touch, also accepted
-    /// by GNU touch), derived from a computed target epoch via `date -r EPOCH`
-    /// (macOS) or `date -d @EPOCH` (Linux/GNU).  Both this helper and all its
-    /// callers are `#[cfg(unix)]` (the mtime-aging trick is POSIX-only).
+    /// Sets the mtime in-process via `filetime::set_file_mtime`, no subprocess
+    /// spawn. Both this helper and all its callers are `#[cfg(unix)]` (the
+    /// mtime-aging trick is POSIX-only).
     #[cfg(unix)]
     fn write_aged_file(path: &std::path::Path, content: &str, age_secs: u64) {
         fs::write(path, content).unwrap();
 
-        #[cfg(unix)]
-        {
-            let target_epoch = unix_now_secs().saturating_sub(age_secs);
-
-            // Try `date -r EPOCH …` (macOS/BSD) then `date -d @EPOCH …` (GNU).
-            let ts = std::process::Command::new("date")
-                .args(["-r", &target_epoch.to_string(), "+%Y%m%d%H%M.%S"])
-                .output()
-                .ok()
-                .filter(|o| o.status.success())
-                .and_then(|o| String::from_utf8(o.stdout).ok())
-                .map(|s| s.trim().to_owned())
-                .or_else(|| {
-                    std::process::Command::new("date")
-                        .args(["-d", &format!("@{target_epoch}"), "+%Y%m%d%H%M.%S"])
-                        .output()
-                        .ok()
-                        .filter(|o| o.status.success())
-                        .and_then(|o| String::from_utf8(o.stdout).ok())
-                        .map(|s| s.trim().to_owned())
-                })
-                .expect("could not format touch timestamp via date -r or date -d");
-
-            let status = std::process::Command::new("touch")
-                .args(["-t", &ts, path.to_string_lossy().as_ref()])
-                .status()
-                .expect("touch -t invocation failed");
-            assert!(status.success(), "touch -t exited with failure for ts={ts}");
-        }
+        let target_epoch = unix_now_secs().saturating_sub(age_secs);
+        filetime::set_file_mtime(
+            path,
+            filetime::FileTime::from_unix_time(target_epoch as i64, 0),
+        )
+        .expect("set_file_mtime failed");
     }
 
     // ── parse_usage_json ──────────────────────────────────────────────────────
