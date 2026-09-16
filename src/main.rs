@@ -137,16 +137,26 @@ fn print_help() {
     println!("RUN FLAGS (account + session selection)");
     println!("  --profile <name>                     launch under this profile (skip all picking)");
     println!("  -i, --interactive                    manual pick: force account + session pickers");
+    println!("  -A, --pick-account                   force an account pick this launch (overrides --no-pick)");
     println!("  --no-pick                            keep current profile, no scoring");
     println!(
         "  -n, --new                            start a fresh session (skip the session picker)"
     );
     println!("  -c, --continue                       resume newest free session");
-    println!("  (default: always opens the session picker — new / continue / pick existing —");
-    println!("   and auto-picks the best account by usage; opens the account picker when usage");
+    println!("  -r, --resume [<id>|<alias>]          resume a session (csm also reads the id)");
     println!(
-        "   is unavailable — hub down or no scorable data — instead of silently staying put)\n"
+        "  --session-id <uuid>                  forwarded to claude; csm tracks it for sidecar/relaunch state"
     );
+    println!("  --model <m>                          forwarded to claude; remembered across a limit-switch hop");
+    println!("  --effort <e>                         forwarded to claude; remembered across a limit-switch hop");
+    println!(
+        "  --permission-mode <p>                forwarded to claude; remembered across a limit-switch hop"
+    );
+    println!("  (the six flags above are forwarded to claude AND read by csm; every other claude");
+    println!("   flag passes through untouched — use `csm run -- <args>` to force passthrough)");
+    println!("  (default: always opens the session picker — new / continue / pick existing —");
+    println!("   and auto-picks the best account by usage; opens the account picker when no");
+    println!("   usable usage data is available instead of silently staying put)\n");
     println!("PROFILES (registry — ~/.config/claude-as/profiles.json)");
     println!("  csm profiles [list]                  list configured profiles");
     println!("  csm profiles add  <name> [<dir>]     register (dir default ~/.claude.<name>)");
@@ -168,7 +178,7 @@ fn print_help() {
     println!("  csm config unset launch-command      revert to launching `claude`\n");
     println!("USAGE METERING (local, per profile)");
     println!(
-        "  csm usage [--json] [--no-fetch] [--refresh]   multi-profile usage table (offline-aware)"
+        "  csm usage [--json] [--no-fetch] [--refresh] [--refresh-oauth]   multi-profile usage table (offline-aware)"
     );
     println!(
         "  csm usage capture                    read statusLine stdin, merge into the store\n"
