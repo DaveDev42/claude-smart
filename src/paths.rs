@@ -29,6 +29,27 @@ pub fn smart_dir_no_create() -> PathBuf {
         .join("smart")
 }
 
+/// `~/.claude.<name>` — the conventional profile config dir for a profile that
+/// has no explicit entry in `ProfileMap` (toss machines, first-boot before the
+/// registry is populated, or a bare token passed straight through). Shares
+/// only the path-string construction: `ProfileMap` stays the sole registry
+/// *authority* over which profiles exist and where they actually live.
+pub fn synthesize_profile_dir(name: &str) -> PathBuf {
+    dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(format!(".claude.{name}"))
+}
+
+/// `~/.config/claude-as/` — the profile-switch contract shared with the `cas`
+/// shell shims. `profiles_json()` and `cas::default_state_file()` each join
+/// their own leaf onto this.
+pub fn claude_as_dir() -> PathBuf {
+    dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".config")
+        .join("claude-as")
+}
+
 // ─── session-level paths ──────────────────────────────────────────────────────
 
 /// `<smart_dir>/<sid>.json` — sidecar (mode/effort/model/cwd/profile/hop).
@@ -92,11 +113,7 @@ pub fn titles_tsv() -> PathBuf {
 /// Personal-only; absent on toss machines → binary falls back to current
 /// `CLAUDE_CONFIG_DIR` and disables CAS/pick features.
 pub fn profiles_json() -> PathBuf {
-    dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".config")
-        .join("claude-as")
-        .join("profiles.json")
+    claude_as_dir().join("profiles.json")
 }
 
 /// `~/.config/claude-smart/config.json` — csm's OWN global config (drop-in

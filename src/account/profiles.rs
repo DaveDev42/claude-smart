@@ -116,9 +116,7 @@ impl ProfileMap {
         if let Some(dir) = self.get(&name) {
             return PathBuf::from(dir);
         }
-        dirs::home_dir()
-            .unwrap_or_else(|| PathBuf::from("."))
-            .join(format!(".claude.{name}"))
+        paths::synthesize_profile_dir(&name)
     }
 
     /// `true` iff `name` is a syntactically valid profile name:

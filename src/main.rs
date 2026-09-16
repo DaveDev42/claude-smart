@@ -499,10 +499,7 @@ fn resolve_profile_dir(profile: &str, profiles: &account::ProfileMap) -> anyhow:
         return Ok(dir.to_owned());
     }
     // Fallback: synthesise conventional `~/.claude.<profile>` path.
-    let home =
-        dirs::home_dir().ok_or_else(|| anyhow::anyhow!("csm: cannot determine HOME directory"))?;
-    Ok(home
-        .join(format!(".claude.{profile}"))
+    Ok(paths::synthesize_profile_dir(profile)
         .to_string_lossy()
         .into_owned())
 }

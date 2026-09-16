@@ -184,9 +184,7 @@ pub fn apply_edit_action(profiles: &mut ProfileMap, action: Action) -> Outcome {
 fn synth_dir(name: &str, dir: Option<&str>) -> String {
     match dir {
         Some(d) if !d.trim().is_empty() => d.trim().to_owned(),
-        _ => dirs::home_dir()
-            .unwrap_or_else(|| std::path::PathBuf::from("."))
-            .join(format!(".claude.{name}"))
+        _ => crate::paths::synthesize_profile_dir(name)
             .to_string_lossy()
             .into_owned(),
     }

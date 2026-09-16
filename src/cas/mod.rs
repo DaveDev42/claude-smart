@@ -166,11 +166,7 @@ impl Shell {
 
 /// `~/.config/claude-as/default` — the global profile state file.
 pub fn default_state_file() -> PathBuf {
-    dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".config")
-        .join("claude-as")
-        .join("default")
+    crate::paths::claude_as_dir().join("default")
 }
 
 // ─── default_profile — REAL implementation ───────────────────────────────────
@@ -485,9 +481,7 @@ pub fn manage_emit(op: &Op, profiles: &mut ProfileMap) -> anyhow::Result<()> {
 fn resolve_new_dir(name: &str, dir: Option<&str>) -> String {
     match dir {
         Some(d) if !d.is_empty() => d.to_owned(),
-        _ => dirs::home_dir()
-            .unwrap_or_else(|| PathBuf::from("."))
-            .join(format!(".claude.{name}"))
+        _ => crate::paths::synthesize_profile_dir(name)
             .to_string_lossy()
             .into_owned(),
     }
@@ -501,10 +495,7 @@ fn resolve_new_dir(name: &str, dir: Option<&str>) -> String {
 fn resolve_profile(profile: &str, profiles: &ProfileMap) -> anyhow::Result<String> {
     if profiles.is_empty() {
         // Toss machine or pre-ansible boot: synthesize the conventional path.
-        let home = dirs::home_dir()
-            .ok_or_else(|| anyhow::anyhow!("cas: cannot determine HOME directory"))?;
-        return Ok(home
-            .join(format!(".claude.{profile}"))
+        return Ok(crate::paths::synthesize_profile_dir(profile)
             .to_string_lossy()
             .into_owned());
     }
