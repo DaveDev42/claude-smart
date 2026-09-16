@@ -33,7 +33,7 @@
 //!   == "rate_limit"`. Fires when a 429 ends the turn: Claude Code's query
 //!   loop runs the StopFailure hook instead of Stop for that turn —
 //!   fire-and-forget, not awaited, stdout/exit code ignored, and skipped for
-//!   subagent contexts. Tier-1/2 never see that turn's Stop event at all.
+//!   subagent contexts. Tier-2 never sees that turn's Stop event at all.
 //!   CAVEAT (observed on Claude Code 2.1.270, 2026-09): a *subscription* cap
 //!   — the 5-hour session, weekly all-model, or model-scoped weekly limit,
 //!   whose 429 carries a reset time — does NOT end the turn. Claude Code shows
@@ -46,30 +46,13 @@
 //!   matcher `rate_limit` (a companion change outside this crate that adds
 //!   `csm hook --owner <dir>` as a StopFailure handler); until that
 //!   registration exists, no StopFailure payload ever reaches this process and
-//!   tier-1/2 remain the only detectors, as before. A StopFailure with any
+//!   tier-2 remains the only detector, as before. A StopFailure with any
 //!   OTHER `error` value (`overloaded`, `authentication_failed`,
 //!   `invalid_request`, ...) is a real API failure but not a usage limit —
-//!   `classify()` does nothing for it and does not fall through to tier-1/2/
-//!   malformed. Unlike tier-1/2, tier-0 is pure over the parsed stdin and does
-//!   zero I/O, so it has no freshness bound at all — it is data straight from
-//!   the failing request, not a cache.
-//!
-//! Tier-1: `limit-in-tail` — last 12 transcript records contain an
-//!   `isApiErrorMessage`-flagged entry matching the limit-banner regex, within 900 s.
-//!   Reproduces `limit_in_tail()` from the legacy shell implementation.
-//!   The banner-shape match is structural (no model name is ever compared), so it
-//!   would fire the same way for the session limit, the all-model weekly limit,
-//!   or a model-scoped weekly limit (the `week_fable` dimension).
-//!   STATUS (2026-09): dormant. Claude Code does not write a usage-limit notice
-//!   into the transcript JSONL in any record type (checked across ~6.8k
-//!   transcripts: zero `isApiErrorMessage` limit banners, zero assistant/system
-//!   limit notices — the limit is surfaced only in the TUI and through the
-//!   usage API / statusline `rate_limits`). This tier has never been observed
-//!   to fire and is kept only as harmless defense-in-depth should a future
-//!   Claude Code start writing such records. Tier-2 is the operative reactive
-//!   detector for an ordinary Stop event; tier-0 is the operative detector at
-//!   the exact limit moment (once the StopFailure registration above exists).
-//!   Do not rely on tier-1.
+//!   `classify()` does nothing for it and does not fall through to tier-2.
+//!   Unlike tier-2, tier-0 is pure over the parsed stdin and does zero I/O, so
+//!   it has no freshness bound at all — it is data straight from the failing
+//!   request, not a cache.
 //!
 //! Tier-2: `current-usage` thresholding — session%, week_all%, or the
 //!   model-scoped week_fable% at or above limits (all three dimensions, same
@@ -82,9 +65,6 @@
 //!   (`CSM_USAGE_PROFILE_TTL`, default 300 s). A model-scoped cap can therefore
 //!   take up to ~5 min to be noticed here — a data-freshness bound, not a
 //!   detection gap.
-//!
-//! Tier-3 (malformed-in-tail): 4-conjunct Opus-4.8 tool-call fingerprint within 180 s.
-//!   Reproduces `malformed_in_tail()` from the legacy shell implementation.
 //!
 //! # Statusline tick (a second entry point, not a tier)
 //!
@@ -105,12 +85,11 @@
 //!
 //! 1. Kill-switches (env var, file marker, .switched marker).
 //! 2. Reason gate → user_quit flag (doesn't exit yet — detection still runs).
-//! 3. Detect (tier-0 / tier-1 / tier-2 / malformed-in-tail). Tier-0 short-
-//!    circuits the other two outcomes: `NotLimit` → immediate `Skip` (a
-//!    non-limit StopFailure is never a limit, whatever tier-1/2 might say
-//!    from unrelated stale state); `Limit` → limited, `definitive = true`;
-//!    `NotApplicable` (not a StopFailure) → fall through to tier-1/2/malformed
-//!    exactly as before, `definitive = false`.
+//! 3. Detect (tier-0 / tier-2). Tier-0 short-circuits the other two outcomes:
+//!    `NotLimit` → immediate `Skip` (a non-limit StopFailure is never a limit,
+//!    whatever tier-2 might say from unrelated stale state); `Limit` →
+//!    limited, `definitive = true`; `NotApplicable` (not a StopFailure) →
+//!    fall through to tier-2 exactly as before, `definitive = false`.
 //! 4. If not limited → exit (with user-quit log if user_quit).
 //! 5. If user_quit + limited → notify-only (deduped via .detected).
 //! 6. Pick target profile.
@@ -162,7 +141,11 @@ pub struct HookInput {
     /// "exit", etc. The reason gate maps some values to notify-only.
     pub reason: Option<String>,
 
-    /// Path to the `.jsonl` transcript file for this session.
+    /// Path to the `.jsonl` transcript file for this session. Claude Code
+    /// still sends this on every event (part of the stdin contract in the
+    /// module doc above); nothing in this crate reads it since C13 deleted
+    /// the tier-1/tier-3 transcript scanners that used to.
+    #[allow(dead_code)]
     pub transcript_path: Option<String>,
 
     /// Event name: "Stop" | "SubagentStop" | "SessionEnd" | "StopFailure" | ...
@@ -239,18 +222,6 @@ pub const MAX_HOPS: i64 = 1;
 /// Machine-wide cooldown in seconds after a limit-switch.
 pub const LAST_SWITCH_COOLDOWN_SECS: i64 = 300;
 
-/// Tier-1 tail scan: how many records to look at.
-pub const TIER1_TAIL_RECORDS: usize = 12;
-
-/// Tier-1 recency window in seconds.
-pub const TIER1_RECENCY_SECS: i64 = 900;
-
-/// Malformed-in-tail tail records to scan.
-pub const MALFORMED_TAIL_RECORDS: usize = 8;
-
-/// Malformed-in-tail recency window in seconds.
-pub const MALFORMED_RECENCY_SECS: i64 = 180;
-
 /// Usage threshold percent (>=99 means "at the limit").
 pub const LIMIT_PCT: i64 = 99;
 
@@ -310,8 +281,8 @@ pub fn parse_input(raw: &str) -> anyhow::Result<HookInput> {
 ///
 /// 1. Kill-switches (env, file, .switched marker)
 /// 2. Reason gate (user_quit flag — note: does NOT short-circuit yet, detection still runs)
-/// 3. Detect (tier-0 StopFailure / tier-1 / tier-2 / malformed) — a tier-0
-///    `NotLimit` verdict exits immediately with `Skip`, bypassing tier-1/2/malformed
+/// 3. Detect (tier-0 StopFailure / tier-2) — a tier-0 `NotLimit` verdict
+///    exits immediately with `Skip`, bypassing tier-2
 /// 4. No limit signal → Skip
 /// 5. user_quit + limited → NotifyOnly (deduped via .detected)
 /// 6. Pick target profile (exclude current) via account::pick_account
@@ -383,11 +354,11 @@ pub fn classify_with(
         .map(is_user_quit_reason)
         .unwrap_or(false);
 
-    // ── 3. Detect (tier-0 StopFailure / tier-1 / tier-2 / malformed) ─────────
+    // ── 3. Detect (tier-0 StopFailure / tier-2) ──────────────────────────────
     // Shell: the legacy shell implementation (tier-0 has no shell analogue —
     // StopFailure is a hook event class the shell implementation predates).
-    // Tier-0 is pure over the already-parsed input (no I/O at all), tier-1 is
-    // local (transcript read), tier-2 uses the local usage cache.
+    // Tier-0 is pure over the already-parsed input (no I/O at all); tier-2
+    // uses the local usage cache.
     //
     // `definitive` tracks whether the signal came from tier-0: it feeds the
     // cooldown-exception decision at step 9 (a definitive signal is never
@@ -400,38 +371,15 @@ pub fn classify_with(
             // StopFailure for a non-limit API error (overloaded,
             // authentication_failed, invalid_request, ...). Not something to
             // switch accounts over — do nothing, and do NOT fall through to
-            // tier-1/2/malformed: those read transcript/usage-cache state
-            // that has nothing to do with this failure and could produce an
-            // unrelated false positive on the same turn.
+            // tier-2: that reads usage-cache state that has nothing to do with
+            // this failure and could produce an unrelated false positive on
+            // the same turn.
             return Ok(Decision::Skip);
         }
-        (None, StopFailureVerdict::NotApplicable) => {
-            // Not a StopFailure event — fall through to the existing chain,
-            // unchanged.
-            // Tier-1 — transcript tail (local, instant)
-            // Shell: the legacy shell implementation
-            let t1 = detect_limit_in_tail(input);
-            if let Some(msg) = t1 {
-                (msg, true, false)
-            } else {
-                // Tier-2 — usage pct from local cache
-                // Shell: the legacy shell implementation
-                let t2 = detect_usage_threshold(owner_dir);
-                if let Some(msg) = t2 {
-                    (msg, true, false)
-                } else {
-                    // Malformed-in-tail (only if no limit signal from tier-1 or tier-2)
-                    // Note: in the shell this is in a separate hook (malformed-recover),
-                    // but the helper has it in `malformed-in-tail`. We reproduce the check.
-                    let m = detect_malformed_in_tail(input);
-                    if let Some(msg) = m {
-                        (msg, true, false)
-                    } else {
-                        (String::new(), false, false)
-                    }
-                }
-            }
-        }
+        (None, StopFailureVerdict::NotApplicable) => match detect_usage_threshold(owner_dir) {
+            Some(msg) => (msg, true, false),
+            None => (String::new(), false, false),
+        },
     };
 
     // ── 4. No limit → exit (no side effects) ─────────────────────────────────
@@ -635,12 +583,12 @@ pub(crate) enum StopFailureVerdict {
     Limit(String),
     /// A StopFailure event with any OTHER `error` value. A real API failure,
     /// but not a usage limit — classify() must do nothing (`Decision::Skip`)
-    /// rather than fall through to tier-1/2/malformed, which look at
-    /// transcript/usage-cache state unrelated to this specific failure.
+    /// rather than fall through to tier-2, which looks at usage-cache
+    /// state unrelated to this specific failure.
     NotLimit,
     /// Not a StopFailure event at all (or `hook_event_name` absent, as on
     /// every ordinary Stop/SubagentStop/SessionEnd payload) — tier-0 has no
-    /// opinion; classify() falls through to the tier-1/2/malformed chain.
+    /// opinion; classify() falls through to the tier-2 check.
     NotApplicable,
 }
 
@@ -654,8 +602,8 @@ pub(crate) enum StopFailureVerdict {
 /// reached" auto-continue wait — see the module doc's Tier-0 section. Requires
 /// the hook to be registered on the `StopFailure` event with matcher
 /// `rate_limit` (a companion change outside this crate); if it isn't, this fn
-/// is simply never reached with a StopFailure payload and tier-1/2 remain the
-/// detectors, as today.
+/// is simply never reached with a StopFailure payload and tier-2 remains the
+/// detector, as today.
 pub(crate) fn stop_failure_limit(input: &HookInput) -> StopFailureVerdict {
     if input.hook_event_name.as_deref() != Some("StopFailure") {
         return StopFailureVerdict::NotApplicable;
@@ -701,105 +649,6 @@ pub(crate) fn cooldown_should_block(definitive: bool, window_blocked: bool) -> b
         return false;
     }
     window_blocked
-}
-
-/// Tier-1: scan the last [`TIER1_TAIL_RECORDS`] lines of the transcript for an
-/// entry with `isApiErrorMessage: true` matching the limit-banner regex, within
-/// [`TIER1_RECENCY_SECS`] of now.
-///
-/// Returns `Some(description)` if a qualifying limit record is found, `None` otherwise.
-///
-/// Reproduces `limit_in_tail()` from the legacy shell implementation.
-/// Sanitizes the tail_hit text (remove `"` and `\`, collapse newlines/tabs) and
-/// truncates to 80 chars — matching the legacy shell implementation's sanitization.
-fn detect_limit_in_tail(input: &HookInput) -> Option<String> {
-    let tp = input.transcript_path.as_deref().filter(|s| !s.is_empty())?;
-    let path = std::path::Path::new(tp);
-    if !path.exists() {
-        return None;
-    }
-
-    let now_secs = now_epoch();
-    let hit = limit_in_tail_impl(path, TIER1_TAIL_RECORDS, TIER1_RECENCY_SECS, now_secs)?;
-
-    // Sanitize for embedding in notify: remove `"` and `\`, collapse newlines/tabs.
-    // Shell: the legacy shell implementation:
-    //   `tail_hit="$(printf '%s' "$tail_hit" | tr -d '"\\' | tr '\n\t' '  ')"`
-    //   `limited="api-error: ${tail_hit:0:80}"`
-    let sanitized: String = hit
-        .chars()
-        .filter(|c| *c != '"' && *c != '\\')
-        .map(|c| if c == '\n' || c == '\t' { ' ' } else { c })
-        .take(80)
-        .collect();
-    Some(format!("api-error: {sanitized}"))
-}
-
-/// Core logic for tier-1 transcript tail scanning.
-/// Extracted for testability (injected `now_secs`).
-///
-/// Reads the last `n` JSONL lines of the transcript file, parses each as JSON,
-/// and looks for:
-///   - `isApiErrorMessage: true`
-///   - text content matching the limit-banner pattern (case-insensitive)
-///   - timestamp within `window_secs` of `now_secs`
-///
-/// Returns the matched text on first (last-in-file) match, `None` otherwise.
-pub(crate) fn limit_in_tail_impl(
-    path: &Path,
-    n: usize,
-    window_secs: i64,
-    now_secs: i64,
-) -> Option<String> {
-    let content = std::fs::read_to_string(path).ok()?;
-    // Shell: `tail -n "$n" "$tp"` — take last n non-empty lines.
-    let lines: Vec<&str> = content.lines().filter(|l| !l.trim().is_empty()).collect();
-    let tail: &[&str] = if lines.len() > n {
-        &lines[lines.len() - n..]
-    } else {
-        &lines
-    };
-
-    let mut result: Option<String> = None;
-    for line in tail {
-        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
-            continue;
-        };
-        // Must have isApiErrorMessage == true
-        if v.get("isApiErrorMessage").and_then(|b| b.as_bool()) != Some(true) {
-            continue;
-        }
-        // Extract text from message.content (array or string)
-        let text = extract_message_text(&v);
-        if text.is_empty() {
-            continue;
-        }
-        // Must match limit-banner pattern (case-insensitive).
-        // Base shell jq: `test("hit your .*limit|usage limit|limit reached"; "i")`.
-        // Generalized here (structurally, never on a model name) to also catch a
-        // model-scoped weekly banner phrased with "reached" instead of "hit", or
-        // as a bare "weekly limit" mention — the same shapes Anthropic uses for
-        // the session/all-model banners, just with a different noun in between.
-        let tl = text.to_ascii_lowercase();
-        let has_hit_phrase =
-            (tl.contains("hit your") || tl.contains("reached your")) && tl.contains("limit");
-        if !has_hit_phrase
-            && !tl.contains("usage limit")
-            && !tl.contains("limit reached")
-            && !tl.contains("weekly limit")
-        {
-            continue;
-        }
-        // Recency check: timestamp within window_secs of now
-        // Shell: `((.timestamp // "") | sub("\\.[0-9]+Z$"; "Z")) | try fromdateiso8601 catch 0`
-        let ts = extract_timestamp_epoch(&v);
-        if ts <= 0 || (now_secs - ts) > window_secs {
-            continue;
-        }
-        // Last match wins (shell: `| tail -1` on jq output)
-        result = Some(text);
-    }
-    result
 }
 
 /// Tier-2: query the usage cache for the owning profile and check whether
@@ -889,175 +738,7 @@ pub(crate) fn usage_threshold_hit(
     None
 }
 
-/// Malformed-in-tail: scan the last tail for the 4-conjunct Opus-4.8 tool-call
-/// fingerprint within [`MALFORMED_RECENCY_SECS`].
-///
-/// Returns `Some("MALFORMED_TOOL_USE")` on a hit, `None` otherwise.
-///
-/// Reproduces `malformed_in_tail()` from the legacy shell implementation.
-/// Four conjuncts (validated zero-FP on the corpus):
-///   1. `.type == "assistant"` AND `.message.stop_reason == "tool_use"`
-///   2. content has NO block of type "tool_use" (the drop)
-///   3. joined text content ENDS with `</invoke>` (pattern: `</invoke>\s*$`)
-///   4. text CONTAINS `<invoke name=` or `antml:invoke name=`
-fn detect_malformed_in_tail(input: &HookInput) -> Option<String> {
-    let tp = input.transcript_path.as_deref().filter(|s| !s.is_empty())?;
-    let path = std::path::Path::new(tp);
-    if !path.exists() {
-        return None;
-    }
-    let now_secs = now_epoch();
-    malformed_in_tail_impl(
-        path,
-        MALFORMED_TAIL_RECORDS,
-        MALFORMED_RECENCY_SECS,
-        now_secs,
-    )
-}
-
-/// Core logic for malformed-in-tail scanning.
-/// Extracted for testability (injected `now_secs`).
-pub(crate) fn malformed_in_tail_impl(
-    path: &Path,
-    n: usize,
-    window_secs: i64,
-    now_secs: i64,
-) -> Option<String> {
-    let content = std::fs::read_to_string(path).ok()?;
-    let lines: Vec<&str> = content.lines().filter(|l| !l.trim().is_empty()).collect();
-    let tail: &[&str] = if lines.len() > n {
-        &lines[lines.len() - n..]
-    } else {
-        &lines
-    };
-
-    let mut found = false;
-    for line in tail {
-        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
-            continue;
-        };
-        // Conjunct 1: type=="assistant" AND message.stop_reason=="tool_use"
-        if v.get("type").and_then(|t| t.as_str()) != Some("assistant") {
-            continue;
-        }
-        if v.get("message")
-            .and_then(|m| m.get("stop_reason"))
-            .and_then(|r| r.as_str())
-            != Some("tool_use")
-        {
-            continue;
-        }
-        // Conjunct 2: content has NO block of type "tool_use"
-        let content_arr = v
-            .get("message")
-            .and_then(|m| m.get("content"))
-            .and_then(|c| c.as_array())
-            .map(|a| a.as_slice())
-            .unwrap_or(&[]);
-        let has_tool_use_block = content_arr
-            .iter()
-            .any(|block| block.get("type").and_then(|t| t.as_str()) == Some("tool_use"));
-        if has_tool_use_block {
-            continue;
-        }
-        // Build joined text content
-        let text: String = content_arr
-            .iter()
-            .filter_map(|block| {
-                if block.get("type").and_then(|t| t.as_str()) == Some("text") {
-                    block.get("text").and_then(|t| t.as_str())
-                } else {
-                    None
-                }
-            })
-            .collect::<Vec<_>>()
-            .join("");
-        // Conjunct 3: text ends with </invoke> (ignoring trailing whitespace)
-        // Shell: `test("</invoke>\\s*$"; "")`
-        if !text.trim_end().ends_with("</invoke>") {
-            continue;
-        }
-        // Conjunct 4: text contains <invoke name= or antml:invoke name=
-        // Shell: `test("<invoke name=|antml:invoke name="; "")`
-        if !text.contains("<invoke name=") && !text.contains("antml:invoke name=") {
-            continue;
-        }
-        // Recency check
-        let ts = extract_timestamp_epoch(&v);
-        if ts <= 0 || (now_secs - ts) > window_secs {
-            continue;
-        }
-        found = true;
-        // Last match wins (shell: `| tail -1`)
-    }
-    if found {
-        Some("MALFORMED_TOOL_USE".to_string())
-    } else {
-        None
-    }
-}
-
 // ─── helpers ─────────────────────────────────────────────────────────────────
-
-/// Extract the text content from a transcript record's message.
-/// Handles both array-of-blocks and raw-string forms.
-///
-/// Shell jq: `(.message.content // empty) | if type=="array" then (map(select(.type=="text") | .text) | join(" "))
-///            elif type=="string" then . else "" end`
-fn extract_message_text(v: &serde_json::Value) -> String {
-    let content = match v.get("message").and_then(|m| m.get("content")) {
-        Some(c) => c,
-        None => return String::new(),
-    };
-    if let Some(arr) = content.as_array() {
-        arr.iter()
-            .filter_map(|block| {
-                if block.get("type").and_then(|t| t.as_str()) == Some("text") {
-                    block.get("text").and_then(|t| t.as_str())
-                } else {
-                    None
-                }
-            })
-            .collect::<Vec<_>>()
-            .join(" ")
-    } else if let Some(s) = content.as_str() {
-        s.to_string()
-    } else {
-        String::new()
-    }
-}
-
-/// Extract the timestamp epoch from a transcript record, matching the shell's
-/// `((.timestamp // "") | sub("\\.[0-9]+Z$"; "Z")) | try fromdateiso8601 catch 0`
-///
-/// Returns 0 on any parse failure.
-fn extract_timestamp_epoch(v: &serde_json::Value) -> i64 {
-    let ts_str = match v.get("timestamp").and_then(|t| t.as_str()) {
-        Some(s) if !s.is_empty() => s,
-        _ => return 0,
-    };
-    // Strip subsecond digits and trailing Z: "2026-06-10T12:34:56.789Z" → "2026-06-10T12:34:56Z"
-    // Shell: `sub("\\.[0-9]+Z$"; "Z")`
-    let normalized = if let Some(dot_pos) = ts_str.find('.') {
-        // Remove from '.' to end, then append 'Z'
-        let base = &ts_str[..dot_pos];
-        // Ensure it looks like it ends at 'Z' context
-        if ts_str.ends_with('Z') {
-            format!("{base}Z")
-        } else {
-            ts_str.to_string()
-        }
-    } else {
-        ts_str.to_string()
-    };
-    // Parse ISO-8601 UTC datetime
-    use chrono::DateTime;
-    if let Ok(dt) = DateTime::parse_from_rfc3339(&normalized) {
-        dt.timestamp()
-    } else {
-        0
-    }
-}
 
 /// Resolve the relaunch target from an `account::pick_account`-family scoring
 /// result — the single point where classify() decides "who do we switch to".
@@ -1546,252 +1227,6 @@ mod tests {
         assert_eq!(LAST_SWITCH_COOLDOWN_SECS, 300);
     }
 
-    // ── limit_in_tail_impl tests ───────────────────────────────────────────────
-
-    fn make_transcript_line(
-        is_api_error: bool,
-        text: &str,
-        ts_offset_secs: i64,
-        base_epoch: i64,
-    ) -> String {
-        let epoch = base_epoch + ts_offset_secs;
-        let dt = chrono::DateTime::<chrono::Utc>::from_timestamp(epoch, 0)
-            .unwrap()
-            .format("%Y-%m-%dT%H:%M:%S%.3fZ")
-            .to_string();
-        serde_json::json!({
-            "type": "assistant",
-            "isApiErrorMessage": is_api_error,
-            "timestamp": dt,
-            "message": {
-                "content": [
-                    {"type": "text", "text": text}
-                ]
-            }
-        })
-        .to_string()
-    }
-
-    /// Tier-1 detects a fresh limit banner in the transcript tail.
-    #[test]
-    fn limit_in_tail_detects_fresh_banner() {
-        use std::io::Write;
-        use tempfile::NamedTempFile;
-
-        let base_now: i64 = 1_718_000_000;
-        set_test_now(base_now);
-        let banner = "You've hit your session limit · resets 9pm (Asia/Seoul)";
-        let line = make_transcript_line(true, banner, -100, base_now); // 100 s ago
-
-        let mut f = NamedTempFile::new().unwrap();
-        writeln!(f, "{line}").unwrap();
-
-        let result = limit_in_tail_impl(f.path(), 12, 900, base_now);
-        assert!(result.is_some(), "should detect fresh limit banner");
-        assert!(result.unwrap().contains("hit your"));
-    }
-
-    /// Tier-1 does NOT trigger on a stale limit banner (outside the window).
-    #[test]
-    fn limit_in_tail_skips_stale_banner() {
-        use std::io::Write;
-        use tempfile::NamedTempFile;
-
-        let base_now: i64 = 1_718_000_000;
-        let banner = "You've hit your session limit · resets 9pm (Asia/Seoul)";
-        // Banner timestamp is 1000 s ago (outside the 900 s window)
-        let line = make_transcript_line(true, banner, -1000, base_now);
-
-        let mut f = NamedTempFile::new().unwrap();
-        writeln!(f, "{line}").unwrap();
-
-        let result = limit_in_tail_impl(f.path(), 12, 900, base_now);
-        assert!(result.is_none(), "stale banner should not trigger");
-    }
-
-    /// Tier-1 does NOT trigger on a non-error record.
-    #[test]
-    fn limit_in_tail_skips_non_error_record() {
-        use std::io::Write;
-        use tempfile::NamedTempFile;
-
-        let base_now: i64 = 1_718_000_000;
-        let banner = "You've hit your session limit · resets 9pm (Asia/Seoul)";
-        // isApiErrorMessage is false
-        let line = make_transcript_line(false, banner, -100, base_now);
-
-        let mut f = NamedTempFile::new().unwrap();
-        writeln!(f, "{line}").unwrap();
-
-        let result = limit_in_tail_impl(f.path(), 12, 900, base_now);
-        assert!(result.is_none(), "non-error record should not trigger");
-    }
-
-    /// Tier-1 does NOT trigger when text doesn't match the limit pattern.
-    #[test]
-    fn limit_in_tail_skips_wrong_text() {
-        use std::io::Write;
-        use tempfile::NamedTempFile;
-
-        let base_now: i64 = 1_718_000_000;
-        let line = make_transcript_line(true, "Server overloaded, try again later", -100, base_now);
-
-        let mut f = NamedTempFile::new().unwrap();
-        writeln!(f, "{line}").unwrap();
-
-        let result = limit_in_tail_impl(f.path(), 12, 900, base_now);
-        assert!(result.is_none(), "wrong text should not trigger");
-    }
-
-    /// Tier-1: only the last N lines are checked.
-    #[test]
-    fn limit_in_tail_only_last_n_records() {
-        use std::io::Write;
-        use tempfile::NamedTempFile;
-
-        let base_now: i64 = 1_718_000_000;
-        let mut f = NamedTempFile::new().unwrap();
-
-        // Write 15 normal records, then the limit banner at position 13 (inside last 12).
-        for i in 0..12 {
-            let line = make_transcript_line(false, &format!("normal message {i}"), -50, base_now);
-            writeln!(f, "{line}").unwrap();
-        }
-        // This banner is within the window of the last 12 records
-        let banner_line = make_transcript_line(
-            true,
-            "You've hit your session limit · resets 9pm",
-            -60,
-            base_now,
-        );
-        writeln!(f, "{banner_line}").unwrap();
-
-        // Now add 3 more normal records — banner is at position -4 from end (within 12)
-        for i in 0..3 {
-            let line = make_transcript_line(false, &format!("after {i}"), -10, base_now);
-            writeln!(f, "{line}").unwrap();
-        }
-
-        // Total: 16 lines. Banner is at index 12 (0-based), within the last 4+1=4 records
-        // of the tail-12 scan. Should be detected.
-        let result = limit_in_tail_impl(f.path(), 12, 900, base_now);
-        assert!(
-            result.is_some(),
-            "banner within last 12 should be detected: {result:?}"
-        );
-    }
-
-    // ── malformed_in_tail_impl tests ───────────────────────────────────────────
-
-    fn make_malformed_record(ts_offset: i64, base_now: i64) -> String {
-        let epoch = base_now + ts_offset;
-        let dt = chrono::DateTime::<chrono::Utc>::from_timestamp(epoch, 0)
-            .unwrap()
-            .format("%Y-%m-%dT%H:%M:%S%.3fZ")
-            .to_string();
-        serde_json::json!({
-            "type": "assistant",
-            "timestamp": dt,
-            "message": {
-                "stop_reason": "tool_use",
-                "content": [
-                    {
-                        "type": "text",
-                        "text": "I'll use the tool <invoke name=\"bash\"><parameter>ls</parameter></invoke>"
-                    }
-                ]
-            }
-        })
-        .to_string()
-    }
-
-    /// malformed-in-tail detects a fresh malformed tool-call record.
-    #[test]
-    fn malformed_in_tail_detects_fresh_hit() {
-        use std::io::Write;
-        use tempfile::NamedTempFile;
-
-        let base_now: i64 = 1_718_000_000;
-        let line = make_malformed_record(-60, base_now); // 60 s ago, within 180 s
-
-        let mut f = NamedTempFile::new().unwrap();
-        writeln!(f, "{line}").unwrap();
-
-        let result = malformed_in_tail_impl(f.path(), 8, 180, base_now);
-        assert_eq!(result.as_deref(), Some("MALFORMED_TOOL_USE"));
-    }
-
-    /// malformed-in-tail does NOT trigger when the record has a tool_use block.
-    #[test]
-    fn malformed_in_tail_skips_when_has_tool_use_block() {
-        use std::io::Write;
-        use tempfile::NamedTempFile;
-
-        let base_now: i64 = 1_718_000_000;
-        let epoch = base_now - 60;
-        let dt = chrono::DateTime::<chrono::Utc>::from_timestamp(epoch, 0)
-            .unwrap()
-            .format("%Y-%m-%dT%H:%M:%S%.3fZ")
-            .to_string();
-        // Has a real tool_use block → conjunct 2 fails
-        let line = serde_json::json!({
-            "type": "assistant",
-            "timestamp": dt,
-            "message": {
-                "stop_reason": "tool_use",
-                "content": [
-                    {"type": "tool_use", "id": "t1", "name": "bash", "input": {"cmd": "ls"}},
-                    {"type": "text", "text": "running <invoke name=\"bash\"></invoke>"}
-                ]
-            }
-        })
-        .to_string();
-
-        let mut f = NamedTempFile::new().unwrap();
-        writeln!(f, "{line}").unwrap();
-
-        let result = malformed_in_tail_impl(f.path(), 8, 180, base_now);
-        assert!(
-            result.is_none(),
-            "should not trigger when tool_use block present"
-        );
-    }
-
-    /// malformed-in-tail does NOT trigger when text doesn't end with </invoke>.
-    #[test]
-    fn malformed_in_tail_skips_without_close_invoke() {
-        use std::io::Write;
-        use tempfile::NamedTempFile;
-
-        let base_now: i64 = 1_718_000_000;
-        let epoch = base_now - 60;
-        let dt = chrono::DateTime::<chrono::Utc>::from_timestamp(epoch, 0)
-            .unwrap()
-            .format("%Y-%m-%dT%H:%M:%S%.3fZ")
-            .to_string();
-        // Text ends with something else — conjunct 3 fails
-        let line = serde_json::json!({
-            "type": "assistant",
-            "timestamp": dt,
-            "message": {
-                "stop_reason": "tool_use",
-                "content": [
-                    {"type": "text", "text": "<invoke name=\"bash\">ls"}
-                ]
-            }
-        })
-        .to_string();
-
-        let mut f = NamedTempFile::new().unwrap();
-        writeln!(f, "{line}").unwrap();
-
-        let result = malformed_in_tail_impl(f.path(), 8, 180, base_now);
-        assert!(
-            result.is_none(),
-            "should not trigger without </invoke> at end"
-        );
-    }
-
     // ── owner_dir_to_profile_name tests ───────────────────────────────────────
 
     #[test]
@@ -1905,7 +1340,7 @@ mod tests {
     }
 
     /// StopFailure with any other error → NotLimit (do nothing; never falls
-    /// through to tier-1/2).
+    /// through to tier-2).
     #[test]
     fn stop_failure_limit_other_error_is_not_limit() {
         for err in [
@@ -2056,7 +1491,7 @@ mod tests {
         assert!(!cooldown_should_block(true, false));
     }
 
-    /// A non-definitive (tier-1/2/malformed) signal keeps today's behavior
+    /// A non-definitive (tier-2) signal keeps today's behavior
     /// exactly: blocked iff the window says blocked.
     #[test]
     fn cooldown_should_block_non_definitive_follows_window() {
@@ -2088,32 +1523,6 @@ mod tests {
         let (pid, born) = parse_pid_file(content).unwrap();
         assert_eq!(pid, 12345);
         assert_eq!(born, 1_718_000_000);
-    }
-
-    // ── extract_timestamp_epoch tests ─────────────────────────────────────────
-
-    #[test]
-    fn timestamp_epoch_parsed_correctly() {
-        let v = serde_json::json!({"timestamp": "2024-01-10T12:00:00.000Z"});
-        let epoch = extract_timestamp_epoch(&v);
-        assert!(epoch > 0, "should parse ISO-8601 timestamp");
-        // 2024-01-10T12:00:00Z = 1704888000 (approximately)
-        assert!(
-            epoch > 1_700_000_000 && epoch < 1_800_000_000,
-            "epoch out of expected range: {epoch}"
-        );
-    }
-
-    #[test]
-    fn timestamp_epoch_missing_returns_zero() {
-        let v = serde_json::json!({"type": "assistant"});
-        assert_eq!(extract_timestamp_epoch(&v), 0);
-    }
-
-    #[test]
-    fn timestamp_epoch_empty_returns_zero() {
-        let v = serde_json::json!({"timestamp": ""});
-        assert_eq!(extract_timestamp_epoch(&v), 0);
     }
 
     // ── statusline_limit_at (the tick's pre-gate) ───────────────────────────
@@ -2310,76 +1719,5 @@ mod tests {
                 crate::usage::FetchError::NegativeCacheActive,
             ));
         assert!(resolve_target_from_pick(result).is_none());
-    }
-
-    // ── tier-1 pattern: model-scoped weekly banner shapes (generic, no model name) ─
-
-    /// A weekly-scoped banner phrased with "reached your ... limit" (rather
-    /// than "hit your") must still be detected — the model-scoped weekly cap
-    /// message may not share the session banner's exact wording, but the
-    /// pattern match is structural (never keyed to a model name).
-    #[test]
-    fn limit_in_tail_detects_reached_your_phrasing() {
-        let base_now: i64 = 1_718_000_000;
-        let banner =
-            "You've reached your weekly limit for this session's model tier · resets Mon 9am";
-        let line = make_transcript_line(true, banner, -100, base_now);
-
-        let mut f = tempfile::NamedTempFile::new().unwrap();
-        {
-            use std::io::Write;
-            writeln!(f, "{line}").unwrap();
-        }
-
-        let result = limit_in_tail_impl(f.path(), 12, 900, base_now);
-        assert!(
-            result.is_some(),
-            "'reached your ... limit' phrasing should be detected"
-        );
-    }
-
-    /// A bare "weekly limit" mention — with none of "hit your"/"reached
-    /// your"/"usage limit"/"limit reached" present — is also detected: covers
-    /// a terser model-scoped weekly banner shape. The model tier name (data,
-    /// e.g. "Fable") never has to appear in the pattern itself.
-    #[test]
-    fn limit_in_tail_detects_bare_weekly_limit_phrasing() {
-        let base_now: i64 = 1_718_000_000;
-        let banner = "Your weekly limit for Fable is used up for this week. Resets Monday.";
-        let line = make_transcript_line(true, banner, -100, base_now);
-
-        let mut f = tempfile::NamedTempFile::new().unwrap();
-        {
-            use std::io::Write;
-            writeln!(f, "{line}").unwrap();
-        }
-
-        let result = limit_in_tail_impl(f.path(), 12, 900, base_now);
-        assert!(
-            result.is_some(),
-            "bare 'weekly limit' phrasing should be detected"
-        );
-    }
-
-    /// Sanity: the generalized pattern still does NOT fire on unrelated text
-    /// that merely mentions "weekly" or "limit" separately without any of the
-    /// recognized banner shapes.
-    #[test]
-    fn limit_in_tail_still_skips_unrelated_weekly_mention() {
-        let base_now: i64 = 1_718_000_000;
-        let banner = "Here's your weekly summary. No caps were exceeded.";
-        let line = make_transcript_line(true, banner, -100, base_now);
-
-        let mut f = tempfile::NamedTempFile::new().unwrap();
-        {
-            use std::io::Write;
-            writeln!(f, "{line}").unwrap();
-        }
-
-        let result = limit_in_tail_impl(f.path(), 12, 900, base_now);
-        assert!(
-            result.is_none(),
-            "unrelated weekly summary text must not trigger a false positive"
-        );
     }
 }
