@@ -24,8 +24,9 @@
 #     "captured_at": "2026-06-24T00:00:00Z",
 #     "profiles": {
 #       "<profile-name>": {
-#         "session":  {"pct": <int>, "resets": "<string>"},
-#         "week_all": {"pct": <int>, "resets": "<string>"}
+#         "session":    {"pct": <int>, "resets": "<string>"},
+#         "week_all":   {"pct": <int>, "resets": "<string>"},
+#         "week_fable": {"pct": <int>, "resets": "<string>"}   # optional: one model-scoped weekly window
 #       },
 #       ...
 #     },
@@ -34,8 +35,11 @@
 #
 # csm's scoring (defaults, override via env):
 #   - skip a profile if it is in "errors"
-#   - skip if session.pct >= CLAUDE_LIMIT_PCT            (default 99)
-#   - skip if week_all.pct >= CLAUDE_PICK_SATURATION_PCT (default 95)
+#   - skip if session.pct >= CLAUDE_LIMIT_PCT              (default 99)
+#   - skip if week_all.pct >= CLAUDE_PICK_SATURATION_PCT   (default 95)
+#   - skip if week_fable.pct >= CLAUDE_PICK_SATURATION_PCT (same variable; only
+#     when the profile has a week_fable section at all — absence is never read
+#     as "limited")
 #   - among survivors: soonest week_all reset wins (budget on the account
 #     that refills first is the cheapest to spend; a known reset beats an
 #     unknown one); ties broken by highest week_all.pct.
@@ -53,14 +57,14 @@
 # source other than the per-profile credentials csm reads by default.
 set -eu
 
-# ── Strategy A: proxy an existing hub HTTP endpoint ──────────────────────────
-# If you already run (or can reach) a usage hub, the whole job is one curl.
-# This is the most robust option — the hub already produces the exact shape.
+# ── Strategy A: proxy an HTTP endpoint you control ───────────────────────────
+# If some service you run already produces this exact JSON shape, the whole
+# job is one curl:
 #
-#   exec curl -fsS --max-time 8 "https://your-hub.example/cc-usage/api/data/limits"
+#   exec curl -fsS --max-time 8 "https://your-service.example/usage.json"
 #
 # (Uncomment the line above and you are done. The rest of this file is only for
-#  environments WITHOUT a hub.)
+#  environments without such a service.)
 
 # ── Strategy B: re-emit a cache file your own tooling refreshes ──────────────
 # If some scheduled job on this machine writes the UsageData JSON to a file,

@@ -58,6 +58,13 @@ csm run [csm-flags] [-- claude...]   smart launcher (session + account + relaunc
   -A, --pick-account                 force an account pick this launch (overrides --no-pick)
   -n, --new                          start a fresh session (skip the session picker)
   -c, --continue                     resume newest free session
+  -r, --resume [<id>|<alias>]        resume a session (csm also reads the id)
+  --session-id <uuid>                forwarded to claude; csm tracks it for sidecar/relaunch state
+  --model <m>                        forwarded to claude; remembered across a limit-switch hop
+  --effort <e>                       forwarded to claude; remembered across a limit-switch hop
+  --permission-mode <p>              forwarded to claude; remembered across a limit-switch hop
+  # the six flags above are forwarded to claude AND read by csm; every other claude
+  #   flag passes through untouched — use `csm run -- <args>` to force passthrough
   # default: ALWAYS opens the session picker (new / continue / pick existing) so the
   #   choice is never made silently, and auto-picks the best account by usage; if
   #   usage is unavailable (no usable usage data) it opens the account picker
@@ -70,8 +77,13 @@ csm profiles rm   <name>             unregister (refused if it is the default)
 csm profiles use  <name>             set the machine default profile (+ floor)
 csm profiles edit                    interactive editor (TTY)
 csm profiles dir  [<name>]           print a profile's config dir
-csm profiles bootstrap [<name>|--all] provision a profile's env (dir + shared plugins)
+csm profiles bootstrap [<name>|--all] provision a profile's env (dir + shared plugins/projects)
 csm profiles doctor [--fix] [<name>|--all] diagnose/repair provisioning
+
+csm config [show]                    print csm's own config JSON (~/.config/claude-smart/config.json)
+csm config get launch-command        print the resolved launch command
+csm config set launch-command <cmd>...   launch <cmd> instead of `claude` (e.g. happy)
+csm config unset launch-command      revert to launching `claude`
 
 csm usage [--json] [--no-fetch] [--refresh] [--refresh-oauth]
                                      multi-profile usage table (see Usage metering)
@@ -79,9 +91,11 @@ csm usage capture                    read statusLine stdin, merge into the store
 
 csm pick-account [<cur>] [--include-current]
 csm scan [<cwd>]                     session listing (TSV)
+csm reap [--dry-run] [--term] [--all|--session <sid>]   kill orphan processes left by claude
 csm sidecar {read|write|merge|flags} <sid> [k=v...]   per-session state store
 csm statusline                       `<profile>@<host>` for the shell prompt
 csm completions {zsh|bash|pwsh}      shell completions
+csm newuuid                          fresh lowercase UUID v4
 ```
 
 > `csm` also recognizes a few **machine-interface** subcommands meant for
@@ -275,16 +289,8 @@ capture is what moves a running session off an account that just hit its
 weekly cap (see *Reactive switch* below), so a `csm run` session without it
 only gets the hook-based paths.
 
-| Variable | Meaning |
-|---|---|
-| `CSM_USAGE_PROFILE_TTL` | Seconds a profile's own store record is served without a live probe (default `300`). |
-| `CSM_USAGE_RATE_LIMIT_COOLDOWN` | Seconds to back off a profile after a 429 from the usage API (default `900`). |
-| `CSM_USAGE_API_BASE` | Override the usage API base URL (default `https://api.anthropic.com`). Mainly for tests. |
-| `CSM_OAUTH_REFRESH` | `1` enables the opt-in OAuth access-token refresh (same as `csm usage --refresh-oauth`). Default off. See *Headless collectors*. |
-| `CSM_OAUTH_TOKEN_URL` | Override the OAuth token endpoint used by that refresh (default `https://platform.claude.com/v1/oauth/token`). Mainly for tests; an override is announced on stderr. |
-| `CSM_STATUSLINE_NO_CAPTURE` | `1`/`true` disables the automatic statusline capture in `csm statusline`. |
-| `CLAUDE_USAGE_TTL` / `CSM_USAGE_TTL_SECS` | Positive-cache lifetime in seconds (default `60`). The legacy name wins if both are set. |
-| `CLAUDE_USAGE_FAIL_COOLDOWN` | Negative-cache cooldown in seconds after every profile fails at once (default `120`). |
+See *Usage collection and caching* in [Environment variables](#environment-variables)
+for every variable named above.
 
 **Known limitation.** An idle profile you haven't run `claude` under in a
 while can have an expired access token. `csm` does not refresh a token unless
@@ -444,11 +450,11 @@ script" path takes precedence over the built-in collector), and its result is
 cached like any other fetch, so a slow command is not re-run within the cache
 TTL.
 
-| Variable | Meaning |
-|---|---|
-| `CSM_USAGE_CMD` | Shell command whose stdout is a usage JSON blob. Empty/unset = disabled. Runs via `sh -c` (POSIX) / `cmd /C` (Windows) — so on Windows the value must be `cmd.exe`-safe (single-quote quoting and Unix pipelines won't work; wrap complex logic in a `.cmd`/`.ps1` script and point at that). |
-| `CSM_USAGE_CMD_TIMEOUT` | Hard deadline in seconds for that command (default `10`). On timeout `csm` falls through to local collection. |
-| `CLAUDE_USAGE_TTL` / `CSM_USAGE_TTL_SECS` | Positive-cache lifetime in seconds (default `60`). The legacy name wins if both are set. |
+`CSM_USAGE_CMD` runs via `sh -c` (POSIX) / `cmd /C` (Windows) — so on Windows
+the value must be `cmd.exe`-safe (single-quote quoting and Unix pipelines
+won't work; wrap complex logic in a `.cmd`/`.ps1` script and point at that).
+See *Custom usage source* in [Environment variables](#environment-variables)
+for `CSM_USAGE_CMD`, `CSM_USAGE_CMD_TIMEOUT`, and the shared cache TTL.
 
 `csm` does the scoring and the account choice itself — the command only reports
 the **facts** (each profile's usage); you do not pick a profile in it.
@@ -466,6 +472,55 @@ existing endpoint (one `curl`), re-emit a cache file, or synthesize the JSON
 from per-profile facts. Its header comment also documents the **full usage JSON
 shape** (`profiles[<name>].session.pct` / `.week_all.pct` / `.resets`) and the
 scoring rules csm applies to it, so it doubles as the format reference.
+
+## Environment variables
+
+Every environment variable `csm` reads, grouped by what it affects. Names are
+frozen — this section documents them, it never renames or deprecates one.
+Defaults shown are what applies when the variable is unset or unparseable.
+
+### Launch and profile
+
+| Variable | Meaning |
+|---|---|
+| `CLAUDE_CONFIG_DIR` | The active profile's Claude Code config home. Set by the shell `cas` shim (or the platform floor) before `csm` runs; `csm` reads it to resolve the current profile name and directory. See *Profiles*. |
+| `CLAUDE_SMART_CLAUDE_BIN` | A single binary path/name that overrides what `csm run` spawns instead of `claude`. Highest precedence (above `csm config set launch-command`); mainly for tests and one-off overrides. See *Configuration*. |
+| `CSM_HOST_REPLACE` | A literal, case-insensitive, first-match `find/replace` pair (e.g. `Acme-/`) applied to the short hostname `csm statusline` shows as `<profile>@<host>`. Unset = the raw short hostname, no rewrite; `csm` carries no built-in naming convention. |
+| `CLAUDE_TITLE_INDEX_TTL` | Seconds the session title index (`titles.tsv`) is served without a rebuild (default `300`). |
+
+### Account scoring and the limit switch
+
+| Variable | Meaning |
+|---|---|
+| `CLAUDE_LIMIT_PCT` | The 5-hour session window's "not viable" threshold, percent (default `99`). Gates both scoring/pick and the hook's/statusline tick's rate-limit check. See *What counts as a viable account*. |
+| `CLAUDE_PICK_SATURATION_PCT` | The weekly (all-model and model-scoped) "not viable" threshold, percent (default `95`). |
+| `CLAUDE_USAGE_MAX_AGE` / `CSM_USAGE_MAX_AGE_SECS` | Max age, in seconds, of usage data that auto-pick will still trust (default `1800`); `0` disables the gate. `CLAUDE_USAGE_MAX_AGE` wins if both are set. |
+| `CLAUDE_AUTO_SWITCH` | `0` disables the whole limit-switch decision (a kill-switch). Anything else, or unset, leaves it enabled. |
+| `CLAUDE_AUTO_SWITCH_RELAUNCH` | `1` (default) actually relaunches under the target profile on a switch. Any other value only notifies — it prints the manual switch command instead of relaunching. |
+| `CLAUDE_SWITCH_COOLDOWN` | Seconds the machine-wide switch cooldown enforces between percentage-based switches (default `300`). Throttles the `Stop` percentage path only — never the statusline tick or a `StopFailure(rate_limit)` hit, each of which is a session's own live evidence. See *Reactive switch*. |
+| `CLAUDE_MAX_HOPS` | Max switch hops one session chain may take before the hook gives up and skips (default `1`). |
+| `CLAUDE_SMART_RESUME_PROMPT` | Overrides the handoff message injected into a session after a switch. Unset = `csm`'s default handoff text; set to an empty string = no handoff prompt at all; any other value is used verbatim. |
+| `CLAUDE_SWITCH_GRACE_MS` | Milliseconds the process supervisor waits for the launched child to exit gracefully after a stop signal before escalating (default `5000`). |
+
+### Usage collection and caching
+
+| Variable | Meaning |
+|---|---|
+| `CLAUDE_USAGE_TTL` / `CSM_USAGE_TTL_SECS` | Positive-cache lifetime for a fetched usage snapshot, seconds (default `60`). The legacy name wins if both are set. |
+| `CLAUDE_USAGE_FAIL_COOLDOWN` | Negative-cache cooldown in seconds after every profile fails to fetch at once (default `120`). |
+| `CSM_USAGE_PROFILE_TTL` | Seconds a profile's own store record is served without a live probe (default `300`). |
+| `CSM_USAGE_RATE_LIMIT_COOLDOWN` | Seconds to back off a profile after a 429 from the usage API (default `900`). |
+| `CSM_USAGE_API_BASE` | Override the usage API base URL (default `https://api.anthropic.com`). Mainly for tests. |
+| `CSM_OAUTH_REFRESH` | `1` enables the opt-in headless OAuth access-token refresh (same as `csm usage --refresh-oauth`). Default off. See *Headless collectors*. |
+| `CSM_OAUTH_TOKEN_URL` | Override the OAuth token endpoint used by that refresh (default `https://platform.claude.com/v1/oauth/token`). Mainly for tests; an override is announced on stderr. |
+| `CSM_STATUSLINE_NO_CAPTURE` | `1`/`true` disables the automatic statusline usage capture in `csm statusline`. |
+
+### Custom usage source
+
+| Variable | Meaning |
+|---|---|
+| `CSM_USAGE_CMD` | Shell command whose stdout is a usage JSON blob, overriding local collection. Empty/unset = disabled. See *Custom usage command*. |
+| `CSM_USAGE_CMD_TIMEOUT` | Hard deadline in seconds for that command (default `10`). On timeout `csm` falls through to local collection. |
 
 ## License
 
