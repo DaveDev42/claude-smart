@@ -579,10 +579,7 @@ pub fn classify_with(
     // keep today's throttle exactly.
     let smart_dir = paths::smart_dir()?;
     let last_switch_path = paths::last_switch();
-    let cooldown_secs = std::env::var("CLAUDE_SWITCH_COOLDOWN")
-        .ok()
-        .and_then(|s| s.parse::<i64>().ok())
-        .unwrap_or(LAST_SWITCH_COOLDOWN_SECS);
+    let cooldown_secs = crate::envvar::i64_or("CLAUDE_SWITCH_COOLDOWN", LAST_SWITCH_COOLDOWN_SECS);
 
     let window_blocked = check_and_claim_cooldown(&last_switch_path, cooldown_secs);
     let _ = smart_dir; // ensure we called smart_dir for side effect
@@ -592,10 +589,7 @@ pub fn classify_with(
 
     // ── 10. Hop guard ─────────────────────────────────────────────────────────
     // Shell: the legacy shell implementation
-    let max_hops = std::env::var("CLAUDE_MAX_HOPS")
-        .ok()
-        .and_then(|s| s.parse::<i64>().ok())
-        .unwrap_or(MAX_HOPS);
+    let max_hops = crate::envvar::i64_or("CLAUDE_MAX_HOPS", MAX_HOPS);
     let current_hop = read_sidecar_hop(sid);
     if current_hop >= max_hops {
         return Ok(Decision::Skip);
@@ -834,10 +828,7 @@ fn detect_usage_threshold(owner_dir: &Path) -> Option<String> {
         .and_then(|pu| pu.week_fable.as_ref())
         .map(|s| s.pct);
 
-    let limit_pct = std::env::var("CLAUDE_LIMIT_PCT")
-        .ok()
-        .and_then(|s| s.parse::<i64>().ok())
-        .unwrap_or(LIMIT_PCT);
+    let limit_pct = crate::envvar::i64_or("CLAUDE_LIMIT_PCT", LIMIT_PCT);
 
     usage_threshold_hit(session_pct, week_pct, week_fable_pct, limit_pct)
 }
@@ -849,10 +840,7 @@ fn detect_usage_threshold(owner_dir: &Path) -> Option<String> {
 /// contract [`usage_threshold_hit`] documents. Pure, so the tick's whole
 /// decision about *whether to even run `classify`* is unit-tested here.
 pub(crate) fn statusline_limit(usage: &crate::usage::model::ProfileUsage) -> Option<String> {
-    let limit_pct = std::env::var("CLAUDE_LIMIT_PCT")
-        .ok()
-        .and_then(|s| s.parse::<i64>().ok())
-        .unwrap_or(LIMIT_PCT);
+    let limit_pct = crate::envvar::i64_or("CLAUDE_LIMIT_PCT", LIMIT_PCT);
     statusline_limit_at(usage, limit_pct)
 }
 

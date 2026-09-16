@@ -127,12 +127,7 @@ impl Launcher for WindowsLauncher {
         let _ = crate::platform::pid::write_pid_file(&crate::paths::pid_file(sid), pid, born);
 
         let stop_flag = crate::paths::stop_flag(sid);
-        let grace = Duration::from_millis(
-            std::env::var("CLAUDE_SWITCH_GRACE_MS")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(5_000),
-        );
+        let grace = Duration::from_millis(crate::envvar::u64_or("CLAUDE_SWITCH_GRACE_MS", 5_000));
 
         let status = supervise(child, &stop_flag, pid, grace)?;
 

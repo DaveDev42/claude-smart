@@ -410,10 +410,7 @@ fn dedup_title_rows_by_sid(rows: Vec<TitleRow>) -> Vec<TitleRow> {
 
 /// Return the TTL from `CLAUDE_TITLE_INDEX_TTL` env var, or the default 300 s.
 fn read_ttl_from_env() -> u64 {
-    std::env::var("CLAUDE_TITLE_INDEX_TTL")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(DEFAULT_TITLE_INDEX_TTL)
+    crate::envvar::u64_or("CLAUDE_TITLE_INDEX_TTL", DEFAULT_TITLE_INDEX_TTL)
 }
 
 /// Return `true` if `titles.tsv` is older than `ttl` seconds (or missing).

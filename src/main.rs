@@ -2,6 +2,7 @@ mod account;
 mod cas;
 mod cli;
 mod config;
+mod envvar;
 mod hook;
 mod paths;
 mod picker;

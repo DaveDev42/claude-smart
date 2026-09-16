@@ -331,15 +331,11 @@ fn run_usage_command(cmd: &str) -> Result<UsageData, FetchError> {
 /// alias lets users configure the cache lifetime under a csm-prefixed name
 /// without knowing the legacy variable.
 fn positive_ttl_secs() -> u64 {
-    std::env::var("CLAUDE_USAGE_TTL")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .or_else(|| {
-            std::env::var("CSM_USAGE_TTL_SECS")
-                .ok()
-                .and_then(|v| v.parse().ok())
-        })
-        .unwrap_or(DEFAULT_POSITIVE_TTL_SECS)
+    crate::envvar::u64_with_alias(
+        "CLAUDE_USAGE_TTL",
+        "CSM_USAGE_TTL_SECS",
+        DEFAULT_POSITIVE_TTL_SECS,
+    )
 }
 
 /// Return `Ok(Some(data))` if the cache file exists, is non-empty, and its
@@ -1030,6 +1026,28 @@ mod tests {
         // Legacy set → legacy takes precedence over alias.
         std::env::set_var("CLAUDE_USAGE_TTL", "5");
         assert_eq!(positive_ttl_secs(), 5, "legacy var should win over alias");
+        match saved_legacy {
+            Some(v) => std::env::set_var("CLAUDE_USAGE_TTL", v),
+            None => std::env::remove_var("CLAUDE_USAGE_TTL"),
+        }
+        match saved_alias {
+            Some(v) => std::env::set_var("CSM_USAGE_TTL_SECS", v),
+            None => std::env::remove_var("CSM_USAGE_TTL_SECS"),
+        }
+    }
+
+    #[test]
+    fn positive_ttl_unparseable_legacy_falls_through_to_alias() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let saved_legacy = std::env::var("CLAUDE_USAGE_TTL").ok();
+        let saved_alias = std::env::var("CSM_USAGE_TTL_SECS").ok();
+        std::env::set_var("CLAUDE_USAGE_TTL", "not-a-number");
+        std::env::set_var("CSM_USAGE_TTL_SECS", "90");
+        assert_eq!(
+            positive_ttl_secs(),
+            90,
+            "present-but-unparseable legacy var should fall through to a valid alias"
+        );
         match saved_legacy {
             Some(v) => std::env::set_var("CLAUDE_USAGE_TTL", v),
             None => std::env::remove_var("CLAUDE_USAGE_TTL"),

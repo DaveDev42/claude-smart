@@ -40,7 +40,6 @@
 //! `SATURATION_PCT` constant/override as `week_all`, never a separate knob.
 
 use std::collections::HashMap;
-use std::env;
 
 use chrono::{DateTime, Utc};
 
@@ -65,19 +64,13 @@ pub const ABSENT_SESSION_PCT: i64 = -1;
 
 /// Read `CLAUDE_LIMIT_PCT` from the environment, falling back to [`LIMIT_PCT`].
 fn limit_pct() -> i64 {
-    env::var("CLAUDE_LIMIT_PCT")
-        .ok()
-        .and_then(|v| v.trim().parse::<i64>().ok())
-        .unwrap_or(LIMIT_PCT)
+    crate::envvar::i64_or("CLAUDE_LIMIT_PCT", LIMIT_PCT)
 }
 
 /// Read `CLAUDE_PICK_SATURATION_PCT` from the environment, falling back to
 /// [`SATURATION_PCT`].
 fn saturation_pct() -> i64 {
-    env::var("CLAUDE_PICK_SATURATION_PCT")
-        .ok()
-        .and_then(|v| v.trim().parse::<i64>().ok())
-        .unwrap_or(SATURATION_PCT)
+    crate::envvar::i64_or("CLAUDE_PICK_SATURATION_PCT", SATURATION_PCT)
 }
 
 /// Default max age, in seconds, of the usage data that account auto-pick will
@@ -96,14 +89,17 @@ pub const USAGE_MAX_AGE_SECS: u64 = 1800;
 ///
 /// `CLAUDE_USAGE_MAX_AGE` wins; `CSM_USAGE_MAX_AGE_SECS` is the namespaced
 /// alias (mirrors the `CLAUDE_USAGE_TTL` / `CSM_USAGE_TTL_SECS` pair in the
-/// transport layer). Unparseable / unset → [`USAGE_MAX_AGE_SECS`]. `0` = gate
-/// off.
+/// transport layer). An unparseable `CLAUDE_USAGE_MAX_AGE` now falls through
+/// to a valid `CSM_USAGE_MAX_AGE_SECS` rather than straight to the default
+/// (see [`crate::envvar::u64_with_alias`] — this used to disagree with the
+/// transport layer's more forgiving rule; it no longer does). Unparseable /
+/// unset both → [`USAGE_MAX_AGE_SECS`]. `0` = gate off.
 fn usage_max_age_secs() -> u64 {
-    env::var("CLAUDE_USAGE_MAX_AGE")
-        .ok()
-        .or_else(|| env::var("CSM_USAGE_MAX_AGE_SECS").ok())
-        .and_then(|v| v.trim().parse::<u64>().ok())
-        .unwrap_or(USAGE_MAX_AGE_SECS)
+    crate::envvar::u64_with_alias(
+        "CLAUDE_USAGE_MAX_AGE",
+        "CSM_USAGE_MAX_AGE_SECS",
+        USAGE_MAX_AGE_SECS,
+    )
 }
 
 /// The freshest `captured_at` instant in `data`: the top-level field if
@@ -1397,6 +1393,28 @@ mod tests {
             result.unwrap().as_deref(),
             Some("alt"),
             "max-age 0 must disable the gate (trust any age)"
+        );
+    }
+
+    #[test]
+    fn usage_max_age_unparseable_legacy_falls_through_to_alias() {
+        // env is process-global; set/restore around the assertion.
+        let saved_legacy = std::env::var("CLAUDE_USAGE_MAX_AGE").ok();
+        let saved_alias = std::env::var("CSM_USAGE_MAX_AGE_SECS").ok();
+        std::env::set_var("CLAUDE_USAGE_MAX_AGE", "not-a-number");
+        std::env::set_var("CSM_USAGE_MAX_AGE_SECS", "90");
+        let result = usage_max_age_secs();
+        match saved_legacy {
+            Some(v) => std::env::set_var("CLAUDE_USAGE_MAX_AGE", v),
+            None => std::env::remove_var("CLAUDE_USAGE_MAX_AGE"),
+        }
+        match saved_alias {
+            Some(v) => std::env::set_var("CSM_USAGE_MAX_AGE_SECS", v),
+            None => std::env::remove_var("CSM_USAGE_MAX_AGE_SECS"),
+        }
+        assert_eq!(
+            result, 90,
+            "present-but-unparseable legacy var should fall through to a valid alias"
         );
     }
 
