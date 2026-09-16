@@ -33,8 +33,9 @@ use scoring::{ScoringError, ScoringResult};
 /// - `Ok(None)` — winner is already current (`include_current` was `true`).
 /// - `Err(ScoringError::AllSaturated)` — no viable candidate; caller warns and
 ///   keeps the current profile.
-/// - `Err(ScoringError::FetchFailed(_))` — hub down / negative-cache active;
-///   caller opens the hub-down interactive picker (spec §4a).
+/// - `Err(ScoringError::FetchFailed(_))` — usage collection failed / negative-cache
+///   active; caller opens the stale-usage interactive picker (spec §4a, see
+///   [`crate::picker::account`]).
 ///
 /// Applies the staleness gate (proactive / CLI path). For the reactive hook —
 /// which must switch off an already-limited profile even on stale data — use

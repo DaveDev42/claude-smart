@@ -207,7 +207,7 @@ fn print_help() {
 /// Full launch path per spec §2:
 ///   1. Parse args via the hand-rolled `cli::parser`.
 ///   2. Resolve profile dir: `--profile` pin > proactive `pick_account` with
-///      hub-down picker gate §4a > current `CLAUDE_CONFIG_DIR`.
+///      stale-usage picker gate §4a > current `CLAUDE_CONFIG_DIR`.
 ///   3. Resolve session id: explicit `--session-id` > `--resume` > picker >
 ///      auto-resume default.
 ///   4. Build `LaunchSpec` (session_id + profile_dir + cwd + cli) and hand off
@@ -218,10 +218,10 @@ fn print_help() {
 ///   the session picker), skipping auto-pick, as long as interactive + a
 ///   non-empty ProfileMap. `--profile <p>` still wins (explicit choice).
 ///
-///   Otherwise the *hub-down / no-data* picker opens when ALL of:
+///   Otherwise the *stale-usage / no-data* picker opens when ALL of:
 ///   - interactive (isatty(0) && isatty(1))
 ///   - proactive pick context (not `--profile` / not `--no-pick`)
-///   - `pick_account` returned `Err(FetchFailed)` (hub unreachable) OR
+///   - `pick_account` returned `Err(FetchFailed)` (usage collection failed) OR
 ///     `Err(NoUsableData)` (fetch ok but no profile had scorable usage —
 ///     "couldn't tell" must not silently keep current).
 ///     NOT when hook / `--profile` / `--no-pick` / non-interactive, and NOT for
@@ -248,7 +248,7 @@ fn cmd_run(args: &[OsString]) -> anyhow::Result<()> {
     } else if flags.interactive {
         // `-i`/`--interactive` — manual pick: disable *all* auto-pick / skip.
         // Always open the account picker (recommendation-ordered, never the
-        // silent auto-pick), regardless of whether the hub is up. Empty
+        // silent auto-pick), regardless of whether usage collection succeeded. Empty
         // ProfileMap (toss/first-boot) keeps current. The session picker is
         // also forced later by the same flag.
         match force_account_pick(&profiles)? {
@@ -263,7 +263,7 @@ fn cmd_run(args: &[OsString]) -> anyhow::Result<()> {
         current_profile_dir(&profiles)
     } else {
         // Proactive pick (include_current=true — no-op switch if already best).
-        // `None` = the hub-down picker was cancelled with Escape → abort.
+        // `None` = the stale-usage picker was cancelled with Escape → abort.
         match proactive_pick_profile(&current_profile_name, &profiles, flags.pick_account)? {
             Some(dir) => dir,
             None => {
@@ -604,10 +604,12 @@ fn print_launch_attention_warnings(profile_dir: &Path, profiles: &account::Profi
     }
 }
 
-/// Proactive account pick with hub-down picker fallback (spec §4a).
+/// Proactive account pick with stale-usage picker fallback (spec §4a).
+///
+/// See [`crate::picker::account`] for what the stale-usage picker shows.
 ///
 /// Returns `Ok(Some(dir))` with the resolved profile directory, or `Ok(None)`
-/// when the hub-down picker was cancelled (Escape / Ctrl-C) — the caller aborts.
+/// when the stale-usage picker was cancelled (Escape / Ctrl-C) — the caller aborts.
 ///
 /// Pick guard (mirrors zsh `claude-smart.zsh` lines 204-209, 316-323):
 /// - `pick_account(current, include_current=true)` → scoring pick, which
@@ -616,8 +618,8 @@ fn print_launch_attention_warnings(profile_dir: &Path, profiles: &account::Profi
 ///   current profile whose `week_fable` is saturated is treated as limited
 ///   just like a session- or week_all-limited one, so this proactively picks
 ///   a switch away from it (R2).
-/// - `Err(FetchFailed)` (hub down) or `Err(NoUsableData)` (fetch ok but no
-///   scorable usage) + interactive → hub-down account picker (§4a).
+/// - `Err(FetchFailed)` (usage collection failed) or `Err(NoUsableData)` (fetch
+///   ok but no scorable usage) + interactive → stale-usage account picker (§4a).
 /// - same errors + non-interactive → silent fail-safe to current.
 /// - `Err(AllSaturated)` → warn + keep current (no picker; real limits read).
 fn proactive_pick_profile(
@@ -653,24 +655,26 @@ fn proactive_pick_profile(
             );
             Ok(Some(current_dir))
         }
-        // Hub unreachable OR fetch succeeded but carried no usable usage for any
-        // profile. Both mean "we could not determine the best account" — never
-        // silently keep current. Open the interactive picker (interactive) or
-        // fail safe to current (non-interactive), same as a hub-down miss.
+        // Usage collection unreachable OR fetch succeeded but carried no usable
+        // usage for any profile. Both mean "we could not determine the best
+        // account" — never silently keep current. Open the interactive picker
+        // (interactive) or fail safe to current (non-interactive), same as a
+        // stale-usage miss.
         Err(ScoringError::FetchFailed(_)) | Err(ScoringError::NoUsableData) => {
-            hub_down_pick(profiles, &current_dir)
+            stale_usage_pick(profiles, &current_dir)
         }
     }
 }
 
-/// Hub-down account picker (spec §4a Decision #1).
+/// Stale-usage account picker (spec §4a Decision #1). See
+/// [`crate::picker::account`].
 ///
 /// Interactive + fetch-miss → open the account picker with stale usage data.
 /// Non-interactive → silent fail-safe to current profile.
 ///
 /// Returns `Ok(Some(dir))` to launch under `dir`, or `Ok(None)` when the user
 /// pressed Escape / Ctrl-C in the picker (cancel the launch entirely).
-fn hub_down_pick(
+fn stale_usage_pick(
     profiles: &account::ProfileMap,
     current_dir: &Path,
 ) -> anyhow::Result<Option<PathBuf>> {
@@ -678,12 +682,13 @@ fn hub_down_pick(
     if !is_interactive() {
         return Ok(Some(current_dir.to_path_buf()));
     }
-    run_account_picker(profiles, current_dir, "hub-down picker")
+    run_account_picker(profiles, current_dir, "stale-usage picker")
 }
 
 /// Forced account picker for `-i`/`--interactive` (manual pick).
 ///
-/// Unlike [`hub_down_pick`], this is invoked even when the hub is up and a
+/// Unlike [`stale_usage_pick`], this is invoked even when usage collection
+/// succeeded and a
 /// confident auto-pick exists: `-i` means "let me choose", so we skip the
 /// auto-pick entirely and always present the recommendation-ordered picker
 /// (Enter still takes the recommendation). The TTY gate still applies — a piped
@@ -694,10 +699,10 @@ fn force_account_pick(profiles: &account::ProfileMap) -> anyhow::Result<Option<P
     if profiles.is_empty() || !is_interactive() {
         return Ok(Some(current_dir));
     }
-    run_account_picker(profiles, &current_dir, "interactive picker")
+    run_account_picker(profiles, &current_dir, "manual account picker")
 }
 
-/// Shared account-picker driver for [`hub_down_pick`] and
+/// Shared account-picker driver for [`stale_usage_pick`] and
 /// [`force_account_pick`]. Builds recommendation-ordered rows (stale usage if
 /// that is all we have) and maps the picker outcome:
 /// - Selected → that profile's dir.
@@ -730,11 +735,12 @@ fn run_account_picker(
     }
 }
 
-/// Recommendation rank for a hub-down picker row, mirroring `scoring::pick_best`.
+/// Recommendation rank for a stale-usage picker row, mirroring `scoring::pick_best`.
 ///
 /// The picker renders top-to-bottom with the cursor on the FIRST row, so
 /// pressing Enter selects it. We therefore order rows so the
-/// recommended profile (the one `pick_best` would auto-select when the hub is up)
+/// recommended profile (the one `pick_best` would auto-select when usage
+/// collection succeeds)
 /// leads, and the user can just press Enter.
 ///
 /// Viability is delegated to `scoring::is_viable_pcts` — the SINGLE viability
@@ -784,7 +790,7 @@ fn account_row_rank(
     // `resets` display string — same precedence as
     // `UsageSection::reset_instant` / `scoring::pick_best_at`. `week_fable`
     // carries no display-string fallback here (only `resets_at`) — a minor,
-    // deliberate asymmetry: the hub-down picker's cache read never needed a
+    // deliberate asymmetry: the stale-usage picker's cache read never needed a
     // fable resets STRING before this field existed, and the epoch is what
     // ranking actually consumes.
     let week_all_epoch = data.resets_at.or_else(|| {
@@ -803,7 +809,7 @@ fn account_row_rank(
     (0, epoch, -week_pct, name.to_owned())
 }
 
-/// Build `AccountRow` list for the hub-down picker, ordered by recommendation so
+/// Build `AccountRow` list for the stale-usage picker, ordered by recommendation so
 /// the top row is what `pick_best` would auto-select (Enter selects it).
 fn build_account_rows(profiles: &account::ProfileMap) -> Vec<picker::account::AccountRow> {
     use picker::account::{AccountRow, StaleProfileData};
@@ -1655,8 +1661,8 @@ fn cmd_usage(args: &[OsString]) -> anyhow::Result<()> {
     let profiles =
         account::ProfileMap::load().context("csm usage: failed to load profiles.json")?;
     // "Configured" now simply means the registry isn't empty — local
-    // collection needs no separate opt-in env (unlike the retired hub
-    // transports, which required two site-specific env vars to name the hub).
+    // collection needs no separate opt-in env (unlike the retired remote
+    // transport, which required two site-specific env vars to name it).
     let configured = !profiles.is_empty();
 
     // Resolve usage data + freshness. `--no-fetch` reads the cache directly;
@@ -1770,8 +1776,8 @@ fn cmd_pick_account(args: &[OsString]) -> anyhow::Result<()> {
     }
 
     // Degraded mode: no registry → no accounts to pick between. Bail gracefully
-    // (empty stdout, a hint on stderr, rc 0) instead of attempting a hub fetch
-    // that fails with a raw "hub returned empty payload". Mirrors the
+    // (empty stdout, a hint on stderr, rc 0) instead of attempting a remote
+    // fetch that fails with a raw "empty payload" error. Mirrors the
     // `profiles.is_empty()` guard in `proactive_pick_profile`.
     if account::ProfileMap::load().unwrap_or_default().is_empty() {
         eprintln!("csm pick-account: no profiles configured — `csm profiles add <name>`");
@@ -2602,7 +2608,7 @@ mod tests {
         assert_eq!(res.sid(), existing);
     }
 
-    // ── account_row_rank (hub-down picker: recommended profile leads) ─────────
+    // ── account_row_rank (stale-usage picker: recommended profile leads) ─────────
     // The picker starts the cursor on row 0, so the top row is what Enter
     // selects. account_row_rank must order rows the same way pick_best chooses,
     // so the recommendation leads and a bare Enter picks it.

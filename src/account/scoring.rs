@@ -4,8 +4,9 @@
 //!
 //! 1. Build candidate rows: profiles NOT in errors{}, with a numeric week_all.pct.
 //! 2. Exclusions (in order) — see [`is_viable_pcts`], the SINGLE viability
-//!    authority every caller (this module's own ranking, the hub-down
-//!    picker's `main::account_row_rank`) routes through:
+//!    authority every caller (this module's own ranking, the stale-usage
+//!    picker's `main::account_row_rank` — see [`crate::picker::account`])
+//!    routes through:
 //!    - `session.pct >= LIMIT_PCT(99)` → skip (absent session.pct = -1, never fires).
 //!    - `week_all.pct >= SATURATION_PCT(95)` → skip.
 //!    - `week_fable.pct >= SATURATION_PCT(95)` → skip, when `week_fable` is
@@ -134,8 +135,8 @@ fn newest_captured_at(data: &UsageData) -> Option<DateTime<Utc>> {
 /// **fail-open**: returns `false` (trust the data) when the gate is disabled
 /// (`max_age == 0`) OR no `captured_at` parses — we never *block* on an unknown
 /// age, only on a known-and-too-old one. This preserves the pre-gate behaviour
-/// for cache files / sources that carry no timestamp, while a hub whose scrape
-/// froze (its `captured_at` stops advancing) is correctly caught.
+/// for cache files / sources that carry no timestamp, while a collector whose
+/// data froze (its `captured_at` stops advancing) is correctly caught.
 fn data_too_stale_at(data: &UsageData, max_age_secs: u64, now: DateTime<Utc>) -> bool {
     if max_age_secs == 0 {
         return false; // gate disabled
@@ -154,7 +155,7 @@ fn data_too_stale_at(data: &UsageData, max_age_secs: u64, now: DateTime<Utc>) ->
 /// percentages is a legitimate pick candidate.
 ///
 /// This is the single authority for "is this profile viable" — [`pick_best_at`]
-/// (below) and `main::account_row_rank` (the hub-down/stale-cache picker rows)
+/// (below) and `main::account_row_rank` (the stale-usage picker rows)
 /// both route through it rather than each hand-rolling the same three checks,
 /// so a profile whose model-scoped weekly cap is exhausted is skipped
 /// everywhere a pick or a recommendation is made, not just in one of the two
@@ -217,8 +218,8 @@ pub enum ScoringError {
     #[error("no usable usage data for any profile")]
     NoUsableData,
 
-    /// The usage fetch failed (hub down / negative-cache cooldown).
-    /// Caller should open the hub-down interactive picker.
+    /// The usage fetch failed (unreachable / negative-cache cooldown).
+    /// Caller should open the stale-usage interactive picker.
     #[error("usage fetch failed: {0}")]
     FetchFailed(#[from] FetchError),
 }
@@ -306,7 +307,7 @@ pub fn pick_best_at(
     now: DateTime<Utc>,
 ) -> ScoringResult {
     // Staleness gate (spec: proactive auto-pick must not fly on stale usage). A
-    // frozen hub scrape keeps serving the same `captured_at`; once that ages
+    // frozen data source keeps serving the same `captured_at`; once that ages
     // past the gate we refuse to score and let the caller fall back to the
     // picker/current. The reactive hook opts OUT (apply_stale_gate=false): it
     // must move off an already-limited profile even on stale numbers.
@@ -1368,7 +1369,7 @@ mod tests {
 
     #[test]
     fn missing_captured_at_fails_open() {
-        // No captured_at anywhere (legacy cache / non-hub source). The gate must
+        // No captured_at anywhere (legacy cache / non-standard source). The gate must
         // NOT block — unknown age is trusted, preserving pre-gate behaviour.
         let mut profiles = HashMap::new();
         profiles.insert("alt".to_string(), make_profile(Some(10), 50, None));

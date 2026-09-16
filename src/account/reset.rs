@@ -54,7 +54,7 @@ pub enum ResetParseError {
 /// 1. Supplying today's date when the input is a bare time (no date part).
 /// 2. The "already past?" test that triggers next-year rollover.
 ///
-/// Calling modules (`scoring`, the hub-down picker) pass a real `Utc::now()`,
+/// Calling modules (`scoring`, the stale-usage picker) pass a real `Utc::now()`,
 /// captured once per pass so every profile's reset is ranked against the same
 /// instant. Tests inject a fixed instant for determinism.
 pub fn resets_to_epoch_at(

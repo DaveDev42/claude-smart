@@ -1,6 +1,8 @@
-//! Hub-down account picker — interactive account selector.
+//! The stale-usage account picker: opened when local usage collection fails
+//! or returns nothing scorable, so csm cannot auto-pick. Rows show
+//! last-known usage from `.usage-cache.json` with a stale-age annotation.
 //!
-//! Spec §4a "Hub-down account picker" (Decision #1):
+//! Spec §4a "Stale-usage account picker" (Decision #1):
 //!
 //! When an *interactive* proactive-pick context encounters a usage fetch miss
 //! (`Err(FetchError)`) or negative-cache active, the binary opens a picker over
@@ -17,7 +19,7 @@
 //! `account > ` prompt; single select, best match on top.
 //!
 //! Degrade path (no usable terminal):
-//!   Print to stderr: `csm: hub usage fetch failed and no interactive terminal — keeping current profile`
+//!   Print to stderr: `csm: usage collection failed and no interactive terminal — keeping current profile`
 //!   Return `Unavailable` (caller falls back to current profile).
 //!
 //! Escape / Ctrl-C → `Cancelled` (caller aborts the launch).
@@ -30,7 +32,7 @@ use crate::picker::engine::{self, PickerOpts, PickerOutcome};
 
 /// Per-profile usage data for stale-cache rendering.
 ///
-/// All fields are `Option` because a hub-down picker may only have partial data
+/// All fields are `Option` because a stale-usage picker may only have partial data
 /// (or none at all for profiles absent from the cache).
 #[derive(Debug, Clone)]
 pub struct StaleProfileData {
@@ -204,9 +206,9 @@ pub fn format_stale_age(age_secs: u64) -> String {
 
 // ─── AccountPicker ────────────────────────────────────────────────────────────
 
-/// Interactive account picker shown when the hub usage fetch fails.
+/// Interactive account picker shown when local usage collection fails.
 ///
-/// Spec §4a "Hub-down account picker".
+/// Spec §4a "Stale-usage account picker".
 ///
 /// Build with `AccountPicker::new(rows)`, then call `AccountPicker::pick()`.
 ///
@@ -237,7 +239,7 @@ impl AccountPicker {
         }
         if !engine::terminal_available() {
             eprintln!(
-                "csm: hub usage fetch failed and no interactive terminal — keeping current profile"
+                "csm: usage collection failed and no interactive terminal — keeping current profile"
             );
             return PickerOutcome::Unavailable;
         }

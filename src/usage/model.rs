@@ -1,7 +1,8 @@
 //! Serde model shared by the local usage store (`<smart_dir>/usage/<profile>.json`,
 //! wrapped in `local::store::StoreRecord`) and `.usage-cache.json` (the
 //! positive TTL cache `transport.rs` writes on top of whatever produced a
-//! `UsageData` — the local collector today; historically a hub scrape).
+//! `UsageData` — the local collector, reading each profile's own OAuth usage
+//! API).
 //!
 //! Shape:
 //!

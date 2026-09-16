@@ -110,7 +110,7 @@ pub struct OauthUsage {
 /// Fetch `/api/oauth/usage` for the account behind `token`.
 ///
 /// Timeouts: 3s connect / 8s total — the same order of magnitude as
-/// `transport.rs`'s hub HTTP path, generous enough for a real network round
+/// `transport.rs`'s HTTP path, generous enough for a real network round
 /// trip but bounded so a hung request never blocks `collect()` across every
 /// other profile indefinitely.
 ///
@@ -189,9 +189,9 @@ pub(crate) fn validate_base(base: &str) -> Result<(), ApiError> {
 }
 
 /// Resolve the API base URL: `CSM_USAGE_API_BASE` if set (trailing slash
-/// trimmed), else the compiled-in default. Unlike the removed hub URL, this
-/// default IS safe to compile in — `api.anthropic.com` is Anthropic's public
-/// endpoint, not site-private infrastructure.
+/// trimmed), else the compiled-in default. Unlike a removed site-private
+/// endpoint, this default IS safe to compile in — `api.anthropic.com` is
+/// Anthropic's public endpoint, not site-private infrastructure.
 pub fn resolve_base() -> String {
     let base = std::env::var("CSM_USAGE_API_BASE")
         .ok()

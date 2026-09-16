@@ -1,4 +1,5 @@
-//! Local, hub-free usage collection — replaces the hub scrape entirely.
+//! Local usage collection: reads each configured profile's own OAuth usage
+//! API directly, with no shared remote service in the path.
 //!
 //! Two entry points:
 //! - [`collect`] — for every configured profile, serve a fresh store record,

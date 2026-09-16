@@ -1,10 +1,13 @@
-//! Render a unix epoch reset time into the hub-compatible display string —
+//! Render a unix epoch reset time into the same display string csm has
+//! always used —
 //! `"Sep 3 at 8:59pm (Asia/Seoul)"` — so `UsageSection.resets` keeps the exact
 //! shape [`crate::account::reset::resets_to_epoch_at`] already parses. Nothing
 //! downstream (scoring's stale-age math, the picker's row rendering) needs to
 //! change because of the switch to local collection: the local collector still
 //! emits a `resets` string, just derived from `resets_at` instead of scraped
-//! from `claude`'s own `/usage` screen.
+//! from `claude`'s own `/usage` screen. This format is a back-compat
+//! constraint: existing store records and cached rows carry it, so it can't
+//! change shape without a migration.
 
 use chrono::{DateTime, Timelike, Utc};
 use chrono_tz::Tz;
@@ -14,7 +17,7 @@ use chrono_tz::Tz;
 ///
 /// Falls back to UTC — rendered as `"… (UTC)"` — when the OS can't name a
 /// zone (e.g. a minimal container with no `/etc/localtime`), matching the
-/// hub scraper's own UTC fallback for the equivalent case.
+/// original scraper's own UTC fallback for the equivalent case.
 pub fn format_resets(epoch_secs: i64) -> String {
     format_resets_in(epoch_secs, local_tz())
 }
@@ -42,7 +45,7 @@ pub fn format_resets_in(epoch_secs: i64, tz: Tz) -> String {
 
     // "%-d" = day-of-month with no zero-padding (chrono implements this
     // itself, not delegated to libc strftime, so it's portable). Matches the
-    // hub-scraper shape exactly: "Sep 3 at 8:59pm (Asia/Seoul)".
+    // original shape exactly: "Sep 3 at 8:59pm (Asia/Seoul)".
     format!(
         "{} at {}:{:02}{} ({})",
         local.format("%b %-d"),
