@@ -180,6 +180,19 @@ pub fn shared_base_dir() -> PathBuf {
         .join(".claude.shared")
 }
 
+/// `$HOME/.claude` — Claude Code's default config dir, i.e. where a process that
+/// ignores `CLAUDE_CONFIG_DIR` reads and writes. csm keeps it as a compatibility
+/// shim: its `projects` entry links to [`session_base_dir`] so tools that
+/// hardcode this path still see every profile's transcripts. See
+/// [`crate::homeguard`]. Unused off unix, where that link is provisioned
+/// OS-side (mirrors `provision`'s platform split).
+#[cfg_attr(not(unix), allow(dead_code))]
+pub fn home_claude_dir() -> PathBuf {
+    dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".claude")
+}
+
 /// `$HOME/.claude.shared/projects` — the single source of truth for Claude Code
 /// session transcripts shared across every profile. Each profile dir's
 /// `projects` is symlinked here so `csm`'s own session scanner/alias index
@@ -373,6 +386,17 @@ mod tests {
         assert!(
             s.ends_with("smart"),
             "smart_dir should end with 'smart', got: {s}"
+        );
+    }
+
+    #[test]
+    fn home_claude_dir_is_the_bare_default_home() {
+        let d = home_claude_dir();
+        assert_eq!(d.file_name().and_then(|n| n.to_str()), Some(".claude"));
+        let s = d.to_string_lossy();
+        assert!(
+            !s.contains(".claude."),
+            "the default home must not sit in the profile namespace: {s}"
         );
     }
 

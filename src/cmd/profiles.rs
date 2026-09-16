@@ -9,6 +9,8 @@ use anyhow::Context as _;
 use crate::cmd::cas::parse_cas_op;
 use crate::cmd::support::{current_profile_dir, derive_current_profile_name, resolve_profile_dir};
 use crate::{account, cas, provision};
+#[cfg(unix)]
+use crate::{homeguard, paths};
 
 /// `csm profiles <verb> ...` — the human-facing registry noun.
 ///
@@ -139,17 +141,25 @@ fn cmd_profiles_bootstrap(rest: &[String]) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// `csm profiles doctor [--fix] [<name> | --all]`
+/// `csm profiles doctor [--fix] [--fix-home] [<name> | --all]`
 ///
 /// Diagnose the provisioning invariants and report what is broken. `--fix`
 /// repairs anything unhealthy (the same code path as `bootstrap`). Without
 /// `--fix` it is read-only (a dry run). Defaults to every registered profile.
+///
+/// The `~/.claude` compatibility shim is a separate, machine-wide axis reported
+/// on the first line, before any profile and before the empty-registry exit.
+/// `--fix` never touches it and `--fix-home` never touches a profile: the two
+/// flags are independent, so repairing one is never a side effect of the other.
 fn cmd_profiles_doctor(rest: &[String]) -> anyhow::Result<()> {
     let profiles =
         account::ProfileMap::load().context("csm profiles doctor: failed to load profiles.json")?;
 
     let fix = rest.iter().any(|a| a == "--fix");
+    let fix_home = rest.iter().any(|a| a == "--fix-home");
     let named: Option<&String> = rest.iter().find(|a| !a.starts_with('-'));
+
+    report_home_shim(&profiles, fix_home);
 
     let targets: Vec<(String, PathBuf)> = if let Some(name) = named {
         let dir = resolve_profile_dir(name, &profiles)?;
@@ -197,6 +207,146 @@ fn cmd_profiles_doctor(rest: &[String]) -> anyhow::Result<()> {
         println!("\n{unhealthy} profile(s) need provisioning — run `csm profiles doctor --fix`.");
     }
     Ok(())
+}
+
+/// Print the machine-wide `~/.claude` shim line, the optional identity-file
+/// advisory, and — under `--fix-home` — what the repair did.
+#[cfg(unix)]
+fn report_home_shim(profiles: &account::ProfileMap, fix_home: bool) {
+    let finding = homeguard::inspect(profiles);
+    println!("home ~/.claude: {}", describe_home_shim(&finding));
+    let registered = matches!(
+        finding.verdict,
+        homeguard::HomeShimVerdict::Registered { .. }
+    );
+    if !finding.identity_files.is_empty() && !registered {
+        println!(
+            "  holds {}: a login outside the registry that csm does not meter; \
+             register it (csm profiles add <name> ~/.claude) or remove them",
+            finding.identity_files.join(", ")
+        );
+    }
+    if !fix_home {
+        return;
+    }
+    match homeguard::ensure_home_shim(profiles, homeguard::ShimMode::Repair) {
+        Ok(homeguard::ShimOutcome::Skipped(verdict)) => {
+            println!("  → skipped: {}", describe_shim_skip(&verdict));
+        }
+        Ok(homeguard::ShimOutcome::PartiallyMerged(report)) => {
+            println!(
+                "  → skipped: {} name{} already exist{} in the shared transcript dir; \
+                 nothing moved, ~/.claude/projects left as found",
+                report.left_behind.len(),
+                if report.left_behind.len() == 1 {
+                    ""
+                } else {
+                    "s"
+                },
+                if report.left_behind.len() == 1 {
+                    "s"
+                } else {
+                    ""
+                },
+            );
+            for left in &report.left_behind {
+                println!("    conflict: {}", left.display());
+            }
+        }
+        Ok(homeguard::ShimOutcome::Merged(report)) => {
+            println!(
+                "  → fixed: home projects {} and linked",
+                describe_merge(&report)
+            );
+        }
+        // The link was already right and only its target was missing, so
+        // `describe_link` would report "already linked" and say nothing about
+        // what the repair actually did.
+        Ok(homeguard::ShimOutcome::Linked(_))
+            if finding.verdict == homeguard::HomeShimVerdict::SharedMissing =>
+        {
+            println!("  → fixed: shared transcript dir recreated; the link resolves again");
+        }
+        Ok(homeguard::ShimOutcome::Linked(outcome)) => {
+            println!("  → fixed: home projects {}", describe_link(&outcome));
+        }
+        Err(e) => eprintln!("  → fix-home FAILED: {e}"),
+    }
+}
+
+/// Non-unix: the `projects` entry would be an OS-side junction, so there is no
+/// shim for csm to diagnose or repair here.
+#[cfg(not(unix))]
+fn report_home_shim(_profiles: &account::ProfileMap, _fix_home: bool) {
+    println!("home ~/.claude: ok (dir linking handled OS-side on this platform)");
+}
+
+/// One-line description of a [`homeguard::HomeShimFinding`].
+#[cfg(unix)]
+fn describe_home_shim(f: &homeguard::HomeShimFinding) -> String {
+    use homeguard::HomeShimVerdict as V;
+    let shared_dir = paths::session_base_dir();
+    let shared = shared_dir.display();
+    // A registered `~/.claude` is provisioned like any profile, and profile
+    // provisioning renames a real `projects` dir to `projects.bak` once the
+    // shared store exists. Say so: a `.bak` takes that history out of reach of a
+    // plain `claude --resume`, which is the one thing this shim exists to keep.
+    let backup_on_fix =
+        matches!(f.projects, Some(provision::LinkState::RealDir)) && shared_dir.exists();
+    match &f.verdict {
+        V::Ok => format!("shim ok (projects → {shared})"),
+        V::SharedMissing => format!(
+            "projects → {shared}, which is gone: the link dangles and \
+             reading ~/.claude/projects fails; --fix-home recreates it"
+        ),
+        V::Absent => "absent: tools that hardcode ~/.claude/projects see no sessions; \
+             --fix-home creates the shim"
+            .to_owned(),
+        V::ProjectsMissing => format!("no projects entry; --fix-home links it to {shared}"),
+        V::ProjectsRealDir => format!(
+            "projects is a real dir (transcripts outside the shared dir); \
+             --fix-home merges it into {shared} and links"
+        ),
+        V::ProjectsWrongLink(t) => format!(
+            "projects symlinked to {} instead of {shared}; --fix-home repoints",
+            t.display()
+        ),
+        V::ProjectsNotADir => "projects is a file; --fix-home backs it up and links".to_owned(),
+        V::LinkedElsewhere(t) => format!("is a symlink → {} (left alone)", t.display()),
+        V::Registered { name } if backup_on_fix => format!(
+            "registered as profile {name}; its projects is a real dir, so \
+             `csm profiles doctor --fix` backs it up as projects.bak instead of \
+             merging it into {shared} — move those transcripts across by hand first"
+        ),
+        V::Registered { name } => {
+            format!("registered as profile {name} (provisioned like any profile)")
+        }
+        V::Unsupported => "is not a directory (left alone)".to_owned(),
+    }
+}
+
+/// Why `--fix-home` left the shim as it found it.
+#[cfg(unix)]
+fn describe_shim_skip(verdict: &homeguard::HomeShimVerdict) -> String {
+    use homeguard::HomeShimVerdict as V;
+    match verdict {
+        V::Ok => "already linked".to_owned(),
+        V::LinkedElsewhere(t) => format!("~/.claude is a symlink → {}", t.display()),
+        V::Registered { name } => {
+            format!("~/.claude is registered profile {name} — profile provisioning owns it")
+        }
+        V::Unsupported => "~/.claude is not a directory".to_owned(),
+        other => format!("{other:?}"),
+    }
+}
+
+/// What a [`homeguard::MergeReport`] moved, in words.
+#[cfg(unix)]
+fn describe_merge(report: &homeguard::MergeReport) -> String {
+    format!(
+        "merged {} dir(s) and {} file(s) into the shared transcript dir",
+        report.moved_dirs, report.moved_files
+    )
 }
 
 /// One-line description of a [`provision::LinkOutcome`] for command output.

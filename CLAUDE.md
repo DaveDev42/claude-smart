@@ -63,6 +63,12 @@ It is consumed by the **private** `dave-environment` Ansible repo (the operator'
   core behind `csm profiles doctor`. Called implicitly on every
   launch/switch/register so csm maintains its own invariants; explicit via
   `bootstrap`/`doctor`. Unix-only symlink (non-unix = OS-side junction).
+- `src/homeguard.rs` — the `~/.claude` compatibility shim: keeps
+  `~/.claude/projects` → `~/.claude.shared/projects` so tools that hardcode the
+  default home see every profile's transcripts. Launch-time create-only
+  (`ensure_home_shim_soft`, opt-out `CSM_NO_HOME_SHIM`); `csm profiles doctor
+  --fix-home` repairs (merges a real `projects` dir, repoints a wrong link);
+  never touches credentials or settings in `~/.claude`.
 - `tests/no_private_names.rs` — CI leak guard (recursively greps `src/`).
 - `.github/workflows/release-please.yml` — CI. (Design specs live in the private
   `dave-environment` repo, not here.)

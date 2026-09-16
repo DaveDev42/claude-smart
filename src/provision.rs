@@ -149,9 +149,11 @@ pub fn diagnose_profile(dir: &Path) -> ProfileDiagnosis {
     }
 }
 
-/// Classify a single `link` against its expected `shared` SSOT target.
+/// Classify a single `link` against its expected `shared` SSOT target. Shared
+/// with [`crate::homeguard`], which classifies `~/.claude/projects` by exactly
+/// the same rules.
 #[cfg(unix)]
-fn classify_link(link: &Path, shared: &Path) -> LinkState {
+pub(crate) fn classify_link(link: &Path, shared: &Path) -> LinkState {
     match std::fs::symlink_metadata(link) {
         Ok(meta) if meta.file_type().is_symlink() => match std::fs::read_link(link) {
             Ok(target) if links_match(&target, link, shared) => LinkState::Ok,
@@ -238,6 +240,7 @@ pub fn ensure_provisioned_soft(dir: &Path) {
     if let Err(e) = ensure_profile_provisioned(&name, dir) {
         eprintln!("csm: warning: profile provisioning skipped: {e}");
     }
+    crate::homeguard::ensure_home_shim_soft();
 }
 
 /// Derive a human display name from a profile dir leaf: `~/.claude.<name>` →

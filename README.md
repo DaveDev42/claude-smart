@@ -78,7 +78,9 @@ csm profiles use  <name>             set the machine default profile (+ floor)
 csm profiles edit                    interactive editor (TTY)
 csm profiles dir  [<name>]           print a profile's config dir
 csm profiles bootstrap [<name>|--all] provision a profile's env (dir + shared plugins/projects)
-csm profiles doctor [--fix] [<name>|--all] diagnose/repair provisioning
+csm profiles doctor [--fix] [--fix-home] [<name>|--all]
+                                     check profile dirs / shared links; --fix repairs
+                                     profiles, --fix-home repairs the ~/.claude shim
 
 csm config [show]                    print csm's own config JSON (~/.config/claude-smart/config.json)
 csm config get launch-command        print the resolved launch command
@@ -174,6 +176,7 @@ the launch). You can also do it explicitly:
 csm profiles bootstrap --all     # provision every profile (dir + shared plugins)
 csm profiles doctor              # read-only: report what's broken
 csm profiles doctor --fix        # repair anything unhealthy
+csm profiles doctor --fix-home   # repair the ~/.claude shim (see below)
 ```
 
 The first time a profile with an existing real `plugins/` dir is provisioned,
@@ -182,6 +185,53 @@ already has content) before replacing it with the symlink — no plugin data is
 lost. `settings.json` stays per-profile; `doctor` is where cross-profile drift
 (e.g. divergent marketplace registrations) gets surfaced. On Windows the symlink
 step is delegated to OS-native tooling and `csm` treats it as a no-op.
+
+### Third-party integration contract
+
+`csm` honors `CLAUDE_CONFIG_DIR` on every launch, so the active profile decides
+where Claude Code reads and writes. Much of the surrounding tooling never reads
+that variable: GUI session browsers and transcript indexers resolve
+`~/.claude/projects` by hand and scan nothing else, and other tools write their
+own hooks or settings into `~/.claude/settings.json`.
+
+`csm` therefore keeps `~/.claude` as a credential-free compatibility shim. Its
+`projects` entry is a symlink to `~/.claude.shared/projects`, the same shared
+transcript store every profile links to, so a tool that hardcodes
+`~/.claude/projects` sees every profile's sessions. Everything else in
+`~/.claude` stays as you or another tool left it: `csm` never creates, renames,
+or removes an entry there other than `projects`, and it never places
+credentials in that directory.
+
+Every launch, every `csm profiles add` / `set` / `use`, and every change of the
+global default creates the shim when it is missing, and changes nothing that
+already exists, so the launch path can never move your files. A per-shell
+`cas <profile>` switch only exports `CLAUDE_CONFIG_DIR` and leaves the shim to
+the next launch. Set `CSM_NO_HOME_SHIM=1` to turn the step off; `doctor` still
+reports the shim either way.
+
+Repairs are explicit:
+
+```sh
+csm profiles doctor              # reports the shim state on its first line
+csm profiles doctor --fix-home   # repairs it
+```
+
+`--fix-home` creates a missing link, repoints one aimed somewhere else, recreates
+the shared store when the link dangles, and backs up a stray file named
+`projects`. When `~/.claude/projects` is a real directory holding transcripts,
+`--fix-home` merges those into `~/.claude.shared/projects` entry by entry and
+then links it. Nothing is copied and nothing is deleted. The merge never makes a
+backup copy, because a backup would hide that history from a plain
+`claude --resume`.
+
+The merge is all or nothing. If any name is already taken in the shared store,
+`--fix-home` moves nothing, prints the colliding paths, and leaves
+`~/.claude/projects` exactly as it found it — resolve those names by hand and run
+it again. Moving the rest would take sessions out of `~/.claude/projects` without
+leaving a link behind, so the default home would show fewer sessions than before
+the repair.
+
+`--fix` and `--fix-home` are independent; neither implies the other.
 
 ### Without a registry (degraded mode)
 
@@ -486,6 +536,7 @@ Defaults shown are what applies when the variable is unset or unparseable.
 | `CLAUDE_CONFIG_DIR` | The active profile's Claude Code config home. Set by the shell `cas` shim (or the platform floor) before `csm` runs; `csm` reads it to resolve the current profile name and directory. See *Profiles*. |
 | `CLAUDE_SMART_CLAUDE_BIN` | A single binary path/name that overrides what `csm run` spawns instead of `claude`. Highest precedence (above `csm config set launch-command`); mainly for tests and one-off overrides. See *Configuration*. |
 | `CSM_HOST_REPLACE` | A literal, case-insensitive, first-match `find/replace` pair (e.g. `Acme-/`) applied to the short hostname `csm statusline` shows as `<profile>@<host>`. Unset = the raw short hostname, no rewrite; `csm` carries no built-in naming convention. |
+| `CSM_NO_HOME_SHIM` | Any non-empty value turns off the launch-time create-only step for the `~/.claude` compatibility shim. `csm profiles doctor` still reports the shim and `--fix-home` still repairs it. See *Third-party integration contract*. |
 | `CLAUDE_TITLE_INDEX_TTL` | Seconds the session title index (`titles.tsv`) is served without a rebuild (default `300`). |
 
 ### Account scoring and the limit switch

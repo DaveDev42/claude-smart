@@ -5,6 +5,7 @@ mod cmd;
 mod config;
 mod envvar;
 mod epoch;
+mod homeguard;
 mod hook;
 mod paths;
 mod picker;
@@ -134,7 +135,9 @@ fn print_help() {
     println!(
         "  csm profiles bootstrap [<name>|--all] provision profile env (dir + shared plugins/projects)"
     );
-    println!("  csm profiles doctor [--fix] [<name>|--all] diagnose/repair provisioning\n");
+    println!(
+        "  csm profiles doctor [--fix] [--fix-home] [<name>|--all]   check profile dirs / shared links; --fix repairs profiles, --fix-home repairs the ~/.claude shim\n"
+    );
     println!("CONFIG (csm's own — ~/.config/claude-smart/config.json)");
     println!("  csm config [show]                    print the config JSON");
     println!("  csm config get launch-command        print the resolved launch command");
