@@ -815,9 +815,8 @@ fn build_account_rows(profiles: &account::ProfileMap) -> Vec<picker::account::Ac
     // Read the smart-dir cache (the positive TTL cache `usage::fetch` writes
     // from local collection).
     let cache_path = paths::usage_cache();
-    let (cache_mtime, cache_json) = load_stale_cache(&cache_path);
-
-    let (cache_profiles, cache_errors) = parse_cache_sections(&cache_json);
+    let cache_mtime = cache_mtime(&cache_path);
+    let cache_data = read_usage_cache();
 
     // Union of configured profiles + any extra profiles from cache.
     let mut all_names: Vec<String> = profiles
@@ -825,9 +824,15 @@ fn build_account_rows(profiles: &account::ProfileMap) -> Vec<picker::account::Ac
         .iter()
         .map(|s| s.to_string())
         .collect();
-    for name in cache_profiles.keys().chain(cache_errors.keys()) {
-        if !all_names.contains(name) {
-            all_names.push(name.clone());
+    if let Some(data) = &cache_data {
+        for name in data
+            .profiles
+            .keys()
+            .chain(data.errors.as_ref().map(|e| e.keys()).into_iter().flatten())
+        {
+            if !all_names.contains(name) {
+                all_names.push(name.clone());
+            }
         }
     }
 
@@ -837,7 +842,13 @@ fn build_account_rows(profiles: &account::ProfileMap) -> Vec<picker::account::Ac
     let mut entries: Vec<(String, StaleProfileData)> = all_names
         .into_iter()
         .map(|profile| {
-            let data = if let Some(err) = cache_errors.get(&profile) {
+            let error = cache_data
+                .as_ref()
+                .and_then(|d| d.errors.as_ref())
+                .and_then(|e| e.get(&profile))
+                .cloned();
+            let pu = cache_data.as_ref().and_then(|d| d.profiles.get(&profile));
+            let data = if let Some(err) = error {
                 StaleProfileData {
                     session_pct: None,
                     week_all_pct: None,
@@ -845,16 +856,16 @@ fn build_account_rows(profiles: &account::ProfileMap) -> Vec<picker::account::Ac
                     resets_at: None,
                     week_fable_pct: None,
                     week_fable_resets_at: None,
-                    error: Some(err.clone()),
+                    error: Some(err),
                 }
-            } else if let Some(pu) = cache_profiles.get(&profile) {
+            } else if let Some(pu) = pu {
                 StaleProfileData {
-                    session_pct: pu.session_pct,
-                    week_all_pct: pu.week_all_pct,
-                    resets: pu.resets.clone(),
-                    resets_at: pu.resets_at,
-                    week_fable_pct: pu.week_fable_pct,
-                    week_fable_resets_at: pu.week_fable_resets_at,
+                    session_pct: pu.session.as_ref().map(|s| s.pct),
+                    week_all_pct: pu.week_all.as_ref().map(|s| s.pct),
+                    resets: pu.week_all.as_ref().and_then(|s| s.resets.clone()),
+                    resets_at: pu.week_all.as_ref().and_then(|s| s.resets_at),
+                    week_fable_pct: pu.week_fable.as_ref().map(|s| s.pct),
+                    week_fable_resets_at: pu.week_fable.as_ref().and_then(|s| s.resets_at),
                     error: None,
                 }
             } else {
@@ -896,113 +907,13 @@ fn build_account_rows(profiles: &account::ProfileMap) -> Vec<picker::account::Ac
         .collect()
 }
 
-/// Per-profile parsed data from the usage cache JSON.
-#[derive(Default)]
-struct CacheProfileEntry {
-    session_pct: Option<i64>,
-    week_all_pct: Option<i64>,
-    resets: Option<String>,
-    /// Machine-native reset epoch (`week_all.resets_at`), when the cache was
-    /// written by the local collector. Preferred over re-parsing `resets` —
-    /// see `account_row_rank`.
-    resets_at: Option<i64>,
-    /// Weekly PER-MODEL-TIER (`week_fable`) usage percentage, or `None` when
-    /// this profile carries no model-scoped weekly cap.
-    week_fable_pct: Option<i64>,
-    /// Machine-native reset epoch for `week_fable` (`week_fable.resets_at`).
-    week_fable_resets_at: Option<i64>,
-}
-
-/// Load a usage cache JSON file; returns `(Option<mtime_secs>, Option<Value>)`.
-fn load_stale_cache(path: &std::path::Path) -> (Option<u64>, Option<serde_json::Value>) {
-    let mtime = std::fs::metadata(path)
+/// Modification time of a usage cache file, as a unix epoch, or `None` when
+/// the file is absent/unreadable.
+fn cache_mtime(path: &std::path::Path) -> Option<u64> {
+    std::fs::metadata(path)
         .ok()
         .and_then(|m| m.modified().ok())
-        .map(epoch::from_systemtime);
-    let json = std::fs::read_to_string(path)
-        .ok()
-        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok());
-    (mtime, json)
-}
-
-/// Parse `profiles` and `errors` from the usage cache JSON.
-///
-/// Cache shape:
-///   `profiles[<name>].session.pct`, `.week_all.pct`, `.week_all.resets`,
-///   `.week_all.resets_at`
-///   `errors[<name>]` = error string
-fn parse_cache_sections(
-    json: &Option<serde_json::Value>,
-) -> (
-    std::collections::HashMap<String, CacheProfileEntry>,
-    std::collections::HashMap<String, String>,
-) {
-    let mut profiles: std::collections::HashMap<String, CacheProfileEntry> =
-        std::collections::HashMap::new();
-    let mut errors: std::collections::HashMap<String, String> = std::collections::HashMap::new();
-
-    let v = match json {
-        Some(v) => v,
-        None => return (profiles, errors),
-    };
-
-    if let Some(err_map) = v.get("errors").and_then(|e| e.as_object()) {
-        for (name, msg) in err_map {
-            if let Some(s) = msg.as_str() {
-                errors.insert(name.clone(), s.to_owned());
-            }
-        }
-    }
-
-    if let Some(prof_map) = v.get("profiles").and_then(|p| p.as_object()) {
-        for (name, pu) in prof_map {
-            let session_pct = pu
-                .get("session")
-                .and_then(|s| s.as_object())
-                .and_then(|s| s.get("pct"))
-                .and_then(|p| p.as_i64());
-            let week_all_pct = pu
-                .get("week_all")
-                .and_then(|w| w.as_object())
-                .and_then(|w| w.get("pct"))
-                .and_then(|p| p.as_i64());
-            let resets = pu
-                .get("week_all")
-                .and_then(|w| w.as_object())
-                .and_then(|w| w.get("resets"))
-                .and_then(|r| r.as_str())
-                .map(str::to_owned);
-            let resets_at = pu
-                .get("week_all")
-                .and_then(|w| w.as_object())
-                .and_then(|w| w.get("resets_at"))
-                .and_then(|r| r.as_i64());
-            let week_fable_pct = pu
-                .get("week_fable")
-                .and_then(|w| w.as_object())
-                .and_then(|w| w.get("pct"))
-                .and_then(|p| p.as_i64());
-            let week_fable_resets_at = pu
-                .get("week_fable")
-                .and_then(|w| w.as_object())
-                .and_then(|w| w.get("resets_at"))
-                .and_then(|r| r.as_i64());
-
-            profiles.insert(
-                name.clone(),
-                CacheProfileEntry {
-                    session_pct,
-                    week_all_pct,
-                    resets,
-                    resets_at,
-                    week_fable_pct,
-                    week_fable_resets_at,
-                },
-            );
-        }
-    }
-
-    (profiles, errors)
+        .map(epoch::from_systemtime)
 }
 
 /// `true` when both stdin and stdout are terminals — mirrors zsh `[[ -t 0 && -t 1 ]]`.
@@ -2367,11 +2278,11 @@ mod tests {
         assert!(parse_sidecar_kv_args(&args).is_err());
     }
 
-    // ── parse_cache_sections ──────────────────────────────────────────────────
+    // ── UsageData decode (cache_mtime / read_usage_cache field mapping) ───────
 
     #[test]
-    fn parse_cache_sections_full_payload() {
-        let json: serde_json::Value = serde_json::json!({
+    fn usage_data_full_payload_maps_fields() {
+        let json = serde_json::json!({
             "profiles": {
                 "home": {
                     "session": { "pct": 3 },
@@ -2386,43 +2297,57 @@ mod tests {
                 "broken": "no credentials"
             }
         });
-        let (profiles, errors) = parse_cache_sections(&Some(json));
-        assert_eq!(profiles.len(), 2);
-        assert_eq!(profiles["home"].session_pct, Some(3));
-        assert_eq!(profiles["home"].week_all_pct, Some(32));
+        let data: usage::UsageData = serde_json::from_value(json).unwrap();
+        assert_eq!(data.profiles.len(), 2);
+        let home = &data.profiles["home"];
+        assert_eq!(home.session.as_ref().map(|s| s.pct), Some(3));
+        let home_week_all = home.week_all.as_ref().unwrap();
+        assert_eq!(home_week_all.pct, 32);
         assert_eq!(
-            profiles["home"].resets.as_deref(),
+            home_week_all.resets.as_deref(),
             Some("Jun 18 at 9pm (Asia/Seoul)")
         );
-        assert_eq!(profiles["home"].resets_at, Some(1_781_000_000));
-        assert!(profiles["work"].session_pct.is_none());
-        assert_eq!(profiles["work"].week_all_pct, Some(80));
+        assert_eq!(home_week_all.resets_at, Some(1_781_000_000));
+
+        let work = &data.profiles["work"];
+        assert!(work.session.is_none());
+        let work_week_all = work.week_all.as_ref().unwrap();
+        assert_eq!(work_week_all.pct, 80);
         assert_eq!(
-            profiles["work"].resets_at, None,
+            work_week_all.resets_at, None,
             "resets_at absent in cache JSON must parse as None"
         );
-        assert_eq!(errors["broken"], "no credentials");
+
+        assert_eq!(data.errors.unwrap()["broken"], "no credentials");
     }
 
     #[test]
-    fn parse_cache_sections_absent_errors_key() {
-        let json: serde_json::Value = serde_json::json!({
+    fn usage_data_absent_errors_key_parses_none() {
+        let json = serde_json::json!({
             "profiles": {
                 "home": {
                     "week_all": { "pct": 50 }
                 }
             }
         });
-        let (profiles, errors) = parse_cache_sections(&Some(json));
-        assert_eq!(profiles.len(), 1);
-        assert!(errors.is_empty());
+        let data: usage::UsageData = serde_json::from_value(json).unwrap();
+        assert_eq!(data.profiles.len(), 1);
+        assert!(data.errors.is_none());
     }
 
     #[test]
-    fn parse_cache_sections_none_input() {
-        let (profiles, errors) = parse_cache_sections(&None);
-        assert!(profiles.is_empty());
-        assert!(errors.is_empty());
+    fn usage_data_empty_object_parses_to_defaults() {
+        let data: usage::UsageData = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert!(data.profiles.is_empty());
+        assert!(data.errors.is_none());
+    }
+
+    #[test]
+    fn cache_mtime_absent_file_is_none() {
+        assert_eq!(
+            cache_mtime(std::path::Path::new("/nonexistent/for/csm")),
+            None
+        );
     }
 
     // ── newuuid ───────────────────────────────────────────────────────────────
