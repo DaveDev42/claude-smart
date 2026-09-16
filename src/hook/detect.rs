@@ -1266,10 +1266,7 @@ fn check_and_claim_cooldown(last_switch_path: &Path, cooldown_secs: i64) -> bool
 /// In tests, use injected time to avoid SystemTime::now().
 #[cfg(not(test))]
 pub(crate) fn now_epoch() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs() as i64
+    crate::epoch::now_secs() as i64
 }
 
 /// In tests, we use a thread-local override for deterministic time.

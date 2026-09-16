@@ -3,6 +3,7 @@ mod cas;
 mod cli;
 mod config;
 mod envvar;
+mod epoch;
 mod hook;
 mod paths;
 mod picker;
@@ -917,8 +918,7 @@ fn load_stale_cache(path: &std::path::Path) -> (Option<u64>, Option<serde_json::
     let mtime = std::fs::metadata(path)
         .ok()
         .and_then(|m| m.modified().ok())
-        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|d| d.as_secs());
+        .map(epoch::from_systemtime);
     let json = std::fs::read_to_string(path)
         .ok()
         .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok());

@@ -631,10 +631,7 @@ fn create_lock(path: &Path) -> std::io::Result<LockGuard> {
 
 fn lock_age_secs(path: &Path, now_epoch: i64) -> Option<i64> {
     let modified = std::fs::metadata(path).ok()?.modified().ok()?;
-    let secs = modified
-        .duration_since(std::time::UNIX_EPOCH)
-        .ok()?
-        .as_secs();
+    let secs = crate::epoch::from_systemtime(modified);
     Some(now_epoch - i64::try_from(secs).ok()?)
 }
 
