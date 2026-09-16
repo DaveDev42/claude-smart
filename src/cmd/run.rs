@@ -376,7 +376,7 @@ fn launch_attention_lines(
 /// Silently does nothing when there's no cache to read — a missing/unreadable
 /// cache is not itself something a launch should warn about.
 fn print_launch_attention_warnings(profile_dir: &Path, profiles: &account::ProfileMap) {
-    let Some(data) = crate::read_usage_cache() else {
+    let Some(data) = crate::cmd::usage::read_usage_cache() else {
         return;
     };
     let current = profile_name_for_dir(profile_dir, profiles);
@@ -593,7 +593,7 @@ fn build_account_rows(profiles: &account::ProfileMap) -> Vec<picker::account::Ac
     // from local collection).
     let cache_path = paths::usage_cache();
     let cache_mtime = cache_mtime(&cache_path);
-    let cache_data = crate::read_usage_cache();
+    let cache_data = crate::cmd::usage::read_usage_cache();
 
     // Union of configured profiles + any extra profiles from cache.
     let mut all_names: Vec<String> = profiles

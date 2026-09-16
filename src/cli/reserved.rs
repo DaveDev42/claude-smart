@@ -123,4 +123,187 @@ mod tests {
         let a = vec![OsString::from("csm"), OsString::from("--version")];
         assert!(!invoked_as_hook_alias(&a));
     }
+
+    // ══════════════════════════════════════════════════════════════════════════
+    // Dispatch routing — verify that the argument dispatcher picks the right
+    // subcommand word, covering the full table in main(). Exercises
+    // `dispatch_subcommand`, the single tested source of truth for the
+    // reserved word list. Pure-logic tests: no subprocess / real I/O / network
+    // calls.
+    // ══════════════════════════════════════════════════════════════════════════
+
+    fn argv(ss: &[&str]) -> Vec<OsString> {
+        ss.iter().map(|s| OsString::from(*s)).collect()
+    }
+
+    // ── explicit subcommands ──────────────────────────────────────────────────
+
+    #[test]
+    fn dispatch_explicit_hook() {
+        let a = argv(&["csm", "hook", "--owner", "/tmp/.claude.home"]);
+        let (cmd, rest_len) = dispatch_subcommand(&a);
+        assert_eq!(cmd, "hook");
+        assert_eq!(rest_len, 2);
+    }
+
+    #[test]
+    fn dispatch_explicit_cas() {
+        let a = argv(&["csm", "cas", "--eval", "--shell", "zsh", "--", "home"]);
+        let (cmd, rest_len) = dispatch_subcommand(&a);
+        assert_eq!(cmd, "cas");
+        assert_eq!(rest_len, 5);
+    }
+
+    #[test]
+    fn dispatch_explicit_pick_account() {
+        let a = argv(&["csm", "pick-account", "home", "--include-current"]);
+        let (cmd, _) = dispatch_subcommand(&a);
+        assert_eq!(cmd, "pick-account");
+    }
+
+    #[test]
+    fn dispatch_explicit_profiles() {
+        let a = argv(&["csm", "profiles", "list"]);
+        let (cmd, rest_len) = dispatch_subcommand(&a);
+        assert_eq!(cmd, "profiles");
+        assert_eq!(rest_len, 1);
+    }
+
+    #[test]
+    fn dispatch_explicit_usage() {
+        let a = argv(&["csm", "usage", "--json"]);
+        let (cmd, rest_len) = dispatch_subcommand(&a);
+        assert_eq!(cmd, "usage");
+        assert_eq!(rest_len, 1);
+    }
+
+    #[test]
+    fn dispatch_explicit_config() {
+        let a = argv(&["csm", "config", "show"]);
+        let (cmd, rest_len) = dispatch_subcommand(&a);
+        assert_eq!(cmd, "config");
+        assert_eq!(rest_len, 1);
+    }
+
+    #[test]
+    fn dispatch_explicit_reap() {
+        let a = argv(&["csm", "reap", "--dry-run"]);
+        let (cmd, rest_len) = dispatch_subcommand(&a);
+        assert_eq!(cmd, "reap");
+        assert_eq!(rest_len, 1);
+    }
+
+    /// A word that is NOT a reserved csm subcommand falls through to `run`
+    /// (→ forwarded to claude). This is the collision-avoidance contract: any
+    /// claude subcommand (mcp/doctor/update/…) is forwarded, never hijacked.
+    #[test]
+    fn dispatch_claude_subcommands_fall_through_to_run() {
+        for w in [
+            "mcp", "doctor", "update", "agents", "auth", "plugin", "project",
+        ] {
+            let a = argv(&["csm", w, "--some-flag"]);
+            let (cmd, _) = dispatch_subcommand(&a);
+            assert_eq!(
+                cmd, "run",
+                "`csm {w}` must fall through to run (forward to claude)"
+            );
+        }
+    }
+
+    #[test]
+    fn dispatch_explicit_scan() {
+        let a = argv(&["csm", "scan", "/tmp/project"]);
+        let (cmd, rest_len) = dispatch_subcommand(&a);
+        assert_eq!(cmd, "scan");
+        assert_eq!(rest_len, 1);
+    }
+
+    #[test]
+    fn dispatch_explicit_current_usage() {
+        let a = argv(&["csm", "current-usage", "home"]);
+        let (cmd, rest_len) = dispatch_subcommand(&a);
+        assert_eq!(cmd, "current-usage");
+        assert_eq!(rest_len, 1);
+    }
+
+    #[test]
+    fn dispatch_explicit_sidecar() {
+        let a = argv(&["csm", "sidecar", "read", "abc-sid"]);
+        let (cmd, rest_len) = dispatch_subcommand(&a);
+        assert_eq!(cmd, "sidecar");
+        assert_eq!(rest_len, 2);
+    }
+
+    #[test]
+    fn dispatch_explicit_statusline() {
+        let a = argv(&["csm", "statusline"]);
+        let (cmd, _) = dispatch_subcommand(&a);
+        assert_eq!(cmd, "statusline");
+    }
+
+    #[test]
+    fn dispatch_explicit_completions() {
+        let a = argv(&["csm", "completions", "zsh"]);
+        let (cmd, rest_len) = dispatch_subcommand(&a);
+        assert_eq!(cmd, "completions");
+        assert_eq!(rest_len, 1);
+    }
+
+    #[test]
+    fn dispatch_explicit_newuuid() {
+        let a = argv(&["csm", "newuuid"]);
+        let (cmd, _) = dispatch_subcommand(&a);
+        assert_eq!(cmd, "newuuid");
+    }
+
+    // ── implicit `run` fallthrough ────────────────────────────────────────────
+
+    #[test]
+    fn dispatch_bare_csm_is_run() {
+        let a = argv(&["csm"]);
+        let (cmd, rest_len) = dispatch_subcommand(&a);
+        assert_eq!(cmd, "run");
+        assert_eq!(rest_len, 0);
+    }
+
+    #[test]
+    fn dispatch_csm_flag_only_is_run() {
+        let a = argv(&["csm", "-c"]);
+        let (cmd, rest_len) = dispatch_subcommand(&a);
+        assert_eq!(cmd, "run");
+        assert_eq!(rest_len, 1);
+    }
+
+    #[test]
+    fn dispatch_unknown_subcommand_falls_through_to_run() {
+        let a = argv(&["csm", "unknowncmd"]);
+        let (cmd, _) = dispatch_subcommand(&a);
+        assert_eq!(cmd, "run");
+    }
+
+    #[test]
+    fn dispatch_explicit_run_subcommand() {
+        let a = argv(&["csm", "run", "-c", "--profile=personal"]);
+        let (cmd, rest_len) = dispatch_subcommand(&a);
+        assert_eq!(cmd, "run");
+        assert_eq!(rest_len, 2);
+    }
+
+    // ── argv[0]-aware hook dispatch ───────────────────────────────────────────
+
+    #[test]
+    fn dispatch_argv0_csm_hook_routes_to_hook() {
+        let a = argv(&["csm-hook", "--owner", "/tmp/dir"]);
+        let (cmd, rest_len) = dispatch_subcommand(&a);
+        assert_eq!(cmd, "hook");
+        assert_eq!(rest_len, 2);
+    }
+
+    #[test]
+    fn dispatch_argv0_csm_hook_no_args() {
+        let a = argv(&["csm-hook"]);
+        let (cmd, rest_len) = dispatch_subcommand(&a);
+        assert_eq!(cmd, "hook");
+        assert_eq!(rest_len, 0);
+    }
 }
