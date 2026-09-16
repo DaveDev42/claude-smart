@@ -4,7 +4,7 @@
 //! This is the **`csm hook` subcommand** — there is no separate `csm-hook` binary
 //! (single-binary form, per locked scaffold decision).
 //!
-//! Commit ordering (mirrors `limit-switch.sh.j2` §4b):
+//! Commit ordering (matches the legacy shell implementation):
 //!   1. merge-sidecar hop
 //!   2. write `.relaunch` sentinel (atomic tmp+rename)
 //!   3. noclobber-create `.switched` marker
@@ -60,8 +60,9 @@ pub fn run(owner_dir: &Path) -> anyhow::Result<()> {
     };
 
     // Classify the hook event and determine whether a limit-switch is warranted.
-    // classify() reproduces the full limit-switch.sh.j2 flow including kill-switches,
-    // reason gate, detection tiers, managed-session gate, cooldown, and hop guard.
+    // classify() reproduces the full legacy shell implementation's flow including
+    // kill-switches, reason gate, detection tiers, managed-session gate, cooldown,
+    // and hop guard.
     let decision = detect::classify(&input, owner_dir)?;
 
     match decision {
@@ -89,8 +90,9 @@ pub fn run(owner_dir: &Path) -> anyhow::Result<()> {
             ref cwd,
             born,
         } => {
-            // Full limit-switch commit sequence (§4b ordering):
-            // notify first (stdout before any mutation), then commit_and_stop.
+            // Full limit-switch commit sequence (matches the legacy shell
+            // implementation's ordering): notify first (stdout before any
+            // mutation), then commit_and_stop.
             notify::emit_osc777(message).unwrap_or(());
 
             let log_msg = format!(

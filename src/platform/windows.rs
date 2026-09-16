@@ -3,13 +3,13 @@
 //! This file is **only compiled on Windows** (`cfg(windows)`).  It intentionally
 //! does NOT compile on macOS/Linux — the cfg guard is the contract.
 //!
-//! `WindowsLauncher` — console-control supervisor (spec §4b):
+//! `WindowsLauncher` — console-control supervisor:
 //!   - Spawns `claude.exe` sharing the console with `CREATE_NEW_PROCESS_GROUP`
 //!     (`0x00000200`).  This puts claude in its own process group so that
 //!     `GenerateConsoleCtrlEvent` can target it for the cooperative console-stop.
-//!   - **BLOCKER B1 (spec §3/§5 #1):** `CREATE_NEW_PROCESS_GROUP` causes the OS to
-//!     stop delivering keyboard Ctrl-C to the new group.  The supervisor therefore
-//!     installs a `SetConsoleCtrlHandler` that, on `CTRL_C_EVENT`, **forwards** the
+//!   - `CREATE_NEW_PROCESS_GROUP` causes the OS to stop delivering keyboard
+//!     Ctrl-C to the new group.  The supervisor therefore installs a
+//!     `SetConsoleCtrlHandler` that, on `CTRL_C_EVENT`, **forwards** the
 //!     interrupt to claude's group via `GenerateConsoleCtrlEvent(CTRL_C_EVENT, pgid)`
 //!     and returns TRUE (handled — do NOT let the default handler kill the
 //!     supervisor).  Without forwarding, interactive Ctrl-C would be silently
@@ -21,8 +21,8 @@
 //!   - Writes `<sid>.pid` immediately after spawn (same born-timing contract as
 //!     `PosixLauncher` — the hook reads it mid-session).
 //!
-//! ⚠ Two BLOCKING empirical checks gate shipping the Windows relaunch loop
-//!   (§4 / §8), verified on Acme-Windows against real `claude.exe`:
+//! ⚠ Two BLOCKING empirical checks gate shipping the Windows relaunch loop,
+//!   verified on Acme-Windows against real `claude.exe`:
 //!     1. Interactive Ctrl-C forwarding cancels claude's prompt (not the supervisor).
 //!     2. CTRL_BREAK transcript flush: the `.jsonl` is complete after a switch.
 

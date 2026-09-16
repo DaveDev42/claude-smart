@@ -36,10 +36,6 @@
 //! falling back to the registry's `preferred_default`. The management verbs
 //! (`list`/`add`/`set`/`remove`/`use`) author the registry itself via
 //! `manage_emit` — csm owns the full profile lifecycle, not just consumption.
-//!
-//! # Spec reference
-//! `docs/superpowers/specs/2026-06-17-csm-rust-port-design.md` §2 "CAS integration"
-//! `docs/superpowers/specs/2026-06-18-csm-rust-crate-scaffold.md` §3 `cas/mod.rs`
 
 use std::io;
 use std::path::PathBuf;
@@ -271,10 +267,9 @@ pub fn eval_emit(shell: Shell, op: &Op, profiles: &ProfileMap) -> anyhow::Result
 
         Op::Minus => {
             // _CLAUDE_AS_PREV is a non-exported zsh variable — the binary
-            // cannot read it. Emit a shell error snippet that mirrors the zsh
-            // `claude-as: no previous profile to toggle to` message.
-            //
-            // Reproduces zsh claude-as.zsh lines 79-84:
+            // cannot read it. Emit a shell error snippet with the same
+            // `claude-as: no previous profile to toggle to` message the
+            // legacy shell implementation used:
             //   if [[ -z "${_CLAUDE_AS_PREV:-}" ]]; then
             //     print -u2 "claude-as: no previous profile to toggle to"
             //     return 1
@@ -316,7 +311,7 @@ pub fn eval_emit(shell: Shell, op: &Op, profiles: &ProfileMap) -> anyhow::Result
 
         Op::Resync => {
             // Re-read the state file and emit the export for its current value.
-            // Reproduces zsh claude-as.zsh lines 68-76:
+            // Matches the legacy shell implementation:
             //   def=$(_claude_as_default_profile)
             //   def_dir="${CLAUDE_PROFILES[$def]}"
             //   _CLAUDE_AS_PREV=$(_claude_as_current_profile)
@@ -342,18 +337,12 @@ pub fn eval_emit(shell: Shell, op: &Op, profiles: &ProfileMap) -> anyhow::Result
                 //     command csm cas --eval --shell zsh -- status --print-current
                 //   }
                 // and evals the result to get the current profile name (not the
-                // full export). We emit the profile name as a simple echo so
-                // `eval` sets nothing (the shim reads it as output, not as a
-                // command to eval).
-                //
-                // Actually the shim design says eval it — so we emit the profile
-                // name as a zsh `echo` statement. But the comment in the scaffold
-                // says this is for reading the current profile. Per the spec §3:
+                // full export). The shell shim calls this directly (not via
+                // eval) to read the current profile name:
                 //   _claude_as_current_profile() { command csm cas --eval --shell
                 //     zsh -- status --print-current; }
-                // This is NOT wrapped in eval — it's called directly. So we just
-                // print the profile name (the one word the shell captures via
-                // command substitution).
+                // So we just print the profile name (the one word the shell
+                // captures via command substitution).
                 let current_dir = std::env::var("CLAUDE_CONFIG_DIR").unwrap_or_default();
                 let profile_name = if current_dir.is_empty() {
                     "unknown".to_owned()
@@ -366,8 +355,8 @@ pub fn eval_emit(shell: Shell, op: &Op, profiles: &ProfileMap) -> anyhow::Result
                 };
                 println!("{profile_name}");
             } else {
-                // Full status display — NOT eval-able.
-                // Reproduces zsh claude-as.zsh lines 87-110 (no-args branch).
+                // Full status display — NOT eval-able. Matches the legacy
+                // shell implementation's no-args branch.
                 print_status(shell, profiles)?;
             }
         }
@@ -529,8 +518,8 @@ fn resolve_profile(profile: &str, profiles: &ProfileMap) -> anyhow::Result<Strin
     })
 }
 
-/// Print informational status (no eval output). Mirrors the zsh `cas` with no
-/// args output (lines 87-110 of claude-as.zsh).
+/// Print informational status (no eval output). Matches the legacy shell
+/// implementation's `cas` with no args.
 fn print_status(_shell: Shell, profiles: &ProfileMap) -> anyhow::Result<()> {
     // The live shell's CLAUDE_CONFIG_DIR is read from the environment.
     // The binary does not have a "previous profile" concept (that lives in the
@@ -540,7 +529,7 @@ fn print_status(_shell: Shell, profiles: &ProfileMap) -> anyhow::Result<()> {
     let default_dir = profiles.default_dir().to_string_lossy().into_owned();
 
     // Resolve current profile name from CLAUDE_CONFIG_DIR.
-    // Reproduces zsh `_claude_as_current_profile` (lines 46-54).
+    // Reproduces the legacy shell implementation's `_claude_as_current_profile`.
     let current_name = if current_dir.is_empty() {
         "unset".to_owned()
     } else {
@@ -551,7 +540,7 @@ fn print_status(_shell: Shell, profiles: &ProfileMap) -> anyhow::Result<()> {
             .unwrap_or_else(|| "unknown".to_owned())
     };
 
-    // Reproduces zsh lines 93-110:
+    // Matches the legacy shell implementation:
     //   print "current shell:  $current_profile ($shell_state)"
     //   print "global default: $default_profile (~/.config/claude-as/default)"
     //   print "available:"

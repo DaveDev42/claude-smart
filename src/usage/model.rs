@@ -263,7 +263,7 @@ impl UsageData {
     /// Return `(session_pct, week_all_pct)` for `profile`, or `None` if the
     /// profile is in `errors`, absent, or has no section data.
     ///
-    /// Absent `session.pct` is encoded as `-1` in the scoring logic (spec §2).
+    /// Absent `session.pct` is encoded as `-1` in the scoring logic.
     pub fn current_usage(&self, profile: &str) -> Option<(i64, i64)> {
         // If this profile is in the errors map, it has no usable data.
         if let Some(errors) = &self.errors {

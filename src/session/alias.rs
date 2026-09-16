@@ -3,7 +3,7 @@
 //! `resolve_alias(name)` maps a human-readable session title alias to its
 //! canonical UUID `sid` by looking up `titles.tsv`.
 //!
-//! ## Spec reference (N6 / §2 Arg parsing)
+//! ## Alias resolution
 //!
 //! When `-r`/`--resume <name>` is given and `<name>` is **not** UUID-shaped,
 //! `csm` treats it as a title alias and calls `resolve_alias` to obtain the
@@ -46,7 +46,7 @@ use thiserror::Error;
 /// Errors from alias resolution.
 #[derive(Debug, Error)]
 pub enum AliasError {
-    /// The alias was not found in `titles.tsv`.  This is a hard error per spec N6.
+    /// The alias was not found in `titles.tsv`.  This is a hard error.
     #[error(
         "unknown session alias {alias:?} — not found in titles.tsv (use a UUID or a known title)"
     )]
@@ -72,9 +72,9 @@ const DEFAULT_TITLE_INDEX_TTL: u64 = 300;
 /// `mtime` wins.
 ///
 /// Returns `Err(AliasError::NotFound)` when no match is found — this is a hard
-/// error; the caller must not silently start a fresh session (spec N6).
+/// error; the caller must not silently start a fresh session.
 ///
-/// Mirrors `resolve_alias` in `claude-smart-helper.sh.j2` (lines 459–492).
+/// Matches the legacy shell implementation's `resolve_alias`.
 pub fn resolve_alias(name: &str) -> Result<String, AliasError> {
     // Fast path: already a UUID — no file I/O needed.
     if looks_like_uuid(name) {
@@ -214,7 +214,7 @@ fn lookup_alias(alias: &str, titles_path: &PathBuf) -> Result<Option<String>, Al
 /// scan of all transcripts.  Atomic temp+rename so a concurrent resolve never
 /// reads a half-written file.  Best-effort — any failure leaves the old index.
 ///
-/// Mirrors `reindex_titles` in `claude-smart-helper.sh.j2` (lines 409–444).
+/// Matches the legacy shell implementation's `reindex_titles`.
 ///
 /// Title extraction: last `"custom-title"` or `"agent-name"` record per
 /// transcript, matching the jq:

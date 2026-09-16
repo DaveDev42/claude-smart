@@ -4,7 +4,7 @@
 //! - [`SessionRow`] — one row of the TSV output from a session scan.
 //! - [`scan`] — scan `cwd` and return sorted `Vec<SessionRow>`.
 //! - [`resolve_alias`] — look up a non-UUID alias in `titles.tsv`, returning
-//!   the canonical UUID `sid`.  An unknown alias is a hard error (spec N6).
+//!   the canonical UUID `sid`.  An unknown alias is a hard error.
 
 pub mod alias;
 pub mod liveness;
@@ -17,7 +17,7 @@ use std::path::Path;
 
 /// One row of the session-scan TSV output.
 ///
-/// TSV contract (spec §2 / `session/scan.rs`):
+/// TSV contract (see `session/scan.rs`):
 /// ```text
 /// sid \t mtime \t human_ts \t mode \t label(≤80)
 /// ```

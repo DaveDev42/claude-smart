@@ -2,14 +2,15 @@
 //!
 //! This module is the entry-point for account-selection logic:
 //!
-//! - [`pick_account`] — choose the best profile to launch under (spec §2).
+//! - [`pick_account`] — choose the best profile to launch under.
 //! - [`current_usage`] — emit `(session_pct, week_all_pct)` for one profile.
 //! - [`ProfileMap`] — re-exported profile→dir map loaded from `profiles.json`.
 //!
 //! Submodules:
-//! - `profiles` — load `~/.config/claude-as/profiles.json` (REAL impl).
-//! - `scoring`  — scoring/tie-break/exclusions (stub, Phase 6).
-//! - `reset`    — parse `"Jun 4 at 9pm (Asia/Seoul)"` → UTC epoch (stub, Phase 6).
+//! - `profiles` — load `~/.config/claude-as/profiles.json`.
+//! - `scoring`  — scoring/tie-break/exclusions; complete, fixture-tested.
+//! - `reset`    — parse `"Jun 4 at 9pm (Asia/Seoul)"` → UTC epoch; complete,
+//!   fixture-tested.
 
 pub mod profiles;
 pub mod reset;
@@ -34,7 +35,7 @@ use scoring::{ScoringError, ScoringResult};
 /// - `Err(ScoringError::AllSaturated)` — no viable candidate; caller warns and
 ///   keeps the current profile.
 /// - `Err(ScoringError::FetchFailed(_))` — usage collection failed / negative-cache
-///   active; caller opens the stale-usage interactive picker (spec §4a, see
+///   active; caller opens the stale-usage interactive picker (see
 ///   [`crate::picker::account`]).
 ///
 /// Applies the staleness gate (proactive / CLI path). For the reactive hook —
@@ -64,8 +65,8 @@ pub fn pick_account_gated(
 /// Return `(session_pct, week_all_pct)` for `profile`, or `None` when the
 /// profile is errored, absent from the cache, or the fetch fails.
 ///
-/// Spec §2: `current-usage <profile>` → `<session_pct> <week_all_pct>` on
-/// stdout, or empty (errored profile ⇒ empty).
+/// `current-usage <profile>` → `<session_pct> <week_all_pct>` on stdout, or
+/// empty (errored profile ⇒ empty).
 pub fn current_usage(profile: &str) -> Option<(i64, i64)> {
     let data = usage::fetch().ok()?;
     data.current_usage(profile)

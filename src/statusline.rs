@@ -1,11 +1,10 @@
 //! `csm statusline` — print `<profile>@<host>` for shell prompt integration.
 //!
-//! Ships **DORMANT (N5)**: `csm statusline` is built but the `settings.json`
-//! `statuslineCommand` entry still points at `statusline-command.sh` until the
-//! explicit cutover described in §7 of the design spec.
+//! Ships **dormant**: `csm statusline` is built but the `settings.json`
+//! `statuslineCommand` entry still points at the legacy shell script until an
+//! explicit cutover is made.
 //!
-//! ## Output contract (reproduced from `statusline-command.sh.j2` lines 159–171
-//! and `statusline-command.ps1.j2` lines 141–157)
+//! ## Output contract
 //!
 //! The `<profile>@<host>` segment is the **host field** that appears first in
 //! the rendered status line; `run()` emits this segment alone (with a trailing
@@ -80,7 +79,7 @@ const CAPTURE_STDIN_CAP_BYTES: u64 = 256 * 1024;
 
 /// Subcommand handler: print `<profile>@<host>` (or just `<host>`) to stdout.
 ///
-/// Mirrors the host-display block from `statusline-command.sh.j2` lines 164–171:
+/// Matches the legacy shell implementation's host-display block:
 ///
 /// ```sh
 /// host=$(hostname -s)
@@ -231,7 +230,7 @@ pub fn format_segment(host: String, personal: bool) -> String {
 
 /// Derive the profile label from `$CLAUDE_CONFIG_DIR`.
 ///
-/// Rules (mirrors `statusline-command.sh.j2` lines 167–169):
+/// Rules (matches the legacy shell implementation):
 /// - Absent env var → `"unknown"`.
 /// - Take `basename($CLAUDE_CONFIG_DIR)`.
 /// - If the basename starts with `.claude.`, strip that prefix.

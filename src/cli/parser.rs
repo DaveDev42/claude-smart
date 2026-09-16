@@ -5,19 +5,19 @@
 //! swallow them. This parser consumes only the flags that `csm` itself cares
 //! about; everything else accumulates in `passthru`.
 //!
-//! Implements spec §2 "Arg parsing" in full:
+//! Handles arg parsing in full:
 //! - Consumed-internally flags: `-i`/`--interactive`, `-n`/`--new`,
 //!   `-c`/`--continue`, `-A`/`--pick-account`, `--no-pick`, `-r`/`--resume`,
 //!   `--permission-mode`, `--effort`, `--model`, `--session-id`, `--profile`.
-//! - **Equals-form (N7):** `--resume=<id>`, `--permission-mode=<m>`,
+//! - **Equals-form:** `--resume=<id>`, `--permission-mode=<m>`,
 //!   `--effort=<e>`, `--model=<m>`, `--session-id=<id>`, `--profile=<p>`.
-//! - **`-r`/`--resume` alias resolution (N6):** non-UUID value → alias token;
+//! - **`-r`/`--resume` alias resolution:** non-UUID value → alias token;
 //!   missing / dash-prefixed next token → promote to picker ([`ResumeArg::Picker`]).
 //! - `--` stops parsing; everything after goes verbatim into `passthru`.
 //! - Unknown flags / positional args go into `passthru`.
 //!
-//! The zsh source being reproduced is `claude-smart.zsh` lines 121–150
-//! (the `while (( $# )); do … done` arg-parse block).
+//! Matches the legacy shell implementation's `while (( $# )); do … done`
+//! arg-parse block.
 
 use std::ffi::OsString;
 
@@ -31,7 +31,7 @@ use std::ffi::OsString;
 /// - `Picker` — the flag was present but no id followed (next token absent or
 ///   dash-prefixed): open the interactive session picker.
 ///
-/// Mirrors the zsh logic at `claude-smart.zsh` lines 128–135:
+/// Matches the legacy shell implementation's logic:
 /// ```zsh
 /// -r|--resume)
 ///   if [[ -n "${2:-}" && "$2" != -* ]]; then
@@ -53,7 +53,7 @@ pub enum ResumeArg {
 /// `None` means the flag was absent; `Some(ResumeArg::Picker)` means "open
 /// picker" (the flag was present but no value followed).
 ///
-/// Reproduces the local variables at `claude-smart.zsh` lines 116–118:
+/// Reproduces the legacy shell implementation's local variables:
 /// ```zsh
 /// local want_picker=false want_continue=false pick_account=false no_pick=false
 /// local want_new=false
@@ -122,12 +122,12 @@ pub struct ParsedArgs {
 /// consumed by `main.rs`'s dispatcher (i.e. `args[2..]` or `args[1..]`
 /// depending on dispatch mode).
 ///
-/// Reproduces the `while (( $# )); do case "$1" in … esac; done` loop at
-/// `claude-smart.zsh` lines 121–150 exactly, including:
-/// - `--` passthrough terminator (line 147)
-/// - `-r`/`--resume` picker promotion (lines 128–135)
-/// - equals-form via zsh's `${1#--flag=}` (lines 138–146; Rust: `strip_prefix`)
-/// - unrecognised args → `passthru` (line 148)
+/// Reproduces the legacy shell implementation's
+/// `while (( $# )); do case "$1" in … esac; done` loop exactly, including:
+/// - `--` passthrough terminator
+/// - `-r`/`--resume` picker promotion
+/// - equals-form via zsh's `${1#--flag=}` (Rust: `strip_prefix`)
+/// - unrecognised args → `passthru`
 pub fn parse(args: &[OsString]) -> ParsedArgs {
     let mut flags = Flags::default();
     let mut passthru: Vec<OsString> = Vec::new();
@@ -138,14 +138,12 @@ pub fn parse(args: &[OsString]) -> ParsedArgs {
         let s = arg.to_string_lossy();
 
         // `--` stops csm-side parsing; everything after is passthru.
-        // Reproduces zsh line 147: `--)  shift; passthru+=("$@"); break ;;`
         if s == "--" {
             passthru.extend(iter.cloned());
             break;
         }
 
         // ── no-value boolean flags ─────────────────────────────────────────────
-        // zsh lines 123–127
         if s == "-i" || s == "--interactive" {
             flags.interactive = true;
             continue;
@@ -168,24 +166,18 @@ pub fn parse(args: &[OsString]) -> ParsedArgs {
         }
 
         // ── -r / --resume [<id-or-alias>] ─────────────────────────────────────
-        // zsh lines 128–135:
-        //   if [[ -n "${2:-}" && "$2" != -* ]]; then
-        //     resume_id="$2"; shift 2
-        //   else
-        //     want_picker=true; shift
-        //   fi
+        // When the next token is absent or starts with '-', promote to the
+        // picker instead of consuming it as the resume value.
         if s == "-r" || s == "--resume" {
             flags.resume = Some(consume_value_or_picker(&mut iter));
             continue;
         }
-        // zsh line 136: --resume=*)  resume_id="${1#--resume=}"; shift ;;
         if let Some(val) = strip_eq_prefix(&s, "--resume") {
             flags.resume = Some(ResumeArg::Id(val.to_owned()));
             continue;
         }
 
         // ── --permission-mode ──────────────────────────────────────────────────
-        // zsh lines 137–138
         if s == "--permission-mode" {
             flags.permission_mode = consume_required_value(&mut iter);
             continue;
@@ -196,7 +188,6 @@ pub fn parse(args: &[OsString]) -> ParsedArgs {
         }
 
         // ── --effort ──────────────────────────────────────────────────────────
-        // zsh lines 139–140
         if s == "--effort" {
             flags.effort = consume_required_value(&mut iter);
             continue;
@@ -207,7 +198,6 @@ pub fn parse(args: &[OsString]) -> ParsedArgs {
         }
 
         // ── --model ───────────────────────────────────────────────────────────
-        // zsh lines 141–142
         if s == "--model" {
             flags.model = consume_required_value(&mut iter);
             continue;
@@ -218,7 +208,6 @@ pub fn parse(args: &[OsString]) -> ParsedArgs {
         }
 
         // ── --session-id ──────────────────────────────────────────────────────
-        // zsh lines 143–144
         if s == "--session-id" {
             flags.session_id = consume_required_value(&mut iter);
             continue;
@@ -229,7 +218,6 @@ pub fn parse(args: &[OsString]) -> ParsedArgs {
         }
 
         // ── --profile ─────────────────────────────────────────────────────────
-        // zsh lines 145–146
         if s == "--profile" {
             flags.profile = consume_required_value(&mut iter);
             continue;
@@ -240,7 +228,6 @@ pub fn parse(args: &[OsString]) -> ParsedArgs {
         }
 
         // Unrecognised argument: forward verbatim to claude.
-        // zsh line 148: *)  passthru+=("$1"); shift ;;
         passthru.push(arg.clone());
     }
 
@@ -252,7 +239,7 @@ pub fn parse(args: &[OsString]) -> ParsedArgs {
 /// Try to strip a `--flag=` prefix from `s`, returning the value slice.
 /// Returns `None` if `s` does not start with `"{flag}="`.
 ///
-/// Reproduces zsh's `${1#--flag=}` strip form (lines 136, 138, 140, 142, 144, 146).
+/// Reproduces the legacy shell implementation's `${1#--flag=}` strip form.
 fn strip_eq_prefix<'a>(s: &'a str, flag: &str) -> Option<&'a str> {
     let prefix = format!("{flag}=");
     s.strip_prefix(prefix.as_str())
@@ -262,7 +249,7 @@ fn strip_eq_prefix<'a>(s: &'a str, flag: &str) -> Option<&'a str> {
 /// it and return `ResumeArg::Id(value)`. Otherwise return `ResumeArg::Picker`
 /// (promote to picker intent) without advancing the iterator.
 ///
-/// Reproduces zsh's `-r`/`--resume` guard at lines 131–134:
+/// Reproduces the legacy shell implementation's `-r`/`--resume` guard:
 /// ```zsh
 /// if [[ -n "${2:-}" && "$2" != -* ]]; then
 ///   resume_id="$2"; shift 2
@@ -427,7 +414,7 @@ mod tests {
     }
 
     // ══════════════════════════════════════════════════════════════════════════
-    // ResumeArg — equals-form (N7)
+    // ResumeArg — equals-form
     // ══════════════════════════════════════════════════════════════════════════
 
     #[test]
@@ -450,8 +437,8 @@ mod tests {
     // ══════════════════════════════════════════════════════════════════════════
     // ResumeArg — picker promotion
     //
-    // Reproduces zsh lines 128–135: when the next token is absent OR starts
-    // with '-', want_picker=true (our ResumeArg::Picker).
+    // When the next token is absent or starts with '-', promote to the
+    // picker (`ResumeArg::Picker`) instead of consuming it as the value.
     // ══════════════════════════════════════════════════════════════════════════
 
     #[test]
@@ -545,7 +532,7 @@ mod tests {
     }
 
     // ══════════════════════════════════════════════════════════════════════════
-    // Value flags — equals-form (N7)
+    // Value flags — equals-form
     // ══════════════════════════════════════════════════════════════════════════
 
     #[test]
@@ -587,7 +574,7 @@ mod tests {
     }
 
     // ══════════════════════════════════════════════════════════════════════════
-    // Space-form vs equals-form equivalence (N7 parity)
+    // Space-form vs equals-form equivalence
     // ══════════════════════════════════════════════════════════════════════════
 
     #[test]
@@ -628,8 +615,6 @@ mod tests {
 
     // ══════════════════════════════════════════════════════════════════════════
     // `--` passthrough terminator
-    //
-    // Reproduces zsh line 147: `--)  shift; passthru+=("$@"); break ;;`
     // ══════════════════════════════════════════════════════════════════════════
 
     #[test]
@@ -664,8 +649,6 @@ mod tests {
 
     // ══════════════════════════════════════════════════════════════════════════
     // Passthru: claude's own flags fall through unchanged
-    //
-    // Reproduces zsh line 148: *)  passthru+=("$1"); shift ;;
     // ══════════════════════════════════════════════════════════════════════════
 
     #[test]
@@ -759,8 +742,9 @@ mod tests {
         assert!(r.flags.no_pick);
     }
 
-    /// Reproduces the real-world `csm -i -A` invocation from the zsh source
-    /// doc-comment (line 71: "pick a session AND the best account").
+    /// Reproduces the real-world `csm -i -A` invocation from the legacy
+    /// shell implementation's doc-comment: "pick a session AND the best
+    /// account".
     #[test]
     fn interactive_plus_pick_account() {
         let r = parse(&os_args(&["-i", "-A"]));
@@ -770,7 +754,7 @@ mod tests {
         assert!(r.passthru.is_empty());
     }
 
-    /// `csm --permission-mode plan --effort high` from zsh doc (line 66)
+    /// `csm --permission-mode plan --effort high` from the legacy shell doc.
     #[test]
     fn permission_mode_and_effort_fresh_session() {
         let r = parse(&os_args(&["--permission-mode", "plan", "--effort", "high"]));

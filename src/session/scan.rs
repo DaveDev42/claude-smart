@@ -1,6 +1,6 @@
 //! Session scan + incremental index.
 //!
-//! ## Algorithm (spec §2 "Session scan / index")
+//! ## Algorithm
 //!
 //! 1. **Dual cwd encoding** — `paths::encode_cwd(cwd)` returns `(current, legacy)`.
 //!    Both encoded names are checked under `paths::session_base_dir()`; results
@@ -405,7 +405,7 @@ pub(crate) fn extract_index_row(transcript_path: &Path) -> Option<SessionRow> {
 /// - The display `label` (ai-title → last-prompt → first-user-prompt fallback,
 ///   truncated to ≤ 80 chars).
 ///
-/// Reads at most the first 256 KiB + tail 4 MiB as a byte window (spec §2).
+/// Reads at most the first 256 KiB + tail 4 MiB as a byte window.
 /// Returns `(mode, label)`.  On any I/O or parse error returns `("?", "")`.
 pub(crate) fn extract_label_and_mode(transcript_path: &Path) -> (String, String) {
     let bytes = match read_byte_window(transcript_path) {

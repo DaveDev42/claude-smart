@@ -3,9 +3,10 @@
 //! The sidecar records per-session metadata that must survive across the relaunch
 //! loop: permission mode, effort, model, cwd, profile, and the hop counter.
 //!
-//! **Read-compat contract (§6):** the legacy zsh writer emits `hop` as a JSON
-//! STRING (produced by `jq --arg`). The Rust binary may write it as a JSON
-//! NUMBER. `hop_int()` accepts both forms transparently.
+//! **Read-compat contract:** the legacy zsh writer emits `hop` as a JSON
+//! STRING (produced by `jq --arg`) — an external contract other readers
+//! depend on. The Rust binary may write it as a JSON NUMBER. `hop_int()`
+//! accepts both forms transparently.
 //!
 //! **Merge-not-clobber semantics:** `write_sidecar` and `merge_sidecar` never
 //! discard an existing `hop` value when the incoming data does not supply one.

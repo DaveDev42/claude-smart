@@ -14,8 +14,8 @@
 //! when the inferred date is in the past: if the parsed datetime is before
 //! `now`, add one year and retry.
 //!
-//! Shell source faithfully reproduced from:
-//!   `shared/claude/claude-smart-helper.sh.j2` lines 831–881
+//! Compat parser for legacy and external `resets`-only usage payloads
+//! (`CSM_USAGE_CMD` is an external contract; pre-`resets_at` caches).
 //!
 //! Key shell steps this Rust code mirrors:
 //!
@@ -654,9 +654,9 @@ mod tests {
         assert_eq!(parse_month("xyz"), None);
     }
 
-    // ── real-world sample strings from the spec ──────────────────────────────────
+    // ── real-world sample strings ─────────────────────────────────────────────
 
-    /// From spec §4a rendered examples and usage model test fixture.
+    /// From rendered account-picker examples and the usage model test fixture.
     #[test]
     fn spec_sample_jun18_9pm_seoul() {
         // From SAMPLE_CACHE_JSON: "Jun 18 at 9pm (Asia/Seoul)"

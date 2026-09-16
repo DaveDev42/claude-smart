@@ -28,8 +28,9 @@ use serde::{Deserialize, Serialize};
 /// `<sid>.relaunch` — atomic JSON sentinel written by the hook, consumed by the
 /// supervisor's post-wait path.
 ///
-/// Field names match the legacy zsh `write_relaunch` jq output exactly (spec §6):
-///   `session_id`, `target_profile`, `cwd`, `handoff`, `hop`, `born`.
+/// Field names match the legacy zsh `write_relaunch` jq output exactly —
+/// external readers of `<sid>.relaunch` depend on this: `session_id`,
+/// `target_profile`, `cwd`, `handoff`, `hop`, `born`.
 ///
 /// `hop` is a JSON **number** here (contrast with `Sidecar.hop` which is a JSON
 /// string).  `born` is compared against the `born` epoch written into `<sid>.pid`

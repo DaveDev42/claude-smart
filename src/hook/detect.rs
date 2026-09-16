@@ -56,7 +56,7 @@
 //!
 //! Tier-1: `limit-in-tail` — last 12 transcript records contain an
 //!   `isApiErrorMessage`-flagged entry matching the limit-banner regex, within 900 s.
-//!   Reproduces `limit_in_tail()` from `claude-smart-helper.sh.j2` lines 770–786.
+//!   Reproduces `limit_in_tail()` from the legacy shell implementation.
 //!   The banner-shape match is structural (no model name is ever compared), so it
 //!   would fire the same way for the session limit, the all-model weekly limit,
 //!   or a model-scoped weekly limit (the `week_fable` dimension).
@@ -74,7 +74,7 @@
 //! Tier-2: `current-usage` thresholding — session%, week_all%, or the
 //!   model-scoped week_fable% at or above limits (all three dimensions, same
 //!   `LIMIT_PCT` threshold; `week_fable` absent ⇒ that dimension never fires).
-//!   Reproduces the tier-2 block from `limit-switch.sh.j2` lines 205–221, extended
+//!   Reproduces the tier-2 block from the legacy shell implementation, extended
 //!   with the week_fable dimension the shell source predates.
 //!   Freshness: session%/week_all% are also refreshed by the statusline capture,
 //!   but the statusline `rate_limits` payload carries no model-scoped window, so
@@ -84,7 +84,7 @@
 //!   detection gap.
 //!
 //! Tier-3 (malformed-in-tail): 4-conjunct Opus-4.8 tool-call fingerprint within 180 s.
-//!   Reproduces `malformed_in_tail()` from `claude-smart-helper.sh.j2` lines 812–829.
+//!   Reproduces `malformed_in_tail()` from the legacy shell implementation.
 //!
 //! # Statusline tick (a second entry point, not a tier)
 //!
@@ -101,7 +101,7 @@
 //! session/week_all and of the last usage-API probe for week_fable (same
 //! bound as tier-2).
 //!
-//! # Flow (mirrors limit-switch.sh.j2 exactly)
+//! # Flow (matches the legacy shell implementation exactly)
 //!
 //! 1. Kill-switches (env var, file marker, .switched marker).
 //! 2. Reason gate → user_quit flag (doesn't exit yet — detection still runs).
@@ -259,7 +259,7 @@ pub const LIMIT_PCT: i64 = 99;
 /// Returns true if the `reason` field indicates a user-initiated quit.
 /// These cases suppress the relaunch but still emit a notify (deduped).
 ///
-/// Shell source: limit-switch.sh.j2 lines 159-161:
+/// Shell source: the legacy shell implementation:
 ///   `case "$reason" in clear|logout|prompt_input_exit|exit) user_quit=1 ;; esac`
 pub fn is_user_quit_reason(reason: &str) -> bool {
     matches!(reason, "clear" | "logout" | "prompt_input_exit" | "exit")
@@ -305,7 +305,7 @@ pub fn parse_input(raw: &str) -> anyhow::Result<HookInput> {
 
 /// Classify the hook event given the parsed input and the owner profile dir.
 ///
-/// Reproduces the full `limit-switch.sh.j2` flow exactly, plus a tier-0 step
+/// Reproduces the full legacy shell implementation's flow exactly, plus a tier-0 step
 /// (StopFailure) the shell source predates:
 ///
 /// 1. Kill-switches (env, file, .switched marker)
@@ -352,7 +352,7 @@ pub fn classify_with(
     };
 
     // ── 1. Kill-switches (cheapest checks first) ──────────────────────────────
-    // Shell: limit-switch.sh.j2 lines 136-141
+    // Shell: the legacy shell implementation
 
     // 1a. Env var kill-switch: CLAUDE_AUTO_SWITCH=0
     if std::env::var("CLAUDE_AUTO_SWITCH").as_deref() == Ok("0") {
@@ -368,13 +368,13 @@ pub fn classify_with(
     }
 
     // 1c. Already switched this session: .switched marker (fast path)
-    // Shell: limit-switch.sh.j2 lines 140-141
+    // Shell: the legacy shell implementation
     if paths::switched(sid).exists() {
         return Ok(Decision::Skip);
     }
 
     // ── 2. Reason gate (set flag, DON'T exit yet) ─────────────────────────────
-    // Shell: limit-switch.sh.j2 lines 158-161
+    // Shell: the legacy shell implementation
     // NOTE: the shell (post-2026-06-10 fix) does NOT exit here — it sets user_quit
     // and continues so that detection still runs; detection + user_quit → notify-only.
     let user_quit = input
@@ -384,7 +384,7 @@ pub fn classify_with(
         .unwrap_or(false);
 
     // ── 3. Detect (tier-0 StopFailure / tier-1 / tier-2 / malformed) ─────────
-    // Shell: limit-switch.sh.j2 lines 184-226 (tier-0 has no shell analogue —
+    // Shell: the legacy shell implementation (tier-0 has no shell analogue —
     // StopFailure is a hook event class the shell implementation predates).
     // Tier-0 is pure over the already-parsed input (no I/O at all), tier-1 is
     // local (transcript read), tier-2 uses the local usage cache.
@@ -409,13 +409,13 @@ pub fn classify_with(
             // Not a StopFailure event — fall through to the existing chain,
             // unchanged.
             // Tier-1 — transcript tail (local, instant)
-            // Shell: limit-switch.sh.j2 lines 195-203
+            // Shell: the legacy shell implementation
             let t1 = detect_limit_in_tail(input);
             if let Some(msg) = t1 {
                 (msg, true, false)
             } else {
                 // Tier-2 — usage pct from local cache
-                // Shell: limit-switch.sh.j2 lines 205-221
+                // Shell: the legacy shell implementation
                 let t2 = detect_usage_threshold(owner_dir);
                 if let Some(msg) = t2 {
                     (msg, true, false)
@@ -435,7 +435,7 @@ pub fn classify_with(
     };
 
     // ── 4. No limit → exit (no side effects) ─────────────────────────────────
-    // Shell: limit-switch.sh.j2 lines 223-227
+    // Shell: the legacy shell implementation
     if !limited {
         if user_quit {
             // Shell: `_log "user-quit-skip" "reason=${reason}"`
@@ -447,7 +447,7 @@ pub fn classify_with(
     // ──────────────── Limit detected from this point on ──────────────────────
 
     // ── 5. User-quit + limited → one-shot notify (deduped via .detected) ─────
-    // Shell: limit-switch.sh.j2 lines 246-258
+    // Shell: the legacy shell implementation
     // NEVER kill/relaunch on a session the user explicitly closed.
     if user_quit {
         let detect_path = paths::detected(sid);
@@ -465,7 +465,7 @@ pub fn classify_with(
     }
 
     // ── 6. Pick target profile (exclude current, reactive hook mode) ──────────
-    // Shell: limit-switch.sh.j2 lines 267-285
+    // Shell: the legacy shell implementation
     //
     // Gate OFF (apply_stale_gate=false): the proactive launch path refuses to
     // auto-pick on stale usage (it has a picker fallback), but this hook fires
@@ -489,7 +489,7 @@ pub fn classify_with(
         Some(name) => name,
         None => {
             // No viable target (all saturated/errored, or fetch miss)
-            // Shell: limit-switch.sh.j2 lines 274-286
+            // Shell: the legacy shell implementation
             let detect_path = paths::detected(sid);
             if !detect_path.exists() {
                 let _ = paths::smart_dir();
@@ -505,7 +505,7 @@ pub fn classify_with(
     };
 
     // ── 7. Detect-only mode (CLAUDE_AUTO_SWITCH_RELAUNCH != "1") ─────────────
-    // Shell: limit-switch.sh.j2 lines 298-308
+    // Shell: the legacy shell implementation
     // Default is "1" (relaunch enabled). Explicit =0 → notify-only.
     // MUST run before any state mutation — does NOT claim .switched or cooldown.
     let relaunch_env =
@@ -526,7 +526,7 @@ pub fn classify_with(
     }
 
     // ── 8. Managed-session gate: .pid file must exist and match claude/node ───
-    // Shell: limit-switch.sh.j2 lines 318-348
+    // Shell: the legacy shell implementation
     let pid_path = paths::pid_file(sid);
     if !pid_path.exists() {
         let detect_path = paths::detected(sid);
@@ -544,7 +544,7 @@ pub fn classify_with(
     }
 
     // Read the pid file: "<pid> <born_epoch>"
-    // Shell: limit-switch.sh.j2 lines 332-348
+    // Shell: the legacy shell implementation
     let pid_content = std::fs::read_to_string(&pid_path).unwrap_or_default();
     let (claude_pid, born_epoch) = match parse_pid_file(&pid_content) {
         Some(v) => v,
@@ -555,13 +555,13 @@ pub fn classify_with(
     };
 
     // Confirm the PID is a live claude/node process
-    // Shell: limit-switch.sh.j2 lines 339-348
+    // Shell: the legacy shell implementation
     if !is_live_claude_or_node(claude_pid) {
         return Ok(Decision::Skip);
     }
 
     // ── 9. Machine-wide cooldown (atomic noclobber claim) ─────────────────────
-    // Shell: limit-switch.sh.j2 lines 355-367
+    // Shell: the legacy shell implementation
     // Claim with noclobber; if fails, check if within cooldown window.
     //
     // Exception (Rust-side addition, no shell analogue): a definitive tier-0
@@ -591,7 +591,7 @@ pub fn classify_with(
     }
 
     // ── 10. Hop guard ─────────────────────────────────────────────────────────
-    // Shell: limit-switch.sh.j2 lines 376-381
+    // Shell: the legacy shell implementation
     let max_hops = std::env::var("CLAUDE_MAX_HOPS")
         .ok()
         .and_then(|s| s.parse::<i64>().ok())
@@ -602,7 +602,7 @@ pub fn classify_with(
     }
 
     // ── 11. Build the handoff prompt ──────────────────────────────────────────
-    // Shell: limit-switch.sh.j2 lines 402-406
+    // Shell: the legacy shell implementation
     let next_hop = current_hop + 1;
     let sid_short = sid.get(..8).unwrap_or(sid);
     let handoff = build_handoff(sid_short, &current_profile, &target_profile, next_hop);
@@ -715,9 +715,9 @@ pub(crate) fn cooldown_should_block(definitive: bool, window_blocked: bool) -> b
 ///
 /// Returns `Some(description)` if a qualifying limit record is found, `None` otherwise.
 ///
-/// Reproduces `limit_in_tail()` from `claude-smart-helper.sh.j2` lines 770–786.
+/// Reproduces `limit_in_tail()` from the legacy shell implementation.
 /// Sanitizes the tail_hit text (remove `"` and `\`, collapse newlines/tabs) and
-/// truncates to 80 chars — matching the shell sanitization at limit-switch.sh.j2 lines 198-200.
+/// truncates to 80 chars — matching the legacy shell implementation's sanitization.
 fn detect_limit_in_tail(input: &HookInput) -> Option<String> {
     let tp = input.transcript_path.as_deref().filter(|s| !s.is_empty())?;
     let path = std::path::Path::new(tp);
@@ -729,7 +729,7 @@ fn detect_limit_in_tail(input: &HookInput) -> Option<String> {
     let hit = limit_in_tail_impl(path, TIER1_TAIL_RECORDS, TIER1_RECENCY_SECS, now_secs)?;
 
     // Sanitize for embedding in notify: remove `"` and `\`, collapse newlines/tabs.
-    // Shell: limit-switch.sh.j2 lines 198-200:
+    // Shell: the legacy shell implementation:
     //   `tail_hit="$(printf '%s' "$tail_hit" | tr -d '"\\' | tr '\n\t' '  ')"`
     //   `limited="api-error: ${tail_hit:0:80}"`
     let sanitized: String = hit
@@ -820,7 +820,7 @@ pub(crate) fn limit_in_tail_impl(
 /// carries no model-scoped weekly cap (e.g. `week_fable` is absent) — that
 /// dimension then never constrains the verdict.
 ///
-/// Reproduces the tier-2 block from `limit-switch.sh.j2` lines 205-221, extended
+/// Reproduces the tier-2 block from the legacy shell implementation, extended
 /// with the week_fable dimension (never a hardcoded model name — the fleet's
 /// `week_fable` field name is what's fixed, the model it measures is data,
 /// carried separately in `week_model_label`).
@@ -873,7 +873,7 @@ pub(crate) fn statusline_limit_at(
 /// Pure decision core for tier-2: given the three usage-pct dimensions and the
 /// threshold, decide whether a limit was hit.
 ///
-/// Shell: limit-switch.sh.j2 lines 215-219 (session/week_all only — week_fable
+/// Shell: the legacy shell implementation (session/week_all only — week_fable
 /// is a Rust-side addition, same rule: threshold only on non-negative integers,
 /// so absent-as-`-1` never fires, and `None` — no model-scoped cap at all for
 /// this profile — never fires either).
@@ -906,7 +906,7 @@ pub(crate) fn usage_threshold_hit(
 ///
 /// Returns `Some("MALFORMED_TOOL_USE")` on a hit, `None` otherwise.
 ///
-/// Reproduces `malformed_in_tail()` from `claude-smart-helper.sh.j2` lines 812–829.
+/// Reproduces `malformed_in_tail()` from the legacy shell implementation.
 /// Four conjuncts (validated zero-FP on the corpus):
 ///   1. `.type == "assistant"` AND `.message.stop_reason == "tool_use"`
 ///   2. content has NO block of type "tool_use" (the drop)
@@ -1123,7 +1123,8 @@ fn is_live_claude_or_node(pid: u32) -> bool {
 }
 
 /// Read the `hop` field from `<sid>.json` sidecar.
-/// Returns 0 on missing/corrupt sidecar. Tolerates both String and Number (§6 compat).
+/// Returns 0 on missing/corrupt sidecar. Tolerates both String and Number
+/// (the legacy sidecar writer used a string; readers accept both forms).
 /// Delegates to the single `Sidecar::hop_int` SSOT (was triplicated).
 fn read_sidecar_hop(sid: &str) -> i64 {
     crate::sidecar::read_sidecar(&crate::paths::sidecar(sid))
@@ -1133,11 +1134,11 @@ fn read_sidecar_hop(sid: &str) -> i64 {
 
 /// Build the handoff prompt string.
 ///
-/// Shell: limit-switch.sh.j2 lines 402-406:
+/// Shell: the legacy shell implementation:
 ///   `HANDOFF="이전 세션(${session_id:0:8})이 사용량 한도에 걸려 [${current_profile}]에서 [${target_profile}] 계정으로 자동 전환됐어. (hop ${next_hop}) 직전까지 하던 작업을 그대로 이어서 진행해줘."`
 /// Unless overridden by CLAUDE_SMART_RESUME_PROMPT or suppressed (empty string).
 ///
-/// The spec (§2 relaunch): `${CLAUDE_SMART_RESUME_PROMPT-resume}` semantics:
+/// `${CLAUDE_SMART_RESUME_PROMPT-resume}` semantics:
 ///   - unset → "resume"
 ///   - empty ("") → disabled (return empty string)
 ///   - set to a value → that value
@@ -1222,7 +1223,7 @@ fn prune_detected_markers() {
 /// Returns `true` (blocked) if within the cooldown window.
 /// Returns `false` (proceed) if the window has expired or we claimed the slot.
 ///
-/// Shell: limit-switch.sh.j2 lines 355-367:
+/// Shell: the legacy shell implementation:
 ///   - Try noclobber create `.last-switch` → if succeeds, we own it (proceed).
 ///   - If fails (already exists): read timestamp, check window.
 ///     - Within window → skip (return true).
@@ -1548,13 +1549,13 @@ mod tests {
 
     // ── constant tests ─────────────────────────────────────────────────────────
 
-    /// MAX_HOPS constant is 1 (spec §2 hop guard).
+    /// MAX_HOPS constant is 1 (the hop guard).
     #[test]
     fn max_hops_is_one() {
         assert_eq!(MAX_HOPS, 1);
     }
 
-    /// LAST_SWITCH_COOLDOWN_SECS is 300 (spec §2 machine-wide cooldown).
+    /// LAST_SWITCH_COOLDOWN_SECS is 300 (the machine-wide cooldown).
     #[test]
     fn last_switch_cooldown_is_300() {
         assert_eq!(LAST_SWITCH_COOLDOWN_SECS, 300);

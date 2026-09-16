@@ -156,8 +156,8 @@ pub fn session_claude_is_live(table: &[ProcRow], session: &Session) -> bool {
 /// PURE: select reap candidates for `session` from a process-table snapshot.
 ///
 /// `self_pid` is the reaper's own pid (never a candidate). `include_live_claude`
-/// is true only for the startup stale-sweep (class 3); in the post-exit trigger
-/// claude is already dead, so it is false and the live-claude branch is skipped.
+/// is true only for the startup stale-sweep; in the post-exit trigger claude
+/// is already dead, so it is false and the live-claude branch is skipped.
 ///
 /// The candidate predicate (per process `P`):
 /// ```text

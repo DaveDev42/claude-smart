@@ -3,7 +3,7 @@
 //! `sid_live(sid)` answers: "Is there a live Claude Code process managing
 //! session `sid` right now?"
 //!
-//! ## Algorithm (spec §2 "_sid-live")
+//! ## Algorithm
 //!
 //! 1. Read `<smart_dir>/<sid>.pid` — one line `"<pid> <born>"`.
 //!    If the file is absent or unparseable → `false` (no managed process).
@@ -20,11 +20,8 @@
 //! loop does this).  `sid_live` intentionally does not do the born-match itself
 //! — it is a quick annotation helper for the picker and the auto-resume path.
 //!
-//! ## Phase 0
-//!
-//! The body is `unimplemented!()` — the platform proc-check trait and its
-//! impls live in `platform/proc_check.rs` (Phase 7 in the scaffold order).
-//! The signature and types are final.
+//! The platform proc-check trait and its implementations live in
+//! `platform/proc_check.rs`.
 
 use crate::paths;
 
@@ -60,8 +57,8 @@ pub fn sid_live(sid: &str) -> bool {
 /// Parse the two-token PID-file content `"<pid> <born>"`.
 ///
 /// Returns `None` on any parse failure (absent, non-UTF-8, wrong token count,
-/// non-numeric tokens).  This matches the spec §6 read-compat contract:
-/// "parse failure = absent".
+/// non-numeric tokens).  This matches the read-compat contract with the
+/// legacy pidfile format: "parse failure = absent".
 ///
 /// This is a pure function — always fully implemented (trivial, no platform
 /// dependency).

@@ -84,8 +84,8 @@ fn main() -> anyhow::Result<()> {
     }
 
     // argv[0]-aware dispatch: if this binary is invoked as a known alias, treat
-    // it as if that subcommand was the first argument (spec §2 "Multi-call
-    // binary"). `cli::reserved::dispatch_subcommand` is the single tested
+    // it as if that subcommand was the first argument (multi-call binary
+    // support). `cli::reserved::dispatch_subcommand` is the single tested
     // source of truth for this rule and the reserved word list.
     let (subcommand, rest_len) = cli::reserved::dispatch_subcommand(&args);
     let rest: &[OsString] = &args[args.len() - rest_len..];
@@ -204,10 +204,10 @@ fn print_help() {
 
 /// `csm run [csm-flags] [-- passthru...]`
 ///
-/// Full launch path per spec §2:
+/// Full launch path:
 ///   1. Parse args via the hand-rolled `cli::parser`.
 ///   2. Resolve profile dir: `--profile` pin > proactive `pick_account` with
-///      stale-usage picker gate §4a > current `CLAUDE_CONFIG_DIR`.
+///      stale-usage picker gate > current `CLAUDE_CONFIG_DIR`.
 ///   3. Resolve session id: explicit `--session-id` > `--resume` > picker >
 ///      auto-resume default.
 ///   4. Build `LaunchSpec` (session_id + profile_dir + cwd + cli) and hand off
@@ -273,11 +273,10 @@ fn cmd_run(args: &[OsString]) -> anyhow::Result<()> {
         }
     };
 
-    // Surface 4b (design spec "맛이 간 프로필은 로그인하라고 경고" §csm run 실행
-    // 시점): print every profile's dead-credential warning, right after the
-    // pick is resolved and regardless of what got picked (a cancelled pick
-    // already returned above — this only runs on a launch that is actually
-    // going ahead). Reads the CACHED UsageData only — no network — so a dead
+    // Print every profile's dead-credential warning, right after the pick is
+    // resolved and regardless of what got picked (a cancelled pick already
+    // returned above — this only runs on a launch that is actually going
+    // ahead). Reads the CACHED UsageData only — no network — so a dead
     // token can never slow down or fail a launch.
     print_launch_attention_warnings(&profile_dir, &profiles);
 
@@ -448,7 +447,8 @@ fn resolve_session_via_picker(cwd: &std::path::Path) -> anyhow::Result<Option<Se
         .collect();
 
     let sp = SessionPicker::new(picker_rows);
-    let newest_live_label: Option<&str> = None; // TODO: derive in Phase 9
+    // Always `None` today: a deliberate simplification, not yet derived.
+    let newest_live_label: Option<&str> = None;
 
     match sp.pick(newest_live_label) {
         // `None` (no usable terminal) and `Fresh` both mean "start new" — degrade.
@@ -604,22 +604,22 @@ fn print_launch_attention_warnings(profile_dir: &Path, profiles: &account::Profi
     }
 }
 
-/// Proactive account pick with stale-usage picker fallback (spec §4a).
+/// Proactive account pick with stale-usage picker fallback.
 ///
 /// See [`crate::picker::account`] for what the stale-usage picker shows.
 ///
 /// Returns `Ok(Some(dir))` with the resolved profile directory, or `Ok(None)`
 /// when the stale-usage picker was cancelled (Escape / Ctrl-C) — the caller aborts.
 ///
-/// Pick guard (mirrors zsh `claude-smart.zsh` lines 204-209, 316-323):
+/// Pick guard (matches the legacy shell implementation's behavior):
 /// - `pick_account(current, include_current=true)` → scoring pick, which
 ///   weighs all THREE usage dimensions (session, week_all, and the
 ///   model-scoped weekly `week_fable`) through `scoring::is_viable_pcts` — a
 ///   current profile whose `week_fable` is saturated is treated as limited
 ///   just like a session- or week_all-limited one, so this proactively picks
-///   a switch away from it (R2).
+///   a switch away from it.
 /// - `Err(FetchFailed)` (usage collection failed) or `Err(NoUsableData)` (fetch
-///   ok but no scorable usage) + interactive → stale-usage account picker (§4a).
+///   ok but no scorable usage) + interactive → stale-usage account picker.
 /// - same errors + non-interactive → silent fail-safe to current.
 /// - `Err(AllSaturated)` → warn + keep current (no picker; real limits read).
 fn proactive_pick_profile(
@@ -666,8 +666,7 @@ fn proactive_pick_profile(
     }
 }
 
-/// Stale-usage account picker (spec §4a Decision #1). See
-/// [`crate::picker::account`].
+/// Stale-usage account picker. See [`crate::picker::account`].
 ///
 /// Interactive + fetch-miss → open the account picker with stale usage data.
 /// Non-interactive → silent fail-safe to current profile.
@@ -930,7 +929,7 @@ fn load_stale_cache(path: &std::path::Path) -> (Option<u64>, Option<serde_json::
 
 /// Parse `profiles` and `errors` from the usage cache JSON.
 ///
-/// Cache shape (spec §4a):
+/// Cache shape:
 ///   `profiles[<name>].session.pct`, `.week_all.pct`, `.week_all.resets`,
 ///   `.week_all.resets_at`
 ///   `errors[<name>]` = error string
@@ -1021,9 +1020,8 @@ fn is_interactive() -> bool {
     }
     #[cfg(not(unix))]
     {
-        // Windows: check whether the stdio handles are console handles via
-        // `GetConsoleMode`. Best-effort; fall back to env-var heuristic.
-        // TODO: use windows-sys GetConsoleMode for a proper check in Phase 9.
+        // Windows: the `GetConsoleMode` check is unimplemented; the env
+        // heuristic stands in.
         std::env::var("WT_SESSION").is_ok() || std::env::var("TERM").is_ok()
     }
 }
@@ -1574,8 +1572,9 @@ fn describe_diagnosis(diag: &provision::ProfileDiagnosis, dir: &Path) -> String 
     }
 }
 
-/// Non-unix: the symlink invariant is delegated to OS-native tooling, so the
-/// diagnosis carries no link detail to describe.
+/// Non-unix: nothing beyond directory existence is checked on this platform —
+/// the symlink invariant is delegated to OS-native tooling, so the diagnosis
+/// carries no link detail to describe.
 #[cfg(not(unix))]
 fn describe_diagnosis(diag: &provision::ProfileDiagnosis, dir: &Path) -> String {
     if !diag.dir_exists {
@@ -1762,7 +1761,7 @@ fn read_stdin_capped(max_bytes: u64) -> String {
 /// Routes through `account::pick_account` → `scoring::pick_best_at`, which
 /// scores on all three usage dimensions (session, week_all, and the
 /// model-scoped weekly `week_fable`) — a profile whose `week_fable` is
-/// saturated is skipped exactly like a session- or week_all-limited one (R2).
+/// saturated is skipped exactly like a session- or week_all-limited one.
 fn cmd_pick_account(args: &[OsString]) -> anyhow::Result<()> {
     let mut current = String::new();
     let mut include_current = false;
@@ -1913,7 +1912,8 @@ fn parse_sidecar_kv_args(args: &[OsString]) -> anyhow::Result<sidecar::Sidecar> 
                 let n: i64 = value.parse().with_context(|| {
                     format!("csm sidecar: hop must be an integer, got {value:?}")
                 })?;
-                // Store as a JSON Number (the canonical Rust-binary form; §6 compat).
+                // Store as a JSON Number (the canonical Rust-binary form; the
+                // legacy sidecar writer used a string, so readers tolerate both).
                 patch.hop = Some(serde_json::Value::Number(serde_json::Number::from(n)));
             }
             other => anyhow::bail!("csm sidecar: unknown key {other:?}"),
@@ -2778,7 +2778,7 @@ mod tests {
 
     // ── model-scoped weekly (week_fable) gate ──────────────────────────────
     // account_row_rank must sink a fable-saturated row exactly like a
-    // session- or week_all-saturated one (R2/R3): it routes through the same
+    // session- or week_all-saturated one: it routes through the same
     // `scoring::is_viable_pcts` authority `pick_best_at` uses.
 
     #[test]
@@ -2863,8 +2863,8 @@ mod tests {
     }
 
     // ══════════════════════════════════════════════════════════════════════════
-    // Launch-time credential warnings (design spec "맛이 간 프로필은 로그인하라고
-    // 경고" §csm run 실행 시점) — `launch_attention_lines`/`profile_name_for_dir`.
+    // Launch-time credential warnings — `launch_attention_lines`/
+    // `profile_name_for_dir`.
     // ══════════════════════════════════════════════════════════════════════════
 
     fn attention_now() -> chrono::DateTime<chrono::Utc> {

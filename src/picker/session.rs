@@ -1,6 +1,5 @@
 //! Session picker — interactive session selector (in-process fuzzy picker).
 //!
-//! Spec §2 Picker (session-select):
 //! - Synthetic sentinel rows `__NEW__` (mtime 9999999999) and `__CONTINUE__`
 //!   (mtime 9999999998) are prepended to the picker input.
 //! - Live sessions are annotated with `● live in another pane · …`; col1 keeps
@@ -142,7 +141,6 @@ pub enum PickedSession {
 ///
 /// Build with `SessionPicker::new(rows)`, then call `SessionPicker::pick()`.
 ///
-/// Spec §2 Picker:
 /// - When `rows` is empty, returns `PickedSession::Fresh` immediately (no picker).
 /// - When there is no usable terminal, degrades to newest-free-sid
 ///   auto-selection (callers interpret `PickedSession::Continue` accordingly).

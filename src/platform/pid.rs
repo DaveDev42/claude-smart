@@ -1,7 +1,7 @@
 //! PID file helpers: `<sid>.pid` — `"<pid> <born>\n"`.
 //!
 //! Format is preserved for cutover read-compat with the legacy zsh
-//! `write_pid` function (spec §6 / §2 Foreground launch):
+//! `write_pid` function — an external contract other readers depend on:
 //!
 //! ```text
 //! <pid_decimal> <born_epoch_decimal>
@@ -35,7 +35,7 @@ pub fn write_pid_file(path: &Path, pid: u32, born: i64) -> io::Result<()> {
 ///
 /// Returns `Some((pid, born))` on success, `None` on:
 /// - File absent (`NotFound`)
-/// - Any parse error (treated as "no live managed session" per spec §6)
+/// - Any parse error (treated as "no live managed session")
 /// - Malformed content
 // Read only by the unix relaunch loop's clobber guard; on Windows the loop is
 // gated off (`run_once`), so this is unused in the Windows bin build (still

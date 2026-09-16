@@ -7,7 +7,7 @@
 //!
 //! - [`AccountPicker`] — select a Claude account (profile) when local usage
 //!   collection fails and the user is in an interactive context (the
-//!   stale-usage picker — see [`crate::picker::account`], spec §4a Decision #1).
+//!   stale-usage picker — see [`crate::picker::account`]).
 //!
 //! Both pickers use the shared [`engine`] machinery: delimiter-separated rows
 //! with a hidden col1 recovery key, `display_from` to show/match the rest, and a

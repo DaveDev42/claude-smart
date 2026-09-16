@@ -8,7 +8,8 @@
 //!
 //! # OSC 777 format
 //!
-//! The terminal sequence written by the hook mirrors `_notify()` in `limit-switch.sh.j2`:
+//! The terminal sequence written by the hook matches the legacy shell
+//! implementation's `_notify()`:
 //!
 //! ```
 //! ESC ] 777 ; notify ; <title> ; <body> ESC \
@@ -27,7 +28,7 @@
 //! # limit-switch.log
 //!
 //! Append-only log at `<smart_dir>/limit-switch.log`.
-//! Format (mirrors limit-switch.sh.j2 `_log()` function, lines 114-119):
+//! Format matches the legacy shell implementation's `_log()` function:
 //!   `<YYYY-MM-DD HH:MM:SS>  host=<hostname>  sid=<sid>  action=<action>  <extra>`
 
 use std::io::Write as _;
@@ -39,7 +40,7 @@ use anyhow::Context as _;
 
 /// Build the OSC 777 `{"terminalSequence":…}` JSON string for a given title and body.
 ///
-/// Reproduces the `_notify()` function from `limit-switch.sh.j2` lines 237-239.
+/// Matches the legacy shell implementation's `_notify()` function.
 /// Title and body semicolons are passed through (the OSC 777 spec field separator
 /// is the semicolon between title and body; we trust the caller to avoid semicolons
 /// in the title, and escape the body for safety).
@@ -62,7 +63,7 @@ pub fn build_osc777_json(title: &str, body: &str) -> String {
 ///
 /// The `message` is the human-readable body; the title is `"limit detected"`.
 ///
-/// Shell: `_notify "limit detected" "<message>"` (limit-switch.sh.j2 lines 237-239)
+/// Shell: `_notify "limit detected" "<message>"`
 pub fn emit_osc777(message: &str) -> anyhow::Result<()> {
     let json = build_osc777_json("limit detected", message);
     // Write exactly one JSON object to stdout (hook contract: one object or nothing).
@@ -74,13 +75,13 @@ pub fn emit_osc777(message: &str) -> anyhow::Result<()> {
 
 /// Append a one-line timestamped entry to `<smart_dir>/limit-switch.log`.
 ///
-/// Format mirrors the `_log()` function from `limit-switch.sh.j2` lines 114-119:
+/// Format matches the legacy shell implementation's `_log()` function:
 ///   `<YYYY-MM-DD HH:MM:SS>  host=<hostname>  sid=<sid>  action=<action>  <extra>`
 ///
 /// `_owner_dir` is accepted for API compatibility (the shell's per-profile `.log`
 /// convention), but the canonical log destination is the shared smart_dir so all
 /// profiles' limit-switch events appear in one place (matching the shell's
-/// `LOG="$SMART_DIR/limit-switch.log"` line 103).
+/// `LOG="$SMART_DIR/limit-switch.log"`).
 pub fn append_log(sid: &str, message: &str, _owner_dir: &Path) -> anyhow::Result<()> {
     use crate::paths;
     use std::fs::OpenOptions;

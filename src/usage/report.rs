@@ -365,7 +365,8 @@ fn join_one(
 pub fn render_table(report: &Report, now: DateTime<Utc>) -> String {
     let mut out = String::new();
 
-    // Stale header (offline degrade — first-class, per spec §1).
+    // Stale header — offline degrade is a first-class rendering path, not an
+    // afterthought.
     if let Some(age) = report.stale_secs {
         // Only warn once the data is meaningfully old (> one positive-TTL window).
         if age >= 60 {

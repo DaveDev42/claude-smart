@@ -1,6 +1,6 @@
 //! Account scoring: choose the best profile to launch under.
 //!
-//! Logic (spec §2 Account pick + scoring):
+//! Logic (account pick + scoring):
 //!
 //! 1. Build candidate rows: profiles NOT in errors{}, with a numeric week_all.pct.
 //! 2. Exclusions (in order) — see [`is_viable_pcts`], the SINGLE viability
@@ -27,16 +27,15 @@
 //!    candidate in name order. Rationale: budget spent on the account that
 //!    refills first is the cheapest budget — drain that account, keep the
 //!    later-resetting ones in reserve.
-//!    (Policy changed post-0.2.11: the retired shell source — pick_account,
-//!    claude-smart-helper.sh.j2 lines 883–971 — drained highest-pct-first with
-//!    a soonest-reset tie-break; the primary and secondary keys are now
-//!    swapped.)
+//!    (Policy changed post-0.2.11: the retired shell source's `pick_account`
+//!    drained highest-pct-first with a soonest-reset tie-break; the primary
+//!    and secondary keys are now swapped.)
 //! 4. `include_current = false` (reactive / hook): skip the current profile entirely.
 //! 5. `include_current = true` (proactive / fresh csm): current competes; if the
 //!    winner is current → return `Ok(None)` so the caller keeps it with no switch.
 //! 6. No viable candidate → `Err(ScoringError::AllSaturated)`.
 //!
-//! Env overrides: `CLAUDE_LIMIT_PCT` / `CLAUDE_PICK_SATURATION_PCT` (spec §2).
+//! Env overrides: `CLAUDE_LIMIT_PCT` / `CLAUDE_PICK_SATURATION_PCT`.
 //! Both overrides apply to `week_fable` too — it reuses the same
 //! `SATURATION_PCT` constant/override as `week_all`, never a separate knob.
 
@@ -441,11 +440,11 @@ pub fn pick_best_at(
 /// Return the `(session_pct, week_all_pct)` for a given profile from `data`,
 /// or `None` when the profile is errored, absent, or has no week_all section.
 ///
-/// Absent `session.pct` is encoded as [`ABSENT_SESSION_PCT`] (-1) (spec §2,
-/// shell `current-usage` lines 730–753).
+/// Absent `session.pct` is encoded as [`ABSENT_SESSION_PCT`] (-1), matching
+/// the shell `current-usage` encoding.
 ///
 /// Test-isolation helper: the production scorer inlines `data.current_usage`;
-/// this named wrapper lets unit tests assert the §2 encoding independently.
+/// this named wrapper lets unit tests assert the encoding independently.
 #[allow(dead_code)]
 pub fn current_usage_pcts(data: &UsageData, profile: &str) -> Option<(i64, i64)> {
     data.current_usage(profile)
@@ -1014,7 +1013,7 @@ mod tests {
 
     /// A profile whose model-scoped weekly cap (week_fable) is fully
     /// exhausted (100%) must be excluded from picking even though its session
-    /// and week_all readings are perfectly healthy (R2).
+    /// and week_all readings are perfectly healthy.
     #[test]
     fn fable_saturated_excludes_even_with_healthy_session_and_week_all() {
         let mut profiles = HashMap::new();

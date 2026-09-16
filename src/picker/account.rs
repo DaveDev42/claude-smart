@@ -2,8 +2,6 @@
 //! or returns nothing scorable, so csm cannot auto-pick. Rows show
 //! last-known usage from `.usage-cache.json` with a stale-age annotation.
 //!
-//! Spec §4a "Stale-usage account picker" (Decision #1):
-//!
 //! When an *interactive* proactive-pick context encounters a usage fetch miss
 //! (`Err(FetchError)`) or negative-cache active, the binary opens a picker over
 //! configured profiles showing last-known stale usage from `.usage-cache.json`.
@@ -107,7 +105,7 @@ impl AccountRow {
     /// `recommended` marks this as the row `pick_best` would auto-select; it gets
     /// a leading `★` at render time (see [`AccountRow::to_tsv`]).
     ///
-    /// Spec §4a "Row format / Rendered examples":
+    /// Row format / rendered examples:
     /// ```text
     /// home   session 3%   week 32%   resets Jun 18 9pm   (stale 4m ago)
     /// work   [error: no credentials]                      (stale 4m ago)
@@ -130,7 +128,7 @@ impl AccountRow {
 
         // The display column (col2, shown via --with-nth=2..) MUST lead with the
         // profile name — col1 is hidden for recovery, so without this the user
-        // could not tell which account each row is. Matches the spec §4a example
+        // could not tell which account each row is. Matches the example above
         // (`home   session 3%   …`). Left-pad to a fixed width so the usage
         // columns line up across rows.
         let usage = render_display(data, stale_annotation.as_deref());
@@ -146,7 +144,7 @@ impl AccountRow {
 
 /// Render the usage portion (everything after the profile-name column) for a row.
 ///
-/// Spec §4a rendering rules:
+/// Rendering rules:
 /// - error present → `[error: <string>]  (stale Nm ago)`
 /// - no data at all → `(no usage data)` (no stale annotation either way for
 ///   no-data; but stale annotation is still appended if we have a cache mtime)
@@ -187,7 +185,7 @@ fn render_display(data: &StaleProfileData, stale: Option<&str>) -> String {
 
 /// Format a stale age in seconds into a human-readable git-relative-style string.
 ///
-/// Spec §4a "Stale-age computation":
+/// Stale-age computation:
 /// - Minutes (up to 60): `Nm ago`, where N = ceil(age / 60).
 /// - Hours: `Nh ago`.
 /// - Days: `Nd ago`.
@@ -208,8 +206,6 @@ pub fn format_stale_age(age_secs: u64) -> String {
 
 /// Interactive account picker shown when local usage collection fails.
 ///
-/// Spec §4a "Stale-usage account picker".
-///
 /// Build with `AccountPicker::new(rows)`, then call `AccountPicker::pick()`.
 ///
 /// Degrade: when there is no usable terminal, `pick()` prints a stderr warning
@@ -221,8 +217,8 @@ pub struct AccountPicker {
 impl AccountPicker {
     /// Create a picker from pre-built account rows.
     ///
-    /// The list should cover *all* configured profiles (not just those in the
-    /// cache), per spec §4a "Profile enumeration".
+    /// The list should cover *all* configured profiles (not just those in
+    /// the cache).
     pub fn new(rows: Vec<AccountRow>) -> Self {
         Self { rows }
     }

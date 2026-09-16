@@ -90,8 +90,8 @@ pub fn titles_tsv() -> PathBuf {
 
 /// `<smart_dir>/bin/claude-smart-helper.sh` — legacy deployed helper path.
 /// Used only for the playbook cleanup (`state: absent`). Not written by the binary.
-/// Kept as the SSOT anchor for the not-yet-implemented Ansible cleanup task
-/// (rust-port spec §line 447); no Rust caller reads it today.
+/// Kept as the SSOT anchor for the not-yet-implemented Ansible cleanup task;
+/// no Rust caller reads it today.
 #[allow(dead_code)]
 pub fn legacy_helper_sh() -> PathBuf {
     smart_dir_no_create()

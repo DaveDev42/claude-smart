@@ -7,9 +7,8 @@
 //! - **macOS** (`cfg(target_os = "macos")`): `launchctl setenv CLAUDE_CONFIG_DIR <dir>`
 //!   updates the `gui/<uid>` launchd domain so GUI apps (Dock, Spotlight, non-login
 //!   shells) pick up the new value immediately without a re-login.
-//!   Mirrors the zsh `cas -g` path:
-//!   `[[ "$OSTYPE" == darwin* ]] && /bin/launchctl setenv CLAUDE_CONFIG_DIR "$dir"`
-//!   (`shared/zsh/claude-as.zsh` line 135).
+//!   Matches the legacy shell implementation's `cas -g` path:
+//!   `[[ "$OSTYPE" == darwin* ]] && /bin/launchctl setenv CLAUDE_CONFIG_DIR "$dir"`.
 //!
 //! - **Windows** (`cfg(windows)`): writes `CLAUDE_CONFIG_DIR` to
 //!   `HKCU\Environment` via `RegSetValueExW` and broadcasts a
@@ -25,13 +24,8 @@
 //!
 //! Both `launchctl_setenv` and `hkcu_setenv` treat failure as *soft*: a missing
 //! binary, a permission error, or a locked registry key logs a warning to stderr
-//! but does **not** prevent the live-shell export from succeeding. This mirrors
-//! the zsh `… 2>/dev/null` suppression on line 135 of `claude-as.zsh`.
-//!
-//! # Spec reference
-//! `docs/superpowers/specs/2026-06-17-csm-rust-port-design.md` §2 "cas -g",
-//! §3 "`cas --eval` shell-export shim", §5 #3 "cas live-shell env export"
-//! `docs/superpowers/specs/2026-06-18-csm-rust-crate-scaffold.md` §3 `cas/platform.rs`
+//! but does **not** prevent the live-shell export from succeeding. This matches
+//! the legacy shell implementation's `… 2>/dev/null` suppression.
 
 /// Apply the platform-specific global setenv side-effect for `cas -g`.
 ///
@@ -60,13 +54,13 @@ fn apply_global_impl(profile: &str, dir: &str) -> std::io::Result<()> {
 /// non-login shells spawned by launchd) inherit the new `CLAUDE_CONFIG_DIR`
 /// immediately — without requiring a re-login.
 ///
-/// Mirrors the zsh `cas -g` path (claude-as.zsh line 135):
+/// Matches the legacy shell implementation's `cas -g` path:
 /// ```zsh
 /// [[ "$OSTYPE" == darwin* ]] && /bin/launchctl setenv CLAUDE_CONFIG_DIR "$dir" 2>/dev/null
 /// ```
 ///
 /// Failure is **soft** — we print a warning to stderr but do NOT return an
-/// error, matching the `2>/dev/null` suppression in the zsh source. The
+/// error, matching the `2>/dev/null` suppression in the shell source. The
 /// live-shell export still succeeds even if launchctl is unavailable (e.g. CI
 /// / a container / a sandboxed test environment).
 #[cfg(target_os = "macos")]
@@ -74,8 +68,8 @@ pub fn launchctl_setenv(_profile: &str, dir: &str) -> std::io::Result<()> {
     use std::process::Command;
 
     // `/bin/launchctl setenv CLAUDE_CONFIG_DIR <dir>`
-    // Matches the zsh line exactly: the env var name is hardcoded, the value
-    // is the resolved config-dir path.
+    // Matches the legacy shell implementation exactly: the env var name is
+    // hardcoded, the value is the resolved config-dir path.
     let status = Command::new("/bin/launchctl")
         .args(["setenv", "CLAUDE_CONFIG_DIR", dir])
         .status();
@@ -114,11 +108,6 @@ fn apply_global_impl(profile: &str, dir: &str) -> std::io::Result<()> {
 ///   for the broadcast
 ///
 /// Failure is soft — we print a warning to stderr but do NOT return an error.
-///
-/// # Status (Phase 4 — Windows supervisor)
-/// The registry write and `SendMessageTimeout` broadcast are implemented here
-/// as stubs that log a warning. The full Win32 implementation will be added
-/// during the Windows supervisor phase (Phase 13 per §6 of the scaffold spec).
 /// On POSIX this code is not compiled.
 #[cfg(windows)]
 pub fn hkcu_setenv(_profile: &str, dir: &str) -> std::io::Result<()> {

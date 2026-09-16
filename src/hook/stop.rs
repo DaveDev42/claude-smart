@@ -1,6 +1,6 @@
 //! Hook kill/stop — commit ordering + POSIX SIGTERM / Windows .stop flag IPC.
 //!
-//! # Commit ordering (§4b, mirrors `limit-switch.sh.j2` lines 384–425)
+//! # Commit ordering (matches the legacy shell implementation)
 //!
 //! 1. merge-sidecar `hop` (increment next_hop into `<sid>.json`)
 //! 2. write `.relaunch` sentinel (atomic tmp+rename)
@@ -39,7 +39,7 @@ pub use crate::platform::relaunch::RelaunchSentinel;
 /// `born`           — born epoch read from the PID file by classify().
 /// `_owner_dir`     — CLAUDE_CONFIG_DIR of the owning profile (reserved for future use).
 ///
-/// The commit ordering (§4b, mirrors `limit-switch.sh.j2` lines 384–425):
+/// The commit ordering (matches the legacy shell implementation):
 ///   1. merge-sidecar hop
 ///   2. write .relaunch sentinel (atomic tmp+rename)
 ///   3. noclobber-create .switched marker
@@ -56,7 +56,6 @@ pub fn commit_and_stop(
     use crate::paths;
 
     // ── Step 1: read current hop from sidecar, compute next_hop ──────────────
-    // Shell: limit-switch.sh.j2 lines 394-395
     let current_hop = read_sidecar_hop(sid);
     let next_hop = current_hop + 1;
 
@@ -65,7 +64,7 @@ pub fn commit_and_stop(
     merge_sidecar_hop(sid, next_hop)?;
 
     // ── Step 2: write .relaunch sentinel (atomic) ─────────────────────────────
-    // Shell: `"$HELPER" write-relaunch ...` (limit-switch.sh.j2 lines 403-406)
+    // Shell: `"$HELPER" write-relaunch ...`
     // born is passed from classify() (already read from the pidfile there).
     let actual_born = if born != 0 {
         born
@@ -106,7 +105,8 @@ pub fn commit_and_stop(
 // ─── sidecar hop helpers ─────────────────────────────────────────────────────
 
 /// Read the `hop` field from `<sid>.json`, tolerating both String and Number forms.
-/// Returns 0 on missing/corrupt sidecar (§6 compat: old zsh wrote hop as a JSON string).
+/// Returns 0 on missing/corrupt sidecar (the legacy zsh wrote hop as a JSON string;
+/// readers accept both forms).
 /// Delegates to the single `Sidecar::hop_int` SSOT so the String/Number tolerance
 /// rule lives in exactly one place (was triplicated across stop.rs/detect.rs/sidecar).
 fn read_sidecar_hop(sid: &str) -> i64 {
@@ -116,8 +116,9 @@ fn read_sidecar_hop(sid: &str) -> i64 {
 }
 
 /// Merge `next_hop` into `<sid>.json` without clobbering other fields.
-/// The hop field is written as a JSON **string** for sidecar compatibility (§6 compat:
-/// `merge_sidecar` in the old zsh used `jq --arg` which always produces a string value).
+/// The hop field is written as a JSON **string** for sidecar compatibility:
+/// `merge_sidecar` in the legacy zsh implementation used `jq --arg`, which
+/// always produces a string value.
 fn merge_sidecar_hop(sid: &str, next_hop: i64) -> anyhow::Result<()> {
     use crate::paths;
 
@@ -341,7 +342,7 @@ mod tests {
             born: 1718000000,
         };
         let json = serde_json::to_string(&sentinel).unwrap();
-        // hop must be a JSON number (not a string) in .relaunch (§6 compat)
+        // hop must be a JSON number (not a string) in .relaunch
         assert!(
             json.contains("\"hop\":1"),
             "hop should be a JSON number in .relaunch: {json}"
