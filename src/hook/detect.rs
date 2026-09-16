@@ -324,23 +324,7 @@ pub fn classify_with(
 
     // ── 1. Kill-switches (cheapest checks first) ──────────────────────────────
     // Shell: the legacy shell implementation
-
-    // 1a. Env var kill-switch: CLAUDE_AUTO_SWITCH=0
-    if std::env::var("CLAUDE_AUTO_SWITCH").as_deref() == Ok("0") {
-        return Ok(Decision::Skip);
-    }
-
-    // 1b. File-based kill-switch: .auto-switch-disabled
-    if paths::smart_dir_no_create()
-        .join(".auto-switch-disabled")
-        .exists()
-    {
-        return Ok(Decision::Skip);
-    }
-
-    // 1c. Already switched this session: .switched marker (fast path)
-    // Shell: the legacy shell implementation
-    if paths::switched(sid).exists() {
+    if kill_switches_engaged(sid) {
         return Ok(Decision::Skip);
     }
 
@@ -364,10 +348,10 @@ pub fn classify_with(
     // cooldown-exception decision at step 9 (a definitive signal is never
     // throttled by the machine-wide cooldown — see `cooldown_should_block`).
 
-    let (limited_msg, limited, definitive) = match (live_limit, stop_failure_limit(input)) {
-        (Some(msg), _) => (msg.to_string(), true, true),
-        (None, StopFailureVerdict::Limit(msg)) => (msg, true, true),
-        (None, StopFailureVerdict::NotLimit) => {
+    // ── 4. No limit → exit (no side effects) ─────────────────────────────────
+    // Shell: the legacy shell implementation
+    let (limited_msg, definitive) = match detect_limit(input, owner_dir, live_limit) {
+        Detection::NotLimit => {
             // StopFailure for a non-limit API error (overloaded,
             // authentication_failed, invalid_request, ...). Not something to
             // switch accounts over — do nothing, and do NOT fall through to
@@ -376,21 +360,18 @@ pub fn classify_with(
             // the same turn.
             return Ok(Decision::Skip);
         }
-        (None, StopFailureVerdict::NotApplicable) => match detect_usage_threshold(owner_dir) {
-            Some(msg) => (msg, true, false),
-            None => (String::new(), false, false),
-        },
-    };
-
-    // ── 4. No limit → exit (no side effects) ─────────────────────────────────
-    // Shell: the legacy shell implementation
-    if !limited {
-        if user_quit {
-            // Shell: `_log "user-quit-skip" "reason=${reason}"`
-            // No notification — this is just a log entry when no limit detected.
+        Detection::NoSignal => {
+            if user_quit {
+                // Shell: `_log "user-quit-skip" "reason=${reason}"`
+                // No notification — this is just a log entry when no limit detected.
+            }
+            return Ok(Decision::Skip);
         }
-        return Ok(Decision::Skip);
-    }
+        Detection::Limited {
+            message,
+            definitive,
+        } => (message, definitive),
+    };
 
     // ──────────────── Limit detected from this point on ──────────────────────
 
@@ -398,18 +379,11 @@ pub fn classify_with(
     // Shell: the legacy shell implementation
     // NEVER kill/relaunch on a session the user explicitly closed.
     if user_quit {
-        let detect_path = paths::detected(sid);
-        if !detect_path.exists() {
-            let _ = paths::smart_dir(); // ensure dir exists
-            let _ = write_noclobber_epoch(&detect_path);
-            prune_detected_markers();
-            let profile_name = owner_dir_to_profile_name(owner_dir);
-            let body = format!(
-                "[{profile_name}] hit {limited_msg} — you quit, so not relaunching; next csm will pick a healthy account"
-            );
-            return Ok(Decision::NotifyOnly { message: body });
-        }
-        return Ok(Decision::Skip);
+        let profile_name = owner_dir_to_profile_name(owner_dir);
+        let body = format!(
+            "[{profile_name}] hit {limited_msg} — you quit, so not relaunching; next csm will pick a healthy account"
+        );
+        return Ok(notify_once(sid, body));
     }
 
     // ── 6. Pick target profile (exclude current, reactive hook mode) ──────────
@@ -423,32 +397,15 @@ pub fn classify_with(
     // same stale data would leave the user stranded on the limited profile —
     // detected-but-not-switched. Score on the freshest-known numbers instead.
     let current_profile = owner_dir_to_profile_name(owner_dir);
-    let target_result = crate::account::pick_account_gated(
-        &current_profile,
-        /*include_current=*/ false,
-        /*apply_stale_gate=*/ false,
-    );
-    // Single viability authority: `resolve_target_from_pick` is a pure pass-through
-    // over `account::pick_account_gated`'s verdict — the hook never recomputes or
-    // second-guesses which profile is viable. Whatever `scoring::pick_best`
-    // excludes (session-limited, week_all-saturated, or — once fable-aware —
-    // week_fable-saturated) can therefore never come back as a relaunch target.
-    let target_profile = match resolve_target_from_pick(target_result) {
+    let target_profile = match pick_target(&current_profile) {
         Some(name) => name,
         None => {
             // No viable target (all saturated/errored, or fetch miss)
             // Shell: the legacy shell implementation
-            let detect_path = paths::detected(sid);
-            if !detect_path.exists() {
-                let _ = paths::smart_dir();
-                let _ = write_noclobber_epoch(&detect_path);
-                prune_detected_markers();
-                let body = format!(
-                    "[{current_profile}] hit {limited_msg} — no account with headroom to switch to"
-                );
-                return Ok(Decision::NotifyOnly { message: body });
-            }
-            return Ok(Decision::Skip);
+            let body = format!(
+                "[{current_profile}] hit {limited_msg} — no account with headroom to switch to"
+            );
+            return Ok(notify_once(sid, body));
         }
     };
 
@@ -456,57 +413,28 @@ pub fn classify_with(
     // Shell: the legacy shell implementation
     // Default is "1" (relaunch enabled). Explicit =0 → notify-only.
     // MUST run before any state mutation — does NOT claim .switched or cooldown.
-    let relaunch_env =
-        std::env::var("CLAUDE_AUTO_SWITCH_RELAUNCH").unwrap_or_else(|_| "1".to_string());
-    if relaunch_env != "1" {
-        let detect_path = paths::detected(sid);
-        if !detect_path.exists() {
-            let _ = paths::smart_dir();
-            let _ = write_noclobber_epoch(&detect_path);
-            prune_detected_markers();
-            let sid_short = crate::hook::sid_short(sid);
-            let body = format!(
-                "[{current_profile}] hit {limited_msg} → switch to [{target_profile}] (auto-relaunch OFF; csm --profile {target_profile} --resume {sid_short})"
-            );
-            return Ok(Decision::NotifyOnly { message: body });
-        }
-        return Ok(Decision::Skip);
+    if !relaunch_enabled() {
+        let sid_short = crate::hook::sid_short(sid);
+        let body = format!(
+            "[{current_profile}] hit {limited_msg} → switch to [{target_profile}] (auto-relaunch OFF; csm --profile {target_profile} --resume {sid_short})"
+        );
+        return Ok(notify_once(sid, body));
     }
 
     // ── 8. Managed-session gate: .pid file must exist and match claude/node ───
     // Shell: the legacy shell implementation
-    let pid_path = paths::pid_file(sid);
-    if !pid_path.exists() {
-        let detect_path = paths::detected(sid);
-        if !detect_path.exists() {
-            let _ = paths::smart_dir();
-            let _ = write_noclobber_epoch(&detect_path);
-            prune_detected_markers();
+    let born_epoch = match managed_session(sid) {
+        ManagedGate::NotManaged => {
             let sid_short = crate::hook::sid_short(sid);
             let body = format!(
                 "[{current_profile}] hit {limited_msg} → switch to [{target_profile}] by hand (csm --profile {target_profile} --resume {sid_short})"
             );
-            return Ok(Decision::NotifyOnly { message: body });
+            return Ok(notify_once(sid, body));
         }
-        return Ok(Decision::Skip);
-    }
-
-    // Read the pid file: "<pid> <born_epoch>"
-    // Shell: the legacy shell implementation
-    let pid_content = std::fs::read_to_string(&pid_path).unwrap_or_default();
-    let (claude_pid, born_epoch) = match parse_pid_file(&pid_content) {
-        Some(v) => v,
-        None => {
-            // Bad PID file — log and skip
-            return Ok(Decision::Skip);
-        }
+        // Bad PID file, or PID not a live claude/node process — log and skip.
+        ManagedGate::Dead => return Ok(Decision::Skip),
+        ManagedGate::Live { born } => born,
     };
-
-    // Confirm the PID is a live claude/node process
-    // Shell: the legacy shell implementation
-    if !is_live_claude_or_node(claude_pid) {
-        return Ok(Decision::Skip);
-    }
 
     // ── 9. Machine-wide cooldown (atomic noclobber claim) ─────────────────────
     // Shell: the legacy shell implementation
@@ -525,27 +453,20 @@ pub fn classify_with(
     // still call `check_and_claim_cooldown` unconditionally so the stamp gets
     // refreshed/claimed best-effort — pct-based (tier-2) detections elsewhere
     // keep today's throttle exactly.
-    let smart_dir = paths::smart_dir()?;
-    let last_switch_path = paths::last_switch();
-    let cooldown_secs = crate::envvar::i64_or("CLAUDE_SWITCH_COOLDOWN", LAST_SWITCH_COOLDOWN_SECS);
-
-    let window_blocked = check_and_claim_cooldown(&last_switch_path, cooldown_secs);
-    let _ = smart_dir; // ensure we called smart_dir for side effect
-    if cooldown_should_block(definitive, window_blocked) {
+    paths::smart_dir()?; // ensure dir exists before cooldown_blocks touches it
+    if cooldown_blocks(definitive) {
         return Ok(Decision::Skip);
     }
 
     // ── 10. Hop guard ─────────────────────────────────────────────────────────
     // Shell: the legacy shell implementation
-    let max_hops = crate::envvar::i64_or("CLAUDE_MAX_HOPS", MAX_HOPS);
-    let current_hop = crate::hook::read_sidecar_hop(sid);
-    if current_hop >= max_hops {
-        return Ok(Decision::Skip);
-    }
+    let next_hop = match next_hop_within_cap(sid) {
+        Some(n) => n,
+        None => return Ok(Decision::Skip),
+    };
 
     // ── 11. Build the handoff prompt ──────────────────────────────────────────
     // Shell: the legacy shell implementation
-    let next_hop = current_hop + 1;
     let sid_short = crate::hook::sid_short(sid);
     let handoff = build_handoff(sid_short, &current_profile, &target_profile, next_hop);
 
@@ -565,6 +486,174 @@ pub fn classify_with(
         cwd: cwd_str,
         born: born_epoch,
     })
+}
+
+// ─── `classify_with` gate steps ───────────────────────────────────────────────
+//
+// Each fn below covers exactly the banner(s) named in its doc comment, split
+// with no new seams beyond `classify_with`'s own pre-existing section
+// boundaries.
+
+/// Step 1 (banners 1a/1b/1c): the three kill-switches, cheapest first.
+fn kill_switches_engaged(sid: &str) -> bool {
+    use crate::paths;
+
+    // 1a. Env var kill-switch: CLAUDE_AUTO_SWITCH=0
+    if std::env::var("CLAUDE_AUTO_SWITCH").as_deref() == Ok("0") {
+        return true;
+    }
+
+    // 1b. File-based kill-switch: .auto-switch-disabled
+    if paths::smart_dir_no_create()
+        .join(".auto-switch-disabled")
+        .exists()
+    {
+        return true;
+    }
+
+    // 1c. Already switched this session: .switched marker (fast path)
+    if paths::switched(sid).exists() {
+        return true;
+    }
+
+    false
+}
+
+/// Outcome of the tier-0/tier-2 limit check (banners 3-4).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Detection {
+    /// A StopFailure event whose `error` is not `"rate_limit"` — a real API
+    /// failure, but not a usage limit. `classify_with` must Skip, never fall
+    /// through to tier-2.
+    NotLimit,
+    /// Neither tier-0 nor tier-2 saw a limit.
+    NoSignal,
+    /// A limit was detected. `definitive` is true for tier-0 (StopFailure or
+    /// the statusline tick's `live_limit`), false for tier-2 (usage-cache
+    /// threshold).
+    Limited { message: String, definitive: bool },
+}
+
+/// Steps 3-4: tier-0 StopFailure / tier-2 usage-cache check.
+fn detect_limit(input: &HookInput, owner_dir: &Path, live_limit: Option<&str>) -> Detection {
+    match (live_limit, stop_failure_limit(input)) {
+        (Some(msg), _) => Detection::Limited {
+            message: msg.to_string(),
+            definitive: true,
+        },
+        (None, StopFailureVerdict::Limit(msg)) => Detection::Limited {
+            message: msg,
+            definitive: true,
+        },
+        (None, StopFailureVerdict::NotLimit) => Detection::NotLimit,
+        (None, StopFailureVerdict::NotApplicable) => match detect_usage_threshold(owner_dir) {
+            Some(msg) => Detection::Limited {
+                message: msg,
+                definitive: false,
+            },
+            None => Detection::NoSignal,
+        },
+    }
+}
+
+/// Banners 5/6/7/8 tails: the one-shot notify deduped via the `.detected`
+/// noclobber marker, repeated verbatim at four exits in the pre-C15 fn.
+fn notify_once(sid: &str, body: String) -> Decision {
+    use crate::paths;
+
+    let detect_path = paths::detected(sid);
+    if !detect_path.exists() {
+        let _ = paths::smart_dir(); // ensure dir exists
+        let _ = write_noclobber_epoch(&detect_path);
+        prune_detected_markers();
+        return Decision::NotifyOnly { message: body };
+    }
+    Decision::Skip
+}
+
+/// Step 6: pick a target profile, excluding `current_profile`, with the
+/// stale-usage gate off (reactive hook mode — see the caller's comment on
+/// why this call site must not apply that gate).
+fn pick_target(current_profile: &str) -> Option<String> {
+    let target_result = crate::account::pick_account_gated(
+        current_profile,
+        /*include_current=*/ false,
+        /*apply_stale_gate=*/ false,
+    );
+    // Single viability authority: `resolve_target_from_pick` is a pure pass-through
+    // over `account::pick_account_gated`'s verdict — the hook never recomputes or
+    // second-guesses which profile is viable. Whatever `scoring::pick_best`
+    // excludes (session-limited, week_all-saturated, or — once fable-aware —
+    // week_fable-saturated) can therefore never come back as a relaunch target.
+    resolve_target_from_pick(target_result)
+}
+
+/// Step 7: `CLAUDE_AUTO_SWITCH_RELAUNCH` defaults to `"1"` (relaunch
+/// enabled); any other value means detect-only (notify, don't relaunch).
+fn relaunch_enabled() -> bool {
+    std::env::var("CLAUDE_AUTO_SWITCH_RELAUNCH").unwrap_or_else(|_| "1".to_string()) == "1"
+}
+
+/// Outcome of the managed-session gate (banner 8).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ManagedGate {
+    /// No `.pid` file — nothing csm is supervising for this session.
+    NotManaged,
+    /// A `.pid` file exists but is malformed, or names a PID that is no
+    /// longer a live claude/node process.
+    Dead,
+    /// A `.pid` file names a live claude/node process; carries its recorded
+    /// birth epoch.
+    Live { born: i64 },
+}
+
+/// Step 8: `.pid` file must exist and name a live claude/node process.
+fn managed_session(sid: &str) -> ManagedGate {
+    use crate::paths;
+
+    let pid_path = paths::pid_file(sid);
+    if !pid_path.exists() {
+        return ManagedGate::NotManaged;
+    }
+
+    // Read the pid file: "<pid> <born_epoch>"
+    let pid_content = std::fs::read_to_string(&pid_path).unwrap_or_default();
+    let (claude_pid, born_epoch) = match parse_pid_file(&pid_content) {
+        Some(v) => v,
+        None => return ManagedGate::Dead,
+    };
+
+    // Confirm the PID is a live claude/node process
+    if !is_live_claude_or_node(claude_pid) {
+        return ManagedGate::Dead;
+    }
+
+    ManagedGate::Live { born: born_epoch }
+}
+
+/// Step 9: machine-wide cooldown (atomic noclobber claim), with the
+/// tier-0-definitive exception. Always claims/refreshes the stamp via
+/// `check_and_claim_cooldown`, even when the result is "don't block" —
+/// see `classify_with`'s call site comment for why.
+fn cooldown_blocks(definitive: bool) -> bool {
+    use crate::paths;
+
+    let last_switch_path = paths::last_switch();
+    let cooldown_secs = crate::envvar::i64_or("CLAUDE_SWITCH_COOLDOWN", LAST_SWITCH_COOLDOWN_SECS);
+    let window_blocked = check_and_claim_cooldown(&last_switch_path, cooldown_secs);
+    cooldown_should_block(definitive, window_blocked)
+}
+
+/// Step 10: hop guard. `None` means the cap is reached; `Some(n)` is the next
+/// hop number to record.
+fn next_hop_within_cap(sid: &str) -> Option<i64> {
+    let max_hops = crate::envvar::i64_or("CLAUDE_MAX_HOPS", MAX_HOPS);
+    let current_hop = crate::hook::read_sidecar_hop(sid);
+    if current_hop >= max_hops {
+        None
+    } else {
+        Some(current_hop + 1)
+    }
 }
 
 // ─── detection tier implementations ──────────────────────────────────────────
