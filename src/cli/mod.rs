@@ -12,3 +12,4 @@
 
 pub mod completions;
 pub mod parser;
+pub mod reserved;

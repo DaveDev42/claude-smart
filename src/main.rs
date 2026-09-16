@@ -63,33 +63,14 @@ impl SessionResolution {
 fn main() -> anyhow::Result<()> {
     let args: Vec<OsString> = std::env::args_os().collect();
 
-    // argv[0]-aware dispatch: if this binary is invoked as a known alias, treat
-    // it as if that subcommand was the first argument (spec §2 "Multi-call binary").
-    let argv0 = args
-        .first()
-        .and_then(|a| {
-            std::path::Path::new(a)
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .map(str::to_ascii_lowercase)
-        })
-        .unwrap_or_default();
-
-    // Determine which subcommand to dispatch and the rest of argv.
-    let subcommand: &str;
-    let rest: &[OsString];
-
-    if argv0 == "csm-hook" {
-        // Invoked as `csm-hook` directly (symlink / rename form) — spec §2.
-        subcommand = "hook";
-        rest = &args[1..];
-    } else if args.len() >= 2 {
-        let candidate = args[1].to_string_lossy();
-        // Top-level `--version`/`-V` and `--help`/`-h` belong to csm itself, not to
-        // claude. (To pass these through to claude, use `csm run -- --version`.)
-        // Intercept only when they are the very first token so `csm run --help`
-        // routing into cmd_run's own usage still works.
-        match candidate.as_ref() {
+    // Top-level `--version`/`-V` and `--help`/`-h` belong to csm itself, not to
+    // claude. (To pass these through to claude, use `csm run -- --version`.)
+    // Intercept only when they are the very first token so `csm run --help`
+    // routing into cmd_run's own usage still works, and only when this
+    // invocation is not the `csm-hook` argv[0] alias — `csm-hook --version`
+    // must still reach `cmd_hook`, not print csm's own version/help.
+    if !cli::reserved::invoked_as_hook_alias(&args) && args.len() >= 2 {
+        match args[1].to_string_lossy().as_ref() {
             "--version" | "-V" => {
                 println!("csm {}", env!("CARGO_PKG_VERSION"));
                 return Ok(());
@@ -100,23 +81,14 @@ fn main() -> anyhow::Result<()> {
             }
             _ => {}
         }
-        match candidate.as_ref() {
-            "run" | "hook" | "profiles" | "config" | "usage" | "cas" | "pick-account" | "scan"
-            | "current-usage" | "sidecar" | "statusline" | "completions" | "newuuid" | "reap" => {
-                subcommand = Box::leak(candidate.into_owned().into_boxed_str());
-                rest = &args[2..];
-            }
-            _ => {
-                // No recognized subcommand → implicit `csm run` fallthrough.
-                subcommand = "run";
-                rest = &args[1..];
-            }
-        }
-    } else {
-        // Bare `csm` → implicit `csm run`.
-        subcommand = "run";
-        rest = &args[1..];
     }
+
+    // argv[0]-aware dispatch: if this binary is invoked as a known alias, treat
+    // it as if that subcommand was the first argument (spec §2 "Multi-call
+    // binary"). `cli::reserved::dispatch_subcommand` is the single tested
+    // source of truth for this rule and the reserved word list.
+    let (subcommand, rest_len) = cli::reserved::dispatch_subcommand(&args);
+    let rest: &[OsString] = &args[args.len() - rest_len..];
 
     match subcommand {
         "run" => cmd_run(rest),
@@ -130,7 +102,7 @@ fn main() -> anyhow::Result<()> {
         "reap" => reaper::cmd(rest),
         "current-usage" => cmd_current_usage(rest),
         "sidecar" => cmd_sidecar(rest),
-        "statusline" => cmd_statusline(rest),
+        "statusline" => statusline::run(rest),
         "completions" => cmd_completions(rest),
         "newuuid" => {
             println!("{}", newuuid());
@@ -1897,10 +1869,6 @@ fn parse_sidecar_kv_args(args: &[OsString]) -> anyhow::Result<sidecar::Sidecar> 
 
 // ─── statusline ────────────────────────────────────────────────────────────────
 
-fn cmd_statusline(args: &[OsString]) -> anyhow::Result<()> {
-    statusline::run(args)
-}
-
 // ─── completions ───────────────────────────────────────────────────────────────
 
 /// `csm completions {zsh|bash|pwsh}`
@@ -1938,48 +1906,18 @@ fn cmd_completions(args: &[OsString]) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cli::parser;
+    use crate::cli::reserved::dispatch_subcommand;
 
     // ══════════════════════════════════════════════════════════════════════════
     // Dispatch routing — verify that the argument dispatcher picks the right
-    // subcommand word, covering the full table in main().
+    // subcommand word, covering the full table in main(). Exercises
+    // `cli::reserved::dispatch_subcommand`, the single tested source of truth
+    // for the reserved word list (`cli::reserved` module).
     // Pure-logic tests: no subprocess / real I/O / network calls.
     // ══════════════════════════════════════════════════════════════════════════
 
     fn argv(ss: &[&str]) -> Vec<OsString> {
         ss.iter().map(|s| OsString::from(*s)).collect()
-    }
-
-    /// Mirror the dispatch logic in `main()`: given a full argv (including argv[0]),
-    /// return `(subcommand, rest_len)` without executing the handler.
-    fn dispatch_subcommand(args: &[OsString]) -> (&'static str, usize) {
-        let argv0 = args
-            .first()
-            .and_then(|a| {
-                std::path::Path::new(a)
-                    .file_stem()
-                    .and_then(|s| s.to_str())
-                    .map(str::to_ascii_lowercase)
-            })
-            .unwrap_or_default();
-
-        if argv0 == "csm-hook" {
-            return ("hook", args.len() - 1);
-        }
-        if args.len() >= 2 {
-            let candidate = args[1].to_string_lossy();
-            match candidate.as_ref() {
-                "run" | "hook" | "profiles" | "usage" | "cas" | "pick-account" | "scan"
-                | "current-usage" | "sidecar" | "statusline" | "completions" | "newuuid" => {
-                    return (
-                        Box::leak(candidate.into_owned().into_boxed_str()),
-                        args.len() - 2,
-                    );
-                }
-                _ => {}
-            }
-        }
-        ("run", args.len() - 1)
     }
 
     // ── explicit subcommands ──────────────────────────────────────────────────
@@ -2020,6 +1958,22 @@ mod tests {
         let a = argv(&["csm", "usage", "--json"]);
         let (cmd, rest_len) = dispatch_subcommand(&a);
         assert_eq!(cmd, "usage");
+        assert_eq!(rest_len, 1);
+    }
+
+    #[test]
+    fn dispatch_explicit_config() {
+        let a = argv(&["csm", "config", "show"]);
+        let (cmd, rest_len) = dispatch_subcommand(&a);
+        assert_eq!(cmd, "config");
+        assert_eq!(rest_len, 1);
+    }
+
+    #[test]
+    fn dispatch_explicit_reap() {
+        let a = argv(&["csm", "reap", "--dry-run"]);
+        let (cmd, rest_len) = dispatch_subcommand(&a);
+        assert_eq!(cmd, "reap");
         assert_eq!(rest_len, 1);
     }
 
@@ -2135,40 +2089,6 @@ mod tests {
         let (cmd, rest_len) = dispatch_subcommand(&a);
         assert_eq!(cmd, "hook");
         assert_eq!(rest_len, 0);
-    }
-
-    // ── parser integration: parser output feeds dispatch correctly ────────────
-
-    #[test]
-    fn parser_run_flags() {
-        let a = argv(&["csm", "run", "-c", "--profile=work"]);
-        let rest = &a[2..];
-        let parsed = parser::parse(rest);
-        assert!(parsed.flags.continue_);
-        assert_eq!(parsed.flags.profile.as_deref(), Some("work"));
-        assert!(parsed.passthru.is_empty());
-    }
-
-    #[test]
-    fn parser_run_new_flag() {
-        let a = argv(&["csm", "run", "--new", "--profile=x"]);
-        let rest = &a[2..];
-        let parsed = parser::parse(rest);
-        assert!(parsed.flags.new);
-        assert_eq!(parsed.flags.profile.as_deref(), Some("x"));
-        assert!(parsed.passthru.is_empty());
-    }
-
-    #[test]
-    fn parser_run_passthru() {
-        let a = argv(&["csm", "run", "--", "--dangerously-skip-permissions"]);
-        let rest = &a[2..];
-        let parsed = parser::parse(rest);
-        assert!(!parsed.flags.continue_);
-        assert_eq!(
-            parsed.passthru,
-            vec![OsString::from("--dangerously-skip-permissions")]
-        );
     }
 
     // ── parse_owner_flag ──────────────────────────────────────────────────────

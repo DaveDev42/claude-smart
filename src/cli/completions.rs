@@ -432,6 +432,29 @@ mod tests {
         );
     }
 
+    // ── completions tree matches the reserved subcommand set ──────────────────
+
+    #[test]
+    fn completions_tree_matches_reserved_set() {
+        use crate::cli::reserved::CSM_RESERVED_SUBCOMMANDS;
+
+        let cmd = CsmCompletionsApp::command();
+        let mut names: Vec<&str> = cmd
+            .get_subcommands()
+            .map(|c| c.get_name())
+            .filter(|n| *n != "help")
+            .collect();
+        names.sort_unstable();
+
+        let mut expected: Vec<&str> = CSM_RESERVED_SUBCOMMANDS.to_vec();
+        expected.sort_unstable();
+
+        assert_eq!(
+            names, expected,
+            "the completions clap tree has drifted from CSM_RESERVED_SUBCOMMANDS"
+        );
+    }
+
     // ── generate is idempotent (called twice produces the same output) ────────
 
     #[test]
