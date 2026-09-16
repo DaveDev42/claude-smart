@@ -104,88 +104,6 @@ pub fn write_default_profile(profile: &str, profiles: &ProfileMap) -> io::Result
     std::fs::write(&path, format!("{profile}\n"))
 }
 
-// ─── test-only grammar fixture ────────────────────────────────────────────────
-//
-// The production cas argument parser is `parse_cas_flags` + `parse_cas_op` in
-// `main.rs` and is the SSOT. The function below is a TEST-ONLY fixture that
-// mirrors the grammar so the 12 unit tests below can exercise the (Shell, Op)
-// outcome combinations without needing access to main.rs's private functions.
-// It is gated `#[cfg(test)]` so it never appears in release builds and does
-// not produce a dead-code warning.
-
-#[cfg(test)]
-fn parse_cas_args_for_test<S: AsRef<str>>(args: &[S]) -> anyhow::Result<(Shell, Op)> {
-    let mut shell = Shell::Zsh; // default
-    let mut i = 0;
-    let n = args.len();
-
-    // Consume csm-level flags (--eval, --shell) before `--`.
-    while i < n {
-        let a = args[i].as_ref();
-        match a {
-            "--eval" => {
-                i += 1;
-            }
-            "--shell" => {
-                i += 1;
-                if i >= n {
-                    anyhow::bail!("cas: --shell requires an argument (zsh|bash|pwsh)");
-                }
-                let s = args[i].as_ref();
-                shell = Shell::parse(s).ok_or_else(|| {
-                    anyhow::anyhow!("cas: unknown shell '{}' — expected zsh, bash, or pwsh", s)
-                })?;
-                i += 1;
-            }
-            "--" => {
-                i += 1;
-                break;
-            }
-            _ => {
-                break;
-            }
-        }
-    }
-
-    // Parse the user command (after `--` or the last csm flag).
-    if i >= n {
-        return Ok((
-            shell,
-            Op::Status {
-                print_current: false,
-            },
-        ));
-    }
-
-    let cmd = args[i].as_ref();
-    match cmd {
-        "-" => Ok((shell, Op::Minus)),
-
-        "resync" => Ok((shell, Op::Resync)),
-
-        "status" => {
-            let print_current = (i + 1 < n) && args[i + 1].as_ref() == "--print-current";
-            Ok((shell, Op::Status { print_current }))
-        }
-
-        "-g" | "--global" => {
-            i += 1;
-            if i >= n {
-                anyhow::bail!("cas: {} requires a profile name", cmd);
-            }
-            let profile = args[i].as_ref().to_owned();
-            Ok((shell, Op::Global { profile }))
-        }
-
-        profile => Ok((
-            shell,
-            Op::Switch {
-                profile: profile.to_owned(),
-            },
-        )),
-    }
-}
-
 // ─── tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -208,6 +126,23 @@ mod tests {
 
     fn empty_profiles() -> ProfileMap {
         ProfileMap::default()
+    }
+
+    /// Compose the real `cmd::cas` parsers (`parse_cas_flags` + `parse_cas_op`)
+    /// into the same `(Shell, Op)` shape the old test-only grammar fixture
+    /// returned, so the `parse_args_*` tests below exercise the SSOT parser
+    /// instead of a hand-copy that had already drifted from it (apc-06).
+    fn compose_parse_cas_args<S: AsRef<str>>(args: &[S]) -> anyhow::Result<(Shell, Op)> {
+        let owned: Vec<std::ffi::OsString> = args.iter().map(|s| s.as_ref().into()).collect();
+        let flags = crate::cmd::cas::parse_cas_flags(&owned)?;
+        let shell = match flags.shell.as_deref() {
+            Some(s) => {
+                Shell::parse(s).ok_or_else(|| anyhow::anyhow!("cas: unknown shell '{}'", s))?
+            }
+            None => Shell::Zsh,
+        };
+        let op = crate::cmd::cas::parse_cas_op(&flags.op_args)?;
+        Ok((shell, op))
     }
 
     // ── default_profile / default_name tests (registry-driven, no allowlist) ──
@@ -324,7 +259,7 @@ mod tests {
     #[test]
     fn parse_args_switch_personal() {
         let args = ["--eval", "--shell", "zsh", "--", "home"];
-        let (shell, op) = parse_cas_args_for_test(&args).unwrap();
+        let (shell, op) = compose_parse_cas_args(&args).unwrap();
         assert_eq!(shell, Shell::Zsh);
         assert_eq!(
             op,
@@ -337,7 +272,7 @@ mod tests {
     #[test]
     fn parse_args_switch_work() {
         let args = ["--eval", "--shell", "zsh", "--", "work"];
-        let (shell, op) = parse_cas_args_for_test(&args).unwrap();
+        let (shell, op) = compose_parse_cas_args(&args).unwrap();
         assert_eq!(shell, Shell::Zsh);
         assert_eq!(
             op,
@@ -350,7 +285,7 @@ mod tests {
     #[test]
     fn parse_args_switch_pwsh() {
         let args = ["--eval", "--shell", "pwsh", "--", "home"];
-        let (shell, op) = parse_cas_args_for_test(&args).unwrap();
+        let (shell, op) = compose_parse_cas_args(&args).unwrap();
         assert_eq!(shell, Shell::Pwsh);
         assert_eq!(
             op,
@@ -363,7 +298,7 @@ mod tests {
     #[test]
     fn parse_args_minus() {
         let args = ["--eval", "--shell", "zsh", "--", "-"];
-        let (shell, op) = parse_cas_args_for_test(&args).unwrap();
+        let (shell, op) = compose_parse_cas_args(&args).unwrap();
         assert_eq!(shell, Shell::Zsh);
         assert_eq!(op, Op::Minus);
     }
@@ -371,7 +306,7 @@ mod tests {
     #[test]
     fn parse_args_global() {
         let args = ["--eval", "--shell", "zsh", "--", "-g", "home"];
-        let (shell, op) = parse_cas_args_for_test(&args).unwrap();
+        let (shell, op) = compose_parse_cas_args(&args).unwrap();
         assert_eq!(shell, Shell::Zsh);
         assert_eq!(
             op,
@@ -384,7 +319,7 @@ mod tests {
     #[test]
     fn parse_args_global_long_form() {
         let args = ["--eval", "--shell", "zsh", "--", "--global", "work"];
-        let (shell, op) = parse_cas_args_for_test(&args).unwrap();
+        let (shell, op) = compose_parse_cas_args(&args).unwrap();
         assert_eq!(shell, Shell::Zsh);
         assert_eq!(
             op,
@@ -397,7 +332,7 @@ mod tests {
     #[test]
     fn parse_args_resync() {
         let args = ["--eval", "--shell", "zsh", "--", "resync"];
-        let (shell, op) = parse_cas_args_for_test(&args).unwrap();
+        let (shell, op) = compose_parse_cas_args(&args).unwrap();
         assert_eq!(shell, Shell::Zsh);
         assert_eq!(op, Op::Resync);
     }
@@ -405,7 +340,7 @@ mod tests {
     #[test]
     fn parse_args_status() {
         let args = ["--eval", "--shell", "zsh", "--", "status"];
-        let (shell, op) = parse_cas_args_for_test(&args).unwrap();
+        let (shell, op) = compose_parse_cas_args(&args).unwrap();
         assert_eq!(shell, Shell::Zsh);
         assert_eq!(
             op,
@@ -425,7 +360,7 @@ mod tests {
             "status",
             "--print-current",
         ];
-        let (shell, op) = parse_cas_args_for_test(&args).unwrap();
+        let (shell, op) = compose_parse_cas_args(&args).unwrap();
         assert_eq!(shell, Shell::Zsh);
         assert_eq!(
             op,
@@ -439,7 +374,7 @@ mod tests {
     fn parse_args_no_shell_defaults_to_zsh() {
         // When --shell is absent (bare call), default to zsh.
         let args = ["--eval", "--", "home"];
-        let (shell, op) = parse_cas_args_for_test(&args).unwrap();
+        let (shell, op) = compose_parse_cas_args(&args).unwrap();
         assert_eq!(shell, Shell::Zsh);
         assert_eq!(
             op,
@@ -453,7 +388,7 @@ mod tests {
     fn parse_args_no_args_is_status() {
         // Bare `csm cas` (no --shell, no --) → status.
         let args: [&str; 0] = [];
-        let (_, op) = parse_cas_args_for_test(&args).unwrap();
+        let (_, op) = compose_parse_cas_args(&args).unwrap();
         assert_eq!(
             op,
             Op::Status {
@@ -465,7 +400,7 @@ mod tests {
     #[test]
     fn parse_args_global_missing_profile_errors() {
         let args = ["--eval", "--shell", "zsh", "--", "-g"];
-        let result = parse_cas_args_for_test(&args);
+        let result = compose_parse_cas_args(&args);
         assert!(result.is_err(), "expected error for -g without profile");
     }
 }

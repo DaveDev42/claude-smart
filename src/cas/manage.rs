@@ -19,7 +19,7 @@ use super::write_default_profile;
 pub fn manage_emit(op: &Op, profiles: &mut ProfileMap) -> anyhow::Result<()> {
     match op {
         Op::List => {
-            print_status(Shell::Zsh, profiles)?;
+            print_status(&mut std::io::stdout(), Shell::Zsh, profiles)?;
         }
 
         Op::Add { name, dir } => {

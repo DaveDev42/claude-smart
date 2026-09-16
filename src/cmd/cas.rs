@@ -29,7 +29,7 @@ pub(crate) fn cmd_cas(args: &[OsString]) -> anyhow::Result<()> {
     // derivation (no `--shell`, no eval). Takes precedence over op parsing.
     if parsed.print_default_dir {
         let profiles = account::ProfileMap::load().unwrap_or_default();
-        println!("{}", profiles.default_dir().to_string_lossy());
+        print_default_dir_to(&mut std::io::stdout(), &profiles)?;
         return Ok(());
     }
 
@@ -75,6 +75,16 @@ pub(crate) fn cmd_cas(args: &[OsString]) -> anyhow::Result<()> {
 
     let profiles = account::ProfileMap::load().context("csm cas: failed to load profiles.json")?;
     cas::eval_emit(shell, &op, &profiles)
+}
+
+/// Thin shell over `--print-default-dir`'s output: print the resolved default
+/// `CLAUDE_CONFIG_DIR` to `w`. Pure core so the golden tests can assert the
+/// exact bytes without going through real stdout.
+pub(crate) fn print_default_dir_to(
+    w: &mut impl std::io::Write,
+    profiles: &account::ProfileMap,
+) -> std::io::Result<()> {
+    writeln!(w, "{}", profiles.default_dir().to_string_lossy())
 }
 
 /// Parsed `csm cas` flags.
@@ -344,5 +354,59 @@ mod tests {
         let op = parse_cas_op(&["use".to_owned(), "w".to_owned()]).unwrap();
         assert!(matches!(op, cas::Op::SetDefault { ref name } if name == "w"));
         assert!(parse_cas_op(&["use".to_owned()]).is_err());
+    }
+
+    // ── print_default_dir_to: golden bytes (test-05) ──────────────────────────
+
+    /// Run `f` with `HOME` pointed at a fresh temp dir, so
+    /// `ProfileMap::default_dir()`'s state-file read never touches the
+    /// developer's real `~/.config/claude-as/default`. Module-local lock,
+    /// mirroring the pattern documented in `crate::testenv`.
+    fn with_isolated_home<R>(f: impl FnOnce(&std::path::Path) -> R) -> R {
+        static HOME_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = HOME_ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let prev = std::env::var_os("HOME");
+        std::env::set_var("HOME", tmp.path());
+        let result = f(tmp.path());
+        match prev {
+            Some(v) => std::env::set_var("HOME", v),
+            None => std::env::remove_var("HOME"),
+        }
+        result
+    }
+
+    #[test]
+    fn golden_print_default_dir_known_profile() {
+        with_isolated_home(|home| {
+            let dir = home.join(".claude.home").to_string_lossy().into_owned();
+            let mut m = std::collections::HashMap::new();
+            m.insert("home".to_owned(), dir.clone());
+            m.insert(
+                "work".to_owned(),
+                home.join(".claude.work").to_string_lossy().into_owned(),
+            );
+            let profiles = account::ProfileMap(m);
+            let mut buf = Vec::new();
+            // Isolated HOME has no state file, so the default is the
+            // alphabetical-first profile — "home".
+            print_default_dir_to(&mut buf, &profiles).unwrap();
+            assert_eq!(String::from_utf8(buf).unwrap(), format!("{dir}\n"));
+        });
+    }
+
+    #[test]
+    fn golden_print_default_dir_empty_registry_synthesizes() {
+        with_isolated_home(|home| {
+            let profiles = account::ProfileMap::default();
+            let mut buf = Vec::new();
+            print_default_dir_to(&mut buf, &profiles).unwrap();
+            let expected = home.join(".claude.").to_string_lossy().into_owned();
+            let out = String::from_utf8(buf).unwrap();
+            assert!(
+                out.starts_with(&expected) && out.ends_with('\n'),
+                "got: {out}"
+            );
+        });
     }
 }

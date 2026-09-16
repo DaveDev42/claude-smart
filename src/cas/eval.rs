@@ -2,6 +2,8 @@
 //! prints the one line the calling shell must eval. See the `cas` module doc
 //! for the overall shell-shim contract.
 
+use std::io::Write;
+
 use crate::account::profiles::ProfileMap;
 
 use super::default_profile;
@@ -10,7 +12,9 @@ use super::types::{Op, Shell};
 
 // ─── eval_emit ───────────────────────────────────────────────────────────────
 
-/// Perform the CAS operation side-effects and print the eval-able output.
+/// Perform the CAS operation side-effects and print the eval-able output to
+/// stdout. Thin wrapper over [`eval_emit_to`] — the pure core that every
+/// golden test exercises directly against an in-memory buffer.
 ///
 /// The caller (`cmd_cas` in `main.rs`) passes the parsed `Shell` and `Op`.
 /// Output contract:
@@ -42,16 +46,30 @@ use super::types::{Op, Shell};
 /// exec failure, etc.) — NOT for user-level errors like unknown profile.
 /// User-level errors are surfaced via the emitted shell error snippet.
 pub fn eval_emit(shell: Shell, op: &Op, profiles: &ProfileMap) -> anyhow::Result<()> {
+    eval_emit_to(&mut std::io::stdout(), shell, op, profiles)
+}
+
+/// Pure core of [`eval_emit`]: same contract, but the eval-able / status
+/// output goes to `w` instead of directly to stdout. Side effects (state-file
+/// write, platform setenv, provisioning) and the stderr informational lines
+/// are unchanged — only the machine-interface bytes are redirected, which is
+/// what the golden tests below assert byte-for-byte.
+pub fn eval_emit_to(
+    w: &mut impl Write,
+    shell: Shell,
+    op: &Op,
+    profiles: &ProfileMap,
+) -> anyhow::Result<()> {
     match op {
         Op::Switch { profile } => {
             match resolve_profile(profile, profiles) {
                 Ok(dir) => {
-                    println!("{}", shell.export_line(&dir));
+                    writeln!(w, "{}", shell.export_line(&dir))?;
                 }
                 Err(e) => {
                     // Emit an error snippet so eval surfaces the error even
                     // though it discards the binary's exit code.
-                    println!("{}", shell.error_snippet(&e.to_string()));
+                    writeln!(w, "{}", shell.error_snippet(&e.to_string()))?;
                 }
             }
         }
@@ -65,10 +83,11 @@ pub fn eval_emit(shell: Shell, op: &Op, profiles: &ProfileMap) -> anyhow::Result
             //     print -u2 "claude-as: no previous profile to toggle to"
             //     return 1
             //   fi
-            println!(
+            writeln!(
+                w,
                 "{}",
                 shell.error_snippet("claude-as: no previous profile to toggle to")
-            );
+            )?;
         }
 
         Op::Global { profile } => {
@@ -85,7 +104,7 @@ pub fn eval_emit(shell: Shell, op: &Op, profiles: &ProfileMap) -> anyhow::Result
                     //     `cas <profile>` shell switch lands on a consistent dir.
                     crate::provision::ensure_provisioned_soft(std::path::Path::new(&dir));
                     // 3. Emit the per-shell export line.
-                    println!("{}", shell.export_line(&dir));
+                    writeln!(w, "{}", shell.export_line(&dir))?;
                     // 4. Print the informational message to stderr (matches
                     //    zsh `print "global default → $profile ($dir)"` which
                     //    goes to stdout in the original but is printed before
@@ -95,7 +114,7 @@ pub fn eval_emit(shell: Shell, op: &Op, profiles: &ProfileMap) -> anyhow::Result
                     eprintln!("(new shells follow this via ~/.zshenv guard; running claude sessions keep their captured paths)");
                 }
                 Err(e) => {
-                    println!("{}", shell.error_snippet(&e.to_string()));
+                    writeln!(w, "{}", shell.error_snippet(&e.to_string()))?;
                 }
             }
         }
@@ -111,11 +130,11 @@ pub fn eval_emit(shell: Shell, op: &Op, profiles: &ProfileMap) -> anyhow::Result
             let profile = default_profile(profiles);
             match resolve_profile(&profile, profiles) {
                 Ok(dir) => {
-                    println!("{}", shell.export_line(&dir));
+                    writeln!(w, "{}", shell.export_line(&dir))?;
                     eprintln!("shell → {profile} ({dir})");
                 }
                 Err(e) => {
-                    println!("{}", shell.error_snippet(&e.to_string()));
+                    writeln!(w, "{}", shell.error_snippet(&e.to_string()))?;
                 }
             }
         }
@@ -144,11 +163,11 @@ pub fn eval_emit(shell: Shell, op: &Op, profiles: &ProfileMap) -> anyhow::Result
                         .map(|(name, _)| name.to_owned())
                         .unwrap_or_else(|| "unknown".to_owned())
                 };
-                println!("{profile_name}");
+                writeln!(w, "{profile_name}")?;
             } else {
                 // Full status display — NOT eval-able. Matches the legacy
                 // shell implementation's no-args branch.
-                print_status(shell, profiles)?;
+                print_status(w, shell, profiles)?;
             }
         }
 
@@ -191,7 +210,11 @@ pub(super) fn resolve_profile(profile: &str, profiles: &ProfileMap) -> anyhow::R
 
 /// Print informational status (no eval output). Matches the legacy shell
 /// implementation's `cas` with no args.
-pub(super) fn print_status(_shell: Shell, profiles: &ProfileMap) -> anyhow::Result<()> {
+pub(super) fn print_status(
+    w: &mut impl Write,
+    _shell: Shell,
+    profiles: &ProfileMap,
+) -> anyhow::Result<()> {
     // The live shell's CLAUDE_CONFIG_DIR is read from the environment.
     // The binary does not have a "previous profile" concept (that lives in the
     // shell's `_CLAUDE_AS_PREV` var). We render what we can.
@@ -227,23 +250,23 @@ pub(super) fn print_status(_shell: Shell, profiles: &ProfileMap) -> anyhow::Resu
         current_dir.clone()
     };
 
-    println!("current shell:  {current_name} ({shell_state})");
+    writeln!(w, "current shell:  {current_name} ({shell_state})")?;
     // Show the RESOLVED config dir of the default profile (not a hardcoded path),
     // so the user can see where the default actually points — falls back to the
     // pointer-file location when the dir can't be resolved.
     if default.is_empty() {
         // Degraded / no registry: there is no default profile name, so don't print
         // an empty name with a bogus `.claude.`-suffixed dir built from it.
-        println!("global default: (none — no default profile set)");
+        writeln!(w, "global default: (none — no default profile set)")?;
     } else if default_dir.is_empty() {
-        println!("global default: {default} (~/.config/claude-as/default)");
+        writeln!(w, "global default: {default} (~/.config/claude-as/default)")?;
     } else {
-        println!("global default: {default} ({default_dir})");
+        writeln!(w, "global default: {default} ({default_dir})")?;
     }
-    println!("available:");
+    writeln!(w, "available:")?;
 
     if profiles.is_empty() {
-        println!("  (profiles.json absent — CAS/pick features disabled)");
+        writeln!(w, "  (profiles.json absent — CAS/pick features disabled)")?;
     } else {
         for name in profiles.names_sorted() {
             let dir = profiles.get(name).unwrap_or("");
@@ -255,9 +278,9 @@ pub(super) fn print_status(_shell: Shell, profiles: &ProfileMap) -> anyhow::Resu
                 (false, true) => " d",
                 (false, false) => "  ",
             };
-            println!("  {mark} {name:<12} {dir}");
+            writeln!(w, "  {mark} {name:<12} {dir}")?;
         }
-        println!("(legend: * = current shell, d = global default)");
+        writeln!(w, "(legend: * = current shell, d = global default)")?;
     }
 
     Ok(())
@@ -420,5 +443,282 @@ mod tests {
         let dir = resolve_profile("work", &profiles).unwrap();
         let line = Shell::Pwsh.export_line(&dir);
         assert_eq!(line, "$env:CLAUDE_CONFIG_DIR = '/tmp/.claude.work'");
+    }
+
+    // ── golden tests: eval_emit_to exact stdout bytes (test-05) ──────────────
+    //
+    // These pin the exact bytes `eval_emit_to` writes for every reachable
+    // (Op, Shell) combination — the invariant-5 tripwire for the shell-shim
+    // machine interface (`csm cas --eval` stdout). `Op::Global`, `Op::Resync`,
+    // and the full `Op::Status` render also read/write process-global state
+    // (a `HOME`-rooted state file, `CLAUDE_CONFIG_DIR`), so those cases run
+    // under an isolated `HOME` and/or the crate's shared `CLAUDE_CONFIG_DIR`
+    // lock — never the developer's real `~/.config/claude-as/default`.
+
+    use std::sync::Mutex;
+
+    static HOME_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Run `f` with `HOME` pointed at a fresh, empty temp dir (dropped at the
+    /// end), restoring the previous value afterward. Guarded so parallel
+    /// `cargo test` threads never race on the process-global `HOME` var (see
+    /// `crate::testenv` for why this per-module-lock pattern exists at all).
+    fn with_isolated_home<R>(f: impl FnOnce(&std::path::Path) -> R) -> R {
+        let _guard = HOME_ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let prev = std::env::var_os("HOME");
+        std::env::set_var("HOME", tmp.path());
+        let result = f(tmp.path());
+        match prev {
+            Some(v) => std::env::set_var("HOME", v),
+            None => std::env::remove_var("HOME"),
+        }
+        result
+    }
+
+    /// Run `eval_emit_to` against an in-memory buffer and return its decoded
+    /// stdout bytes alongside the `Result`.
+    fn emit(shell: Shell, op: &Op, profiles: &ProfileMap) -> (String, anyhow::Result<()>) {
+        let mut buf = Vec::new();
+        let r = eval_emit_to(&mut buf, shell, op, profiles);
+        (String::from_utf8(buf).unwrap(), r)
+    }
+
+    #[test]
+    fn golden_switch_zsh() {
+        let profiles = test_profiles();
+        let (out, r) = emit(
+            Shell::Zsh,
+            &Op::Switch {
+                profile: "home".to_owned(),
+            },
+            &profiles,
+        );
+        r.unwrap();
+        assert_eq!(out, "export CLAUDE_CONFIG_DIR='/tmp/.claude.home'\n");
+    }
+
+    #[test]
+    fn golden_switch_pwsh() {
+        let profiles = test_profiles();
+        let (out, r) = emit(
+            Shell::Pwsh,
+            &Op::Switch {
+                profile: "work".to_owned(),
+            },
+            &profiles,
+        );
+        r.unwrap();
+        assert_eq!(out, "$env:CLAUDE_CONFIG_DIR = '/tmp/.claude.work'\n");
+    }
+
+    #[test]
+    fn golden_switch_unknown_profile_zsh() {
+        let profiles = test_profiles();
+        let expected = Shell::Zsh.error_snippet(
+            &resolve_profile("hacker", &profiles)
+                .unwrap_err()
+                .to_string(),
+        );
+        let (out, r) = emit(
+            Shell::Zsh,
+            &Op::Switch {
+                profile: "hacker".to_owned(),
+            },
+            &profiles,
+        );
+        r.unwrap();
+        assert_eq!(out, format!("{expected}\n"));
+    }
+
+    #[test]
+    fn golden_switch_unknown_profile_pwsh() {
+        let profiles = test_profiles();
+        let expected = Shell::Pwsh.error_snippet(
+            &resolve_profile("hacker", &profiles)
+                .unwrap_err()
+                .to_string(),
+        );
+        let (out, r) = emit(
+            Shell::Pwsh,
+            &Op::Switch {
+                profile: "hacker".to_owned(),
+            },
+            &profiles,
+        );
+        r.unwrap();
+        assert_eq!(out, format!("{expected}\n"));
+    }
+
+    #[test]
+    fn golden_minus_zsh() {
+        let profiles = test_profiles();
+        let (out, r) = emit(Shell::Zsh, &Op::Minus, &profiles);
+        r.unwrap();
+        assert_eq!(
+            out,
+            ">&2 printf '%s\\n' 'claude-as: no previous profile to toggle to'; false\n"
+        );
+    }
+
+    #[test]
+    fn golden_minus_pwsh() {
+        let profiles = test_profiles();
+        let (out, r) = emit(Shell::Pwsh, &Op::Minus, &profiles);
+        r.unwrap();
+        assert_eq!(
+            out,
+            "Write-Error 'claude-as: no previous profile to toggle to'; exit 1\n"
+        );
+    }
+
+    #[test]
+    fn golden_global_zsh() {
+        with_isolated_home(|home| {
+            let dir = home.join(".claude.home").to_string_lossy().into_owned();
+            let mut m = HashMap::new();
+            m.insert("home".to_owned(), dir.clone());
+            m.insert(
+                "work".to_owned(),
+                home.join(".claude.work").to_string_lossy().into_owned(),
+            );
+            let profiles = ProfileMap(m);
+            let (out, r) = emit(
+                Shell::Zsh,
+                &Op::Global {
+                    profile: "home".to_owned(),
+                },
+                &profiles,
+            );
+            r.unwrap();
+            assert_eq!(out, format!("export CLAUDE_CONFIG_DIR='{dir}'\n"));
+        });
+    }
+
+    #[test]
+    fn golden_global_pwsh() {
+        with_isolated_home(|home| {
+            let dir = home.join(".claude.work").to_string_lossy().into_owned();
+            let mut m = HashMap::new();
+            m.insert(
+                "home".to_owned(),
+                home.join(".claude.home").to_string_lossy().into_owned(),
+            );
+            m.insert("work".to_owned(), dir.clone());
+            let profiles = ProfileMap(m);
+            let (out, r) = emit(
+                Shell::Pwsh,
+                &Op::Global {
+                    profile: "work".to_owned(),
+                },
+                &profiles,
+            );
+            r.unwrap();
+            assert_eq!(out, format!("$env:CLAUDE_CONFIG_DIR = '{dir}'\n"));
+        });
+    }
+
+    #[test]
+    fn golden_global_unknown_profile_zsh() {
+        // No filesystem side effects on the error path (resolve_profile fails
+        // before the state-file write), so no HOME isolation is needed.
+        let profiles = test_profiles();
+        let expected = Shell::Zsh.error_snippet(
+            &resolve_profile("hacker", &profiles)
+                .unwrap_err()
+                .to_string(),
+        );
+        let (out, r) = emit(
+            Shell::Zsh,
+            &Op::Global {
+                profile: "hacker".to_owned(),
+            },
+            &profiles,
+        );
+        r.unwrap();
+        assert_eq!(out, format!("{expected}\n"));
+    }
+
+    #[test]
+    fn golden_resync_zsh() {
+        with_isolated_home(|_home| {
+            // Isolated HOME has no state file, so default_profile() falls
+            // back to the alphabetical-first profile — "home".
+            let profiles = test_profiles();
+            let (out, r) = emit(Shell::Zsh, &Op::Resync, &profiles);
+            r.unwrap();
+            assert_eq!(out, "export CLAUDE_CONFIG_DIR='/tmp/.claude.home'\n");
+        });
+    }
+
+    #[test]
+    fn golden_resync_pwsh() {
+        with_isolated_home(|_home| {
+            let profiles = test_profiles();
+            let (out, r) = emit(Shell::Pwsh, &Op::Resync, &profiles);
+            r.unwrap();
+            assert_eq!(out, "$env:CLAUDE_CONFIG_DIR = '/tmp/.claude.home'\n");
+        });
+    }
+
+    #[test]
+    fn golden_status_print_current_known() {
+        let _guard = crate::testenv::CLAUDE_CONFIG_DIR_ENV_LOCK.lock().unwrap();
+        std::env::set_var("CLAUDE_CONFIG_DIR", "/tmp/.claude.work");
+        let profiles = test_profiles();
+        let (out, r) = emit(
+            Shell::Zsh,
+            &Op::Status {
+                print_current: true,
+            },
+            &profiles,
+        );
+        std::env::remove_var("CLAUDE_CONFIG_DIR");
+        r.unwrap();
+        assert_eq!(out, "work\n");
+    }
+
+    #[test]
+    fn golden_status_print_current_unset() {
+        let _guard = crate::testenv::CLAUDE_CONFIG_DIR_ENV_LOCK.lock().unwrap();
+        std::env::remove_var("CLAUDE_CONFIG_DIR");
+        let profiles = test_profiles();
+        let (out, r) = emit(
+            Shell::Pwsh,
+            &Op::Status {
+                print_current: true,
+            },
+            &profiles,
+        );
+        r.unwrap();
+        assert_eq!(out, "unknown\n");
+    }
+
+    #[test]
+    fn golden_status_full_display() {
+        let _cfg_guard = crate::testenv::CLAUDE_CONFIG_DIR_ENV_LOCK.lock().unwrap();
+        with_isolated_home(|_home| {
+            std::env::set_var("CLAUDE_CONFIG_DIR", "/tmp/.claude.work");
+            let profiles = test_profiles();
+            let (out, r) = emit(
+                Shell::Zsh,
+                &Op::Status {
+                    print_current: false,
+                },
+                &profiles,
+            );
+            std::env::remove_var("CLAUDE_CONFIG_DIR");
+            r.unwrap();
+            // Isolated HOME → no state file → default is "home" (alphabetical-first).
+            assert_eq!(
+                out,
+                "current shell:  work (/tmp/.claude.work)\n\
+                 global default: home (/tmp/.claude.home)\n\
+                 available:\n\
+                 \x20  d home         /tmp/.claude.home\n\
+                 \x20 *  work         /tmp/.claude.work\n\
+                 (legend: * = current shell, d = global default)\n"
+            );
+        });
     }
 }
