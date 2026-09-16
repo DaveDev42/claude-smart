@@ -26,8 +26,13 @@ impl ProfileMap {
     /// - File absent → `Ok(empty map)`
     /// - Parse error → `Err`
     pub fn load() -> io::Result<Self> {
-        let path = paths::profiles_json();
-        match std::fs::read_to_string(&path) {
+        Self::load_from(&paths::profiles_json())
+    }
+
+    /// Load from an arbitrary `path` (testable seam). Same semantics as
+    /// [`Self::load`]: absent file → `Ok(empty map)`, parse error → `Err`.
+    pub fn load_from(path: &Path) -> io::Result<Self> {
+        match std::fs::read_to_string(path) {
             Ok(s) => {
                 let map: HashMap<String, String> = serde_json::from_str(&s).map_err(|e| {
                     io::Error::new(
@@ -214,23 +219,9 @@ mod tests {
 
     #[test]
     fn absent_file_returns_empty_map() {
-        // Use a path that cannot exist (points to a non-existent file under
-        // a known-absent subdir). We test the load() code path by replacing
-        // the profiles.json file at the real path; instead just verify the
-        // absent-file branch behavior using the known-absent path directly.
-        //
-        // We can't easily redirect paths::profiles_json() without a mock, so
-        // we exercise the same io::ErrorKind::NotFound arm inline.
-        let path = std::path::PathBuf::from("/tmp/csm-test-absent-profiles-NOPE.json");
-        let result = match std::fs::read_to_string(&path) {
-            Ok(s) => {
-                let m: HashMap<String, String> = serde_json::from_str(&s).unwrap();
-                Ok(ProfileMap(m))
-            }
-            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(ProfileMap::default()),
-            Err(e) => Err(e),
-        };
-        let pm = result.unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nope.json");
+        let pm = ProfileMap::load_from(&path).unwrap();
         assert!(pm.is_empty());
     }
 
