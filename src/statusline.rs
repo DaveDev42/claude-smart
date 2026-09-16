@@ -301,8 +301,8 @@ pub fn short_hostname() -> Result<String> {
 /// prefix); the find is matched case-insensitively at the first occurrence and
 /// replaced literally. `None`, an empty rule, or a rule without a `/` separator
 /// leaves the hostname untouched. This keeps every site-specific convention out
-/// of the binary — the rule is injected from the environment (the
-/// dave-environment deployment sets `CSM_HOST_REPLACE=Acme-/`).
+/// of the binary — the rule is injected from the environment
+/// (a deployment can set CSM_HOST_REPLACE=Acme-/ to drop a site prefix).
 pub fn apply_host_replace(s: String, rule: Option<&str>) -> String {
     let Some(rule) = rule.filter(|r| !r.is_empty()) else {
         return s;

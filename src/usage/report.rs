@@ -21,9 +21,6 @@
 //! - `NoData`   — registered, but absent from the local store (or no sections).
 //! - `NearLimit`— any of session/week_all/week_fable pct ≥ `WARN_PCT`.
 //! - `Ok`       — otherwise.
-//!
-//! # Spec reference
-//! `dave-environment docs/superpowers/specs/2026-06-19-csm-usage-and-interactive-cas-edit.md` §1.
 
 use chrono::{DateTime, Utc};
 use serde::Serialize;

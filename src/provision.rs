@@ -21,8 +21,10 @@
 //! ## Platform
 //! POSIX uses `std::os::unix::fs::symlink`. On Windows, directory symlinks are
 //! privilege-gated and the relaunch loop is currently disabled there, so we make
-//! provisioning a no-op rather than fail — the dave-environment Ansible side
-//! handles the Windows junction. The plugin-sharing logic is unix-only for now.
+//! provisioning a no-op rather than fail — the Windows junction is delegated to
+//! OS-native tooling provisioned outside this crate (the operator's private
+//! deployment repo); csm treats it as a no-op. The plugin-sharing logic is
+//! unix-only for now.
 
 use std::io;
 use std::path::{Path, PathBuf};

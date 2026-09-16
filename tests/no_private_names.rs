@@ -1,13 +1,14 @@
 //! Publish-gate guard: fail the build if any private identifier leaks into the
 //! shipped crate — **including test fixtures**. The public crate must not carry
-//! the operator's tailnet suffix, hub/host names, account-profile names, real
-//! home paths, or personal email anywhere; all such values come from runtime
-//! config/env, and examples must use neutral placeholders (`work`, `home`,
-//! `/Users/example`, `Acme-…`).
+//! the operator's tailnet suffix, host names, account-profile names, real
+//! home paths, personal email, or the operator's private companion-repo name
+//! anywhere; all such values come from runtime config/env, and examples must
+//! use neutral placeholders (`work`, `home`, `/Users/example`, `Acme-…`).
 //!
 //! Every `.rs` file under `src/` is scanned in full (production and `#[cfg(test)]`
 //! alike). This file — the guard's own forbidden list — is the only thing that
 //! names the identifiers, and it lives under `tests/`, which is not scanned.
+//! Scope: `src/` only, for now (widened to cover other paths in a later commit).
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -17,14 +18,15 @@ use std::path::{Path, PathBuf};
 /// not sit searchable in this public file.
 fn forbidden() -> Vec<String> {
     vec![
-        format!("{}{}", "tail", "91e9e"),      // tailnet suffix
-        format!("{}{}", "dave-", "macmini"),   // hub hostname (lowercase)
-        format!("{}{}", "Dave-", "MacMini"),   // hub hostname (display)
-        format!("{}{}", "helloworld", "4625"), // personal email local-part
-        format!("{}{}", "ely", "vian"),        // private account-profile name
-        format!("/Users/{}", "dave"),          // real home path (account owner)
-        format!("/home/{}", "dave"),           // real home path (Linux/WSL)
-        format!(r"C:\Users\{}", "dave"),       // real home path (Windows)
+        format!("{}{}", "tail", "91e9e"),        // tailnet suffix
+        format!("{}{}", "dave-", "macmini"),     // operator hostname (lowercase)
+        format!("{}{}", "Dave-", "MacMini"),     // operator hostname (display)
+        format!("{}{}", "helloworld", "4625"),   // personal email local-part
+        format!("{}{}", "ely", "vian"),          // private account-profile name
+        format!("/Users/{}", "dave"),            // real home path (account owner)
+        format!("/home/{}", "dave"),             // real home path (Linux/WSL)
+        format!(r"C:\Users\{}", "dave"),         // real home path (Windows)
+        format!("{}-{}", "dave", "environment"), // operator's private companion repo
     ]
 }
 
@@ -37,8 +39,9 @@ fn forbidden_host_prefix() -> String {
 }
 
 /// Profile-name literals forbidden as quoted string literals anywhere in `src/`.
-/// They are valid only in the dave-environment SSOT, never compiled in. Built
-/// from fragments + the quote chars so the full literal isn't searchable here.
+/// They are valid only in the operator's private deployment repo, never
+/// compiled in. Built from fragments + the quote chars so the full literal
+/// isn't searchable here.
 fn forbidden_profile_literals() -> Vec<String> {
     let q = '"';
     vec![

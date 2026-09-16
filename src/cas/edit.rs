@@ -16,9 +16,6 @@
 //! is written via the same `write_default_profile` + platform-floor path that
 //! `csm profiles use` uses, so the interactive `set-default` is identical to the
 //! scriptable one.
-//!
-//! # Spec reference
-//! `dave-environment docs/superpowers/specs/2026-06-19-csm-usage-and-interactive-cas-edit.md` §2.
 
 use std::io::{self, Write};
 
