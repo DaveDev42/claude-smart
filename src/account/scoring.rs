@@ -269,10 +269,9 @@ pub type ScoringResult = Result<Option<String>, ScoringError>;
 /// source, which ranked highest-pct-first).
 ///
 /// Production callers go through [`pick_account`](crate::account::pick_account)
-/// → [`pick_best_gated`]; this gate-on convenience wrapper is the documented
-/// public entry and is exercised by the scoring tests, hence the non-test
-/// `dead_code` allow.
-#[cfg_attr(not(test), allow(dead_code))]
+/// → [`pick_best_gated`]; this gate-on convenience wrapper exists for the
+/// scoring tests only.
+#[cfg(test)]
 pub fn pick_best(data: &UsageData, current_profile: &str, include_current: bool) -> ScoringResult {
     pick_best_at(data, current_profile, include_current, true, Utc::now())
 }
@@ -435,53 +434,6 @@ pub fn pick_best_at(
             }
         }
     }
-}
-
-/// Return the `(session_pct, week_all_pct)` for a given profile from `data`,
-/// or `None` when the profile is errored, absent, or has no week_all section.
-///
-/// Absent `session.pct` is encoded as [`ABSENT_SESSION_PCT`] (-1), matching
-/// the shell `current-usage` encoding.
-///
-/// Test-isolation helper: the production scorer inlines `data.current_usage`;
-/// this named wrapper lets unit tests assert the encoding independently.
-#[allow(dead_code)]
-pub fn current_usage_pcts(data: &UsageData, profile: &str) -> Option<(i64, i64)> {
-    data.current_usage(profile)
-}
-
-/// Helper: is a profile excluded from candidacy?
-///
-/// Returns `true` when the profile should be skipped in scoring:
-/// - present in `errors` map, or
-/// - not viable per [`is_viable_pcts`] (session/week_all/week_fable — see its
-///   doc for the exact per-dimension rule).
-///
-/// Used by tests to assert individual exclusion conditions independently.
-/// Test-isolation helper: the production scorer's own gate is the same
-/// `is_viable_pcts` call, applied inline in `pick_best_at`.
-#[allow(dead_code)]
-pub fn is_excluded(data: &UsageData, profile: &str) -> bool {
-    if let Some(errors) = &data.errors {
-        if errors.contains_key(profile) {
-            return true;
-        }
-    }
-
-    if let Some(pu) = data.profiles.get(profile) {
-        let session_pct = pu
-            .session
-            .as_ref()
-            .map(|s| s.pct)
-            .unwrap_or(ABSENT_SESSION_PCT);
-        let week_all_pct = pu.week_all.as_ref().map(|s| s.pct);
-        let week_fable_pct = pu.week_fable.as_ref().map(|s| s.pct);
-        if !is_viable_pcts(session_pct, week_all_pct, week_fable_pct) {
-            return true;
-        }
-    }
-
-    false
 }
 
 // ─── tests ────────────────────────────────────────────────────────────────────
@@ -1158,7 +1110,34 @@ mod tests {
         );
     }
 
-    // ─── is_excluded helper ───────────────────────────────────────────────────
+    // ─── exclusion check (errors map / is_viable_pcts, inlined as pick_best_at
+    // applies it) ───────────────────────────────────────────────────────────
+
+    /// Mirrors the exclusion gate `pick_best_at` applies inline: a profile is
+    /// excluded when it is present in `errors`, or when its pcts fail
+    /// `is_viable_pcts`.
+    fn is_excluded(data: &UsageData, profile: &str) -> bool {
+        if let Some(errors) = &data.errors {
+            if errors.contains_key(profile) {
+                return true;
+            }
+        }
+
+        if let Some(pu) = data.profiles.get(profile) {
+            let session_pct = pu
+                .session
+                .as_ref()
+                .map(|s| s.pct)
+                .unwrap_or(ABSENT_SESSION_PCT);
+            let week_all_pct = pu.week_all.as_ref().map(|s| s.pct);
+            let week_fable_pct = pu.week_fable.as_ref().map(|s| s.pct);
+            if !is_viable_pcts(session_pct, week_all_pct, week_fable_pct) {
+                return true;
+            }
+        }
+
+        false
+    }
 
     #[test]
     fn is_excluded_for_error_profile() {
@@ -1216,14 +1195,14 @@ mod tests {
         assert!(!is_excluded(&data, "p"));
     }
 
-    // ─── current_usage_pcts ───────────────────────────────────────────────────
+    // ─── data.current_usage ────────────────────────────────────────────────
 
     #[test]
     fn current_usage_pcts_present_profile() {
         let mut profiles = HashMap::new();
         profiles.insert("p".to_string(), make_profile(Some(42), 31, None));
         let data = make_data(profiles);
-        let (sess, week) = current_usage_pcts(&data, "p").unwrap();
+        let (sess, week) = data.current_usage("p").unwrap();
         assert_eq!(sess, 42);
         assert_eq!(week, 31);
     }
@@ -1233,7 +1212,7 @@ mod tests {
         let mut profiles = HashMap::new();
         profiles.insert("p".to_string(), make_profile(None, 55, None));
         let data = make_data(profiles);
-        let (sess, week) = current_usage_pcts(&data, "p").unwrap();
+        let (sess, week) = data.current_usage("p").unwrap();
         assert_eq!(sess, ABSENT_SESSION_PCT);
         assert_eq!(week, 55);
     }
@@ -1245,13 +1224,13 @@ mod tests {
         let mut errors = HashMap::new();
         errors.insert("p".to_string(), "err".to_string());
         let data = make_data_with_errors(profiles, errors);
-        assert!(current_usage_pcts(&data, "p").is_none());
+        assert!(data.current_usage("p").is_none());
     }
 
     #[test]
     fn current_usage_pcts_absent_is_none() {
         let data = make_data(HashMap::new());
-        assert!(current_usage_pcts(&data, "nonexistent").is_none());
+        assert!(data.current_usage("nonexistent").is_none());
     }
 
     // ─── no_week_all_section ──────────────────────────────────────────────────

@@ -208,12 +208,12 @@ pub fn run(scope: ReapScope, dry_run: bool, term: bool) -> anyhow::Result<()> {
         }
     }
 
-    // Per-session candidates. `include_live_claude = false`: the startup class-3
-    // ("claude outlived a dead csm") path is a later phase, and surfacing a
-    // supervised claude as a kill target here would be unsafe.
+    // Per-session candidates. The startup class-3 ("claude outlived a dead
+    // csm") path is a later phase, so a supervised claude is never itself a
+    // candidate here — only its descendants.
     let mut total: Vec<(String, Candidate)> = Vec::new();
     for session in &sessions {
-        for c in select_candidates(&table, session, self_pid, false) {
+        for c in select_candidates(&table, session, self_pid) {
             total.push((session.sid.clone(), c));
         }
     }

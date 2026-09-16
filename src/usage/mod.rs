@@ -36,12 +36,6 @@ pub enum FetchError {
     #[error("usage command failed: {0}")]
     Command(String),
 
-    /// Local, per-profile usage collection failed in a way that isn't already
-    /// captured per-profile in `UsageData::errors` — e.g. an I/O error writing
-    /// the local store. See `local::LocalError`.
-    #[error("local usage collection error: {0}")]
-    Local(#[from] local::LocalError),
-
     /// The JSON payload (cache file or `CSM_USAGE_CMD` output) was unparseable.
     #[error("JSON parse error: {0}")]
     Json(#[from] serde_json::Error),

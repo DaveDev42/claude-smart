@@ -64,8 +64,6 @@ pub struct Session {
 pub enum CandidateKind {
     /// A descendant of claude (pgid match and/or ppid-walk reachable).
     Child,
-    /// `claude` itself, still alive after its `csm` supervisor went away.
-    LiveClaude,
 }
 
 impl CandidateKind {
@@ -73,7 +71,6 @@ impl CandidateKind {
     pub fn tag(self) -> &'static str {
         match self {
             CandidateKind::Child => "child",
-            CandidateKind::LiveClaude => "live-claude",
         }
     }
 }
@@ -93,16 +90,6 @@ impl Candidate {
         Candidate {
             pid: p.pid,
             kind: CandidateKind::Child,
-            exe_base: p.exe_base.clone(),
-            start_time: p.start_time,
-            cmd_snippet: p.cmd_snippet.clone(),
-        }
-    }
-
-    fn live_claude(p: &ProcRow) -> Self {
-        Candidate {
-            pid: p.pid,
-            kind: CandidateKind::LiveClaude,
             exe_base: p.exe_base.clone(),
             start_time: p.start_time,
             cmd_snippet: p.cmd_snippet.clone(),
@@ -155,9 +142,7 @@ pub fn session_claude_is_live(table: &[ProcRow], session: &Session) -> bool {
 
 /// PURE: select reap candidates for `session` from a process-table snapshot.
 ///
-/// `self_pid` is the reaper's own pid (never a candidate). `include_live_claude`
-/// is true only for the startup stale-sweep; in the post-exit trigger claude
-/// is already dead, so it is false and the live-claude branch is skipped.
+/// `self_pid` is the reaper's own pid (never a candidate).
 ///
 /// The candidate predicate (per process `P`):
 /// ```text
@@ -168,12 +153,7 @@ pub fn session_claude_is_live(table: &[ProcRow], session: &Session) -> bool {
 ///    OR P.pid ∈ ppid_descendants(claude_pid) )
 /// ```
 /// Results are deduped by pid and sorted ascending for a stable display order.
-pub fn select_candidates(
-    table: &[ProcRow],
-    session: &Session,
-    self_pid: u32,
-    include_live_claude: bool,
-) -> Vec<Candidate> {
+pub fn select_candidates(table: &[ProcRow], session: &Session, self_pid: u32) -> Vec<Candidate> {
     let c = session.claude_pid;
     let born = session.born;
 
@@ -190,17 +170,6 @@ pub fn select_candidates(
         let pgid_match = p.pgid == Some(c);
         if pgid_match || descendants.contains(&p.pid) {
             out.push(Candidate::child(p));
-        }
-    }
-
-    if include_live_claude {
-        if let Some(cp) = table.iter().find(|p| p.pid == c) {
-            // Exact born match (not `>=`): this must be THE claude we recorded,
-            // not a same-pid recycle. The exe gate rejects a same-second impostor
-            // that happens to be non-claude.
-            if cp.start_time == born && is_claude_or_node_name(&cp.exe_base) {
-                out.push(Candidate::live_claude(cp));
-            }
         }
     }
 
@@ -279,7 +248,7 @@ mod tests {
             row(CLAUDE, Some(1), Some(CLAUDE), BORN, "node"),
             row(200, Some(CLAUDE), Some(CLAUDE), BORN + 5, "node"), // MCP server
         ];
-        let got = select_candidates(&table, &session(CLAUDE, BORN), SELF, false);
+        let got = select_candidates(&table, &session(CLAUDE, BORN), SELF);
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].pid, 200);
         assert_eq!(got[0].kind, CandidateKind::Child);
@@ -292,7 +261,7 @@ mod tests {
             row(CLAUDE, Some(1), Some(CLAUDE), BORN, "node"),
             row(300, Some(1), Some(300), BORN + 5, "firefox"),
         ];
-        let got = select_candidates(&table, &session(CLAUDE, BORN), SELF, false);
+        let got = select_candidates(&table, &session(CLAUDE, BORN), SELF);
         assert!(
             got.is_empty(),
             "unrelated proc must not be a candidate: {got:?}"
@@ -308,7 +277,7 @@ mod tests {
             row(CLAUDE, Some(1), Some(CLAUDE), BORN, "node"),
             row(200, Some(CLAUDE), Some(CLAUDE), BORN - 1, "node"), // older than session
         ];
-        let got = select_candidates(&table, &session(CLAUDE, BORN), SELF, false);
+        let got = select_candidates(&table, &session(CLAUDE, BORN), SELF);
         assert!(got.is_empty(), "pre-born pid must be rejected: {got:?}");
     }
 
@@ -320,7 +289,7 @@ mod tests {
             row(CLAUDE, Some(1), Some(CLAUDE), BORN, "node"),
             row(SELF, Some(1), Some(CLAUDE), BORN, "csm"),
         ];
-        let got = select_candidates(&table, &session(CLAUDE, BORN), SELF, false);
+        let got = select_candidates(&table, &session(CLAUDE, BORN), SELF);
         assert!(
             got.iter().all(|c| c.pid != SELF && c.pid != CLAUDE),
             "self/claude must never be child candidates: {got:?}"
@@ -336,7 +305,7 @@ mod tests {
             row(200, Some(CLAUDE), Some(CLAUDE), BORN + 1, "bash"), // child, in group
             row(201, Some(200), Some(201), BORN + 2, "python3"),    // grandchild, escaped pgid
         ];
-        let got = select_candidates(&table, &session(CLAUDE, BORN), SELF, false);
+        let got = select_candidates(&table, &session(CLAUDE, BORN), SELF);
         let pids: Vec<u32> = got.iter().map(|c| c.pid).collect();
         assert!(pids.contains(&200), "in-group child missing: {pids:?}");
         assert!(
@@ -352,7 +321,7 @@ mod tests {
             row(CLAUDE, Some(1), Some(CLAUDE), BORN, "node"),
             row(200, Some(CLAUDE), Some(CLAUDE), BORN + 1, "bash"), // pgid match AND ppid-reachable
         ];
-        let got = select_candidates(&table, &session(CLAUDE, BORN), SELF, false);
+        let got = select_candidates(&table, &session(CLAUDE, BORN), SELF);
         assert_eq!(got.len(), 1, "must dedup to a single candidate: {got:?}");
         assert_eq!(got[0].pid, 200);
     }
@@ -366,49 +335,12 @@ mod tests {
             row(200, Some(CLAUDE), None, BORN + 1, "helper"), // ppid-reachable only
             row(300, Some(1), None, BORN + 1, "unrelated"),   // neither signal
         ];
-        let got = select_candidates(&table, &session(CLAUDE, BORN), SELF, false);
+        let got = select_candidates(&table, &session(CLAUDE, BORN), SELF);
         let pids: Vec<u32> = got.iter().map(|c| c.pid).collect();
         assert_eq!(
             pids,
             vec![200],
             "only the ppid-reachable None-pgid proc: {pids:?}"
-        );
-    }
-
-    #[test]
-    fn live_claude_included_only_when_requested_and_matching() {
-        let table = vec![row(CLAUDE, Some(1), Some(CLAUDE), BORN, "claude")];
-
-        // include_live_claude = false → claude itself never appears.
-        let off = select_candidates(&table, &session(CLAUDE, BORN), SELF, false);
-        assert!(
-            off.is_empty(),
-            "claude must be absent when not requested: {off:?}"
-        );
-
-        // include_live_claude = true, exact born + claude exe → appears as LiveClaude.
-        let on = select_candidates(&table, &session(CLAUDE, BORN), SELF, true);
-        assert_eq!(on.len(), 1);
-        assert_eq!(on[0].pid, CLAUDE);
-        assert_eq!(on[0].kind, CandidateKind::LiveClaude);
-    }
-
-    #[test]
-    fn live_claude_rejected_on_born_mismatch_or_wrong_exe() {
-        // Same pid but a DIFFERENT start_time → a recycled pid, not our claude.
-        let recycled = vec![row(CLAUDE, Some(1), Some(CLAUDE), BORN + 50, "claude")];
-        let got = select_candidates(&recycled, &session(CLAUDE, BORN), SELF, true);
-        assert!(
-            got.is_empty(),
-            "born mismatch must reject live-claude: {got:?}"
-        );
-
-        // Exact born but the exe is not claude/node → a same-second impostor.
-        let impostor = vec![row(CLAUDE, Some(1), Some(CLAUDE), BORN, "python3")];
-        let got = select_candidates(&impostor, &session(CLAUDE, BORN), SELF, true);
-        assert!(
-            got.is_empty(),
-            "non-claude exe must reject live-claude: {got:?}"
         );
     }
 

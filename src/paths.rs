@@ -88,17 +88,6 @@ pub fn titles_tsv() -> PathBuf {
     smart_dir_no_create().join("titles.tsv")
 }
 
-/// `<smart_dir>/bin/claude-smart-helper.sh` — legacy deployed helper path.
-/// Used only for the playbook cleanup (`state: absent`). Not written by the binary.
-/// Kept as the SSOT anchor for the not-yet-implemented Ansible cleanup task;
-/// no Rust caller reads it today.
-#[allow(dead_code)]
-pub fn legacy_helper_sh() -> PathBuf {
-    smart_dir_no_create()
-        .join("bin")
-        .join("claude-smart-helper.sh")
-}
-
 /// `~/.config/claude-as/profiles.json` — cross-platform profile→dir map.
 /// Personal-only; absent on toss machines → binary falls back to current
 /// `CLAUDE_CONFIG_DIR` and disables CAS/pick features.
