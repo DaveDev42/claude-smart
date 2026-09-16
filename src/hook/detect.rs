@@ -464,7 +464,7 @@ pub fn classify_with(
             let _ = paths::smart_dir();
             let _ = write_noclobber_epoch(&detect_path);
             prune_detected_markers();
-            let sid_short = sid.get(..8).unwrap_or(sid);
+            let sid_short = crate::hook::sid_short(sid);
             let body = format!(
                 "[{current_profile}] hit {limited_msg} → switch to [{target_profile}] (auto-relaunch OFF; csm --profile {target_profile} --resume {sid_short})"
             );
@@ -482,7 +482,7 @@ pub fn classify_with(
             let _ = paths::smart_dir();
             let _ = write_noclobber_epoch(&detect_path);
             prune_detected_markers();
-            let sid_short = sid.get(..8).unwrap_or(sid);
+            let sid_short = crate::hook::sid_short(sid);
             let body = format!(
                 "[{current_profile}] hit {limited_msg} → switch to [{target_profile}] by hand (csm --profile {target_profile} --resume {sid_short})"
             );
@@ -538,7 +538,7 @@ pub fn classify_with(
     // ── 10. Hop guard ─────────────────────────────────────────────────────────
     // Shell: the legacy shell implementation
     let max_hops = crate::envvar::i64_or("CLAUDE_MAX_HOPS", MAX_HOPS);
-    let current_hop = read_sidecar_hop(sid);
+    let current_hop = crate::hook::read_sidecar_hop(sid);
     if current_hop >= max_hops {
         return Ok(Decision::Skip);
     }
@@ -546,7 +546,7 @@ pub fn classify_with(
     // ── 11. Build the handoff prompt ──────────────────────────────────────────
     // Shell: the legacy shell implementation
     let next_hop = current_hop + 1;
-    let sid_short = sid.get(..8).unwrap_or(sid);
+    let sid_short = crate::hook::sid_short(sid);
     let handoff = build_handoff(sid_short, &current_profile, &target_profile, next_hop);
 
     let message = format!(
@@ -789,16 +789,6 @@ fn parse_pid_file(content: &str) -> Option<(u32, i64)> {
 fn is_live_claude_or_node(pid: u32) -> bool {
     // Reuse the platform implementation from stop.rs via the public helper.
     crate::hook::stop::check_is_live_claude_or_node(pid)
-}
-
-/// Read the `hop` field from `<sid>.json` sidecar.
-/// Returns 0 on missing/corrupt sidecar. Tolerates both String and Number
-/// (the legacy sidecar writer used a string; readers accept both forms).
-/// Delegates to the single `Sidecar::hop_int` SSOT (was triplicated).
-fn read_sidecar_hop(sid: &str) -> i64 {
-    crate::sidecar::read_sidecar(&crate::paths::sidecar(sid))
-        .map(|s| s.hop_int())
-        .unwrap_or(0)
 }
 
 /// Build the handoff prompt string.

@@ -32,7 +32,6 @@
 //!   `<YYYY-MM-DD HH:MM:SS>  host=<hostname>  sid=<sid>  action=<action>  <extra>`
 
 use std::io::Write as _;
-use std::path::Path;
 
 use anyhow::Context as _;
 
@@ -78,11 +77,9 @@ pub fn emit_osc777(message: &str) -> anyhow::Result<()> {
 /// Format matches the legacy shell implementation's `_log()` function:
 ///   `<YYYY-MM-DD HH:MM:SS>  host=<hostname>  sid=<sid>  action=<action>  <extra>`
 ///
-/// `_owner_dir` is accepted for API compatibility (the shell's per-profile `.log`
-/// convention), but the canonical log destination is the shared smart_dir so all
-/// profiles' limit-switch events appear in one place (matching the shell's
-/// `LOG="$SMART_DIR/limit-switch.log"`).
-pub fn append_log(sid: &str, message: &str, _owner_dir: &Path) -> anyhow::Result<()> {
+/// The log destination is the shared smart_dir so all profiles' limit-switch
+/// events appear in one place (matching the shell's `LOG="$SMART_DIR/limit-switch.log"`).
+pub fn append_log(sid: &str, message: &str) -> anyhow::Result<()> {
     use crate::paths;
     use std::fs::OpenOptions;
 

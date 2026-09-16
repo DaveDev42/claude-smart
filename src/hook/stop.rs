@@ -37,7 +37,6 @@ pub use crate::platform::relaunch::RelaunchSentinel;
 /// `handoff`        — handoff prompt string forwarded to the resumed session.
 /// `cwd`            — working directory from the hook input (not owner_dir).
 /// `born`           — born epoch read from the PID file by classify().
-/// `_owner_dir`     — CLAUDE_CONFIG_DIR of the owning profile (reserved for future use).
 ///
 /// The commit ordering (matches the legacy shell implementation):
 ///   1. merge-sidecar hop
@@ -51,12 +50,11 @@ pub fn commit_and_stop(
     handoff: &str,
     cwd: &str,
     born: i64,
-    _owner_dir: &Path,
 ) -> anyhow::Result<()> {
     use crate::paths;
 
     // ── Step 1: read current hop from sidecar, compute next_hop ──────────────
-    let current_hop = read_sidecar_hop(sid);
+    let current_hop = crate::hook::read_sidecar_hop(sid);
     let next_hop = current_hop + 1;
 
     // Merge next_hop back into the sidecar (merge-not-clobber: preserve other fields).
@@ -103,17 +101,6 @@ pub fn commit_and_stop(
 }
 
 // ─── sidecar hop helpers ─────────────────────────────────────────────────────
-
-/// Read the `hop` field from `<sid>.json`, tolerating both String and Number forms.
-/// Returns 0 on missing/corrupt sidecar (the legacy zsh wrote hop as a JSON string;
-/// readers accept both forms).
-/// Delegates to the single `Sidecar::hop_int` SSOT so the String/Number tolerance
-/// rule lives in exactly one place (was triplicated across stop.rs/detect.rs/sidecar).
-fn read_sidecar_hop(sid: &str) -> i64 {
-    crate::sidecar::read_sidecar(&crate::paths::sidecar(sid))
-        .map(|s| s.hop_int())
-        .unwrap_or(0)
-}
 
 /// Merge `next_hop` into `<sid>.json` without clobbering other fields.
 /// The hop field is written as a JSON **string** for sidecar compatibility:

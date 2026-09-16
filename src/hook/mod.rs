@@ -40,6 +40,37 @@ use std::path::Path;
 
 use anyhow::Context as _;
 
+/// Read the `hop` field from `<sid>.json` sidecar, tolerating both String and
+/// Number forms. Returns 0 on missing/corrupt sidecar (the legacy zsh wrote
+/// hop as a JSON string; readers accept both forms). Delegates to the single
+/// `Sidecar::hop_int` SSOT so the String/Number tolerance rule lives in
+/// exactly one place — this was previously duplicated byte-for-byte in
+/// `detect.rs` and `stop.rs`.
+pub(crate) fn read_sidecar_hop(sid: &str) -> i64 {
+    crate::sidecar::read_sidecar(&crate::paths::sidecar(sid))
+        .map(|s| s.hop_int())
+        .unwrap_or(0)
+}
+
+/// First 8 bytes of a session UUID, for compact log lines and handoff
+/// prompts. Panic-free on any input (unlike a raw `&sid[..8]` slice, which
+/// panics on a session id shorter than 8 bytes).
+pub(crate) fn sid_short(sid: &str) -> &str {
+    sid.get(..8).unwrap_or(sid)
+}
+
+/// Build one `limit-switch.log` line. `kind` is `"notify-only"` or
+/// `"limit-switch"`; `detail` carries the kind-specific fields (`msg=…`, or
+/// `to=… cwd=… born=…`); `via` is `Some("statusline")` for the statusline
+/// entry point and `None` for the hook entry point (whose lines carry no
+/// `via=` suffix, matching the format before this helper existed).
+fn decision_log_line(kind: &str, sid_short: &str, detail: &str, via: Option<&str>) -> String {
+    match via {
+        Some(via) => format!("{kind} sid={sid_short} {detail} via={via}"),
+        None => format!("{kind} sid={sid_short} {detail}"),
+    }
+}
+
 /// Entry point for `csm hook [--owner <profile_dir>]`.
 ///
 /// `owner_dir` is the profile directory (value of CLAUDE_CONFIG_DIR for the hook's
@@ -74,13 +105,14 @@ pub fn run(owner_dir: &Path) -> anyhow::Result<()> {
             // Notify-only: user-quit + limited, no-target, detect-only mode, or
             // unmanaged session. Emit OSC 777 notify on stdout.
             // Log goes to the smart_dir limit-switch.log.
-            let log_msg = format!(
-                "notify-only sid={} msg={}",
-                &sid[..sid.len().min(8)],
-                message
+            let log_msg = decision_log_line(
+                "notify-only",
+                sid_short(&sid),
+                &format!("msg={message}"),
+                None,
             );
             notify::emit_osc777(message).unwrap_or(()); // best-effort stdout
-            let _ = notify::append_log(&sid, &log_msg, owner_dir); // best-effort log
+            let _ = notify::append_log(&sid, &log_msg); // best-effort log
         }
 
         detect::Decision::LimitSwitch {
@@ -95,16 +127,15 @@ pub fn run(owner_dir: &Path) -> anyhow::Result<()> {
             // mutation), then commit_and_stop.
             notify::emit_osc777(message).unwrap_or(());
 
-            let log_msg = format!(
-                "limit-switch sid={} to={} cwd={} born={}",
-                &sid[..sid.len().min(8)],
-                target_profile,
-                cwd,
-                born,
+            let log_msg = decision_log_line(
+                "limit-switch",
+                sid_short(&sid),
+                &format!("to={target_profile} cwd={cwd} born={born}"),
+                None,
             );
-            let _ = notify::append_log(&sid, &log_msg, owner_dir);
+            let _ = notify::append_log(&sid, &log_msg);
 
-            stop::commit_and_stop(sid.as_str(), target_profile, handoff, cwd, born, owner_dir)
+            stop::commit_and_stop(sid.as_str(), target_profile, handoff, cwd, born)
                 .with_context(|| format!("commit_and_stop failed for session {sid}"))?;
         }
     }
@@ -147,7 +178,7 @@ pub fn run_from_statusline(raw: &str, capture: &crate::usage::local::StatuslineC
     let Ok(decision) = detect::classify_with(&input, owner_dir, Some(&limit_msg)) else {
         return;
     };
-    let sid_short = &sid[..sid.len().min(8)];
+    let sid_short = sid_short(&sid);
 
     match decision {
         detect::Decision::Skip => {}
@@ -155,8 +186,13 @@ pub fn run_from_statusline(raw: &str, capture: &crate::usage::local::StatuslineC
         detect::Decision::NotifyOnly { ref message } => {
             // Deduped by `.detected` inside classify, so this lands once per
             // session, not once per second.
-            let log_msg = format!("notify-only sid={sid_short} msg={message} via=statusline");
-            let _ = notify::append_log(&sid, &log_msg, owner_dir);
+            let log_msg = decision_log_line(
+                "notify-only",
+                sid_short,
+                &format!("msg={message}"),
+                Some("statusline"),
+            );
+            let _ = notify::append_log(&sid, &log_msg);
         }
 
         detect::Decision::LimitSwitch {
@@ -169,18 +205,24 @@ pub fn run_from_statusline(raw: &str, capture: &crate::usage::local::StatuslineC
             if !stop::claim_switched(&sid) {
                 return;
             }
-            let log_msg = format!(
-                "limit-switch sid={sid_short} to={target_profile} cwd={cwd} born={born} via=statusline"
+            let log_msg = decision_log_line(
+                "limit-switch",
+                sid_short,
+                &format!("to={target_profile} cwd={cwd} born={born}"),
+                Some("statusline"),
             );
-            let _ = notify::append_log(&sid, &log_msg, owner_dir);
+            let _ = notify::append_log(&sid, &log_msg);
 
-            if let Err(e) =
-                stop::commit_and_stop(sid.as_str(), target_profile, handoff, cwd, born, owner_dir)
+            if let Err(e) = stop::commit_and_stop(sid.as_str(), target_profile, handoff, cwd, born)
             {
                 let _ = notify::append_log(
                     &sid,
-                    &format!("limit-switch sid={sid_short} commit failed: {e:#} via=statusline"),
-                    owner_dir,
+                    &decision_log_line(
+                        "limit-switch",
+                        sid_short,
+                        &format!("commit failed: {e:#}"),
+                        Some("statusline"),
+                    ),
                 );
                 let _ = std::fs::remove_file(crate::paths::switched(&sid));
             }
