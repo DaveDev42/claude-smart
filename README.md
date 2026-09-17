@@ -50,6 +50,7 @@ tiny shim — see *Profiles* below).
 ```
 csm [claude-args...]                 bare = smart launch (implicit `csm run`)
 csm run [csm-flags] [-- claude...]   smart launcher (session + account + relaunch)
+csm [--profile <name>] <subcommand>  run any subcommand under that profile
 
 # run flags (account + session selection)
   --profile <name>                   launch under this profile (skip all picking)
@@ -108,6 +109,20 @@ claude's.
 > SessionEnd limit-switch hook, wired from Claude Code `settings.json`), `csm cas` (the
 > `eval`-shim contract behind the shell `cas` function), and `csm current-usage`
 > (a raw usage probe used by the shims). They work without a profile registry.
+
+### A global profile for any subcommand
+
+`--profile <name>` may also sit in *front* of a subcommand word:
+
+```sh
+csm --profile work statusline        # that profile's status line
+csm --profile work usage --json      # collected as that profile
+```
+
+csm resolves the name through the registry, provisions the profile, and exports
+`CLAUDE_CONFIG_DIR` for the subcommand. Without it (`csm --profile work -p 'hi'`,
+say) nothing changes: the tokens belong to the implicit `csm run` and pin the
+launch the way they always have.
 
 ### No collision with `claude`
 

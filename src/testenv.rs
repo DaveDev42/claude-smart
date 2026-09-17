@@ -17,9 +17,12 @@
 //! that touches the same variable serializes through the same lock while
 //! tests touching different variables still run in parallel.
 //!
-//! `set_var`/`remove_var` here are the crate's only two call sites for
-//! `std::env::set_var`/`remove_var` — nothing else touches the raw `std::env`
-//! mutators. Most fixtures reach them through `with_env_var`/`with_env_vars`;
+//! `set_var`/`remove_var` here are the crate's only two TEST-side call sites
+//! for `std::env::set_var`/`remove_var` — no fixture touches the raw
+//! `std::env` mutators. (Production has exactly one: `main::pin_global_profile`
+//! exporting `CLAUDE_CONFIG_DIR` for a csm-global `--profile`, which runs
+//! single-threaded before dispatch and so needs no lock.)
+//! Most fixtures reach them through `with_env_var`/`with_env_vars`;
 //! a few RAII fixtures (`hook`'s `EnvFixture` and `spawn_fake_managed_process`,
 //! `usage::local::refresh`'s `TokenUrlEnv`) call `set_var`/`remove_var`
 //! directly but still hold `lock_for(name)` for their whole set→act→restore

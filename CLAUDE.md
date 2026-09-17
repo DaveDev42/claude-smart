@@ -38,8 +38,10 @@ see *Invariants*.
   passthru flags a limit-switch hop replays on `claude --resume`, and which it
   drops), `completions.rs` (clap tree used ONLY for
   `csm completions`, never to parse real argv), `reserved.rs` (the reserved
-  subcommand consts + `dispatch_subcommand`, read by dispatch, completions, and
-  the disjointness test).
+  subcommand consts + `dispatch_subcommand` → `Dispatch {subcommand, rest_len,
+  profile}`, which also peels the ONE csm-global flag allowed in front of a
+  subcommand word — `--profile <name>` / `--profile=<name>` — read by dispatch,
+  completions, and the disjointness test).
 - `src/account/` — `profiles.rs` (`ProfileMap` = the registry authority),
   `scoring.rs` (pick-best thresholds: `LIMIT_PCT=99`, `SATURATION_PCT=95`;
   `is_viable_pcts` is the ONE viability predicate over session / week_all /
@@ -148,7 +150,9 @@ dependency/MSRV checks).
    which scans every line of `src/` and fails on any leak (its forbidden list is
    assembled from fragments so the guard file itself stays clean).
 2. **No collision with `claude`'s CLI.** `csm` treats a word as its own
-   subcommand ONLY at `args[1]`, and the reserved set is disjoint from claude's
+   subcommand ONLY at `args[1]` (or at the token right after a csm-global
+   `--profile <name>`, the one flag `dispatch_subcommand` peels), and the
+   reserved set is disjoint from claude's
    (`agents/auth/auto-mode/doctor/install/mcp/plugin(s)/project/setup-token/
    ultrareview/update`). Any other first token → implicit `csm run` → forwarded
    verbatim to `claude`. Adding a subcommand whose name collides with a claude
@@ -173,7 +177,10 @@ dependency/MSRV checks).
 config {show|get|set|unset launch-command},
 usage [--json] [--no-fetch] [--refresh] [--refresh-oauth] | usage capture,
 pick-account, scan, sidecar, statusline, completions, reap, newuuid` + machine
-interface `cas` (+ back-compat `cas <verb>` aliases, `current-usage`). The
+interface `cas` (+ back-compat `cas <verb>` aliases, `current-usage`). Any of
+them may be preceded by the csm-global `csm --profile <name> …`, which pins
+`CLAUDE_CONFIG_DIR` for the subcommand (`run` gets the flag re-injected instead,
+so `cli::parser` stays the one place a launch resolves its pin). The
 collision analysis against claude's own subcommands is Invariant 2 above.
 
 ## Git workflow

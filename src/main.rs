@@ -53,12 +53,26 @@ fn main() -> anyhow::Result<()> {
     // argv[0]-aware dispatch: if this binary is invoked as a known alias, treat
     // it as if that subcommand was the first argument (multi-call binary
     // support). `cli::reserved::dispatch_subcommand` is the single tested
-    // source of truth for this rule and the reserved word list.
-    let (subcommand, rest_len) = cli::reserved::dispatch_subcommand(&args);
-    let rest: &[OsString] = &args[args.len() - rest_len..];
+    // source of truth for this rule, the reserved word list, and the one
+    // csm-global flag that may precede the subcommand word (`--profile`).
+    let dispatch = cli::reserved::dispatch_subcommand(&args);
+    let rest: &[OsString] = &args[args.len() - dispatch.rest_len..];
 
-    match subcommand {
-        "run" => cmd::run::run(rest),
+    // `csm --profile <name> <subcommand>`: pin CLAUDE_CONFIG_DIR so everything
+    // below — statusline, usage, hook, sidecar — reads that profile. `run` is
+    // the exception: it gets the flag re-injected instead, so `cli::parser`'s
+    // `--profile` stays the one place a launch resolves its pin.
+    if let Some(name) = dispatch.profile.as_deref()
+        && dispatch.subcommand != "run"
+    {
+        pin_global_profile(name)?;
+    }
+
+    match dispatch.subcommand {
+        "run" => cmd::run::run(&cli::reserved::run_args_with_profile(
+            dispatch.profile.as_deref(),
+            rest,
+        )),
         "hook" => cmd::hook::cmd_hook(rest),
         "profiles" => cmd::profiles::cmd_profiles(rest),
         "config" => cmd::config::cmd_config(rest),
@@ -83,6 +97,30 @@ fn main() -> anyhow::Result<()> {
     }
 }
 
+/// Pin `CLAUDE_CONFIG_DIR` for a csm-global `--profile <name>` that preceded a
+/// reserved subcommand word (`csm --profile work statusline`).
+///
+/// The name resolves through `ProfileMap` via the same
+/// `cmd::support::resolve_profile_dir` that `csm run --profile` uses — registry
+/// hit first, conventional `~/.claude.<name>` synthesis as the fallback — so
+/// both spellings land on the same directory, and the profile is provisioned
+/// the same best-effort way a launch provisions it.
+fn pin_global_profile(name: &str) -> anyhow::Result<()> {
+    use anyhow::Context as _;
+
+    let profiles = account::ProfileMap::load().context("csm: failed to load profiles.json")?;
+    let dir = cmd::support::resolve_profile_dir(name, &profiles)?;
+    provision::ensure_provisioned_soft(std::path::Path::new(&dir));
+
+    // SAFETY: this is `main()` before any subcommand handler runs and before
+    // anything in csm spawns a thread, so the process is single-threaded and
+    // no other thread can be reading the environment concurrently. (The only
+    // other `set_var` call sites in the crate are the test-only ones in
+    // `testenv`.)
+    unsafe { std::env::set_var("CLAUDE_CONFIG_DIR", &dir) };
+    Ok(())
+}
+
 /// Print the top-level `csm --help` surface (noun-verb).
 ///
 /// The reserved subcommand words are DELIBERATELY disjoint from `claude`'s
@@ -100,7 +138,7 @@ fn print_help() {
     println!(
         "  csm run [csm-flags] [-- claude...]   smart launcher (session + account + relaunch)"
     );
-    println!("  csm <subcommand> ...\n");
+    println!("  csm [--profile <name>] <subcommand> ...\n");
     print_run_flags();
     println!();
     println!("PROFILES (registry — ~/.config/claude-as/profiles.json)");
