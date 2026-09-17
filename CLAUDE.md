@@ -178,6 +178,10 @@ first. release-please watches `main` and maintains a release PR automatically.
 Branches/PRs are optional and usually unnecessary for this single-owner repo.
 **Push only when the user asks.** Committing locally without pushing is fine.
 
+Never merge-commit into main; rebase. release-please walks history by date
+and stops at the previous release commit, so commits behind a merge commit
+fall out of the changelog (this happened on 2026-09-17 for 0.3.3).
+
 ## Releases
 
 Cutting a release is mostly automatic — see `/release` for the procedure.
