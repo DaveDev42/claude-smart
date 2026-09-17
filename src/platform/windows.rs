@@ -36,9 +36,10 @@ use std::process::{Command, ExitStatus};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use windows_sys::Win32::Foundation::{FALSE, TRUE};
+use windows_sys::Win32::Foundation::{FALSE, HANDLE, INVALID_HANDLE_VALUE, TRUE};
 use windows_sys::Win32::System::Console::{
-    CTRL_BREAK_EVENT, CTRL_C_EVENT, GenerateConsoleCtrlEvent, SetConsoleCtrlHandler,
+    CONSOLE_MODE, CTRL_BREAK_EVENT, CTRL_C_EVENT, GenerateConsoleCtrlEvent, GetConsoleMode,
+    GetStdHandle, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, SetConsoleCtrlHandler,
 };
 use windows_sys::core::BOOL;
 
@@ -184,5 +185,50 @@ fn supervise(
         }
 
         std::thread::sleep(POLL);
+    }
+}
+
+/// `true` when `handle` is a live console handle with a readable console
+/// mode. Rejects a null or `INVALID_HANDLE_VALUE` handle before calling
+/// `GetConsoleMode`, so a closed or redirected handle never reaches the API.
+fn handle_is_console(handle: HANDLE) -> bool {
+    if handle.is_null() || handle == INVALID_HANDLE_VALUE {
+        return false;
+    }
+    let mut mode: CONSOLE_MODE = 0;
+    // SAFETY: `handle` was checked non-null and not `INVALID_HANDLE_VALUE`
+    // above; `mode` is a valid, uniquely-owned out-pointer for the call.
+    unsafe { GetConsoleMode(handle, &mut mode) != 0 }
+}
+
+/// `(stdin_is_console, stdout_is_console)`, each from its own
+/// `GetConsoleMode` check. Exposed separately, not just ANDed together, so a
+/// caller can tell "one stream is genuinely redirected" (one `true`, one
+/// `false`) apart from "neither handle is a console" (both `false`), which
+/// an MSYS/Cygwin pty also produces on a genuinely interactive session.
+///
+/// This is the `GetConsoleMode`-based counterpart to the Unix `isatty` gate
+/// used by `crate::cmd::support::is_interactive`: a nonzero window handle
+/// from `GetConsoleWindow` is not enough on its own — a plain
+/// `ssh host '<cmd>'` session still returns one — so the caller checks each
+/// std handle's own console-mode result rather than a window handle.
+pub(crate) fn console_handles() -> (bool, bool) {
+    // SAFETY: `GetStdHandle` with a documented `STD_*_HANDLE` constant; the
+    // call has no other preconditions.
+    let stdin_ok = handle_is_console(unsafe { GetStdHandle(STD_INPUT_HANDLE) });
+    // SAFETY: same as above.
+    let stdout_ok = handle_is_console(unsafe { GetStdHandle(STD_OUTPUT_HANDLE) });
+    (stdin_ok, stdout_ok)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn console_mode_is_false_for_a_non_console_handle() {
+        use std::os::windows::io::AsRawHandle;
+        let file = tempfile::tempfile().expect("tempfile");
+        assert!(!handle_is_console(file.as_raw_handle() as HANDLE));
     }
 }

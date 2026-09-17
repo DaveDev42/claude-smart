@@ -85,10 +85,34 @@ pub(crate) fn is_interactive() -> bool {
         let stdout_ok = isatty(std::io::stdout()).unwrap_or(false);
         stdin_ok && stdout_ok
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
     {
-        // Windows: the `GetConsoleMode` check is unimplemented; the env
-        // heuristic stands in.
+        let (stdin_console, stdout_console) = crate::platform::windows::console_handles();
+        if stdin_console && stdout_console {
+            return true;
+        }
+        if stdin_console || stdout_console {
+            // Exactly one handle is a real console, so `GetConsoleMode`
+            // succeeded at least once: this is not the MSYS/Cygwin case
+            // below, it is a genuinely redirected stream (e.g.
+            // `csm run > log.txt`), and the env heuristic must not override
+            // that.
+            return false;
+        }
+        // `GetConsoleMode` failed on both stdin and stdout. That is the
+        // expected shape for a pipe, a redirected file, or a CI runner, but
+        // an MSYS/Cygwin pty (e.g. Git Bash) also fails this check on a
+        // genuinely interactive session, since it emulates a tty over a pipe
+        // rather than handing out a real console handle. Fall back to the
+        // env heuristic only for that case. This fallback is a deliberate,
+        // unverified concession — we could not confirm what Node or claude
+        // itself does on an MSYS/Cygwin pty — not a validated behaviour.
+        std::env::var("WT_SESSION").is_ok() || std::env::var("TERM").is_ok()
+    }
+    #[cfg(all(not(unix), not(windows)))]
+    {
+        // Neither the isatty gate nor GetConsoleMode applies on this target;
+        // the env heuristic is the only signal available.
         std::env::var("WT_SESSION").is_ok() || std::env::var("TERM").is_ok()
     }
 }

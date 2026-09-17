@@ -228,7 +228,6 @@ is needed.
   (`zsh -c 'echo "..."'` p50 18.87 ms). These numbers are macOS-only; Linux,
   WSL and Windows are unmeasured. Render-side latency no longer blocks
   recommending `csm statusline` as the default `statusLine` command.
-- **Windows `is_interactive()`** uses an env-var heuristic, not `GetConsoleMode`.
 
 ## Don't touch / out of scope
 
