@@ -100,6 +100,9 @@ csm completions {zsh|bash|pwsh}      shell completions
 csm newuuid                          fresh lowercase UUID v4
 ```
 
+`csm run --help` prints the run flags above; `csm run -- --help` asks claude for
+claude's.
+
 > `csm` also recognizes a few **machine-interface** subcommands meant for
 > automation, not hand typing: `csm hook` (the Stop/StopFailure/SubagentStop/
 > SessionEnd limit-switch hook, wired from Claude Code `settings.json`), `csm cas` (the

@@ -32,10 +32,11 @@ see *Invariants*.
   `cmd::pick_account::cmd_current_usage`, and `newuuid` → inline in `main()`
   (see the match in `src/main.rs`).
 - `src/cli/` — `parser.rs` (hand-rolled `csm run` flag loop, NOT clap, so
-  claude flags forward verbatim), `carry.rs` (pure `carry_passthru`: the
-  arity-aware allow-list picking which remembered passthru flags a
-  limit-switch hop replays on `claude --resume`, and which it drops),
-  `completions.rs` (clap tree used ONLY for
+  claude flags forward verbatim; `Flags::help` is the one claude-shaped flag it
+  intercepts, and only before any passthru token), `carry.rs` (pure
+  `carry_passthru`: the arity-aware allow-list picking which remembered
+  passthru flags a limit-switch hop replays on `claude --resume`, and which it
+  drops), `completions.rs` (clap tree used ONLY for
   `csm completions`, never to parse real argv), `reserved.rs` (the reserved
   subcommand consts + `dispatch_subcommand`, read by dispatch, completions, and
   the disjointness test).
@@ -152,7 +153,9 @@ dependency/MSRV checks).
    ultrareview/update`). Any other first token → implicit `csm run` → forwarded
    verbatim to `claude`. Adding a subcommand whose name collides with a claude
    subcommand is forbidden. `csm run` consuming a NEW claude flag before `--` is
-   forbidden (the `--` boundary forwards the rest untouched).
+   forbidden (the `--` boundary forwards the rest untouched). The single
+   documented exception is `-h`/`--help` before any passthru token, which prints
+   run's own usage; `csm run -- --help` still reaches claude.
 3. **`ProfileMap` is the single registry authority.** Validity/default/dir
    resolution all go through it. No second source of profile truth, no hardcoded
    allowlist.

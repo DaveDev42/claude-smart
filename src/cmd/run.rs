@@ -77,6 +77,15 @@ pub(crate) fn run(args: &[OsString]) -> anyhow::Result<()> {
     let parsed = parse(args);
     let flags = &parsed.flags;
 
+    // ── 0. `csm run --help` — run's own usage, never a launch ──────────────────
+    // The parser only sets this for an `-h`/`--help` that arrived before any
+    // passthru token and before `--`, so `csm run -- --help` still reaches
+    // claude (see `cli::parser::Flags::help`).
+    if flags.help {
+        crate::print_run_help();
+        return Ok(());
+    }
+
     // ── 1. Resolve the working directory ──────────────────────────────────────
     let cwd = std::env::current_dir().context("csm: cannot determine current directory")?;
 

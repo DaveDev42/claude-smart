@@ -101,35 +101,8 @@ fn print_help() {
         "  csm run [csm-flags] [-- claude...]   smart launcher (session + account + relaunch)"
     );
     println!("  csm <subcommand> ...\n");
-    println!("RUN FLAGS (account + session selection)");
-    println!("  --profile <name>                     launch under this profile (skip all picking)");
-    println!("  -i, --interactive                    manual pick: force account + session pickers");
-    println!(
-        "  -A, --pick-account                   force an account pick this launch (overrides --no-pick)"
-    );
-    println!("  --no-pick                            keep current profile, no scoring");
-    println!(
-        "  -n, --new                            start a fresh session (skip the session picker)"
-    );
-    println!("  -c, --continue                       resume newest free session");
-    println!("  -r, --resume [<id>|<alias>]          resume a session (csm also reads the id)");
-    println!(
-        "  --session-id <uuid>                  forwarded to claude; csm tracks it for sidecar/relaunch state"
-    );
-    println!(
-        "  --model <m>                          forwarded to claude; remembered across a limit-switch hop"
-    );
-    println!(
-        "  --effort <e>                         forwarded to claude; remembered across a limit-switch hop"
-    );
-    println!(
-        "  --permission-mode <p>                forwarded to claude; remembered across a limit-switch hop"
-    );
-    println!("  (the six flags above are forwarded to claude AND read by csm; every other claude");
-    println!("   flag passes through untouched — use `csm run -- <args>` to force passthrough)");
-    println!("  (default: always opens the session picker — new / continue / pick existing —");
-    println!("   and auto-picks the best account by usage; opens the account picker when no");
-    println!("   usable usage data is available instead of silently staying put)\n");
+    print_run_flags();
+    println!();
     println!("PROFILES (registry — ~/.config/claude-as/profiles.json)");
     println!("  csm profiles [list]                  list configured profiles");
     println!("  csm profiles add  <name> [<dir>]     register (dir default ~/.claude.<name>)");
@@ -173,4 +146,53 @@ fn print_help() {
     );
     println!("Words not listed above forward to `claude` (e.g. `csm mcp`, `csm doctor`).");
     println!("To pass a csm-reserved flag to claude, use `csm run -- <args>`.");
+}
+
+/// The `RUN FLAGS` block — shared by `csm --help` and [`print_run_help`], so
+/// the two can never drift.
+fn print_run_flags() {
+    println!("RUN FLAGS (account + session selection)");
+    println!("  --profile <name>                     launch under this profile (skip all picking)");
+    println!("  -i, --interactive                    manual pick: force account + session pickers");
+    println!(
+        "  -A, --pick-account                   force an account pick this launch (overrides --no-pick)"
+    );
+    println!("  --no-pick                            keep current profile, no scoring");
+    println!(
+        "  -n, --new                            start a fresh session (skip the session picker)"
+    );
+    println!("  -c, --continue                       resume newest free session");
+    println!("  -r, --resume [<id>|<alias>]          resume a session (csm also reads the id)");
+    println!(
+        "  --session-id <uuid>                  forwarded to claude; csm tracks it for sidecar/relaunch state"
+    );
+    println!(
+        "  --model <m>                          forwarded to claude; remembered across a limit-switch hop"
+    );
+    println!(
+        "  --effort <e>                         forwarded to claude; remembered across a limit-switch hop"
+    );
+    println!(
+        "  --permission-mode <p>                forwarded to claude; remembered across a limit-switch hop"
+    );
+    println!("  (the six flags above are forwarded to claude AND read by csm; every other claude");
+    println!("   flag passes through untouched — use `csm run -- <args>` to force passthrough)");
+    println!("  (default: always opens the session picker — new / continue / pick existing —");
+    println!("   and auto-picks the best account by usage; opens the account picker when no");
+    println!("   usable usage data is available instead of silently staying put)");
+}
+
+/// `csm run --help` — run's own usage, printed instead of being forwarded to
+/// claude. Called from `cmd::run::run` when the parser saw `-h`/`--help`
+/// before any passthru token; `csm run -- --help` still reaches claude.
+pub(crate) fn print_run_help() {
+    let v = env!("CARGO_PKG_VERSION");
+    println!("csm {v} — `csm run`, the smart launcher\n");
+    println!("USAGE");
+    println!("  csm run [csm-flags] [-- claude-args...]");
+    println!("  csm [claude-args...]                 bare = implicit `csm run`\n");
+    print_run_flags();
+    println!();
+    println!("Everything after `--` goes to claude verbatim, including flags csm reads");
+    println!("itself: `csm run -- --help` prints claude's help, not this one.");
 }

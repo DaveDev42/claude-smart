@@ -9,6 +9,10 @@
 //! - Consumed-internally flags: `-i`/`--interactive`, `-n`/`--new`,
 //!   `-c`/`--continue`, `-A`/`--pick-account`, `--no-pick`, `-r`/`--resume`,
 //!   `--permission-mode`, `--effort`, `--model`, `--session-id`, `--profile`.
+//! - `-h`/`--help` **only while nothing has been forwarded yet** → run's own
+//!   help. Once a passthru token exists (`csm run -p --help`) or the `--`
+//!   boundary has been crossed (`csm run -- --help`), it is claude's flag and
+//!   forwards verbatim.
 //! - **Equals-form:** `--resume=<id>`, `--permission-mode=<m>`,
 //!   `--effort=<e>`, `--model=<m>`, `--session-id=<id>`, `--profile=<p>`.
 //! - **`-r`/`--resume` alias resolution:** non-UUID value → alias token;
@@ -100,6 +104,13 @@ pub struct Flags {
     /// `--profile <p>` / `--profile=<p>`
     /// (`o_profile` in the zsh source)
     pub profile: Option<String>,
+    /// `-h` / `--help` seen before anything was forwarded to claude — print
+    /// `csm run`'s own usage and exit instead of launching.
+    ///
+    /// The window is deliberately narrow: only while `passthru` is still empty
+    /// and before the `--` boundary. `csm run -- --help` and
+    /// `csm run -p --help` are claude's help, not run's, so they forward.
+    pub help: bool,
 }
 
 /// Result of parsing `csm run` arguments.
@@ -141,6 +152,15 @@ pub fn parse(args: &[OsString]) -> ParsedArgs {
         if s == "--" {
             passthru.extend(iter.cloned());
             break;
+        }
+
+        // ── -h / --help, while nothing has been forwarded yet ──────────────────
+        // `csm run --help` is a request for RUN's help; `csm run -p --help`
+        // (help about a claude flag already on the line) and `csm run --
+        // --help` are claude's, and fall through to passthru.
+        if (s == "-h" || s == "--help") && passthru.is_empty() {
+            flags.help = true;
+            continue;
         }
 
         // ── no-value boolean flags ─────────────────────────────────────────────
@@ -871,6 +891,59 @@ mod tests {
             ))
         );
         assert_eq!(r.passthru, os_args(&["resume"]));
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════
+    // -h / --help: run's own help vs claude's
+    //
+    // `csm run --help` used to forward `--help` to claude, so run's flags were
+    // undiscoverable from the subcommand itself (issue #25, "Related").
+    // ══════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn help_long_is_intercepted_when_nothing_forwarded_yet() {
+        let r = parse(&os_args(&["--help"]));
+        assert!(r.flags.help);
+        assert!(r.passthru.is_empty(), "--help must not reach claude here");
+    }
+
+    #[test]
+    fn help_short_is_intercepted_when_nothing_forwarded_yet() {
+        let r = parse(&os_args(&["-h"]));
+        assert!(r.flags.help);
+        assert!(r.passthru.is_empty());
+    }
+
+    #[test]
+    fn help_after_a_csm_flag_is_still_runs_help() {
+        // csm's own flags do not count as "forwarded" — nothing is in passthru
+        // yet, so this is still a question about `csm run`.
+        let r = parse(&os_args(&["-c", "--help"]));
+        assert!(r.flags.help);
+        assert!(r.flags.continue_);
+        assert!(r.passthru.is_empty());
+    }
+
+    #[test]
+    fn help_after_a_passthru_token_forwards_to_claude() {
+        // `-p` is claude's print flag: it lands in passthru first, so the
+        // `--help` after it is a question about CLAUDE and must forward.
+        let r = parse(&os_args(&["-p", "--help"]));
+        assert!(!r.flags.help);
+        assert_eq!(r.passthru, os_args(&["-p", "--help"]));
+    }
+
+    #[test]
+    fn help_after_double_dash_forwards_to_claude() {
+        let r = parse(&os_args(&["--", "--help"]));
+        assert!(!r.flags.help);
+        assert_eq!(r.passthru, os_args(&["--help"]));
+    }
+
+    #[test]
+    fn help_absent_is_false() {
+        let r = parse(&os_args(&["-c"]));
+        assert!(!r.flags.help);
     }
 
     // ══════════════════════════════════════════════════════════════════════════
