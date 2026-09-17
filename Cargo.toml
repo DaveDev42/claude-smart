@@ -110,13 +110,12 @@ nix = { version = "0.31", features = ["hostname", "process", "signal", "term", "
 # (CREATE_NEW_PROCESS_GROUP), TerminateProcess, SendMessageTimeout+WM_SETTINGCHANGE
 # (cas -g HKCU\Environment broadcast)
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.52", features = [
+windows-sys = { version = "0.61", features = [
     "Win32_System_Threading",        # CreateProcess*, WaitForSingleObject, TerminateProcess, OpenProcess
     "Win32_System_Console",          # GenerateConsoleCtrlEvent, SetConsoleCtrlHandler
-    "Win32_Foundation",              # BOOL, HANDLE, HWND, LRESULT
+    "Win32_Foundation",              # TRUE/FALSE, HANDLE, HWND, LRESULT (BOOL moved to windows_sys::core)
     "Win32_UI_WindowsAndMessaging",  # SendMessageTimeout, WM_SETTINGCHANGE, HWND_BROADCAST
     "Win32_System_Registry",         # RegOpenKeyExW, RegSetValueExW (HKCU\Environment)
-    "Win32_Storage_FileSystem",      # stop-flag presence check
     "Win32_System_SystemInformation", # GetComputerNameExW (statusline host)
 ] }
 

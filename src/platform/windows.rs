@@ -36,7 +36,8 @@ use std::process::{Command, ExitStatus};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use windows_sys::Win32::Foundation::{BOOL, FALSE, TRUE};
+use windows_sys::core::BOOL;
+use windows_sys::Win32::Foundation::{FALSE, TRUE};
 use windows_sys::Win32::System::Console::{
     GenerateConsoleCtrlEvent, SetConsoleCtrlHandler, CTRL_BREAK_EVENT, CTRL_C_EVENT,
 };

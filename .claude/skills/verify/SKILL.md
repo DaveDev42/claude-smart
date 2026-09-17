@@ -40,9 +40,9 @@ Run all three checks and report ONE clear verdict. Do not commit on a FAIL.
    only blows up in CI on the `x86_64-pc-windows-msvc` job (this is exactly how
    the `HANDLE.is_null()` break in `reaper/kill.rs` shipped to a release).
    The `-gnu` target needs no MSVC linker — `clippy`/`check` type-check and lint
-   without producing the final binary — and it shares the same `HANDLE = isize`
-   and `windows-sys 0.52` as the MSVC release target, so it reproduces the same
-   class of bug. Run it locally; do not wait for CI to find it.
+   without producing the final binary — and it links the same windows-sys version
+   and the same pointer-shaped HANDLE/HKEY as the MSVC release target, so it
+   reproduces the same class of bug. Run it locally; do not wait for CI to find it.
    - A `warning:`/`error[`/`error:` from the crate against this target = **FAIL**
      (same warnings-as-errors bar as step 2).
    - If the target genuinely cannot be installed (offline / no `rustup`), say so

@@ -104,11 +104,10 @@ fn kill_one(pid: u32, _signal: KillSignal) -> KillOutcome {
     // terminate, then close the handle. A null handle means the process is gone
     // (or not ours) — treat "gone" as success since the goal is met.
     //
-    // `HANDLE` is `isize` in windows-sys 0.52 (not a pointer), so the failure
-    // sentinel is `0`, not `is_null()`.
+    // `HANDLE` is a raw pointer; the failure sentinel is null.
     unsafe {
         let handle = OpenProcess(PROCESS_TERMINATE, 0, pid);
-        if handle == 0 {
+        if handle.is_null() {
             // Could not open — most commonly the pid no longer exists.
             return KillOutcome::AlreadyGone;
         }
