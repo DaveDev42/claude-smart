@@ -89,16 +89,21 @@ iana-time-zone = "0.1"
 # tikv-jemallocator does not build at all.
 mimalloc = "0.1"
 
+# Crypto provider for reqwest's rustls stack: ring, installed once in
+# usage::local::api::http_client.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+
 # ─── HTTP transport (local usage collection: Anthropic's OAuth usage API) ────
-# rustls-tls (not native-tls): native-tls drags in system OpenSSL on Linux, which
-# breaks cross-compile + adds a build-time libssl dep on the WSL target; rustls is
-# pure-Rust and builds cleanly on all 4 targets (darwin/linux/windows-msvc). The
-# only endpoint this hits is Anthropic's own HTTPS API (api.anthropic.com), so
-# rustls's bundled webpki roots are all the trust store this needs.
+# rustls (not native-tls): native-tls drags in system OpenSSL on Linux, which
+# breaks cross-compile. `rustls-no-provider` keeps reqwest off its aws-lc-rs
+# default (a C/cmake toolchain on every release target); csm installs the
+# pure-Rust ring provider itself in usage::local::api::http_client. Server
+# certificates are checked against the OS trust store (rustls-platform-verifier),
+# reqwest 0.13's default.
 [dependencies.reqwest]
-version          = "0.12"
+version          = "0.13"
 default-features = false
-features         = ["json", "blocking", "rustls-tls"]
+features         = ["blocking", "rustls-no-provider"]
 
 # ─── POSIX-only ──────────────────────────────────────────────────────────────
 # tcsetpgrp/setpgid (foreground supervisor), kill() (hook SIGTERM), isatty (TTY gate)

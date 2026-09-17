@@ -423,10 +423,7 @@ fn request_refresh(
         body.insert("scope".into(), json!(scope));
     }
 
-    let client = reqwest::blocking::Client::builder()
-        .connect_timeout(Duration::from_secs(3))
-        .timeout(Duration::from_secs(30))
-        .build()
+    let client = api::http_client(Duration::from_secs(30))
         .map_err(|e| RefreshError::Network(e.to_string()))?;
 
     let resp = client

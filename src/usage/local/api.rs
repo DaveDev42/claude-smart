@@ -107,12 +107,29 @@ pub struct OauthUsage {
 
 // ─── request ────────────────────────────────────────────────────────────────
 
+/// The one blocking HTTP client builder in the crate: installs the ring
+/// provider once, 3s connect, caller-chosen total timeout, OS trust store
+/// (reqwest 0.13's `rustls-platform-verifier` default).
+pub(crate) fn http_client(
+    total: std::time::Duration,
+) -> Result<reqwest::blocking::Client, reqwest::Error> {
+    static PROVIDER: std::sync::Once = std::sync::Once::new();
+    PROVIDER.call_once(|| {
+        // Err means a provider is already installed (e.g. by a test); that is fine.
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    });
+    reqwest::blocking::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(3))
+        .timeout(total)
+        .build()
+}
+
 /// Fetch `/api/oauth/usage` for the account behind `token`.
 ///
-/// Timeouts: 3s connect / 8s total — the same order of magnitude as
-/// `transport.rs`'s HTTP path, generous enough for a real network round
-/// trip but bounded so a hung request never blocks `collect()` across every
-/// other profile indefinitely.
+/// Timeouts: 3s connect / 8s total, via `http_client(Duration::from_secs(8))`
+/// — the same order of magnitude as `transport.rs`'s HTTP path, generous
+/// enough for a real network round trip but bounded so a hung request never
+/// blocks `collect()` across every other profile indefinitely.
 ///
 /// `base` is validated ([`validate_base`]) before anything is sent: `token`
 /// — every configured profile's live OAuth access token — is attached as a
@@ -128,11 +145,8 @@ pub fn fetch_usage(token: &str, base: &str) -> Result<OauthUsage, ApiError> {
 
     let url = format!("{}/api/oauth/usage", base.trim_end_matches('/'));
 
-    let client = reqwest::blocking::Client::builder()
-        .connect_timeout(Duration::from_secs(3))
-        .timeout(Duration::from_secs(8))
-        .build()
-        .map_err(|e| ApiError::Network(e.to_string()))?;
+    let client =
+        http_client(Duration::from_secs(8)).map_err(|e| ApiError::Network(e.to_string()))?;
 
     let resp = client
         .get(&url)
