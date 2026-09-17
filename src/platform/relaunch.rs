@@ -6,9 +6,9 @@
 //! back to a single launch-without-relaunch (`run_once`) because the Windows
 //! console-stop path has two BLOCKING empirical checks that are not yet
 //! verified (interactive Ctrl-C forwarding + CTRL_BREAK transcript flush — see
-//! `platform/windows.rs` and `TODO.md`).  Shipping the relaunch loop on Windows
-//! before those pass risks losing the supervisor (Ctrl-C kills it) or
-//! truncating the session transcript on a limit switch.
+//! `platform/windows.rs` and CLAUDE.md's "Known gaps" section).  Shipping the
+//! relaunch loop on Windows before those pass risks losing the supervisor
+//! (Ctrl-C kills it) or truncating the session transcript on a limit switch.
 //!
 //! ## RelaunchSentinel — read-compat with legacy zsh `write_relaunch`
 //!

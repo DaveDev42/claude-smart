@@ -8,7 +8,15 @@
 //! Every `.rs` file under `src/` is scanned in full (production and `#[cfg(test)]`
 //! alike). This file — the guard's own forbidden list — is the only thing that
 //! names the identifiers, and it lives under `tests/`, which is not scanned.
-//! Scope: `src/` only, for now (widened to cover other paths in a later commit).
+//!
+//! Two scopes:
+//! - `src/**/*.rs`: all three rules — `forbidden()`, the `Dave-` host-prefix
+//!   rule, and the quoted-profile-literal rule.
+//! - `README.md`, `CLAUDE.md`, `Cargo.toml`, `examples/*.sh`: the `forbidden()`
+//!   substring scan only (the other two rules are `src/`-specific: host-prefix
+//!   literals and quoted profile literals are meaningful only in code).
+//!
+//! `tests/` itself stays excluded from every scope.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -65,9 +73,33 @@ fn collect_rs(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
+/// Scan one file for `forbidden()` substrings only (the widened, non-`src/`
+/// scope). Missing files are skipped rather than failing the test — the
+/// caller passes only paths it expects to exist, but a partial checkout
+/// (e.g. no `examples/`) should not turn into a spurious failure here.
+fn scan_forbidden_only(file: &Path, forbidden: &[String], violations: &mut Vec<String>) {
+    let Ok(src) = fs::read_to_string(file) else {
+        return;
+    };
+    for (i, line) in src.lines().enumerate() {
+        let lineno = i + 1;
+        for needle in forbidden {
+            if line.contains(needle) {
+                violations.push(format!(
+                    "{}:{}: forbidden identifier {:?}",
+                    file.display(),
+                    lineno,
+                    needle
+                ));
+            }
+        }
+    }
+}
+
 #[test]
 fn no_private_identifiers_in_shipped_source() {
-    let src_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let src_dir = root.join("src");
     let mut files = Vec::new();
     collect_rs(&src_dir, &mut files);
     assert!(
@@ -123,6 +155,26 @@ fn no_private_identifiers_in_shipped_source() {
                 }
             }
         }
+    }
+
+    // Widened scope: the substring-only scan over shipped docs/build files
+    // that sit outside `src/` but still land in the published tarball or the
+    // repo checkout. `tests/` itself stays excluded from every scope.
+    let mut doc_files: Vec<PathBuf> = vec![
+        root.join("README.md"),
+        root.join("CLAUDE.md"),
+        root.join("Cargo.toml"),
+    ];
+    if let Ok(entries) = fs::read_dir(root.join("examples")) {
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if p.extension().map(|e| e == "sh").unwrap_or(false) {
+                doc_files.push(p);
+            }
+        }
+    }
+    for file in &doc_files {
+        scan_forbidden_only(file, &forbidden, &mut violations);
     }
 
     assert!(
