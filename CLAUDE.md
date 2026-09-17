@@ -25,7 +25,9 @@ see *Invariants*.
   lives under `src/cmd/`.
 - `src/cmd/` — one module per subcommand: `run.rs`, `hook.rs`, `cas.rs`,
   `config.rs`, `profiles.rs`, `usage.rs`, `pick_account.rs`, `scan.rs`,
-  `sidecar.rs`, `completions.rs`, plus `support.rs` (profile-dir / stdin / tty
+  `sidecar.rs`, `completions.rs`, `claude.rs` (the `csm claude <args…>`
+  passthrough: pure `config_dir_for`/`plan` + a thin unix-`exec` /
+  windows-spawn shell), plus `support.rs` (profile-dir / stdin / tty
   helpers shared across subcommands). Four reserved words dispatch outside
   `src/cmd/` instead: `reap` → `reaper::cmd` (`src/reaper/mod.rs`),
   `statusline` → `statusline::run` (`src/statusline.rs`), `current-usage` →
@@ -152,14 +154,16 @@ dependency/MSRV checks).
 2. **No collision with `claude`'s CLI.** `csm` treats a word as its own
    subcommand ONLY at `args[1]` (or at the token right after a csm-global
    `--profile <name>`, the one flag `dispatch_subcommand` peels), and the
-   reserved set is disjoint from claude's
-   (`agents/auth/auto-mode/doctor/install/mcp/plugin(s)/project/setup-token/
-   ultrareview/update`). Any other first token → implicit `csm run` → forwarded
-   verbatim to `claude`. Adding a subcommand whose name collides with a claude
-   subcommand is forbidden. `csm run` consuming a NEW claude flag before `--` is
-   forbidden (the `--` boundary forwards the rest untouched). The single
-   documented exception is `-h`/`--help` before any passthru token, which prints
-   run's own usage; `csm run -- --help` still reaches claude.
+   reserved set is disjoint from claude's — `CLAUDE_RESERVED_SUBCOMMANDS` in
+   `src/cli/reserved.rs` carries the full list `claude --help` prints and the
+   disjointness test asserts over all of it. Any other first token → implicit
+   `csm run` → forwarded verbatim to `claude`. Adding a subcommand whose name
+   collides with a claude subcommand is forbidden; `claude` itself is not one
+   of claude's words, which is what makes the `csm claude <args…>` passthrough
+   legal. `csm run` consuming a NEW claude flag before `--` is forbidden (the
+   `--` boundary forwards the rest untouched). The single documented exception
+   is `-h`/`--help` before any passthru token, which prints run's own usage;
+   `csm run -- --help` still reaches claude.
 3. **`ProfileMap` is the single registry authority.** Validity/default/dir
    resolution all go through it. No second source of profile truth, no hardcoded
    allowlist.
@@ -176,12 +180,13 @@ dependency/MSRV checks).
 `run, hook, profiles {list|add|set|rm|use|edit|dir|bootstrap|doctor},
 config {show|get|set|unset launch-command},
 usage [--json] [--no-fetch] [--refresh] [--refresh-oauth] | usage capture,
-pick-account, scan, sidecar, statusline, completions, reap, newuuid` + machine
-interface `cas` (+ back-compat `cas <verb>` aliases, `current-usage`). Any of
-them may be preceded by the csm-global `csm --profile <name> …`, which pins
-`CLAUDE_CONFIG_DIR` for the subcommand (`run` gets the flag re-injected instead,
-so `cli::parser` stays the one place a launch resolves its pin). The
-collision analysis against claude's own subcommands is Invariant 2 above.
+pick-account, scan, sidecar, statusline, completions, reap, newuuid,
+claude <args…>` + machine interface `cas` (+ back-compat `cas <verb>` aliases,
+`current-usage`). Any of them may be preceded by the csm-global
+`csm --profile <name> …`, which pins `CLAUDE_CONFIG_DIR` for the subcommand
+(`run` gets the flag re-injected instead, so `cli::parser` stays the one place
+a launch resolves its pin). The collision analysis against claude's own
+subcommands is Invariant 2 above.
 
 ## Git workflow
 

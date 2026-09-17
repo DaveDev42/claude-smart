@@ -32,26 +32,48 @@ pub(crate) const CSM_RESERVED_SUBCOMMANDS: &[&str] = &[
     "completions",
     "newuuid",
     "reap",
+    // The documented passthrough verb. `claude` is NOT one of claude's own
+    // subcommands (`claude claude` is not a thing), so reserving the word
+    // costs nothing and gives `csm claude <args…>` — claude under csm's
+    // profile, arguments forwarded verbatim.
+    "claude",
 ];
 
-/// `claude`'s own reserved subcommand words. Never matched against by
-/// `dispatch_subcommand` — this list exists so
+/// `claude`'s own reserved subcommand words, as `claude --help` lists them.
+/// Never matched against by `dispatch_subcommand` — this list exists so
 /// `csm_and_claude_reserved_sets_are_disjoint` can assert the two sets never
 /// overlap, so it is otherwise dead outside `#[cfg(test)]`.
+///
+/// Keep it a superset rather than a minimal one: an entry csm must never claim
+/// is cheap, and a missing entry is how a collision ships.
 #[allow(dead_code)]
 pub(crate) const CLAUDE_RESERVED_SUBCOMMANDS: &[&str] = &[
     "agents",
+    "attach",
     "auth",
     "auto-mode",
+    "configuration",
     "doctor",
+    "fix",
+    "gateway",
+    "import",
     "install",
+    "kill",
+    "lists",
+    "logs",
     "mcp",
     "plugin",
     "plugins",
     "project",
+    "respawn",
+    "rm",
+    "sessions",
     "setup-token",
+    "stop",
+    "terminal",
     "ultrareview",
     "update",
+    "worktree",
 ];
 
 /// True when `argv[0]` is the `csm-hook` alias (symlink/rename form), the one
@@ -317,6 +339,15 @@ mod tests {
         assert_eq!(d.rest_len, 1);
     }
 
+    #[test]
+    fn dispatch_explicit_claude_passthrough() {
+        let a = argv(&["csm", "claude", "--version"]);
+        let d = dispatch_subcommand(&a);
+        assert_eq!(d.subcommand, "claude");
+        assert_eq!(d.rest_len, 1);
+        assert_eq!(d.profile, None);
+    }
+
     /// A word that is NOT a reserved csm subcommand falls through to `run`
     /// (→ forwarded to claude). This is the collision-avoidance contract: any
     /// claude subcommand (mcp/doctor/update/…) is forwarded, never hijacked.
@@ -427,6 +458,18 @@ mod tests {
         assert_eq!(
             routed(&["csm", "--profile=home", "usage", "--json"]),
             ("usage", vec!["--json".to_owned()], Some("home".to_owned()))
+        );
+    }
+
+    #[test]
+    fn dispatch_global_profile_before_claude_passthrough() {
+        assert_eq!(
+            routed(&["csm", "--profile", "home", "claude", "mcp", "list"]),
+            (
+                "claude",
+                vec!["mcp".to_owned(), "list".to_owned()],
+                Some("home".to_owned())
+            )
         );
     }
 

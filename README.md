@@ -99,6 +99,7 @@ csm sidecar {read|write|merge|flags} <sid> [k=v...]   per-session state store
 csm statusline                       `<profile>@<host>` for the shell prompt
 csm completions {zsh|bash|pwsh}      shell completions
 csm newuuid                          fresh lowercase UUID v4
+csm claude <args...>                 run claude under csm's profile, args forwarded verbatim
 ```
 
 `csm run --help` prints the run flags above; `csm run -- --help` asks claude for
@@ -117,12 +118,31 @@ claude's.
 ```sh
 csm --profile work statusline        # that profile's status line
 csm --profile work usage --json      # collected as that profile
+csm --profile work claude mcp list   # claude's own mcp list, under that profile
 ```
 
 csm resolves the name through the registry, provisions the profile, and exports
 `CLAUDE_CONFIG_DIR` for the subcommand. Without it (`csm --profile work -p 'hi'`,
 say) nothing changes: the tokens belong to the implicit `csm run` and pin the
 launch the way they always have.
+
+### Running claude directly
+
+`csm claude <args...>` hands everything after the word to claude verbatim: no
+csm flag parsing, no session picker, no account scoring or auto-switch, no
+sidecar, no relaunch loop. csm only picks the profile (the global `--profile`,
+else the current `CLAUDE_CONFIG_DIR`, else the registry default), provisions it,
+and execs claude in place:
+
+```sh
+csm claude --version
+csm claude mcp list
+csm --profile home claude auth login
+```
+
+Use it for claude's own subcommands under a chosen profile, and for flags `csm
+run` would otherwise read (`-c`, `-r`, `--model`, …). `csm run -- <args>` does
+the same forwarding through the launcher.
 
 ### No collision with `claude`
 
@@ -132,6 +152,9 @@ recognize is forwarded verbatim to `claude`** — so `csm mcp`, `csm doctor`,
 reserved word set is deliberately disjoint from claude's subcommands. To pass a
 flag that `csm` would otherwise interpret (`-c`, `-r`, `-n`, `--model`, …),
 put it after `--`: `csm run -- -c`.
+
+`claude` itself is not one of claude's subcommand words, which is why `csm
+claude …` can be reserved without narrowing what gets forwarded.
 
 ## Profiles
 

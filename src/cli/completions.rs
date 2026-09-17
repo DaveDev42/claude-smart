@@ -213,6 +213,14 @@ pub enum CompletionsSubcmd {
     /// Print a fresh lowercase UUID v4 (used as --session-id on cold launch).
     #[command(name = "newuuid")]
     Newuuid,
+
+    /// Run claude under csm's profile, arguments forwarded verbatim.
+    #[command(name = "claude")]
+    Claude {
+        /// Arguments handed to claude untouched (no csm parsing at all).
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
 }
 
 /// `csm usage <verb>` — the statusLine-stdin capture subverb, distinct from
@@ -401,6 +409,7 @@ mod tests {
             "statusline",
             "completions",
             "newuuid",
+            "claude",
         ] {
             assert!(
                 out.contains(sub),

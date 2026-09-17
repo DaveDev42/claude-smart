@@ -59,9 +59,10 @@ fn main() -> anyhow::Result<()> {
     let rest: &[OsString] = &args[args.len() - dispatch.rest_len..];
 
     // `csm --profile <name> <subcommand>`: pin CLAUDE_CONFIG_DIR so everything
-    // below — statusline, usage, hook, sidecar — reads that profile. `run` is
-    // the exception: it gets the flag re-injected instead, so `cli::parser`'s
-    // `--profile` stays the one place a launch resolves its pin.
+    // below — statusline, usage, hook, `profiles dir`, sidecar, the `claude`
+    // passthrough — reads that profile. `run` is the exception: it gets the
+    // flag re-injected instead, so `cli::parser`'s `--profile` stays the one
+    // place a launch resolves its pin.
     if let Some(name) = dispatch.profile.as_deref()
         && dispatch.subcommand != "run"
     {
@@ -73,6 +74,7 @@ fn main() -> anyhow::Result<()> {
             dispatch.profile.as_deref(),
             rest,
         )),
+        "claude" => cmd::claude::cmd_claude(rest),
         "hook" => cmd::hook::cmd_hook(rest),
         "profiles" => cmd::profiles::cmd_profiles(rest),
         "config" => cmd::config::cmd_config(rest),
@@ -179,6 +181,9 @@ fn print_help() {
     println!("  csm statusline                       `<profile>@<host>` for the shell prompt");
     println!("  csm completions {{zsh|bash|pwsh}}      shell completions");
     println!("  csm newuuid                          fresh lowercase UUID v4");
+    println!(
+        "  csm claude <args...>                 run claude under csm's profile, args forwarded verbatim"
+    );
     println!(
         "  csm cas ...                          eval-class shim contract (machine interface)\n"
     );
