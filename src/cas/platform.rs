@@ -26,6 +26,18 @@
 //! binary, a permission error, or a locked registry key logs a warning to stderr
 //! but does **not** prevent the live-shell export from succeeding. This matches
 //! the legacy shell implementation's `… 2>/dev/null` suppression.
+//!
+//! # Inert under `cfg(test)`
+//!
+//! Both setters return before touching launchd / HKCU when the crate is
+//! compiled for its own unit tests. The side effect is machine-wide and
+//! outlives the test process: a real `launchctl setenv` from a test run left
+//! every GUI-launched `claude` on the developer's machine (Orca included)
+//! pointing at a deleted test tempdir until re-login, and a native Windows
+//! test run wrote a POSIX test literal into `HKCU\Environment`. Every test
+//! that reaches `apply_global` — the `cas -g` / `profiles use` paths, the
+//! editor — therefore exercises the state file and the emitted shell snippet
+//! only.
 
 /// Apply the platform-specific global setenv side-effect for `cas -g`.
 ///
@@ -66,6 +78,12 @@ fn apply_global_impl(profile: &str, dir: &str) -> std::io::Result<()> {
 #[cfg(target_os = "macos")]
 pub fn launchctl_setenv(_profile: &str, dir: &str) -> std::io::Result<()> {
     use std::process::Command;
+
+    // Unit tests must never reach launchd — see the module doc ("Inert under
+    // cfg(test)"): the floor is machine-wide and survives the test process.
+    if cfg!(test) {
+        return Ok(());
+    }
 
     // `/bin/launchctl setenv CLAUDE_CONFIG_DIR <dir>`
     // Matches the legacy shell implementation exactly: the env var name is
@@ -121,6 +139,13 @@ pub fn hkcu_setenv(_profile: &str, dir: &str) -> std::io::Result<()> {
             HWND_BROADCAST, SMTO_ABORTIFHUNG, SendMessageTimeoutW, WM_SETTINGCHANGE,
         },
     };
+
+    // Unit tests must never write HKCU\Environment — see the module doc
+    // ("Inert under cfg(test)"): the value is user-wide and survives the test
+    // process.
+    if cfg!(test) {
+        return Ok(());
+    }
 
     // Convert the dir string to a null-terminated UTF-16 for Win32 APIs.
     let dir_wide: Vec<u16> = dir.encode_utf16().chain(std::iter::once(0)).collect();
@@ -204,38 +229,16 @@ fn apply_global_impl(_profile: &str, _dir: &str) -> std::io::Result<()> {
 mod tests {
     use super::*;
 
-    /// `apply_global` must not panic or return hard errors on the current
-    /// platform. On macOS CI, launchctl may fail (sandbox) — that's OK.
-    /// On Linux/WSL, it is a no-op.
+    /// `apply_global` must not panic or return a hard error on any platform.
+    /// Under `cfg(test)` the macOS / Windows setters are inert (module doc),
+    /// so this never touches launchd or HKCU; the path is deliberately one
+    /// that must never become a real floor.
     #[test]
-    fn apply_global_does_not_panic() {
-        // Soft failure only — never panics or returns hard error on POSIX.
-        let result = apply_global("home", "/tmp/.claude.home");
+    fn apply_global_is_ok_and_inert_under_test() {
+        let result = apply_global("home", "/nonexistent/.claude.home");
         assert!(
             result.is_ok(),
-            "apply_global must not return hard error: {:?}",
-            result
+            "apply_global must not return a hard error: {result:?}"
         );
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn launchctl_setenv_does_not_panic_with_valid_args() {
-        // In a sandboxed CI environment launchctl may fail — that's the soft
-        // failure we're testing: it should log a warning, not panic or return Err.
-        let result = launchctl_setenv("home", "/tmp/.claude.home");
-        assert!(
-            result.is_ok(),
-            "launchctl_setenv should soft-fail, not hard-fail: {:?}",
-            result
-        );
-    }
-
-    #[cfg(all(unix, not(target_os = "macos")))]
-    #[test]
-    fn linux_apply_global_is_noop() {
-        // On Linux/WSL the function must succeed (no-op).
-        let result = apply_global("home", "/tmp/.claude.home");
-        assert!(result.is_ok());
     }
 }
