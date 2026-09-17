@@ -23,3 +23,36 @@
 
 #[cfg(test)]
 pub(crate) static CLAUDE_CONFIG_DIR_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+// `HOME`/`USERPROFILE` fixture override — thread-local, not process-global.
+//
+// On Windows, `dirs::home_dir()` never reads `HOME` or `USERPROFILE`; it
+// calls `SHGetKnownFolderPath(FOLDERID_Profile)` unconditionally. A fixture
+// that does `set_var("HOME", tmpdir)` therefore gives zero isolation there —
+// the code under test still resolves the real runner profile dir. All
+// `dirs::home_dir()` call sites in this crate route through
+// `crate::paths::home_dir` instead, whose `#[cfg(test)]` body consults this
+// thread-local override first.
+//
+// Thread-local, not a `Mutex`-guarded static: every test runs on its own
+// thread and the paths under test never cross threads, so fixtures need no
+// lock here and cannot interfere with each other the way a shared
+// process-global env var would.
+
+#[cfg(test)]
+thread_local! {
+    static TEST_HOME: std::cell::RefCell<Option<std::path::PathBuf>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Set (or clear, with `None`) this thread's home-dir override for tests.
+#[cfg(test)]
+pub(crate) fn set_test_home(home: Option<std::path::PathBuf>) {
+    TEST_HOME.with(|h| *h.borrow_mut() = home);
+}
+
+/// This thread's home-dir override, if a fixture has set one.
+#[cfg(test)]
+pub(crate) fn test_home() -> Option<std::path::PathBuf> {
+    TEST_HOME.with(|h| h.borrow().clone())
+}

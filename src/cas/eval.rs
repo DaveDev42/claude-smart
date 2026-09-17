@@ -451,28 +451,22 @@ mod tests {
     // (Op, Shell) combination — the invariant-5 tripwire for the shell-shim
     // machine interface (`csm cas --eval` stdout). `Op::Global`, `Op::Resync`,
     // and the full `Op::Status` render also read/write process-global state
-    // (a `HOME`-rooted state file, `CLAUDE_CONFIG_DIR`), so those cases run
-    // under an isolated `HOME` and/or the crate's shared `CLAUDE_CONFIG_DIR`
+    // (a home-rooted state file, `CLAUDE_CONFIG_DIR`), so those cases run
+    // under an isolated home dir and/or the crate's shared `CLAUDE_CONFIG_DIR`
     // lock — never the developer's real `~/.config/claude-as/default`.
 
-    use std::sync::Mutex;
-
-    static HOME_ENV_LOCK: Mutex<()> = Mutex::new(());
-
-    /// Run `f` with `HOME` pointed at a fresh, empty temp dir (dropped at the
-    /// end), restoring the previous value afterward. Guarded so parallel
-    /// `cargo test` threads never race on the process-global `HOME` var (see
-    /// `crate::testenv` for why this per-module-lock pattern exists at all).
+    /// Run `f` with the resolved home dir pointed at a fresh, empty temp dir
+    /// (dropped at the end), restoring the previous override afterward.
+    /// Overrides `crate::paths::home_dir()`'s thread-local test hook rather
+    /// than the `HOME` env var — on Windows `dirs::home_dir()` ignores `HOME`
+    /// entirely, so an env-var fixture would give no isolation there. No lock
+    /// needed: the override is thread-local, and each test runs on its own
+    /// thread (see `crate::testenv`).
     fn with_isolated_home<R>(f: impl FnOnce(&std::path::Path) -> R) -> R {
-        let _guard = HOME_ENV_LOCK.lock().unwrap();
         let tmp = tempfile::tempdir().unwrap();
-        let prev = std::env::var_os("HOME");
-        std::env::set_var("HOME", tmp.path());
+        crate::testenv::set_test_home(Some(tmp.path().to_path_buf()));
         let result = f(tmp.path());
-        match prev {
-            Some(v) => std::env::set_var("HOME", v),
-            None => std::env::remove_var("HOME"),
-        }
+        crate::testenv::set_test_home(None);
         result
     }
 

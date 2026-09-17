@@ -358,21 +358,17 @@ mod tests {
 
     // ── print_default_dir_to: golden bytes (test-05) ──────────────────────────
 
-    /// Run `f` with `HOME` pointed at a fresh temp dir, so
+    /// Run `f` with the resolved home dir pointed at a fresh temp dir, so
     /// `ProfileMap::default_dir()`'s state-file read never touches the
-    /// developer's real `~/.config/claude-as/default`. Module-local lock,
-    /// mirroring the pattern documented in `crate::testenv`.
+    /// developer's real `~/.config/claude-as/default`. Overrides
+    /// `crate::paths::home_dir()`'s thread-local test hook directly rather
+    /// than setting `HOME` — on Windows `dirs::home_dir()` ignores `HOME`
+    /// entirely, so an env-var fixture gives no isolation there.
     fn with_isolated_home<R>(f: impl FnOnce(&std::path::Path) -> R) -> R {
-        static HOME_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        let _guard = HOME_ENV_LOCK.lock().unwrap();
         let tmp = tempfile::tempdir().unwrap();
-        let prev = std::env::var_os("HOME");
-        std::env::set_var("HOME", tmp.path());
+        crate::testenv::set_test_home(Some(tmp.path().to_path_buf()));
         let result = f(tmp.path());
-        match prev {
-            Some(v) => std::env::set_var("HOME", v),
-            None => std::env::remove_var("HOME"),
-        }
+        crate::testenv::set_test_home(None);
         result
     }
 

@@ -261,7 +261,6 @@ mod tests {
     /// test even though `ENV_LOCK`'s guard is dropped right along with it.
     struct EnvFixture {
         home: tempfile::TempDir,
-        prev_home: Option<std::ffi::OsString>,
         prev_usage_cmd: Option<std::ffi::OsString>,
         prev_launch_bin: Option<std::ffi::OsString>,
         fake_proc: Option<Child>,
@@ -273,10 +272,7 @@ mod tests {
                 let _ = child.kill();
                 let _ = child.wait();
             }
-            match self.prev_home.take() {
-                Some(v) => std::env::set_var("HOME", v),
-                None => std::env::remove_var("HOME"),
-            }
+            crate::testenv::set_test_home(None);
             match self.prev_usage_cmd.take() {
                 Some(v) => std::env::set_var("CSM_USAGE_CMD", v),
                 None => std::env::remove_var("CSM_USAGE_CMD"),
@@ -288,27 +284,28 @@ mod tests {
         }
     }
 
-    /// Point `HOME` (and so `paths::smart_dir()`) at a fresh temp dir, and
-    /// wire `CSM_USAGE_CMD` to hand `usage::fetch()` the given `UsageData`
-    /// verbatim (via `cat <tmpfile>`) instead of touching any real profile.
-    /// Caller must hold `ENV_LOCK` for the fixture's whole lifetime.
+    /// Point the resolved home dir (and so `paths::smart_dir()`) at a fresh
+    /// temp dir, and wire `CSM_USAGE_CMD` to hand `usage::fetch()` the given
+    /// `UsageData` verbatim (via `cat <tmpfile>`) instead of touching any real
+    /// profile. Caller must hold `ENV_LOCK` for the fixture's whole lifetime
+    /// (still needed for `CSM_USAGE_CMD`/`CLAUDE_SMART_CLAUDE_BIN`, which are
+    /// real process-global env vars; the home-dir override itself is
+    /// thread-local and needs no lock).
     fn isolated_env(usage: &UsageData) -> EnvFixture {
         let home = tempfile::tempdir().expect("tempdir");
         let usage_json = serde_json::to_string(usage).expect("serialize UsageData");
         let usage_file = home.path().join("usage-cmd.json");
         std::fs::write(&usage_file, &usage_json).expect("write usage fixture");
 
-        let prev_home = std::env::var_os("HOME");
         let prev_usage_cmd = std::env::var_os("CSM_USAGE_CMD");
         let prev_launch_bin = std::env::var_os("CLAUDE_SMART_CLAUDE_BIN");
 
-        std::env::set_var("HOME", home.path());
+        crate::testenv::set_test_home(Some(home.path().to_path_buf()));
         std::env::set_var("CSM_USAGE_CMD", format!("cat {}", usage_file.display()));
         std::env::remove_var("CLAUDE_SMART_CLAUDE_BIN");
 
         EnvFixture {
             home,
-            prev_home,
             prev_usage_cmd,
             prev_launch_bin,
             fake_proc: None,
@@ -560,15 +557,11 @@ mod tests {
         // exit 0 silently, with no smart_dir I/O at all.
         let _guard = ENV_LOCK.lock().unwrap();
         let home = tempfile::tempdir().unwrap();
-        let prev_home = std::env::var_os("HOME");
-        std::env::set_var("HOME", home.path());
+        crate::testenv::set_test_home(Some(home.path().to_path_buf()));
 
         let result = run(Path::new("/Users/example/.claude.home"));
 
-        match prev_home {
-            Some(v) => std::env::set_var("HOME", v),
-            None => std::env::remove_var("HOME"),
-        }
+        crate::testenv::set_test_home(None);
 
         assert!(
             result.is_ok(),

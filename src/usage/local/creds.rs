@@ -206,7 +206,7 @@ fn lookup_keychain(dir: &Path, now: DateTime<Utc>) -> Result<OauthToken, CredErr
 
 #[cfg(target_os = "macos")]
 fn is_default_claude_dir(dir: &Path) -> bool {
-    match dirs::home_dir() {
+    match crate::paths::home_dir() {
         Some(home) => home.join(".claude") == dir,
         None => false,
     }

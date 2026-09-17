@@ -5,10 +5,29 @@
 //!
 //! `$SMART_DIR` = `$HOME/.claude.shared/smart` (POSIX) or
 //!               `%USERPROFILE%\.claude.shared\smart` (Windows).
-//! `dirs::home_dir()` resolves `$HOME` / `%USERPROFILE%` cross-platform.
+//! [`home_dir`] resolves the current user's home directory cross-platform.
 
 use std::io;
 use std::path::{Path, PathBuf};
+
+/// The one home-dir resolver every path constructor in this module (and
+/// `usage::local::creds`) uses.
+///
+/// Production body is exactly `dirs::home_dir()`. Under test, `dirs::home_dir()`
+/// itself is not fixture-friendly on Windows: it calls
+/// `SHGetKnownFolderPath(FOLDERID_Profile)` unconditionally and never reads
+/// `HOME`/`USERPROFILE`, so a fixture that sets those env vars gets zero
+/// isolation there. Tests instead override this function's return value
+/// directly via a thread-local set with [`crate::testenv::set_test_home`].
+#[cfg(not(test))]
+pub(crate) fn home_dir() -> Option<PathBuf> {
+    dirs::home_dir()
+}
+
+#[cfg(test)]
+pub(crate) fn home_dir() -> Option<PathBuf> {
+    crate::testenv::test_home().or_else(dirs::home_dir)
+}
 
 /// Return the smart state directory, creating it if it does not yet exist.
 ///
@@ -23,7 +42,7 @@ pub fn smart_dir() -> io::Result<PathBuf> {
 
 /// Return the smart state directory path without creating it.
 pub fn smart_dir_no_create() -> PathBuf {
-    dirs::home_dir()
+    home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join(".claude.shared")
         .join("smart")
@@ -35,7 +54,7 @@ pub fn smart_dir_no_create() -> PathBuf {
 /// only the path-string construction: `ProfileMap` stays the sole registry
 /// *authority* over which profiles exist and where they actually live.
 pub fn synthesize_profile_dir(name: &str) -> PathBuf {
-    dirs::home_dir()
+    home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join(format!(".claude.{name}"))
 }
@@ -44,7 +63,7 @@ pub fn synthesize_profile_dir(name: &str) -> PathBuf {
 /// shell shims. `profiles_json()` and `cas::default_state_file()` each join
 /// their own leaf onto this.
 pub fn claude_as_dir() -> PathBuf {
-    dirs::home_dir()
+    home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join(".config")
         .join("claude-as")
@@ -121,7 +140,7 @@ pub fn profiles_json() -> PathBuf {
 /// which is the profile-switch contract shared with the `cas` shell shims;
 /// this is csm's own runtime config, not part of that contract.
 pub fn config_json() -> PathBuf {
-    dirs::home_dir()
+    home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join(".config")
         .join("claude-smart")
@@ -175,7 +194,7 @@ pub fn scan_index_for(project_dir: &Path) -> PathBuf {
 /// plugin dir causes on switch) and one session history regardless of which
 /// profile is active.
 pub fn shared_base_dir() -> PathBuf {
-    dirs::home_dir()
+    home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join(".claude.shared")
 }
@@ -188,7 +207,7 @@ pub fn shared_base_dir() -> PathBuf {
 /// OS-side (mirrors `provision`'s platform split).
 #[cfg_attr(not(unix), allow(dead_code))]
 pub fn home_claude_dir() -> PathBuf {
-    dirs::home_dir()
+    home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join(".claude")
 }
