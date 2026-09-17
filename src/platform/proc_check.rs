@@ -124,8 +124,33 @@ impl ProcCheck for SysinfoProcCheck {
     }
 }
 
+/// Poll `is_live_claude_or_node` until it returns true or `timeout` elapses,
+/// returning false in that case. On Linux with glibc, `Command::spawn`
+/// resumes the parent as soon as the child has *started* its `execve`,
+/// before the kernel has published the child's `comm` or
+/// `/proc/<pid>/cmdline` — so a freshly spawned pid can briefly fail every
+/// identity check even though it is about to become a live `claude` process.
+/// Production is unaffected: the check there runs against sessions that have
+/// been alive for seconds to hours, never against a pid spawned microseconds
+/// earlier.
+#[cfg(test)]
+pub(crate) fn wait_until_live_claude_or_node(pid: u32, timeout: std::time::Duration) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if SysinfoProcCheck::is_live_claude_or_node(pid) {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    use super::wait_until_live_claude_or_node;
     use super::{bare_basename, identity_matches, is_claude_or_node_name, is_name_for};
     use std::ffi::OsString;
 
@@ -311,7 +336,9 @@ mod tests {
     /// Regression test for the kill-gate: a process launched as `claude` through
     /// a symlink (the native installer's layout) must be recognized. The refresh
     /// used to leave `exe` unset and nothing else was checked, so this was
-    /// always `false` and no limit switch could stop a session.
+    /// always `false` and no limit switch could stop a session. The lookup is
+    /// polled via `wait_until_live_claude_or_node` rather than checked once,
+    /// to ride out the exec window described on that helper's doc comment.
     #[cfg(unix)]
     #[test]
     fn live_symlinked_claude_is_recognized() {
@@ -322,7 +349,7 @@ mod tests {
         std::os::unix::fs::symlink("/bin/sleep", &link).unwrap();
         let mut child = std::process::Command::new(&link).arg("30").spawn().unwrap();
         let pid = child.id();
-        let live = SysinfoProcCheck::is_live_claude_or_node(pid);
+        let live = wait_until_live_claude_or_node(pid, std::time::Duration::from_secs(5));
         let _ = child.kill();
         let _ = child.wait();
         assert!(live, "a live process launched as `claude` must pass");

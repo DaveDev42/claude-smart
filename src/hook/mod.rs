@@ -408,6 +408,15 @@ mod tests {
             .spawn()
             .expect("spawn fake managed process");
         let pid = child.pid();
+        // Ride out the post-spawn exec window on Linux; see
+        // `proc_check::wait_until_live_claude_or_node`'s doc comment.
+        assert!(
+            crate::platform::proc_check::wait_until_live_claude_or_node(
+                pid,
+                std::time::Duration::from_secs(5)
+            ),
+            "fake managed process must become recognizable as live"
+        );
         fixture.fake_proc = Some(child);
 
         let smart_dir = fixture.home.path().join(".claude.shared").join("smart");
