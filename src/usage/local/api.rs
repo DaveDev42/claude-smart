@@ -589,16 +589,16 @@ mod tests {
 
     #[test]
     fn resolve_base_defaults_and_trims_trailing_slash() {
-        let saved = std::env::var("CSM_USAGE_API_BASE").ok();
-        std::env::remove_var("CSM_USAGE_API_BASE");
-        assert_eq!(resolve_base(), DEFAULT_BASE);
+        crate::testenv::with_env_var("CSM_USAGE_API_BASE", None, || {
+            assert_eq!(resolve_base(), DEFAULT_BASE);
+        });
 
-        std::env::set_var("CSM_USAGE_API_BASE", "https://custom.example/");
-        assert_eq!(resolve_base(), "https://custom.example");
-
-        match saved {
-            Some(v) => std::env::set_var("CSM_USAGE_API_BASE", v),
-            None => std::env::remove_var("CSM_USAGE_API_BASE"),
-        }
+        crate::testenv::with_env_var(
+            "CSM_USAGE_API_BASE",
+            Some("https://custom.example/"),
+            || {
+                assert_eq!(resolve_base(), "https://custom.example");
+            },
+        );
     }
 }

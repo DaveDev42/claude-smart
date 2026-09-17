@@ -42,29 +42,9 @@ pub(crate) fn i64_or(name: &str, default: i64) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
 
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
-
-    fn with_vars<F: FnOnce()>(vars: &[(&str, Option<&str>)], f: F) {
-        let _guard = ENV_LOCK.lock().unwrap();
-        let saved: Vec<(&str, Option<String>)> = vars
-            .iter()
-            .map(|(name, _)| (*name, std::env::var(name).ok()))
-            .collect();
-        for (name, value) in vars {
-            match value {
-                Some(v) => std::env::set_var(name, v),
-                None => std::env::remove_var(name),
-            }
-        }
-        f();
-        for (name, saved_value) in saved {
-            match saved_value {
-                Some(v) => std::env::set_var(name, v),
-                None => std::env::remove_var(name),
-            }
-        }
+    fn with_vars<T>(vars: &[(&'static str, Option<&str>)], f: impl FnOnce() -> T) -> T {
+        crate::testenv::with_env_vars(vars, f)
     }
 
     #[test]

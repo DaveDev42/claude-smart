@@ -366,10 +366,7 @@ mod tests {
     /// entirely, so an env-var fixture gives no isolation there.
     fn with_isolated_home<R>(f: impl FnOnce(&std::path::Path) -> R) -> R {
         let tmp = tempfile::tempdir().unwrap();
-        crate::testenv::set_test_home(Some(tmp.path().to_path_buf()));
-        let result = f(tmp.path());
-        crate::testenv::set_test_home(None);
-        result
+        crate::testenv::with_test_home(tmp.path(), || f(tmp.path()))
     }
 
     #[test]

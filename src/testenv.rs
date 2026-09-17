@@ -1,28 +1,101 @@
-//! Shared process-global env-var locks for tests, across module boundaries.
+//! One seam for every test's env-var mutation, across module boundaries.
 //!
 //! `std::env::set_var`/`remove_var` mutate the whole process's environment,
 //! and `cargo test` runs every module's `#[cfg(test)]` tests in parallel
 //! threads of that one process. A module-local `static ENV_LOCK: Mutex<()>`
-//! (the pattern used throughout this crate — `statusline.rs`,
-//! `usage/transport.rs`, `hook/detect.rs`) only serializes tests *within*
-//! that module; it does nothing to protect against a DIFFERENT module's test
-//! mutating the same variable concurrently.
+//! only serializes tests *within* that module; it does nothing to protect
+//! against a DIFFERENT module's test mutating the same variable
+//! concurrently — `CLAUDE_CONFIG_DIR` used to be mutated by tests in three
+//! modules (`statusline`, `usage::local`, `cas::eval`) through three
+//! independent locks, which left a real interleaving possible: one module's
+//! test sets `CLAUDE_CONFIG_DIR` to some path between another module's
+//! `remove_var` and its call into config-dir-reading code, silently
+//! resolving a directory neither test intended.
 //!
-//! `CLAUDE_CONFIG_DIR` is mutated by tests in two modules —
-//! `crate::statusline` and `crate::usage::local` (`record_statusline_payload`'s
-//! own tests) — so both must serialize through the *same* lock, not two
-//! independent ones. Without this, a real interleaving is possible: one
-//! module's test sets `CLAUDE_CONFIG_DIR` to some path between the other
-//! module's `remove_var` and its call into config-dir-reading code, and the
-//! latter test silently resolves a directory neither test intended — in the
-//! `record_statusline_payload` case, this could land a write in the
-//! developer's real `~/.claude.shared/smart/usage/<profile>.json`.
+//! `lock_for(name)` fixes that by keying the guard on the variable name
+//! itself, in one process-wide registry, so every test anywhere in the crate
+//! that touches the same variable serializes through the same lock while
+//! tests touching different variables still run in parallel.
 //!
-//! Every test (in any module) that sets/removes `CLAUDE_CONFIG_DIR` must hold
-//! this lock's guard for the full set→act→restore sequence.
+//! `set_var`/`remove_var` here are the crate's only two call sites for
+//! `std::env::set_var`/`remove_var` — every fixture goes through
+//! `with_env_var`/`with_env_vars`, which call these two functions and
+//! nothing else touches the raw `std::env` mutators. That makes a future
+//! edition bump (where those `std::env` functions become `unsafe`) a
+//! two-function change instead of one scattered across every test module.
+//!
+//! Every lock is acquired with `.unwrap_or_else(|e| e.into_inner())` so one
+//! panicking test never poisons the lock for every other test that touches
+//! the same variable.
 
 #[cfg(test)]
-pub(crate) static CLAUDE_CONFIG_DIR_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+fn registry(
+) -> &'static std::sync::Mutex<std::collections::HashMap<&'static str, &'static std::sync::Mutex<()>>>
+{
+    static REGISTRY: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<&'static str, &'static std::sync::Mutex<()>>>,
+    > = std::sync::OnceLock::new();
+    REGISTRY.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// The per-name lock guard for `name`. Every test (in any module) that
+/// sets/removes the same env var must hold this guard for the full
+/// set→act→restore sequence.
+#[cfg(test)]
+pub(crate) fn lock_for(name: &'static str) -> std::sync::MutexGuard<'static, ()> {
+    let mut map = registry().lock().unwrap_or_else(|e| e.into_inner());
+    let mutex: &'static std::sync::Mutex<()> = map
+        .entry(name)
+        .or_insert_with(|| Box::leak(Box::new(std::sync::Mutex::new(()))));
+    drop(map);
+    mutex.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// The crate's one `std::env::set_var` call site for tests.
+#[cfg(test)]
+pub(crate) fn set_var(name: &str, value: &str) {
+    std::env::set_var(name, value);
+}
+
+/// The crate's one `std::env::remove_var` call site for tests.
+#[cfg(test)]
+pub(crate) fn remove_var(name: &str) {
+    std::env::remove_var(name);
+}
+
+/// Run `f` with `name` set to `value` (or removed, for `None`), holding
+/// `lock_for(name)` for the whole set→act→restore sequence and restoring the
+/// prior value afterward even if `f` panics.
+#[cfg(test)]
+pub(crate) fn with_env_var<T>(name: &'static str, value: Option<&str>, f: impl FnOnce() -> T) -> T {
+    let _guard = lock_for(name);
+    let prior = std::env::var(name).ok();
+    match value {
+        Some(v) => set_var(name, v),
+        None => remove_var(name),
+    }
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+    match &prior {
+        Some(v) => set_var(name, v),
+        None => remove_var(name),
+    }
+    match result {
+        Ok(v) => v,
+        Err(e) => std::panic::resume_unwind(e),
+    }
+}
+
+/// Run `f` with every `(name, value)` pair in `pairs` set (or removed, for
+/// `None`), each held under its own `lock_for(name)` for the duration —
+/// unrelated variables' locks stay independent so tests on different
+/// variables still run in parallel.
+#[cfg(test)]
+pub(crate) fn with_env_vars<T>(pairs: &[(&'static str, Option<&str>)], f: impl FnOnce() -> T) -> T {
+    match pairs.split_first() {
+        None => f(),
+        Some((&(name, value), rest)) => with_env_var(name, value, || with_env_vars(rest, f)),
+    }
+}
 
 // `HOME`/`USERPROFILE` fixture override — thread-local, not process-global.
 //
@@ -55,4 +128,20 @@ pub(crate) fn set_test_home(home: Option<std::path::PathBuf>) {
 #[cfg(test)]
 pub(crate) fn test_home() -> Option<std::path::PathBuf> {
     TEST_HOME.with(|h| h.borrow().clone())
+}
+
+/// Run `f` with this thread's home-dir override pointed at `tmp`, restoring
+/// the prior override afterward even if `f` panics. Thread-local, so this
+/// needs no lock — callers just fold it into the same closure-based fixture
+/// pattern as `with_env_var`.
+#[cfg(test)]
+pub(crate) fn with_test_home<T>(tmp: &std::path::Path, f: impl FnOnce() -> T) -> T {
+    let prior = test_home();
+    set_test_home(Some(tmp.to_path_buf()));
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+    set_test_home(prior);
+    match result {
+        Ok(v) => v,
+        Err(e) => std::panic::resume_unwind(e),
+    }
 }

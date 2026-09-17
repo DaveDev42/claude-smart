@@ -388,45 +388,39 @@ pub fn is_personal_machine() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
 
-    // Serialise all tests that touch CLAUDE_CONFIG_DIR (process-global env
-    // var) — shared across module boundaries with `usage::local`'s own
+    // Env-var mutations below all go through `crate::testenv`'s per-name
+    // locks — shared across module boundaries with `usage::local`'s own
     // CLAUDE_CONFIG_DIR-mutating tests, since a module-local lock cannot
     // protect against a different module's test interleaving on the same
     // process-global variable. See `crate::testenv` for why.
-    use crate::testenv::CLAUDE_CONFIG_DIR_ENV_LOCK as ENV_LOCK;
 
     /// Set `CLAUDE_CONFIG_DIR`, call `current_profile()`, then restore original.
     fn profile_with_dir(dir: &str) -> String {
-        let _guard = ENV_LOCK.lock().unwrap();
-        std::env::set_var("CLAUDE_CONFIG_DIR", dir);
-        let result = current_profile().expect("current_profile() must not fail");
-        std::env::remove_var("CLAUDE_CONFIG_DIR");
-        result
+        crate::testenv::with_env_var("CLAUDE_CONFIG_DIR", Some(dir), || {
+            current_profile().expect("current_profile() must not fail")
+        })
     }
 
     /// Call `current_profile()` with `CLAUDE_CONFIG_DIR` absent.
     fn profile_with_no_var() -> String {
-        let _guard = ENV_LOCK.lock().unwrap();
-        std::env::remove_var("CLAUDE_CONFIG_DIR");
-        current_profile().expect("current_profile() must not fail when var is absent")
+        crate::testenv::with_env_var("CLAUDE_CONFIG_DIR", None, || {
+            current_profile().expect("current_profile() must not fail when var is absent")
+        })
     }
 
     /// Call `format_segment` with a specific `CLAUDE_CONFIG_DIR` (personal machine).
     fn segment_personal(dir: &str) -> String {
-        let _guard = ENV_LOCK.lock().unwrap();
-        std::env::set_var("CLAUDE_CONFIG_DIR", dir);
-        let result = format_segment("Laptop".to_owned(), true);
-        std::env::remove_var("CLAUDE_CONFIG_DIR");
-        result
+        crate::testenv::with_env_var("CLAUDE_CONFIG_DIR", Some(dir), || {
+            format_segment("Laptop".to_owned(), true)
+        })
     }
 
     /// Call `format_segment` without `CLAUDE_CONFIG_DIR` (personal machine, no dir set).
     fn segment_personal_no_dir() -> String {
-        let _guard = ENV_LOCK.lock().unwrap();
-        std::env::remove_var("CLAUDE_CONFIG_DIR");
-        format_segment("Laptop".to_owned(), true)
+        crate::testenv::with_env_var("CLAUDE_CONFIG_DIR", None, || {
+            format_segment("Laptop".to_owned(), true)
+        })
     }
 
     // ── strip_claude_prefix ───────────────────────────────────────────────────
@@ -603,37 +597,44 @@ mod tests {
     #[test]
     fn segment_toss_machine_ignores_dir() {
         // toss / non-personal machine: profile prefix must NOT appear
-        let _guard = ENV_LOCK.lock().unwrap();
-        std::env::set_var("CLAUDE_CONFIG_DIR", "/some/.claude.home");
-        let seg = format_segment("Laptop".to_owned(), false /* personal=false */);
-        std::env::remove_var("CLAUDE_CONFIG_DIR");
-        assert_eq!(seg, "Laptop");
+        crate::testenv::with_env_var("CLAUDE_CONFIG_DIR", Some("/some/.claude.home"), || {
+            let seg = format_segment("Laptop".to_owned(), false /* personal=false */);
+            assert_eq!(seg, "Laptop");
+        });
     }
 
     #[test]
     fn segment_workstation_personal() {
         // Acme- prefix stripped + work profile → "work@Workstation"
-        let _guard = ENV_LOCK.lock().unwrap();
-        std::env::set_var("CLAUDE_CONFIG_DIR", "/Users/example/.claude.work");
-        let host = apply_host_replace("Acme-Workstation".to_owned(), Some("Acme-/"));
-        let seg = format_segment(host, true);
-        std::env::remove_var("CLAUDE_CONFIG_DIR");
-        assert_eq!(seg, "work@Workstation");
+        crate::testenv::with_env_var(
+            "CLAUDE_CONFIG_DIR",
+            Some("/Users/example/.claude.work"),
+            || {
+                let host = apply_host_replace("Acme-Workstation".to_owned(), Some("Acme-/"));
+                let seg = format_segment(host, true);
+                assert_eq!(seg, "work@Workstation");
+            },
+        );
     }
 
     #[test]
     fn segment_windows_personal() {
         // ACME-WINDOWS (NetBIOS uppercased) + personal  →  "home@WINDOWS"
-        let _guard = ENV_LOCK.lock().unwrap();
-        std::env::set_var("CLAUDE_CONFIG_DIR", r"C:\Users\example\.claude.home");
-        let host = apply_host_replace("ACME-WINDOWS".to_owned(), Some("Acme-/"));
-        // On POSIX, Path::file_name treats the Windows-style path as one token;
-        // the basename is the whole string.  We only assert the Acme- strip here.
-        let seg = format_segment(host, true);
-        std::env::remove_var("CLAUDE_CONFIG_DIR");
-        // On POSIX the Windows-path basename won't match .claude.* after
-        // file_name(), so the host-only branch fires — just verify no panic.
-        assert!(!seg.is_empty());
+        crate::testenv::with_env_var(
+            "CLAUDE_CONFIG_DIR",
+            Some(r"C:\Users\example\.claude.home"),
+            || {
+                let host = apply_host_replace("ACME-WINDOWS".to_owned(), Some("Acme-/"));
+                // On POSIX, Path::file_name treats the Windows-style path as
+                // one token; the basename is the whole string. We only
+                // assert the Acme- strip here.
+                let seg = format_segment(host, true);
+                // On POSIX the Windows-path basename won't match .claude.*
+                // after file_name(), so the host-only branch fires — just
+                // verify no panic.
+                assert!(!seg.is_empty());
+            },
+        );
     }
 
     // ── short_hostname ────────────────────────────────────────────────────────
@@ -658,32 +659,32 @@ mod tests {
         // short_hostname() honors CSM_HOST_REPLACE: with a rule matching the
         // raw hostname's first label, that prefix is rewritten away. The binary
         // hardcodes no convention — the rule comes entirely from the env.
-        let _guard = ENV_LOCK.lock().unwrap();
         let raw = hostname().unwrap();
         // Build a rule that strips the raw hostname's leading char as a prefix,
         // so the assertion holds on any host without depending on a real name.
         if let Some(first) = raw.chars().next() {
-            std::env::set_var(HOST_REPLACE_ENV, format!("{first}/"));
-            let h = short_hostname().unwrap();
-            std::env::remove_var(HOST_REPLACE_ENV);
-            // The first occurrence of `first` is removed → result is shorter or
-            // equal, and never starts with that exact char at index 0 unless it
-            // repeated. Just assert the rewrite ran (length strictly decreased).
-            assert!(
-                h.len() < raw.len(),
-                "rule should have removed one char: {raw} → {h}"
-            );
+            crate::testenv::with_env_var(HOST_REPLACE_ENV, Some(&format!("{first}/")), || {
+                let h = short_hostname().unwrap();
+                // The first occurrence of `first` is removed → result is
+                // shorter or equal, and never starts with that exact char
+                // at index 0 unless it repeated. Just assert the rewrite
+                // ran (length strictly decreased).
+                assert!(
+                    h.len() < raw.len(),
+                    "rule should have removed one char: {raw} → {h}"
+                );
+            });
         }
     }
 
     #[test]
     fn short_hostname_no_rule_is_raw() {
         // With no CSM_HOST_REPLACE set, short_hostname() == raw short hostname.
-        let _guard = ENV_LOCK.lock().unwrap();
-        std::env::remove_var(HOST_REPLACE_ENV);
-        let h = short_hostname().unwrap();
-        let raw = hostname().unwrap();
-        assert_eq!(h, raw, "no rule → hostname unchanged");
+        crate::testenv::with_env_var(HOST_REPLACE_ENV, None, || {
+            let h = short_hostname().unwrap();
+            let raw = hostname().unwrap();
+            assert_eq!(h, raw, "no rule → hostname unchanged");
+        });
     }
 
     // ── hostname (raw) ────────────────────────────────────────────────────────
@@ -712,15 +713,14 @@ mod tests {
 
     #[test]
     fn run_does_not_panic_or_error() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        std::env::set_var("CLAUDE_CONFIG_DIR", "/tmp/.claude.test");
-        let result = run(&[]);
-        std::env::remove_var("CLAUDE_CONFIG_DIR");
-        assert!(
-            result.is_ok(),
-            "run() returned Err: {:?}",
-            result.unwrap_err()
-        );
+        crate::testenv::with_env_var("CLAUDE_CONFIG_DIR", Some("/tmp/.claude.test"), || {
+            let result = run(&[]);
+            assert!(
+                result.is_ok(),
+                "run() returned Err: {:?}",
+                result.unwrap_err()
+            );
+        });
     }
 
     #[test]
@@ -733,20 +733,19 @@ mod tests {
 
     #[test]
     fn personal_gate_env_explicit_false() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        std::env::set_var("IS_PERSONAL_MACHINE", "0");
-        assert!(!is_personal_machine(), "IS_PERSONAL_MACHINE=0 → false");
-        std::env::set_var("IS_PERSONAL_MACHINE", "false");
-        assert!(!is_personal_machine(), "IS_PERSONAL_MACHINE=false → false");
-        std::env::remove_var("IS_PERSONAL_MACHINE");
+        crate::testenv::with_env_var("IS_PERSONAL_MACHINE", Some("0"), || {
+            assert!(!is_personal_machine(), "IS_PERSONAL_MACHINE=0 → false");
+        });
+        crate::testenv::with_env_var("IS_PERSONAL_MACHINE", Some("false"), || {
+            assert!(!is_personal_machine(), "IS_PERSONAL_MACHINE=false → false");
+        });
     }
 
     #[test]
     fn personal_gate_env_explicit_true() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        std::env::set_var("IS_PERSONAL_MACHINE", "1");
-        assert!(is_personal_machine(), "IS_PERSONAL_MACHINE=1 → true");
-        std::env::remove_var("IS_PERSONAL_MACHINE");
+        crate::testenv::with_env_var("IS_PERSONAL_MACHINE", Some("1"), || {
+            assert!(is_personal_machine(), "IS_PERSONAL_MACHINE=1 → true");
+        });
     }
 
     #[test]
@@ -754,39 +753,35 @@ mod tests {
         // Unset → delegate to the .claude. match (returns true; the prefix match
         // in format_segment is the real gate). This is the fix for the
         // profiles.json-absent false-negative.
-        let _guard = ENV_LOCK.lock().unwrap();
-        std::env::remove_var("IS_PERSONAL_MACHINE");
-        assert!(is_personal_machine());
+        crate::testenv::with_env_var("IS_PERSONAL_MACHINE", None, || {
+            assert!(is_personal_machine());
+        });
     }
 
     // ── capture_disabled_by_env (CSM_STATUSLINE_NO_CAPTURE gate) ─────────────
 
-    static CAPTURE_ENV_LOCK: Mutex<()> = Mutex::new(());
-
     #[test]
     fn capture_disabled_by_env_unset_is_false() {
-        let _guard = CAPTURE_ENV_LOCK.lock().unwrap();
-        std::env::remove_var("CSM_STATUSLINE_NO_CAPTURE");
-        assert!(!capture_disabled_by_env());
+        crate::testenv::with_env_var("CSM_STATUSLINE_NO_CAPTURE", None, || {
+            assert!(!capture_disabled_by_env());
+        });
     }
 
     #[test]
     fn capture_disabled_by_env_recognizes_1_and_true() {
-        let _guard = CAPTURE_ENV_LOCK.lock().unwrap();
         for v in ["1", "true", "True", "TRUE"] {
-            std::env::set_var("CSM_STATUSLINE_NO_CAPTURE", v);
-            assert!(capture_disabled_by_env(), "{v} should disable capture");
+            crate::testenv::with_env_var("CSM_STATUSLINE_NO_CAPTURE", Some(v), || {
+                assert!(capture_disabled_by_env(), "{v} should disable capture");
+            });
         }
-        std::env::remove_var("CSM_STATUSLINE_NO_CAPTURE");
     }
 
     #[test]
     fn capture_disabled_by_env_rejects_other_values() {
-        let _guard = CAPTURE_ENV_LOCK.lock().unwrap();
         for v in ["0", "false", "yes", ""] {
-            std::env::set_var("CSM_STATUSLINE_NO_CAPTURE", v);
-            assert!(!capture_disabled_by_env(), "{v} should not disable capture");
+            crate::testenv::with_env_var("CSM_STATUSLINE_NO_CAPTURE", Some(v), || {
+                assert!(!capture_disabled_by_env(), "{v} should not disable capture");
+            });
         }
-        std::env::remove_var("CSM_STATUSLINE_NO_CAPTURE");
     }
 }

@@ -706,15 +706,10 @@ mod tests {
     use super::*;
     use chrono::TimeZone;
 
-    /// `CSM_OAUTH_REFRESH` and `CSM_OAUTH_TOKEN_URL` are process-global and
-    /// read nowhere outside this module, so a module-local lock is enough
-    /// (the crate-wide `testenv` lock exists only for variables two modules
-    /// share). Every test that sets either one holds this for the whole
-    /// set→act→restore sequence.
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     /// Sets `CSM_OAUTH_TOKEN_URL` for as long as it is alive, then restores
-    /// whatever was there before.
+    /// whatever was there before. Caller must hold
+    /// `crate::testenv::lock_for("CSM_OAUTH_TOKEN_URL")` for its whole
+    /// lifetime.
     struct TokenUrlEnv {
         saved: Option<String>,
     }
@@ -722,7 +717,7 @@ mod tests {
     impl TokenUrlEnv {
         fn set(url: &str) -> Self {
             let saved = std::env::var("CSM_OAUTH_TOKEN_URL").ok();
-            std::env::set_var("CSM_OAUTH_TOKEN_URL", url);
+            crate::testenv::set_var("CSM_OAUTH_TOKEN_URL", url);
             Self { saved }
         }
     }
@@ -730,8 +725,8 @@ mod tests {
     impl Drop for TokenUrlEnv {
         fn drop(&mut self) {
             match self.saved.take() {
-                Some(v) => std::env::set_var("CSM_OAUTH_TOKEN_URL", v),
-                None => std::env::remove_var("CSM_OAUTH_TOKEN_URL"),
+                Some(v) => crate::testenv::set_var("CSM_OAUTH_TOKEN_URL", &v),
+                None => crate::testenv::remove_var("CSM_OAUTH_TOKEN_URL"),
             }
         }
     }
@@ -1438,8 +1433,6 @@ mod tests {
 
     #[test]
     fn opt_in_env_accepts_only_affirmative_values() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let saved = std::env::var("CSM_OAUTH_REFRESH").ok();
         for (value, expected) in [
             ("1", true),
             ("true", true),
@@ -1449,47 +1442,42 @@ mod tests {
             ("", false),
             ("maybe", false),
         ] {
-            std::env::set_var("CSM_OAUTH_REFRESH", value);
-            assert_eq!(opt_in_from_env(), expected, "value {value:?}");
+            crate::testenv::with_env_var("CSM_OAUTH_REFRESH", Some(value), || {
+                assert_eq!(opt_in_from_env(), expected, "value {value:?}");
+            });
         }
-        std::env::remove_var("CSM_OAUTH_REFRESH");
-        assert!(!opt_in_from_env());
-        if let Some(v) = saved {
-            std::env::set_var("CSM_OAUTH_REFRESH", v);
-        }
+        crate::testenv::with_env_var("CSM_OAUTH_REFRESH", None, || {
+            assert!(!opt_in_from_env());
+        });
     }
 
     // ── (g) the token-URL override and the full assembly around it ──────────
 
     #[test]
     fn resolve_token_url_defaults_and_honours_the_override() {
-        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let saved = std::env::var("CSM_OAUTH_TOKEN_URL").ok();
+        crate::testenv::with_env_var("CSM_OAUTH_TOKEN_URL", None, || {
+            assert_eq!(resolve_token_url(), DEFAULT_TOKEN_URL);
+        });
 
-        std::env::remove_var("CSM_OAUTH_TOKEN_URL");
-        assert_eq!(resolve_token_url(), DEFAULT_TOKEN_URL);
-
-        std::env::set_var(
+        crate::testenv::with_env_var(
             "CSM_OAUTH_TOKEN_URL",
-            "  http://127.0.0.1:9/v1/oauth/token  ",
-        );
-        assert_eq!(
-            resolve_token_url(),
-            "http://127.0.0.1:9/v1/oauth/token",
-            "surrounding whitespace is trimmed"
-        );
-
-        std::env::set_var("CSM_OAUTH_TOKEN_URL", "   ");
-        assert_eq!(
-            resolve_token_url(),
-            DEFAULT_TOKEN_URL,
-            "a blank override is no override"
+            Some("  http://127.0.0.1:9/v1/oauth/token  "),
+            || {
+                assert_eq!(
+                    resolve_token_url(),
+                    "http://127.0.0.1:9/v1/oauth/token",
+                    "surrounding whitespace is trimmed"
+                );
+            },
         );
 
-        match saved {
-            Some(v) => std::env::set_var("CSM_OAUTH_TOKEN_URL", v),
-            None => std::env::remove_var("CSM_OAUTH_TOKEN_URL"),
-        }
+        crate::testenv::with_env_var("CSM_OAUTH_TOKEN_URL", Some("   "), || {
+            assert_eq!(
+                resolve_token_url(),
+                DEFAULT_TOKEN_URL,
+                "a blank override is no override"
+            );
+        });
     }
 
     /// A credentials file holding [`existing_blob`], the shape the merge
@@ -1519,7 +1507,7 @@ mod tests {
 
     #[test]
     fn do_refresh_reads_posts_merges_and_writes_through_the_env_override() {
-        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = crate::testenv::lock_for("CSM_OAUTH_TOKEN_URL");
         let dir = tempfile::tempdir().unwrap();
         let path = credentials_fixture(dir.path());
 
@@ -1563,7 +1551,7 @@ mod tests {
 
     #[test]
     fn do_refresh_changes_nothing_when_the_endpoint_refuses() {
-        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = crate::testenv::lock_for("CSM_OAUTH_TOKEN_URL");
         let dir = tempfile::tempdir().unwrap();
         let path = credentials_fixture(dir.path());
         let before = std::fs::read_to_string(&path).unwrap();
@@ -1609,7 +1597,7 @@ mod tests {
 
     #[test]
     fn maybe_refresh_writes_the_profile_and_releases_the_lock() {
-        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = crate::testenv::lock_for("CSM_OAUTH_TOKEN_URL");
         let dir = tempfile::tempdir().unwrap();
         let path = credentials_fixture(dir.path());
 

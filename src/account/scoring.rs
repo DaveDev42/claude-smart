@@ -1393,42 +1393,32 @@ mod tests {
     #[test]
     fn gate_disabled_with_zero_trusts_any_age() {
         // CLAUDE_USAGE_MAX_AGE=0 disables the gate: even ancient data scores.
-        // env is process-global; set/restore around the assertion.
-        let saved = std::env::var("CLAUDE_USAGE_MAX_AGE").ok();
-        std::env::set_var("CLAUDE_USAGE_MAX_AGE", "0");
-        let data = make_data_captured("2020-01-01T00:00:00Z"); // years old
-        let now = at("2026-06-29T12:00:00Z");
-        let result = pick_best_at(&data, "main", false, true, now);
-        match saved {
-            Some(v) => std::env::set_var("CLAUDE_USAGE_MAX_AGE", v),
-            None => std::env::remove_var("CLAUDE_USAGE_MAX_AGE"),
-        }
-        assert_eq!(
-            result.unwrap().as_deref(),
-            Some("alt"),
-            "max-age 0 must disable the gate (trust any age)"
-        );
+        crate::testenv::with_env_var("CLAUDE_USAGE_MAX_AGE", Some("0"), || {
+            let data = make_data_captured("2020-01-01T00:00:00Z"); // years old
+            let now = at("2026-06-29T12:00:00Z");
+            let result = pick_best_at(&data, "main", false, true, now);
+            assert_eq!(
+                result.unwrap().as_deref(),
+                Some("alt"),
+                "max-age 0 must disable the gate (trust any age)"
+            );
+        });
     }
 
     #[test]
     fn usage_max_age_unparseable_legacy_falls_through_to_alias() {
-        // env is process-global; set/restore around the assertion.
-        let saved_legacy = std::env::var("CLAUDE_USAGE_MAX_AGE").ok();
-        let saved_alias = std::env::var("CSM_USAGE_MAX_AGE_SECS").ok();
-        std::env::set_var("CLAUDE_USAGE_MAX_AGE", "not-a-number");
-        std::env::set_var("CSM_USAGE_MAX_AGE_SECS", "90");
-        let result = usage_max_age_secs();
-        match saved_legacy {
-            Some(v) => std::env::set_var("CLAUDE_USAGE_MAX_AGE", v),
-            None => std::env::remove_var("CLAUDE_USAGE_MAX_AGE"),
-        }
-        match saved_alias {
-            Some(v) => std::env::set_var("CSM_USAGE_MAX_AGE_SECS", v),
-            None => std::env::remove_var("CSM_USAGE_MAX_AGE_SECS"),
-        }
-        assert_eq!(
-            result, 90,
-            "present-but-unparseable legacy var should fall through to a valid alias"
+        crate::testenv::with_env_vars(
+            &[
+                ("CLAUDE_USAGE_MAX_AGE", Some("not-a-number")),
+                ("CSM_USAGE_MAX_AGE_SECS", Some("90")),
+            ],
+            || {
+                let result = usage_max_age_secs();
+                assert_eq!(
+                    result, 90,
+                    "present-but-unparseable legacy var should fall through to a valid alias"
+                );
+            },
         );
     }
 

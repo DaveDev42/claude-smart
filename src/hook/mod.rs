@@ -249,7 +249,6 @@ pub fn run_from_statusline(raw: &str, capture: &crate::usage::local::StatuslineC
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testenv::CLAUDE_CONFIG_DIR_ENV_LOCK as ENV_LOCK;
     use crate::usage::local::StatuslineCapture;
     use crate::usage::model::{ProfileUsage, UsageData, UsageSection};
     use std::collections::HashMap;
@@ -258,7 +257,8 @@ mod tests {
     /// Everything one test needs torn down: restores `HOME`/`CSM_USAGE_CMD`/
     /// `CLAUDE_SMART_CLAUDE_BIN` and kills the fake managed process (if any)
     /// on drop, so a panicking assertion never leaks state into the next
-    /// test even though `ENV_LOCK`'s guard is dropped right along with it.
+    /// test even though the caller's lock guards are dropped right along
+    /// with it.
     struct EnvFixture {
         home: tempfile::TempDir,
         prev_usage_cmd: Option<std::ffi::OsString>,
@@ -274,12 +274,12 @@ mod tests {
             }
             crate::testenv::set_test_home(None);
             match self.prev_usage_cmd.take() {
-                Some(v) => std::env::set_var("CSM_USAGE_CMD", v),
-                None => std::env::remove_var("CSM_USAGE_CMD"),
+                Some(v) => crate::testenv::set_var("CSM_USAGE_CMD", &v.to_string_lossy()),
+                None => crate::testenv::remove_var("CSM_USAGE_CMD"),
             }
             match self.prev_launch_bin.take() {
-                Some(v) => std::env::set_var("CLAUDE_SMART_CLAUDE_BIN", v),
-                None => std::env::remove_var("CLAUDE_SMART_CLAUDE_BIN"),
+                Some(v) => crate::testenv::set_var("CLAUDE_SMART_CLAUDE_BIN", &v.to_string_lossy()),
+                None => crate::testenv::remove_var("CLAUDE_SMART_CLAUDE_BIN"),
             }
         }
     }
@@ -287,10 +287,10 @@ mod tests {
     /// Point the resolved home dir (and so `paths::smart_dir()`) at a fresh
     /// temp dir, and wire `CSM_USAGE_CMD` to hand `usage::fetch()` the given
     /// `UsageData` verbatim (via `cat <tmpfile>`) instead of touching any real
-    /// profile. Caller must hold `ENV_LOCK` for the fixture's whole lifetime
-    /// (still needed for `CSM_USAGE_CMD`/`CLAUDE_SMART_CLAUDE_BIN`, which are
-    /// real process-global env vars; the home-dir override itself is
-    /// thread-local and needs no lock).
+    /// profile. Caller must hold `lock_for("CSM_USAGE_CMD")` and
+    /// `lock_for("CLAUDE_SMART_CLAUDE_BIN")` for the fixture's whole
+    /// lifetime — those are real process-global env vars; the home-dir
+    /// override itself is thread-local and needs no lock.
     fn isolated_env(usage: &UsageData) -> EnvFixture {
         let home = tempfile::tempdir().expect("tempdir");
         let usage_json = serde_json::to_string(usage).expect("serialize UsageData");
@@ -301,8 +301,8 @@ mod tests {
         let prev_launch_bin = std::env::var_os("CLAUDE_SMART_CLAUDE_BIN");
 
         crate::testenv::set_test_home(Some(home.path().to_path_buf()));
-        std::env::set_var("CSM_USAGE_CMD", format!("cat {}", usage_file.display()));
-        std::env::remove_var("CLAUDE_SMART_CLAUDE_BIN");
+        crate::testenv::set_var("CSM_USAGE_CMD", &format!("cat {}", usage_file.display()));
+        crate::testenv::remove_var("CLAUDE_SMART_CLAUDE_BIN");
 
         EnvFixture {
             home,
@@ -391,7 +391,7 @@ mod tests {
     /// binary on the test host. Writes `<sid>.pid` under `home`'s smart_dir
     /// and stores the child on `fixture` so it is reaped on drop.
     fn spawn_fake_managed_process(fixture: &mut EnvFixture, sid: &str) {
-        std::env::set_var("CLAUDE_SMART_CLAUDE_BIN", "sleep");
+        crate::testenv::set_var("CLAUDE_SMART_CLAUDE_BIN", "sleep");
         let child = Command::new("sleep")
             .arg("30")
             .spawn()
@@ -418,7 +418,8 @@ mod tests {
 
     #[test]
     fn run_from_statusline_skips_when_statusline_limit_is_none() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard_cmd = crate::testenv::lock_for("CSM_USAGE_CMD");
+        let _guard_bin = crate::testenv::lock_for("CLAUDE_SMART_CLAUDE_BIN");
         let fixture = isolated_env(&usage_with_no_viable_target());
         let capture = healthy_capture("/Users/example/.claude.home");
 
@@ -439,7 +440,8 @@ mod tests {
 
     #[test]
     fn run_from_statusline_skips_on_unparseable_raw() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard_cmd = crate::testenv::lock_for("CSM_USAGE_CMD");
+        let _guard_bin = crate::testenv::lock_for("CLAUDE_SMART_CLAUDE_BIN");
         let fixture = isolated_env(&usage_with_no_viable_target());
         let capture = capped_capture("/Users/example/.claude.home");
 
@@ -458,7 +460,8 @@ mod tests {
 
     #[test]
     fn run_from_statusline_skips_on_missing_session_id() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard_cmd = crate::testenv::lock_for("CSM_USAGE_CMD");
+        let _guard_bin = crate::testenv::lock_for("CLAUDE_SMART_CLAUDE_BIN");
         let fixture = isolated_env(&usage_with_no_viable_target());
         let capture = capped_capture("/Users/example/.claude.home");
 
@@ -480,7 +483,8 @@ mod tests {
 
     #[test]
     fn run_from_statusline_notify_only_appends_one_log_line_with_via_suffix() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard_cmd = crate::testenv::lock_for("CSM_USAGE_CMD");
+        let _guard_bin = crate::testenv::lock_for("CLAUDE_SMART_CLAUDE_BIN");
         let fixture = isolated_env(&usage_with_no_viable_target());
         let capture = capped_capture("/Users/example/.claude.limited");
         let sid = "sid-notify-only-0001";
@@ -512,7 +516,8 @@ mod tests {
 
     #[test]
     fn run_from_statusline_releases_claim_on_commit_failure() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard_cmd = crate::testenv::lock_for("CSM_USAGE_CMD");
+        let _guard_bin = crate::testenv::lock_for("CLAUDE_SMART_CLAUDE_BIN");
         let mut fixture = isolated_env(&usage_with_one_viable_target());
         let sid = "sid-commit-fails-0001";
         spawn_fake_managed_process(&mut fixture, sid);
@@ -555,13 +560,10 @@ mod tests {
         // empty/blank input, which parses to an all-`None` `HookInput` —
         // exactly the "no session_id" case the hook contract requires to
         // exit 0 silently, with no smart_dir I/O at all.
-        let _guard = ENV_LOCK.lock().unwrap();
         let home = tempfile::tempdir().unwrap();
-        crate::testenv::set_test_home(Some(home.path().to_path_buf()));
-
-        let result = run(Path::new("/Users/example/.claude.home"));
-
-        crate::testenv::set_test_home(None);
+        let result = crate::testenv::with_test_home(home.path(), || {
+            run(Path::new("/Users/example/.claude.home"))
+        });
 
         assert!(
             result.is_ok(),

@@ -464,10 +464,7 @@ mod tests {
     /// thread (see `crate::testenv`).
     fn with_isolated_home<R>(f: impl FnOnce(&std::path::Path) -> R) -> R {
         let tmp = tempfile::tempdir().unwrap();
-        crate::testenv::set_test_home(Some(tmp.path().to_path_buf()));
-        let result = f(tmp.path());
-        crate::testenv::set_test_home(None);
-        result
+        crate::testenv::with_test_home(tmp.path(), || f(tmp.path()))
     }
 
     /// Run `eval_emit_to` against an in-memory buffer and return its decoded
@@ -657,62 +654,60 @@ mod tests {
 
     #[test]
     fn golden_status_print_current_known() {
-        let _guard = crate::testenv::CLAUDE_CONFIG_DIR_ENV_LOCK.lock().unwrap();
-        std::env::set_var("CLAUDE_CONFIG_DIR", "/tmp/.claude.work");
-        let profiles = test_profiles();
-        let (out, r) = emit(
-            Shell::Zsh,
-            &Op::Status {
-                print_current: true,
-            },
-            &profiles,
-        );
-        std::env::remove_var("CLAUDE_CONFIG_DIR");
-        r.unwrap();
-        assert_eq!(out, "work\n");
-    }
-
-    #[test]
-    fn golden_status_print_current_unset() {
-        let _guard = crate::testenv::CLAUDE_CONFIG_DIR_ENV_LOCK.lock().unwrap();
-        std::env::remove_var("CLAUDE_CONFIG_DIR");
-        let profiles = test_profiles();
-        let (out, r) = emit(
-            Shell::Pwsh,
-            &Op::Status {
-                print_current: true,
-            },
-            &profiles,
-        );
-        r.unwrap();
-        assert_eq!(out, "unknown\n");
-    }
-
-    #[test]
-    fn golden_status_full_display() {
-        let _cfg_guard = crate::testenv::CLAUDE_CONFIG_DIR_ENV_LOCK.lock().unwrap();
-        with_isolated_home(|_home| {
-            std::env::set_var("CLAUDE_CONFIG_DIR", "/tmp/.claude.work");
+        crate::testenv::with_env_var("CLAUDE_CONFIG_DIR", Some("/tmp/.claude.work"), || {
             let profiles = test_profiles();
             let (out, r) = emit(
                 Shell::Zsh,
                 &Op::Status {
-                    print_current: false,
+                    print_current: true,
                 },
                 &profiles,
             );
-            std::env::remove_var("CLAUDE_CONFIG_DIR");
             r.unwrap();
-            // Isolated HOME → no state file → default is "home" (alphabetical-first).
-            assert_eq!(
-                out,
-                "current shell:  work (/tmp/.claude.work)\n\
-                 global default: home (/tmp/.claude.home)\n\
-                 available:\n\
-                 \x20  d home         /tmp/.claude.home\n\
-                 \x20 *  work         /tmp/.claude.work\n\
-                 (legend: * = current shell, d = global default)\n"
+            assert_eq!(out, "work\n");
+        });
+    }
+
+    #[test]
+    fn golden_status_print_current_unset() {
+        crate::testenv::with_env_var("CLAUDE_CONFIG_DIR", None, || {
+            let profiles = test_profiles();
+            let (out, r) = emit(
+                Shell::Pwsh,
+                &Op::Status {
+                    print_current: true,
+                },
+                &profiles,
             );
+            r.unwrap();
+            assert_eq!(out, "unknown\n");
+        });
+    }
+
+    #[test]
+    fn golden_status_full_display() {
+        crate::testenv::with_env_var("CLAUDE_CONFIG_DIR", Some("/tmp/.claude.work"), || {
+            with_isolated_home(|_home| {
+                let profiles = test_profiles();
+                let (out, r) = emit(
+                    Shell::Zsh,
+                    &Op::Status {
+                        print_current: false,
+                    },
+                    &profiles,
+                );
+                r.unwrap();
+                // Isolated HOME → no state file → default is "home" (alphabetical-first).
+                assert_eq!(
+                    out,
+                    "current shell:  work (/tmp/.claude.work)\n\
+                     global default: home (/tmp/.claude.home)\n\
+                     available:\n\
+                     \x20  d home         /tmp/.claude.home\n\
+                     \x20 *  work         /tmp/.claude.work\n\
+                     (legend: * = current shell, d = global default)\n"
+                );
+            });
         });
     }
 }

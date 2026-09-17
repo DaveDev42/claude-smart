@@ -1649,17 +1649,12 @@ mod tests {
         // mutate this same process-global var, and without a shared guard
         // that interleaving can flake this test or, worse, resolve some
         // other test's `CLAUDE_CONFIG_DIR` and write into the real store.
-        let _guard = crate::testenv::CLAUDE_CONFIG_DIR_ENV_LOCK.lock().unwrap();
-        // Guard other tests in this process from a leaked env value.
-        let saved = std::env::var("CLAUDE_CONFIG_DIR").ok();
-        std::env::remove_var("CLAUDE_CONFIG_DIR");
-        let result = record_statusline_payload(
-            r#"{"rate_limits": {"five_hour": {"used_percentage": 1.0}}}"#,
-        );
-        assert!(result.unwrap().is_none());
-        if let Some(v) = saved {
-            std::env::set_var("CLAUDE_CONFIG_DIR", v);
-        }
+        crate::testenv::with_env_var("CLAUDE_CONFIG_DIR", None, || {
+            let result = record_statusline_payload(
+                r#"{"rate_limits": {"five_hour": {"used_percentage": 1.0}}}"#,
+            );
+            assert!(result.unwrap().is_none());
+        });
     }
 
     // ── build_statusline_record ─────────────────────────────────────────────

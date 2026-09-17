@@ -1051,11 +1051,6 @@ pub(crate) fn set_test_now(epoch: i64) {
 mod tests {
     use super::*;
     use std::path::Path;
-    use std::sync::Mutex;
-
-    /// Serializes tests that mutate the process-global `CLAUDE_SMART_RESUME_PROMPT`
-    /// env var, so they don't clobber each other under the default parallel runner.
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     // ── HookInput serde tests ──────────────────────────────────────────────────
 
@@ -1331,48 +1326,34 @@ mod tests {
 
     #[test]
     fn build_handoff_default_korean() {
-        let _g = ENV_LOCK.lock().unwrap();
-        // Remove any env override
-        let prev = std::env::var("CLAUDE_SMART_RESUME_PROMPT");
-        std::env::remove_var("CLAUDE_SMART_RESUME_PROMPT");
-        let h = build_handoff("01234567", "home", "work", 1);
-        // Should contain Korean text
-        assert!(h.contains("01234567"), "should contain sid_short: {h}");
-        assert!(h.contains("home"), "should contain current profile: {h}");
-        assert!(h.contains("work"), "should contain target profile: {h}");
-        assert!(h.contains("hop 1"), "should contain hop: {h}");
-        // Restore
-        if let Ok(v) = prev {
-            std::env::set_var("CLAUDE_SMART_RESUME_PROMPT", v);
-        }
+        crate::testenv::with_env_var("CLAUDE_SMART_RESUME_PROMPT", None, || {
+            let h = build_handoff("01234567", "home", "work", 1);
+            // Should contain Korean text
+            assert!(h.contains("01234567"), "should contain sid_short: {h}");
+            assert!(h.contains("home"), "should contain current profile: {h}");
+            assert!(h.contains("work"), "should contain target profile: {h}");
+            assert!(h.contains("hop 1"), "should contain hop: {h}");
+        });
     }
 
     #[test]
     fn build_handoff_empty_suppresses() {
-        let _g = ENV_LOCK.lock().unwrap();
-        let prev = std::env::var("CLAUDE_SMART_RESUME_PROMPT");
-        std::env::set_var("CLAUDE_SMART_RESUME_PROMPT", "");
-        let h = build_handoff("01234567", "home", "work", 1);
-        assert!(h.is_empty(), "empty env var should suppress handoff");
-        if let Ok(v) = prev {
-            std::env::set_var("CLAUDE_SMART_RESUME_PROMPT", v);
-        } else {
-            std::env::remove_var("CLAUDE_SMART_RESUME_PROMPT");
-        }
+        crate::testenv::with_env_var("CLAUDE_SMART_RESUME_PROMPT", Some(""), || {
+            let h = build_handoff("01234567", "home", "work", 1);
+            assert!(h.is_empty(), "empty env var should suppress handoff");
+        });
     }
 
     #[test]
     fn build_handoff_custom_override() {
-        let _g = ENV_LOCK.lock().unwrap();
-        let prev = std::env::var("CLAUDE_SMART_RESUME_PROMPT");
-        std::env::set_var("CLAUDE_SMART_RESUME_PROMPT", "custom prompt here");
-        let h = build_handoff("01234567", "home", "work", 1);
-        assert_eq!(h, "custom prompt here");
-        if let Ok(v) = prev {
-            std::env::set_var("CLAUDE_SMART_RESUME_PROMPT", v);
-        } else {
-            std::env::remove_var("CLAUDE_SMART_RESUME_PROMPT");
-        }
+        crate::testenv::with_env_var(
+            "CLAUDE_SMART_RESUME_PROMPT",
+            Some("custom prompt here"),
+            || {
+                let h = build_handoff("01234567", "home", "work", 1);
+                assert_eq!(h, "custom prompt here");
+            },
+        );
     }
 
     // ── stop_failure_limit (pure tier-0 detector) ──────────────────────────────

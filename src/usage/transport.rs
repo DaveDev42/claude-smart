@@ -501,14 +501,7 @@ pub(crate) fn parse_usage_json(raw: &str) -> Result<UsageData, FetchError> {
 mod tests {
     use super::*;
     use std::fs;
-    use std::sync::Mutex;
     use tempfile::TempDir;
-
-    /// Global mutex for tests that mutate process-wide env vars.
-    /// Rust test harness runs tests in parallel by default; env var mutation
-    /// without serialization causes races between tests that read+write the
-    /// same env key (e.g. `positive_ttl_*`, `negative_cooldown_*`).
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     // ── shared fixture JSON ────────────────────────────────────────────────────
 
@@ -818,17 +811,13 @@ mod tests {
 
     #[test]
     fn resolve_usage_command_disabled_when_unset() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        let saved = std::env::var("CSM_USAGE_CMD").ok();
-        std::env::remove_var("CSM_USAGE_CMD");
-        assert!(resolve_usage_command().is_none(), "unset → None");
+        crate::testenv::with_env_var("CSM_USAGE_CMD", None, || {
+            assert!(resolve_usage_command().is_none(), "unset → None");
+        });
         // set-but-empty / whitespace → None
-        std::env::set_var("CSM_USAGE_CMD", "   ");
-        assert!(resolve_usage_command().is_none(), "blank → None");
-        match saved {
-            Some(v) => std::env::set_var("CSM_USAGE_CMD", v),
-            None => std::env::remove_var("CSM_USAGE_CMD"),
-        }
+        crate::testenv::with_env_var("CSM_USAGE_CMD", Some("   "), || {
+            assert!(resolve_usage_command().is_none(), "blank → None");
+        });
     }
 
     #[test]
@@ -878,24 +867,19 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn run_usage_command_respects_timeout() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        let saved = std::env::var("CSM_USAGE_CMD_TIMEOUT").ok();
-        std::env::set_var("CSM_USAGE_CMD_TIMEOUT", "1");
-        let start = std::time::Instant::now();
-        let result = run_usage_command("sleep 10");
-        let elapsed = start.elapsed();
-        assert!(
-            matches!(result, Err(FetchError::Command(_))),
-            "a command past the deadline must error, got: {result:?}"
-        );
-        assert!(
-            elapsed < std::time::Duration::from_secs(5),
-            "timeout must fire well before the command's own 10s, took {elapsed:?}"
-        );
-        match saved {
-            Some(v) => std::env::set_var("CSM_USAGE_CMD_TIMEOUT", v),
-            None => std::env::remove_var("CSM_USAGE_CMD_TIMEOUT"),
-        }
+        crate::testenv::with_env_var("CSM_USAGE_CMD_TIMEOUT", Some("1"), || {
+            let start = std::time::Instant::now();
+            let result = run_usage_command("sleep 10");
+            let elapsed = start.elapsed();
+            assert!(
+                matches!(result, Err(FetchError::Command(_))),
+                "a command past the deadline must error, got: {result:?}"
+            );
+            assert!(
+                elapsed < std::time::Duration::from_secs(5),
+                "timeout must fire well before the command's own 10s, took {elapsed:?}"
+            );
+        });
     }
 
     #[test]
@@ -907,47 +891,40 @@ mod tests {
         // we block in try_wait — and only escape via the timeout, discarding the
         // (valid) result. Build a >256 KB valid UsageData JSON and assert it
         // parses well within a short deadline.
-        let _guard = ENV_LOCK.lock().unwrap();
-        let saved = std::env::var("CSM_USAGE_CMD_TIMEOUT").ok();
         // 3s deadline: comfortably long for a correct drain, but far shorter than
         // the wall time a deadlock would burn — so a deadlock fails the test fast.
-        std::env::set_var("CSM_USAGE_CMD_TIMEOUT", "3");
+        crate::testenv::with_env_var("CSM_USAGE_CMD_TIMEOUT", Some("3"), || {
+            // Have the CHILD generate the large payload itself, via a tiny awk
+            // program, rather than inlining a >256 KB JSON string as a shell
+            // ARGUMENT. Inlining it (`printf '%s' '<huge json>'`) overflows
+            // ARG_MAX on Linux (execve E2BIG) even though macOS's larger ARG_MAX
+            // tolerated it — that divergence is exactly what broke CI. The awk
+            // command string is ~300 bytes (ARG_MAX-safe by 400x) while its stdout
+            // is ~341 KB, comfortably past the OS pipe buffer (~64 KB) that the
+            // drain thread must survive. POSIX awk only (BEGIN, printf, C-style
+            // for/if, %d, % modulo) — no gawk extensions, no seq, no bash-isms —
+            // so it runs identically on GNU/Linux and BSD/macOS. i goes 0..=3000,
+            // yielding 3001 profiles.
+            let n_profiles = 3001;
+            let cmd = r#"awk 'BEGIN{printf "{\"captured_at\":\"2024-01-01T00:00:00Z\",\"profiles\":{"; for(i=0;i<=3000;i++){if(i>0)printf ","; printf "\"p%d\":{\"session\":{\"pct\":%d,\"resets\":\"2024-01-01T00:00:00Z\"},\"week_all\":{\"pct\":%d,\"resets\":\"2024-01-01T00:00:00Z\"}}",i,i%100,i%100}; printf "},\"errors\":{}}"}'"#;
+            let start = std::time::Instant::now();
+            let result = run_usage_command(cmd);
+            let elapsed = start.elapsed();
 
-        // Have the CHILD generate the large payload itself, via a tiny awk
-        // program, rather than inlining a >256 KB JSON string as a shell
-        // ARGUMENT. Inlining it (`printf '%s' '<huge json>'`) overflows
-        // ARG_MAX on Linux (execve E2BIG) even though macOS's larger ARG_MAX
-        // tolerated it — that divergence is exactly what broke CI. The awk
-        // command string is ~300 bytes (ARG_MAX-safe by 400x) while its stdout
-        // is ~341 KB, comfortably past the OS pipe buffer (~64 KB) that the
-        // drain thread must survive. POSIX awk only (BEGIN, printf, C-style
-        // for/if, %d, % modulo) — no gawk extensions, no seq, no bash-isms —
-        // so it runs identically on GNU/Linux and BSD/macOS. i goes 0..=3000,
-        // yielding 3001 profiles.
-        let n_profiles = 3001;
-        let cmd = r#"awk 'BEGIN{printf "{\"captured_at\":\"2024-01-01T00:00:00Z\",\"profiles\":{"; for(i=0;i<=3000;i++){if(i>0)printf ","; printf "\"p%d\":{\"session\":{\"pct\":%d,\"resets\":\"2024-01-01T00:00:00Z\"},\"week_all\":{\"pct\":%d,\"resets\":\"2024-01-01T00:00:00Z\"}}",i,i%100,i%100}; printf "},\"errors\":{}}"}'"#;
-        let start = std::time::Instant::now();
-        let result = run_usage_command(cmd);
-        let elapsed = start.elapsed();
-
-        assert!(
-            result.is_ok(),
-            "large output must parse (deadlock would time out): {result:?}"
-        );
-        assert_eq!(
-            result.unwrap().profiles.len(),
-            n_profiles,
-            "all profiles parsed"
-        );
-        assert!(
-            elapsed < std::time::Duration::from_secs(3),
-            "must not hit the deadline — a deadlock would, took {elapsed:?}"
-        );
-
-        match saved {
-            Some(v) => std::env::set_var("CSM_USAGE_CMD_TIMEOUT", v),
-            None => std::env::remove_var("CSM_USAGE_CMD_TIMEOUT"),
-        }
+            assert!(
+                result.is_ok(),
+                "large output must parse (deadlock would time out): {result:?}"
+            );
+            assert_eq!(
+                result.unwrap().profiles.len(),
+                n_profiles,
+                "all profiles parsed"
+            );
+            assert!(
+                elapsed < std::time::Duration::from_secs(3),
+                "must not hit the deadline — a deadlock would, took {elapsed:?}"
+            );
+        });
     }
 
     #[test]
@@ -961,126 +938,94 @@ mod tests {
         // block until the grandchild died on its own, silently defeating the
         // hard deadline. This test pins that the timeout returns within the
         // deadline regardless of a surviving grandchild.
-        let _guard = ENV_LOCK.lock().unwrap();
-        let saved = std::env::var("CSM_USAGE_CMD_TIMEOUT").ok();
-        std::env::set_var("CSM_USAGE_CMD_TIMEOUT", "1");
+        crate::testenv::with_env_var("CSM_USAGE_CMD_TIMEOUT", Some("1"), || {
+            // `sleep 30 | cat`: cat inherits our stdout pipe and stays alive
+            // ~30s after sh is killed, holding the write-end open so
+            // read_to_end can't reach EOF.
+            let start = std::time::Instant::now();
+            let result = run_usage_command("sleep 30 | cat");
+            let elapsed = start.elapsed();
 
-        // `sleep 30 | cat`: cat inherits our stdout pipe and stays alive ~30s
-        // after sh is killed, holding the write-end open so read_to_end can't
-        // reach EOF.
-        let start = std::time::Instant::now();
-        let result = run_usage_command("sleep 30 | cat");
-        let elapsed = start.elapsed();
-
-        assert!(
-            matches!(result, Err(FetchError::Command(_))),
-            "a command past the deadline must error, got: {result:?}"
-        );
-        assert!(
-            elapsed < std::time::Duration::from_secs(5),
-            "timeout must stay hard even with a grandchild holding the pipe, took {elapsed:?}"
-        );
-
-        match saved {
-            Some(v) => std::env::set_var("CSM_USAGE_CMD_TIMEOUT", v),
-            None => std::env::remove_var("CSM_USAGE_CMD_TIMEOUT"),
-        }
+            assert!(
+                matches!(result, Err(FetchError::Command(_))),
+                "a command past the deadline must error, got: {result:?}"
+            );
+            assert!(
+                elapsed < std::time::Duration::from_secs(5),
+                "timeout must stay hard even with a grandchild holding the pipe, took {elapsed:?}"
+            );
+        });
     }
 
     #[test]
     fn positive_ttl_alias_csm_secs() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        let saved_legacy = std::env::var("CLAUDE_USAGE_TTL").ok();
-        let saved_alias = std::env::var("CSM_USAGE_TTL_SECS").ok();
-        // Legacy unset, alias set → alias wins.
-        std::env::remove_var("CLAUDE_USAGE_TTL");
-        std::env::set_var("CSM_USAGE_TTL_SECS", "17");
-        assert_eq!(positive_ttl_secs(), 17, "alias should be honored");
-        // Legacy set → legacy takes precedence over alias.
-        std::env::set_var("CLAUDE_USAGE_TTL", "5");
-        assert_eq!(positive_ttl_secs(), 5, "legacy var should win over alias");
-        match saved_legacy {
-            Some(v) => std::env::set_var("CLAUDE_USAGE_TTL", v),
-            None => std::env::remove_var("CLAUDE_USAGE_TTL"),
-        }
-        match saved_alias {
-            Some(v) => std::env::set_var("CSM_USAGE_TTL_SECS", v),
-            None => std::env::remove_var("CSM_USAGE_TTL_SECS"),
-        }
+        crate::testenv::with_env_vars(
+            &[
+                ("CLAUDE_USAGE_TTL", None),
+                ("CSM_USAGE_TTL_SECS", Some("17")),
+            ],
+            || {
+                // Legacy unset, alias set → alias wins.
+                assert_eq!(positive_ttl_secs(), 17, "alias should be honored");
+            },
+        );
+        crate::testenv::with_env_vars(
+            &[
+                ("CLAUDE_USAGE_TTL", Some("5")),
+                ("CSM_USAGE_TTL_SECS", Some("17")),
+            ],
+            || {
+                // Legacy set → legacy takes precedence over alias.
+                assert_eq!(positive_ttl_secs(), 5, "legacy var should win over alias");
+            },
+        );
     }
 
     #[test]
     fn positive_ttl_unparseable_legacy_falls_through_to_alias() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        let saved_legacy = std::env::var("CLAUDE_USAGE_TTL").ok();
-        let saved_alias = std::env::var("CSM_USAGE_TTL_SECS").ok();
-        std::env::set_var("CLAUDE_USAGE_TTL", "not-a-number");
-        std::env::set_var("CSM_USAGE_TTL_SECS", "90");
-        assert_eq!(
-            positive_ttl_secs(),
-            90,
-            "present-but-unparseable legacy var should fall through to a valid alias"
+        crate::testenv::with_env_vars(
+            &[
+                ("CLAUDE_USAGE_TTL", Some("not-a-number")),
+                ("CSM_USAGE_TTL_SECS", Some("90")),
+            ],
+            || {
+                assert_eq!(
+                    positive_ttl_secs(),
+                    90,
+                    "present-but-unparseable legacy var should fall through to a valid alias"
+                );
+            },
         );
-        match saved_legacy {
-            Some(v) => std::env::set_var("CLAUDE_USAGE_TTL", v),
-            None => std::env::remove_var("CLAUDE_USAGE_TTL"),
-        }
-        match saved_alias {
-            Some(v) => std::env::set_var("CSM_USAGE_TTL_SECS", v),
-            None => std::env::remove_var("CSM_USAGE_TTL_SECS"),
-        }
     }
 
     // ── positive_ttl_secs / negative_cooldown_secs env overrides ─────────────
-    //
-    // These tests also mutate env vars; acquire ENV_LOCK.
 
     #[test]
     fn positive_ttl_defaults_to_60() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        let saved = std::env::var("CLAUDE_USAGE_TTL").ok();
-        std::env::remove_var("CLAUDE_USAGE_TTL");
-        assert_eq!(positive_ttl_secs(), 60);
-        match saved {
-            Some(v) => std::env::set_var("CLAUDE_USAGE_TTL", v),
-            None => std::env::remove_var("CLAUDE_USAGE_TTL"),
-        }
+        crate::testenv::with_env_var("CLAUDE_USAGE_TTL", None, || {
+            assert_eq!(positive_ttl_secs(), 60);
+        });
     }
 
     #[test]
     fn positive_ttl_respects_env_override() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        let saved = std::env::var("CLAUDE_USAGE_TTL").ok();
-        std::env::set_var("CLAUDE_USAGE_TTL", "30");
-        assert_eq!(positive_ttl_secs(), 30);
-        match saved {
-            Some(v) => std::env::set_var("CLAUDE_USAGE_TTL", v),
-            None => std::env::remove_var("CLAUDE_USAGE_TTL"),
-        }
+        crate::testenv::with_env_var("CLAUDE_USAGE_TTL", Some("30"), || {
+            assert_eq!(positive_ttl_secs(), 30);
+        });
     }
 
     #[test]
     fn negative_cooldown_defaults_to_120() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        let saved = std::env::var("CLAUDE_USAGE_FAIL_COOLDOWN").ok();
-        std::env::remove_var("CLAUDE_USAGE_FAIL_COOLDOWN");
-        assert_eq!(negative_cooldown_secs(), 120);
-        match saved {
-            Some(v) => std::env::set_var("CLAUDE_USAGE_FAIL_COOLDOWN", v),
-            None => std::env::remove_var("CLAUDE_USAGE_FAIL_COOLDOWN"),
-        }
+        crate::testenv::with_env_var("CLAUDE_USAGE_FAIL_COOLDOWN", None, || {
+            assert_eq!(negative_cooldown_secs(), 120);
+        });
     }
 
     #[test]
     fn negative_cooldown_respects_env_override() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        let saved = std::env::var("CLAUDE_USAGE_FAIL_COOLDOWN").ok();
-        std::env::set_var("CLAUDE_USAGE_FAIL_COOLDOWN", "60");
-        assert_eq!(negative_cooldown_secs(), 60);
-        match saved {
-            Some(v) => std::env::set_var("CLAUDE_USAGE_FAIL_COOLDOWN", v),
-            None => std::env::remove_var("CLAUDE_USAGE_FAIL_COOLDOWN"),
-        }
+        crate::testenv::with_env_var("CLAUDE_USAGE_FAIL_COOLDOWN", Some("60"), || {
+            assert_eq!(negative_cooldown_secs(), 60);
+        });
     }
 
     // ── file_age_secs ─────────────────────────────────────────────────────────
