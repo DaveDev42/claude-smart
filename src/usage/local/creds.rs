@@ -282,7 +282,7 @@ fn run_security(account: &str, service: &str) -> Result<String, CredError> {
         Err(_) => {
             return Err(CredError::Unreadable(
                 "security: reader thread panicked".into(),
-            ))
+            ));
         }
     };
     String::from_utf8(bytes)

@@ -5,7 +5,7 @@ use std::ffi::OsString;
 
 use anyhow::Context as _;
 
-use crate::cmd::support::{read_stdin_capped, CAPTURE_STDIN_CAP_BYTES};
+use crate::cmd::support::{CAPTURE_STDIN_CAP_BYTES, read_stdin_capped};
 use crate::{account, hook, paths, usage};
 
 /// `csm usage [--json] [--no-fetch] [--refresh] [--refresh-oauth]` /

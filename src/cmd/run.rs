@@ -70,7 +70,7 @@ impl SessionResolution {
 ///     NOT when hook / `--profile` / `--no-pick` / non-interactive, and NOT for
 ///     `AllSaturated` (real limits read → warn + keep current).
 pub(crate) fn run(args: &[OsString]) -> anyhow::Result<()> {
-    use crate::cli::parser::{parse, ResumeArg};
+    use crate::cli::parser::{ResumeArg, parse};
     use platform::relaunch::LaunchSpec;
     use session::alias::looks_like_uuid;
 
@@ -549,7 +549,7 @@ fn account_row_rank(
     data: &picker::account::StaleProfileData,
     now: chrono::DateTime<chrono::Utc>,
 ) -> (u8, i64, i64, String) {
-    use account::scoring::{effective_reset_epoch, is_viable_pcts, ABSENT_SESSION_PCT};
+    use account::scoring::{ABSENT_SESSION_PCT, effective_reset_epoch, is_viable_pcts};
 
     let session_pct = data.session_pct.unwrap_or(ABSENT_SESSION_PCT);
     let viable = data.error.is_none()

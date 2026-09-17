@@ -583,7 +583,7 @@ fn probe(name: &str, dir: &Path, now: DateTime<Utc>, base: &str, refresh_oauth: 
             return Event::CredsExpired {
                 refresh_alive,
                 expired_at_ms,
-            }
+            };
         }
         Err(creds::CredError::Unreadable(msg)) => return Event::CredsOther(msg),
     };

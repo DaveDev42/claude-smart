@@ -5,7 +5,7 @@ use std::ffi::OsString;
 use anyhow::Context as _;
 
 use crate::paths;
-use crate::sidecar::{merge_sidecar, read_sidecar, write_sidecar, Sidecar};
+use crate::sidecar::{Sidecar, merge_sidecar, read_sidecar, write_sidecar};
 
 /// `csm sidecar {read|write|merge|flags} <sid> [key=value...]`
 pub(crate) fn cmd_sidecar(args: &[OsString]) -> anyhow::Result<()> {

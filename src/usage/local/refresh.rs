@@ -51,7 +51,7 @@ use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 
 use super::api;
 
@@ -1363,9 +1363,11 @@ mod tests {
 
         let request = server.join().expect("mock server");
         assert!(request.starts_with("POST /v1/oauth/token"), "{request}");
-        assert!(request
-            .to_lowercase()
-            .contains("content-type: application/json"));
+        assert!(
+            request
+                .to_lowercase()
+                .contains("content-type: application/json")
+        );
         assert!(request.to_lowercase().contains("user-agent: csm/"));
         assert!(
             request.contains(r#""grant_type":"refresh_token""#),

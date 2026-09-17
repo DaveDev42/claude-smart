@@ -95,7 +95,9 @@ pub fn manage_emit(op: &Op, profiles: &mut ProfileMap) -> anyhow::Result<()> {
             }
             crate::provision::ensure_provisioned_soft(std::path::Path::new(&dir));
             eprintln!("global default → {name} ({dir})");
-            eprintln!("(new shells + GUI/launchd follow this; your current shell keeps its profile until you run `cas {name}` or open a new shell)");
+            eprintln!(
+                "(new shells + GUI/launchd follow this; your current shell keeps its profile until you run `cas {name}` or open a new shell)"
+            );
         }
 
         Op::Edit => {

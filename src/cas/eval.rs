@@ -111,7 +111,9 @@ pub fn eval_emit_to(
                     //    eval — here we print to stderr so it doesn't confuse
                     //    the eval).
                     eprintln!("global default → {profile} ({dir})");
-                    eprintln!("(new shells follow this via ~/.zshenv guard; running claude sessions keep their captured paths)");
+                    eprintln!(
+                        "(new shells follow this via ~/.zshenv guard; running claude sessions keep their captured paths)"
+                    );
                 }
                 Err(e) => {
                     writeln!(w, "{}", shell.error_snippet(&e.to_string()))?;

@@ -55,8 +55,8 @@ use std::path::Path;
 
 use chrono::Utc;
 
-use super::model::UsageData;
 use super::FetchError;
+use super::model::UsageData;
 use crate::account::ProfileMap;
 use crate::paths;
 
@@ -273,13 +273,13 @@ fn run_usage_command(cmd: &str) -> Result<UsageData, FetchError> {
                 if start.elapsed() >= deadline {
                     let _ = child.kill();
                     let _ = child.wait(); // reap so we don't leave a zombie
-                                          // Do NOT join the reader here. Killing the direct child does
-                                          // not guarantee the pipe's write-end closes: a grandchild
-                                          // (e.g. `cmd | cat`) can inherit it and outlive the parent,
-                                          // so read_to_end never reaches EOF and a join would block past
-                                          // the deadline — defeating the whole timeout. Drop the handle
-                                          // instead: the detached thread ends on its own once the last
-                                          // write-end finally closes, and is reaped at process exit.
+                    // Do NOT join the reader here. Killing the direct child does
+                    // not guarantee the pipe's write-end closes: a grandchild
+                    // (e.g. `cmd | cat`) can inherit it and outlive the parent,
+                    // so read_to_end never reaches EOF and a join would block past
+                    // the deadline — defeating the whole timeout. Drop the handle
+                    // instead: the detached thread ends on its own once the last
+                    // write-end finally closes, and is reaped at process exit.
                     drop(reader);
                     return Err(FetchError::Command(format!(
                         "timed out after {timeout_secs}s"

@@ -26,8 +26,8 @@ use anyhow::Context as _;
 use crate::paths;
 use crate::picker::engine::{self, PickerOpts, PickerOutcome};
 use crate::platform::pid::read_pid_file;
-use kill::{kill_all, summarize, KillSignal};
-use scan::{candidate_row, select_candidates, session_claude_is_live, Candidate, ProcRow, Session};
+use kill::{KillSignal, kill_all, summarize};
+use scan::{Candidate, ProcRow, Session, candidate_row, select_candidates, session_claude_is_live};
 
 /// Which sessions a reap run is scoped to.
 #[derive(Debug, Clone)]
@@ -149,7 +149,7 @@ fn snapshot_proc_table() -> Vec<ProcRow> {
 /// Process-group id of `pid` on POSIX (`getpgid`); `None` on Windows or error.
 #[cfg(unix)]
 fn pgid_of(pid: u32) -> Option<u32> {
-    use nix::unistd::{getpgid, Pid};
+    use nix::unistd::{Pid, getpgid};
     getpgid(Some(Pid::from_raw(pid as i32)))
         .ok()
         .map(|p| p.as_raw() as u32)

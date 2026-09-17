@@ -114,11 +114,11 @@ pub fn hkcu_setenv(_profile: &str, dir: &str) -> std::io::Result<()> {
     use windows_sys::Win32::{
         Foundation::HWND,
         System::Registry::{
-            RegCloseKey, RegOpenKeyExW, RegSetValueExW, HKEY, HKEY_CURRENT_USER, KEY_SET_VALUE,
-            REG_SZ,
+            HKEY, HKEY_CURRENT_USER, KEY_SET_VALUE, REG_SZ, RegCloseKey, RegOpenKeyExW,
+            RegSetValueExW,
         },
         UI::WindowsAndMessaging::{
-            SendMessageTimeoutW, HWND_BROADCAST, SMTO_ABORTIFHUNG, WM_SETTINGCHANGE,
+            HWND_BROADCAST, SMTO_ABORTIFHUNG, SendMessageTimeoutW, WM_SETTINGCHANGE,
         },
     };
 
@@ -164,7 +164,9 @@ pub fn hkcu_setenv(_profile: &str, dir: &str) -> std::io::Result<()> {
     unsafe { RegCloseKey(hkey) };
 
     if set_result != 0 {
-        eprintln!("cas: RegSetValueExW failed (0x{set_result:08X}) — HKCU\\Environment\\CLAUDE_CONFIG_DIR not updated");
+        eprintln!(
+            "cas: RegSetValueExW failed (0x{set_result:08X}) — HKCU\\Environment\\CLAUDE_CONFIG_DIR not updated"
+        );
         return Ok(()); // soft failure
     }
 

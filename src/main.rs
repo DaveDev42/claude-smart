@@ -104,7 +104,9 @@ fn print_help() {
     println!("RUN FLAGS (account + session selection)");
     println!("  --profile <name>                     launch under this profile (skip all picking)");
     println!("  -i, --interactive                    manual pick: force account + session pickers");
-    println!("  -A, --pick-account                   force an account pick this launch (overrides --no-pick)");
+    println!(
+        "  -A, --pick-account                   force an account pick this launch (overrides --no-pick)"
+    );
     println!("  --no-pick                            keep current profile, no scoring");
     println!(
         "  -n, --new                            start a fresh session (skip the session picker)"
@@ -114,8 +116,12 @@ fn print_help() {
     println!(
         "  --session-id <uuid>                  forwarded to claude; csm tracks it for sidecar/relaunch state"
     );
-    println!("  --model <m>                          forwarded to claude; remembered across a limit-switch hop");
-    println!("  --effort <e>                         forwarded to claude; remembered across a limit-switch hop");
+    println!(
+        "  --model <m>                          forwarded to claude; remembered across a limit-switch hop"
+    );
+    println!(
+        "  --effort <e>                         forwarded to claude; remembered across a limit-switch hop"
+    );
     println!(
         "  --permission-mode <p>                forwarded to claude; remembered across a limit-switch hop"
     );

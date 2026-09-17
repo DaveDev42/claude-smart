@@ -41,8 +41,8 @@ impl Launcher for PosixLauncher {
     ) -> io::Result<(ExitStatus, ChildHandle)> {
         use std::os::unix::io::AsFd;
 
-        use nix::sys::signal::{sigaction, SaFlags, SigAction, SigHandler, SigSet, Signal};
-        use nix::unistd::{setpgid, tcgetpgrp, tcsetpgrp, Pid};
+        use nix::sys::signal::{SaFlags, SigAction, SigHandler, SigSet, Signal, sigaction};
+        use nix::unistd::{Pid, setpgid, tcgetpgrp, tcsetpgrp};
 
         let born = SystemTime::now()
             .duration_since(UNIX_EPOCH)

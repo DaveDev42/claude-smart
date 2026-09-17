@@ -196,7 +196,7 @@ fn is_live_claude_or_node(pid: u32) -> bool {
 
 #[cfg(unix)]
 fn platform_stop(pid: u32, _sid: &str) -> anyhow::Result<()> {
-    use nix::sys::signal::{kill, Signal};
+    use nix::sys::signal::{Signal, kill};
     use nix::unistd::Pid;
 
     kill(Pid::from_raw(pid as i32), Signal::SIGTERM)

@@ -29,8 +29,8 @@ use crossterm::cursor;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use crossterm::style::Print;
 use crossterm::terminal::{
-    self, disable_raw_mode, enable_raw_mode, Clear, ClearType, EnterAlternateScreen,
-    LeaveAlternateScreen,
+    self, Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode,
+    enable_raw_mode,
 };
 use crossterm::{execute, queue};
 use nucleo_matcher::pattern::{CaseMatching, Normalization, Pattern};
@@ -569,7 +569,7 @@ mod tests {
         use std::collections::BTreeSet;
         let filtered = vec![0usize, 1, 2];
         let mut sel: BTreeSet<usize> = BTreeSet::from([1]); // partial
-                                                            // Not all selected → select all (does not clear).
+        // Not all selected → select all (does not clear).
         toggle_all(&filtered, &mut sel);
         assert_eq!(sel, BTreeSet::from([0, 1, 2]));
     }

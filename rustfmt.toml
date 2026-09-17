@@ -1,5 +1,0 @@
-# Temporary pin: `style_edition` otherwise follows `edition` (now "2024" as
-# of this commit), which would reformat the whole tree and turn
-# `cargo fmt --check` red before that reformat is reviewed on its own.
-# C37 removes this file and lands the 2024-style reformat.
-style_edition = "2021"

@@ -33,8 +33,8 @@
 //! the same variable.
 
 #[cfg(test)]
-fn registry(
-) -> &'static std::sync::Mutex<std::collections::HashMap<&'static str, &'static std::sync::Mutex<()>>>
+fn registry()
+-> &'static std::sync::Mutex<std::collections::HashMap<&'static str, &'static std::sync::Mutex<()>>>
 {
     static REGISTRY: std::sync::OnceLock<
         std::sync::Mutex<std::collections::HashMap<&'static str, &'static std::sync::Mutex<()>>>,

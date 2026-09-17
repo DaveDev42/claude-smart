@@ -182,7 +182,7 @@ fn lookup_alias(alias: &str, titles_path: &PathBuf) -> Result<Option<String>, Al
             return Err(AliasError::Io {
                 path: titles_path.clone(),
                 source: e,
-            })
+            });
         }
     };
     let mut best_mtime: i64 = -1;

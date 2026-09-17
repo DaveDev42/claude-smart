@@ -78,7 +78,7 @@ pub fn kill_all(pids: &[u32], signal: KillSignal) -> Vec<(u32, KillOutcome)> {
 #[cfg(unix)]
 fn kill_one(pid: u32, signal: KillSignal) -> KillOutcome {
     use nix::errno::Errno;
-    use nix::sys::signal::{kill, Signal};
+    use nix::sys::signal::{Signal, kill};
     use nix::unistd::Pid;
 
     let sig = match signal {
@@ -98,7 +98,7 @@ fn kill_one(pid: u32, signal: KillSignal) -> KillOutcome {
 #[cfg(windows)]
 fn kill_one(pid: u32, _signal: KillSignal) -> KillOutcome {
     use windows_sys::Win32::Foundation::CloseHandle;
-    use windows_sys::Win32::System::Threading::{OpenProcess, TerminateProcess, PROCESS_TERMINATE};
+    use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_TERMINATE, TerminateProcess};
 
     // SAFETY: documented Win32 process APIs. We open with TERMINATE rights,
     // terminate, then close the handle. A null handle means the process is gone
