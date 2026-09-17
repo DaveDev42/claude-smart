@@ -450,6 +450,40 @@ decision; all of them end with the `csm run` supervisor restarting
 `claude --resume` under the best other viable profile, with a short handoff
 prompt so the resumed session knows why it moved.
 
+*What the switch carries.* The hop builds claude's argv fresh rather than
+repeating the one it was launched with. It resumes the same session id,
+re-applies the `--permission-mode`, `--effort` and `--model` the sidecar
+remembers, and then replays the launch flags that shape the session:
+`--dangerously-skip-permissions` and its `--allow-` form, `--add-dir`,
+`--settings` and `--setting-sources`, `--mcp-config` and `--strict-mcp-config`,
+the tool allow and deny lists, the system-prompt flags and their file and
+snapshot forms, `--agent` and `--agents`, `--plugin-dir` and `--plugin-url`,
+`--fallback-model`, `--autocompact`, `--max-budget-usd`, `--verbose` and the
+other valueless switches. A session started
+`csm --dangerously-skip-permissions --add-dir /x "do the thing"` therefore
+comes back after a switch still bypassing prompts and still able to read
+`/x`, instead of stopping on the first permission dialog with nobody watching.
+
+The initial prompt is not replayed: `--resume` already carries that
+conversation, and the handoff prompt is the hop's first turn. Nor are the
+flags that would fight the hop's own argv, among them `--resume`,
+`--continue`, `--session-id` and `--fork-session`, `--print` with its input
+and output formats, and the background, cloud, worktree and tmux launchers.
+Anything after a bare `--` stops the scan, and a flag `csm` does not
+recognise is dropped as well, since replaying it without knowing whether it
+takes a value would either swallow the following argument or strand one on
+the argv. What the hop leaves behind is written to `limit-switch.log` as
+`dropped passthru: …`, so a session that comes back without something it was
+launched with is explainable after the fact. Dropped flags are named there;
+everything else, the initial prompt included, is only counted, because that
+log holds no conversation text.
+
+One shape needs care. A flag that takes a list, such as `--add-dir`, keeps
+collecting values until something stops it, so when the replayed flags end
+inside one of those lists the hop writes `--` before the handoff prompt.
+Otherwise claude reads the handoff as one more directory and the resumed
+session has no first turn.
+
 *Statusline tick.* This is the path that fires for a subscription cap. When
 the account's session, weekly, or model-scoped weekly limit is reached,
 Claude Code (2.1.270) does not end the turn: it shows "Weekly limit reached ·

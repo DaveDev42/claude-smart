@@ -1,7 +1,8 @@
 //! Sidecar state file — `<smart_dir>/<sid>.json`.
 //!
 //! The sidecar records per-session metadata that must survive across the relaunch
-//! loop: permission mode, effort, model, cwd, profile, and the hop counter.
+//! loop: permission mode, effort, model, cwd, profile, the launch passthru, and
+//! the hop counter.
 //!
 //! **Read-compat contract:** the legacy zsh writer emits `hop` as a JSON
 //! STRING (produced by `jq --arg`) — an external contract other readers
@@ -70,6 +71,16 @@ pub struct Sidecar {
     /// `claude-as` profile name (leaf of `CLAUDE_CONFIG_DIR`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub profile: Option<String>,
+
+    /// The launch arguments `csm run` did not consume itself and forwarded to
+    /// claude verbatim, recorded so a limit-switch relaunch can replay the ones
+    /// that shape the session (`--dangerously-skip-permissions`, `--add-dir`,
+    /// `--settings`, …). The list is stored as launched; the hop filters it
+    /// through `cli::carry::carry_passthru`, which knows each flag's arity and
+    /// drops what a resume must not repeat. Absent in every sidecar written
+    /// before this field existed, which reads back as `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub passthru: Option<Vec<String>>,
 
     /// Limit-switch hop counter.
     ///
@@ -235,6 +246,9 @@ fn overlay(dst: &mut Sidecar, src: &Sidecar) {
     if src.profile.is_some() {
         dst.profile = src.profile.clone();
     }
+    if src.passthru.is_some() {
+        dst.passthru = src.passthru.clone();
+    }
     if src.hop.is_some() {
         dst.hop = src.hop.clone();
     }
@@ -254,6 +268,7 @@ fn is_empty_patch(p: &Sidecar) -> bool {
         && p.model.is_none()
         && p.cwd.is_none()
         && p.profile.is_none()
+        && p.passthru.is_none()
         && p.hop.is_none()
         && p.extra.is_empty()
 }
@@ -520,6 +535,97 @@ mod tests {
         assert!(s.permission_mode.is_none());
         assert_eq!(s.hop_int(), 0, "absent hop reads as 0");
         assert!(s.sidecar_flags().is_empty(), "empty sidecar emits no flags");
+    }
+
+    // ─── passthru field ───────────────────────────────────────────────────────
+
+    #[test]
+    fn passthru_round_trips_under_its_own_key() {
+        let s = Sidecar {
+            session_id: Some("abc".to_owned()),
+            passthru: Some(vec![
+                "--dangerously-skip-permissions".to_owned(),
+                "--add-dir".to_owned(),
+                "/Users/example/a".to_owned(),
+            ]),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&s).expect("serialize");
+        assert!(json.contains("\"passthru\""), "missing passthru in: {json}");
+        let back: Sidecar = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back.passthru, s.passthru);
+    }
+
+    #[test]
+    fn passthru_absent_is_none_and_is_not_serialized() {
+        // A sidecar written before the field existed: the key is simply missing
+        // and must read back as None rather than failing the parse.
+        let raw = r#"{"sessionId":"abc","hop":"2","permissionMode":"default"}"#;
+        let s: Sidecar = serde_json::from_str(raw).expect("deserialize legacy");
+        assert!(s.passthru.is_none());
+        assert_eq!(s.hop_int(), 2);
+        let back = serde_json::to_string(&s).expect("reserialize");
+        assert!(
+            !back.contains("passthru"),
+            "an absent passthru must stay absent: {back}"
+        );
+    }
+
+    #[test]
+    fn passthru_overlays_like_the_other_fields() {
+        let dir = TempDir::new().unwrap();
+        let path = tmp_sidecar(&dir, "sid.json");
+        let launched = Sidecar {
+            passthru: Some(vec!["--verbose".to_owned()]),
+            ..Default::default()
+        };
+        write_sidecar(&path, &launched).expect("write");
+
+        // A patch that says nothing about passthru leaves the remembered list.
+        merge_sidecar(
+            &path,
+            &Sidecar {
+                effort: Some("high".to_owned()),
+                ..Default::default()
+            },
+        )
+        .expect("merge");
+        let kept = read_sidecar(&path).expect("read");
+        assert_eq!(kept.passthru, launched.passthru);
+        assert_eq!(kept.effort.as_deref(), Some("high"));
+
+        // A patch that does carry one replaces it wholesale.
+        merge_sidecar(
+            &path,
+            &Sidecar {
+                passthru: Some(vec!["--bare".to_owned()]),
+                ..Default::default()
+            },
+        )
+        .expect("merge");
+        let replaced = read_sidecar(&path).expect("read");
+        assert_eq!(replaced.passthru, Some(vec!["--bare".to_owned()]));
+    }
+
+    #[test]
+    fn a_passthru_only_patch_is_not_an_empty_patch() {
+        // merge_sidecar skips the write entirely for an empty patch, so passthru
+        // has to count as data or a flagless launch would never be remembered.
+        let dir = TempDir::new().unwrap();
+        let path = tmp_sidecar(&dir, "sid.json");
+        merge_sidecar(
+            &path,
+            &Sidecar {
+                passthru: Some(vec!["--verbose".to_owned()]),
+                ..Default::default()
+            },
+        )
+        .expect("merge");
+        assert!(path.exists(), "passthru-only patch must reach the disk");
+        assert_eq!(
+            read_sidecar(&path).expect("read").passthru,
+            Some(vec!["--verbose".to_owned()])
+        );
     }
 
     // ─── sidecar_flags() tests ────────────────────────────────────────────────

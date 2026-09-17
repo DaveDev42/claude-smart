@@ -262,37 +262,75 @@ fn relaunch_loop(
         // the launch flags the sidecar remembers, and inject the handoff prompt
         // (unless suppressed).
         let remembered = crate::sidecar::read_sidecar(&paths::sidecar(&sid)).unwrap_or_default();
-        cli = build_next_cli(&sid, &sentinel, &remembered);
+        let (next_cli, dropped) = build_next_cli(&sid, &sentinel, &remembered);
+        if !dropped.is_empty() {
+            // The switch changed the session's argv. Say so where every other
+            // limit-switch event is recorded, so a session that comes back
+            // without something it was launched with is explainable.
+            let _ = crate::hook::notify::append_log(
+                &sid,
+                &format!(
+                    "relaunch sid={} dropped passthru: {}",
+                    crate::hook::sid_short(&sid),
+                    crate::cli::carry::describe_dropped(&dropped)
+                ),
+            );
+        }
+        cli = next_cli;
     }
 }
 
 /// Build the claude CLI for the next relaunch hop: resume the same session,
 /// re-apply the `--permission-mode`/`--effort`/`--model` the sidecar remembers
-/// for it, and pass the handoff prompt (if any). Only used by the unix
-/// relaunch loop.
+/// for it, replay the session-shaping flags of the original launch, and pass
+/// the handoff prompt (if any). Returns the argv and the remembered passthru
+/// tokens it could not replay, which the caller logs.
 ///
 /// The remembered flags matter because a switch is meant to continue the
 /// same work: a session launched as `csm --model <m>` that moves to another
 /// profile must come back up on `<m>`, not on that profile's default model.
-/// `csm run` persists explicit flags into the sidecar at launch precisely so
-/// this hop can read them back; positional passthrough (an initial prompt) is
-/// deliberately not carried, since `--resume` already has the conversation.
-#[cfg(not(windows))]
+/// The same holds for the flags `csm run` never consumed and forwarded to
+/// claude — a session launched `--dangerously-skip-permissions --add-dir /x`
+/// that comes back without them stops on the first permission prompt with
+/// nobody there to answer it. `csm run` persists both into the sidecar at
+/// launch precisely so this hop can read them back. What is *not* replayed is
+/// the initial prompt (`--resume` already carries that conversation) and every
+/// flag that would fight this argv or the resume itself; `cli::carry` owns
+/// that decision.
+///
+/// Only the unix relaunch loop calls this; on Windows the loop is gated off
+/// (`run_relaunch_loop` → `run_once`, which relaunches nothing and so has no
+/// second argv to build), but the builder still compiles there so both
+/// platforms would carry identically the day that gate lifts.
+#[cfg_attr(windows, allow(dead_code))]
 fn build_next_cli(
     sid: &str,
     sentinel: &RelaunchSentinel,
     remembered: &crate::sidecar::Sidecar,
-) -> Vec<OsString> {
+) -> (Vec<OsString>, Vec<String>) {
     let mut cli: Vec<OsString> = Vec::new();
     cli.push(OsString::from("--resume"));
     cli.push(OsString::from(sid));
     cli.extend(remembered.sidecar_flags());
+
+    let passthru = remembered.passthru.as_deref().unwrap_or(&[]);
+    let carried = crate::cli::carry::carry_passthru(passthru);
+    let open_variadic = carried.trailing_variadic;
+    cli.extend(carried.carried);
+
     // The handoff prompt is the first turn after resume (e.g. "resume"). Empty =
     // suppressed (user already had a pending tail); pass nothing then.
     if !sentinel.handoff.is_empty() {
+        // A carried run that ends inside a variadic flag would swallow the
+        // prompt as one more of its values, and the session would come back
+        // with nothing to do. `--` closes the run; it is emitted only in that
+        // case, so an argv that was already correct keeps its exact shape.
+        if open_variadic {
+            cli.push(OsString::from("--"));
+        }
         cli.push(OsString::from(&sentinel.handoff));
     }
-    cli
+    (cli, carried.dropped)
 }
 
 /// Map a child `ExitStatus` to the loop's `Result`, preserving the exit code by
@@ -341,7 +379,6 @@ pub struct LaunchSpec {
 mod tests {
     use super::*;
 
-    #[cfg(not(windows))]
     fn sentinel(handoff: &str) -> RelaunchSentinel {
         RelaunchSentinel {
             session_id: "abc123".to_string(),
@@ -353,7 +390,6 @@ mod tests {
         }
     }
 
-    #[cfg(not(windows))]
     fn strs(v: &[OsString]) -> Vec<String> {
         v.iter().map(|s| s.to_string_lossy().into_owned()).collect()
     }
@@ -361,7 +397,6 @@ mod tests {
     /// The hop re-applies the sidecar's remembered launch flags between the
     /// resume verb and the handoff prompt, so the switched session runs the
     /// same model/effort/permission mode the user launched with.
-    #[cfg(not(windows))]
     #[test]
     fn build_next_cli_carries_remembered_flags() {
         let remembered = crate::sidecar::Sidecar {
@@ -370,7 +405,7 @@ mod tests {
             permission_mode: Some("plan".to_string()),
             ..Default::default()
         };
-        let cli = build_next_cli("abc123", &sentinel("carry on"), &remembered);
+        let (cli, dropped) = build_next_cli("abc123", &sentinel("carry on"), &remembered);
         assert_eq!(
             strs(&cli),
             [
@@ -385,24 +420,148 @@ mod tests {
                 "carry on",
             ]
         );
+        assert!(dropped.is_empty());
     }
 
-    #[cfg(not(windows))]
     #[test]
     fn build_next_cli_without_flags_is_resume_and_handoff() {
-        let cli = build_next_cli("abc123", &sentinel("carry on"), &Default::default());
+        let (cli, dropped) = build_next_cli("abc123", &sentinel("carry on"), &Default::default());
         assert_eq!(strs(&cli), ["--resume", "abc123", "carry on"]);
+        assert!(dropped.is_empty());
     }
 
-    #[cfg(not(windows))]
     #[test]
     fn build_next_cli_empty_handoff_passes_no_prompt() {
         let remembered = crate::sidecar::Sidecar {
             model: Some("some-model".to_string()),
             ..Default::default()
         };
-        let cli = build_next_cli("abc123", &sentinel(""), &remembered);
+        let (cli, _) = build_next_cli("abc123", &sentinel(""), &remembered);
         assert_eq!(strs(&cli), ["--resume", "abc123", "--model", "some-model"]);
+    }
+
+    /// The whole point of remembering the passthru: the switched session comes
+    /// back with the permission bypass and the extra directory it was launched
+    /// with, ordered after the sidecar flags and before the handoff prompt.
+    #[test]
+    fn build_next_cli_carries_remembered_passthru_before_the_handoff() {
+        let remembered = crate::sidecar::Sidecar {
+            model: Some("some-model".to_string()),
+            passthru: Some(vec![
+                "--dangerously-skip-permissions".to_string(),
+                "--add-dir".to_string(),
+                "/Users/example/x".to_string(),
+                "--settings".to_string(),
+                "/Users/example/s.json".to_string(),
+                "do the thing".to_string(),
+            ]),
+            ..Default::default()
+        };
+        let (cli, dropped) = build_next_cli("abc123", &sentinel("carry on"), &remembered);
+        assert_eq!(
+            strs(&cli),
+            [
+                "--resume",
+                "abc123",
+                "--model",
+                "some-model",
+                "--dangerously-skip-permissions",
+                "--add-dir",
+                "/Users/example/x",
+                "--settings",
+                "/Users/example/s.json",
+                "carry on",
+            ]
+        );
+        assert_eq!(
+            dropped,
+            ["do the thing"],
+            "the initial prompt is not replayed; the caller logs that it went"
+        );
+    }
+
+    #[test]
+    fn build_next_cli_with_a_prompt_only_passthru_carries_nothing() {
+        let remembered = crate::sidecar::Sidecar {
+            passthru: Some(vec!["do the thing".to_string()]),
+            ..Default::default()
+        };
+        let (cli, dropped) = build_next_cli("abc123", &sentinel("carry on"), &remembered);
+        assert_eq!(strs(&cli), ["--resume", "abc123", "carry on"]);
+        assert_eq!(dropped, ["do the thing"]);
+    }
+
+    /// The regression this guards: a launch whose last carried flag is
+    /// variadic (`--add-dir /x`) used to hand claude a prompt it would read as
+    /// one more directory, so the switched session came back with the extra
+    /// directory wrong AND no first turn. `--` closes the run.
+    #[test]
+    fn build_next_cli_closes_a_trailing_variadic_before_the_handoff() {
+        let remembered = crate::sidecar::Sidecar {
+            passthru: Some(vec![
+                "--add-dir".to_string(),
+                "/Users/example/x".to_string(),
+            ]),
+            ..Default::default()
+        };
+        let (cli, _) = build_next_cli("abc123", &sentinel("carry on"), &remembered);
+        assert_eq!(
+            strs(&cli),
+            [
+                "--resume",
+                "abc123",
+                "--add-dir",
+                "/Users/example/x",
+                "--",
+                "carry on",
+            ]
+        );
+    }
+
+    /// The separator is not free: it changes how claude reads everything after
+    /// it, so it appears only when a variadic run is actually open. A launch
+    /// whose carried tail is a boolean (or a one-value flag with its value)
+    /// keeps the argv it always had.
+    #[test]
+    fn build_next_cli_omits_the_separator_when_nothing_can_absorb() {
+        let remembered = crate::sidecar::Sidecar {
+            passthru: Some(vec![
+                "--add-dir".to_string(),
+                "/Users/example/x".to_string(),
+                "--dangerously-skip-permissions".to_string(),
+            ]),
+            ..Default::default()
+        };
+        let (cli, _) = build_next_cli("abc123", &sentinel("carry on"), &remembered);
+        assert_eq!(
+            strs(&cli),
+            [
+                "--resume",
+                "abc123",
+                "--add-dir",
+                "/Users/example/x",
+                "--dangerously-skip-permissions",
+                "carry on",
+            ],
+            "the boolean closed the variadic run already"
+        );
+    }
+
+    #[test]
+    fn build_next_cli_with_an_open_variadic_and_no_handoff_adds_no_separator() {
+        let remembered = crate::sidecar::Sidecar {
+            passthru: Some(vec![
+                "--add-dir".to_string(),
+                "/Users/example/x".to_string(),
+            ]),
+            ..Default::default()
+        };
+        let (cli, _) = build_next_cli("abc123", &sentinel(""), &remembered);
+        assert_eq!(
+            strs(&cli),
+            ["--resume", "abc123", "--add-dir", "/Users/example/x"],
+            "nothing follows the run, so there is nothing to separate"
+        );
     }
 
     #[test]

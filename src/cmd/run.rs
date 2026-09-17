@@ -195,17 +195,13 @@ pub(crate) fn run(args: &[OsString]) -> anyhow::Result<()> {
 
     let cli = launch_cli(&resolution, &existing_sidecar, flags, &parsed.passthru);
 
-    // Remember this invocation's explicit mode/effort/model so a later
-    // `csm -r <sid>` restores them (perfect-continue). Best-effort: a launch
-    // must never fail because the sidecar could not be written.
-    let explicit = sidecar::Sidecar {
-        permission_mode: flags.permission_mode.clone(),
-        effort: flags.effort.clone(),
-        model: flags.model.clone(),
-        ..Default::default()
-    };
-    if !explicit.sidecar_flags().is_empty() {
-        let _ = sidecar::merge_sidecar(&sidecar_path, &explicit);
+    // Remember what this invocation asked for so a later `csm -r <sid>` restores
+    // the mode/effort/model (perfect-continue) and a limit-switch hop can replay
+    // the session-shaping claude flags. Best-effort: a launch must never fail
+    // because the sidecar could not be written.
+    let remembered = remembered_from_launch(flags, &parsed.passthru);
+    if !remembered.sidecar_flags().is_empty() || remembered.passthru.is_some() {
+        let _ = sidecar::merge_sidecar(&sidecar_path, &remembered);
     }
 
     let spec = LaunchSpec {
@@ -219,6 +215,31 @@ pub(crate) fn run(args: &[OsString]) -> anyhow::Result<()> {
     // (Windows). Construct via Default so platform-specific changes are isolated.
     let launcher = <platform::PlatformLauncher as std::default::Default>::default();
     platform::relaunch::run_relaunch_loop(&launcher, &spec)
+}
+
+/// What this launch hands the sidecar to remember: the mode/effort/model the
+/// user named explicitly, and the arguments `csm run` forwarded to claude
+/// untouched.
+///
+/// The passthru is stored as launched, non-empty only — the filtering of which
+/// of those flags a relaunch may replay belongs to the hop that replays them
+/// (`cli::carry::carry_passthru`), not to the launch that records them, so a
+/// later change to that allow-list applies to sessions launched today. A
+/// non-UTF-8 argument is recorded lossily: the sidecar is JSON, and a flag that
+/// survives a switch with a mangled byte is a better outcome than none of them
+/// surviving because one argument was not text.
+fn remembered_from_launch(flags: &cli::parser::Flags, passthru: &[OsString]) -> sidecar::Sidecar {
+    let launched: Vec<String> = passthru
+        .iter()
+        .map(|a| a.to_string_lossy().into_owned())
+        .collect();
+    sidecar::Sidecar {
+        permission_mode: flags.permission_mode.clone(),
+        effort: flags.effort.clone(),
+        model: flags.model.clone(),
+        passthru: (!launched.is_empty()).then_some(launched),
+        ..Default::default()
+    }
 }
 
 /// The claude CLI for a cold launch: the session verb, then mode/effort/model,
@@ -826,6 +847,53 @@ mod tests {
                 "hello"
             ]
         );
+    }
+
+    // ── remembered_from_launch: what the sidecar keeps from this launch ───────
+
+    #[test]
+    fn remembered_from_launch_keeps_flags_and_passthru() {
+        let flags = parse_flags(&["--model", "claude-x-1", "--effort", "high"]);
+        let passthru = [
+            OsString::from("--dangerously-skip-permissions"),
+            OsString::from("--add-dir"),
+            OsString::from("/Users/example/a"),
+        ];
+        let remembered = remembered_from_launch(&flags, &passthru);
+        assert_eq!(remembered.model.as_deref(), Some("claude-x-1"));
+        assert_eq!(remembered.effort.as_deref(), Some("high"));
+        assert_eq!(
+            remembered.passthru,
+            Some(vec![
+                "--dangerously-skip-permissions".to_owned(),
+                "--add-dir".to_owned(),
+                "/Users/example/a".to_owned(),
+            ]),
+            "the passthru is remembered as launched, in order"
+        );
+    }
+
+    #[test]
+    fn remembered_from_launch_records_passthru_without_any_csm_flag() {
+        // The case the write gate used to miss: no --model/--effort/
+        // --permission-mode, so sidecar_flags() is empty, yet the launch still
+        // has a shape a switch must restore.
+        let passthru = [OsString::from("--dangerously-skip-permissions")];
+        let remembered = remembered_from_launch(&parse_flags(&[]), &passthru);
+        assert!(remembered.sidecar_flags().is_empty());
+        assert_eq!(
+            remembered.passthru,
+            Some(vec!["--dangerously-skip-permissions".to_owned()])
+        );
+    }
+
+    #[test]
+    fn remembered_from_launch_of_a_bare_launch_is_empty() {
+        // Nothing to remember → nothing written, so an existing sidecar's
+        // passthru is not clobbered with an empty list by a later bare resume.
+        let remembered = remembered_from_launch(&parse_flags(&[]), &[]);
+        assert!(remembered.sidecar_flags().is_empty());
+        assert!(remembered.passthru.is_none());
     }
 
     #[test]

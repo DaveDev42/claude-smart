@@ -32,7 +32,10 @@ see *Invariants*.
   `cmd::pick_account::cmd_current_usage`, and `newuuid` → inline in `main()`
   (see the match in `src/main.rs`).
 - `src/cli/` — `parser.rs` (hand-rolled `csm run` flag loop, NOT clap, so
-  claude flags forward verbatim), `completions.rs` (clap tree used ONLY for
+  claude flags forward verbatim), `carry.rs` (pure `carry_passthru`: the
+  arity-aware allow-list picking which remembered passthru flags a
+  limit-switch hop replays on `claude --resume`, and which it drops),
+  `completions.rs` (clap tree used ONLY for
   `csm completions`, never to parse real argv), `reserved.rs` (the reserved
   subcommand consts + `dispatch_subcommand`, read by dispatch, completions, and
   the disjointness test).
