@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.3.3](https://github.com/DaveDev42/claude-smart/compare/v0.3.2...v0.3.3) (2026-09-17)
+
+
+### Features
+
+* **doctor:** keep ~/.claude as a compatibility shim — link its projects to the shared transcript dir so hardcoded-path tools see every profile's sessions ([50677f2](https://github.com/DaveDev42/claude-smart/commit/50677f2858d9c9687af7a040dc720e4a87cb54aa))
+* **picker:** surface NeedsRefresh profiles in the stale-usage account picker ([47e9cca](https://github.com/DaveDev42/claude-smart/commit/47e9cca0ce225999100d345ef6d2176b182372d7))
+* **provision:** self-heal the projects symlink alongside plugins — csm no longer depends on out-of-repo tooling for the shared transcript dir ([47e9cca](https://github.com/DaveDev42/claude-smart/commit/47e9cca0ce225999100d345ef6d2176b182372d7))
+
+
+### Bug Fixes
+
+* **help:** document every run flag csm actually accepts ([47e9cca](https://github.com/DaveDev42/claude-smart/commit/47e9cca0ce225999100d345ef6d2176b182372d7))
+* **reaper:** normalize exe basenames through proc_check's helper ([0822bdd](https://github.com/DaveDev42/claude-smart/commit/0822bddb4d1aa31dbfe794a7a5455127879b2c02))
+
 ## [0.3.2](https://github.com/DaveDev42/claude-smart/compare/v0.3.1...v0.3.2) (2026-09-15)
 
 
