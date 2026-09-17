@@ -97,30 +97,18 @@ pub struct SysinfoProcCheck;
 
 impl ProcCheck for SysinfoProcCheck {
     fn is_live_claude_or_node(pid: u32) -> bool {
-        use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
+        use super::proc;
 
-        // `System::new()` starts empty and `refresh_processes_specifics` loads
-        // exactly this one pid, so the process table is never swept.
-        // `ProcessRefreshKind::nothing()` leaves exe and cmd unset (the name is
-        // always filled), so both are requested explicitly.
-        let pid = Pid::from_u32(pid);
-        let mut sys = System::new();
-        let kind = ProcessRefreshKind::nothing()
-            .with_exe(UpdateKind::OnlyIfNotSet)
-            .with_cmd(UpdateKind::OnlyIfNotSet);
-        if sys.refresh_processes_specifics(ProcessesToUpdate::Some(&[pid]), true, kind) == 0 {
-            return false;
-        }
-        let Some(proc_) = sys.process(pid) else {
-            return false;
-        };
-        let name = proc_.name().to_str();
-        let exe = proc_.exe().and_then(|p| p.to_str());
-        let argv0 = proc_.cmd().first().and_then(|s| s.to_str());
-        identity_matches(
-            &[name, exe, argv0],
-            &crate::config::resolve_launch_command(),
-        )
+        proc::probe(pid).is_some_and(|p| {
+            identity_matches(
+                &[
+                    Some(p.name.as_str()),
+                    p.exe.as_deref().and_then(|e| e.to_str()),
+                    p.cmd.first().and_then(|s| s.to_str()),
+                ],
+                &crate::config::resolve_launch_command(),
+            )
+        })
     }
 }
 

@@ -115,35 +115,33 @@ fn exe_base_of(file_name: &str) -> String {
 
 /// Capture the full live process table as `ProcRow`s.
 ///
-/// One `System::new_all()` sweep (off the hot path — the reaper is never on the
-/// latency-sensitive Stop path that `proc_check` warns about), then a per-pid
-/// `getpgid` on POSIX. On Windows `getpgid` has no analogue, so `pgid` is left
-/// `None` and only the ppid-walk net applies (a documented gap).
+/// One full sweep via `platform::proc::snapshot` (off the hot path — the
+/// reaper is never on the latency-sensitive Stop path that `proc_check`
+/// warns about), then a per-pid `getpgid` on POSIX. On Windows `getpgid` has
+/// no analogue, so `pgid` is left `None` and only the ppid-walk net applies
+/// (a documented gap).
 fn snapshot_proc_table() -> Vec<ProcRow> {
-    use sysinfo::System;
-
-    let sys = System::new_all();
-    let mut rows = Vec::with_capacity(sys.processes().len());
-    for (pid, proc_) in sys.processes() {
-        let pid_u32 = pid.as_u32();
-        let exe_base = exe_base_of(
-            proc_
-                .exe()
-                .and_then(|p| p.file_name())
-                .and_then(|n| n.to_str())
-                .unwrap_or(""),
-        );
-        let cmd_snippet = cmd_snippet(proc_.cmd());
-        rows.push(ProcRow {
-            pid: pid_u32,
-            ppid: proc_.parent().map(|p| p.as_u32()),
-            pgid: pgid_of(pid_u32),
-            start_time: proc_.start_time(),
-            exe_base,
-            cmd_snippet,
-        });
-    }
-    rows
+    crate::platform::proc::snapshot()
+        .into_iter()
+        .map(|p| {
+            let exe_base = exe_base_of(
+                p.exe
+                    .as_deref()
+                    .and_then(|path| path.file_name())
+                    .and_then(|n| n.to_str())
+                    .unwrap_or(""),
+            );
+            let cmd_snippet = cmd_snippet(&p.cmd);
+            ProcRow {
+                pid: p.pid,
+                ppid: p.ppid,
+                pgid: pgid_of(p.pid),
+                start_time: p.start_time,
+                exe_base,
+                cmd_snippet,
+            }
+        })
+        .collect()
 }
 
 /// Process-group id of `pid` on POSIX (`getpgid`); `None` on Windows or error.

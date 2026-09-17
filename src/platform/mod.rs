@@ -1,5 +1,6 @@
 pub mod launcher;
 pub mod pid;
+pub(crate) mod proc;
 pub mod proc_check;
 pub mod relaunch;
 
