@@ -322,6 +322,41 @@ mod tests {
         std::os::unix::fs::symlink("/bin/sleep", &link).unwrap();
         let mut child = std::process::Command::new(&link).arg("30").spawn().unwrap();
         let pid = child.id();
+        // TEMP DIAG (throwaway branch only): show what the runner reports.
+        {
+            use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
+            let p = format!("/proc/{pid}");
+            let rd = |f: &str| {
+                std::fs::read_to_string(format!("{p}/{f}")).unwrap_or_else(|e| format!("<err {e}>"))
+            };
+            println!("DIAG comm={:?}", rd("comm"));
+            println!("DIAG cmdline={:?}", rd("cmdline"));
+            println!("DIAG exe={:?}", std::fs::read_link(format!("{p}/exe")));
+            println!("DIAG status={:?}", rd("status").lines().take(8).collect::<Vec<_>>());
+            println!("DIAG stat={:?}", rd("stat"));
+            let spid = Pid::from_u32(pid);
+            let mut sys = System::new();
+            let kind = ProcessRefreshKind::nothing()
+                .with_exe(UpdateKind::OnlyIfNotSet)
+                .with_cmd(UpdateKind::OnlyIfNotSet);
+            let n = sys.refresh_processes_specifics(ProcessesToUpdate::Some(&[spid]), true, kind);
+            println!("DIAG refreshed={n} found={}", sys.process(spid).is_some());
+            if let Some(pr) = sys.process(spid) {
+                println!(
+                    "DIAG name={:?} exe={:?} cmd={:?} thread_kind={:?} status={:?}",
+                    pr.name(), pr.exe(), pr.cmd(), pr.thread_kind(), pr.status()
+                );
+            }
+            let mut sys2 = System::new();
+            let n2 = sys2.refresh_processes_specifics(
+                ProcessesToUpdate::Some(&[spid]), false, ProcessRefreshKind::everything());
+            println!("DIAG everything: refreshed={n2} found={}", sys2.process(spid).is_some());
+            if let Some(pr) = sys2.process(spid) {
+                println!("DIAG2 name={:?} exe={:?} cmd={:?}", pr.name(), pr.exe(), pr.cmd());
+            }
+            println!("DIAG launch={:?}", crate::config::resolve_launch_command());
+            println!("DIAG self_pid={} link={:?} sleep={:?}", std::process::id(), link, std::fs::read_link("/bin/sleep"));
+        }
         let live = SysinfoProcCheck::is_live_claude_or_node(pid);
         let _ = child.kill();
         let _ = child.wait();
