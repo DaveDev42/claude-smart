@@ -38,7 +38,7 @@ pub fn is_claude_or_node_name(base: &str) -> bool {
 /// The configured-binary branch is purely additive: with the default
 /// `["claude"]` (or anything ending in `claude`/`node`) it never adds a match,
 /// so behavior is unchanged when nothing is configured.
-fn is_name_for(base: &str, launch: &[std::ffi::OsString]) -> bool {
+pub(crate) fn is_name_for(base: &str, launch: &[std::ffi::OsString]) -> bool {
     let lower = base.to_ascii_lowercase();
     if lower.ends_with("claude") || lower.ends_with("node") {
         return true;
@@ -61,7 +61,7 @@ fn is_name_for(base: &str, launch: &[std::ffi::OsString]) -> bool {
 /// [`is_name_for`] expects: the directory part dropped (either separator, so a
 /// Windows path reduces the same way on every host) and a trailing `.exe`
 /// stripped in any case.
-fn bare_basename(id: &str) -> &str {
+pub(crate) fn bare_basename(id: &str) -> &str {
     let base = id.rsplit(['/', '\\']).next().unwrap_or(id);
     let cut = base.len().saturating_sub(4);
     match base.get(cut..) {

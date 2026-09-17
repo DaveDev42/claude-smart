@@ -104,6 +104,15 @@ fn sessions_for(scope: &ReapScope) -> Vec<Session> {
 
 // ─── live process-table snapshot ────────────────────────────────────────────
 
+/// Reduce a raw exe file name (path already stripped by the caller) to the
+/// lowercase basename `scan::is_claude_or_node_name` expects: strip a
+/// trailing `.exe` case-insensitively via `proc_check::bare_basename`, THEN
+/// lowercase — not the other way around, or a `.EXE`/`.Exe` suffix survives
+/// the strip and the resulting name never matches.
+fn exe_base_of(file_name: &str) -> String {
+    crate::platform::proc_check::bare_basename(file_name).to_ascii_lowercase()
+}
+
 /// Capture the full live process table as `ProcRow`s.
 ///
 /// One `System::new_all()` sweep (off the hot path — the reaper is never on the
@@ -117,13 +126,13 @@ fn snapshot_proc_table() -> Vec<ProcRow> {
     let mut rows = Vec::with_capacity(sys.processes().len());
     for (pid, proc_) in sys.processes() {
         let pid_u32 = pid.as_u32();
-        let exe_base = proc_
-            .exe()
-            .and_then(|p| p.file_name())
-            .and_then(|n| n.to_str())
-            .unwrap_or("")
-            .trim_end_matches(".exe")
-            .to_ascii_lowercase();
+        let exe_base = exe_base_of(
+            proc_
+                .exe()
+                .and_then(|p| p.file_name())
+                .and_then(|n| n.to_str())
+                .unwrap_or(""),
+        );
         let cmd_snippet = cmd_snippet(proc_.cmd());
         rows.push(ProcRow {
             pid: pid_u32,
@@ -414,5 +423,18 @@ mod tests {
     fn short_sid_truncates_or_passes_through() {
         assert_eq!(short_sid("0123456789abcdef"), "01234567");
         assert_eq!(short_sid("abc"), "abc");
+    }
+
+    #[test]
+    fn exe_base_of_strips_exe_suffix_before_lowercasing() {
+        // Regression: `.trim_end_matches(".exe")` run before lowercasing missed
+        // an upper/mixed-case suffix, so a `Claude.EXE`-shaped exe path was
+        // never recognized as "claude" and the process was never reaped.
+        assert_eq!(
+            exe_base_of(r"C:\Users\example\AppData\Claude.EXE"),
+            "claude"
+        );
+        assert_eq!(exe_base_of("claude.exe"), "claude");
+        assert_eq!(exe_base_of("node.Exe"), "node");
     }
 }
