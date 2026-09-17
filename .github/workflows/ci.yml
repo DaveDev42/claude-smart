@@ -93,3 +93,28 @@ jobs:
           components: rustfmt
       - name: Format check
         run: cargo fmt --check
+
+  # The limit-switch harness (e2e/): builds csm + a fake, sleeping `claude`,
+  # drives both through an isolated sandbox HOME with no network access. POSIX
+  # fork/SIGTERM semantics only, so macOS + Linux, no Windows row (see
+  # e2e/README.md's Portability section). run.sh prints the full report (and,
+  # on failure, every per-invocation log) to stdout, so CI logs are enough to
+  # debug a failure without a separate artifact upload.
+  e2e:
+    name: e2e (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: e2e-${{ matrix.os }}
+      - name: Build csm
+        run: cargo build --bin csm
+      - name: Run the limit-switch e2e harness
+        run: bash e2e/run.sh --csm target/debug/csm

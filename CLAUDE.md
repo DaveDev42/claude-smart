@@ -99,6 +99,11 @@ see *Invariants*.
   (1.95) job.
 - `.github/workflows/release-please.yml` — release automation (conventional
   commits → release PR → tag → build matrix + Homebrew bump; see Releases).
+- `e2e/` — the limit-switch end-to-end harness: `run.sh` builds `csm` and a
+  fake, sleeping `claude` (`fake-claude/claude.c`) and drives both through an
+  isolated sandbox HOME with no network access; `lib.sh` + `scenarios.sh` hold
+  the 10 scenarios. Excluded from the packaged crate (see `Cargo.toml`
+  `exclude`). See *Testing* in `README.md` and `e2e/README.md`.
 
 ## Commands
 
@@ -109,6 +114,7 @@ cargo build --bin csm
 cargo test                 # unit + the no_private_names leak guard
 cargo clippy --all-targets
 cargo run --bin csm -- <args>
+bash e2e/run.sh             # limit-switch end-to-end, fake claude, isolated HOME
 ```
 
 Run `/verify` before every commit (test + clippy + fmt + leak guard + a

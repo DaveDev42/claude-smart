@@ -12,14 +12,16 @@ keywords     = ["claude", "ai", "cli", "session"]
 categories   = ["command-line-utilities"]
 readme       = "README.md"
 # Keep the published crate tarball free of CI config, the in-repo Claude Code
-# harness, and release-please plumbing. .github/ is release plumbing; CLAUDE.md
-# + .claude/ are editor-agent memory/config; release-please-config.json + the
-# manifest drive the release PR — none mean anything to a registry consumer or
-# belong in the artifact.
+# harness, the e2e test harness, and release-please plumbing. .github/ is
+# release plumbing; CLAUDE.md + .claude/ are editor-agent memory/config; e2e/
+# is a shell+C integration harness with no build value to a registry consumer;
+# release-please-config.json + the manifest drive the release PR — none mean
+# anything to a registry consumer or belong in the artifact.
 exclude      = [
     ".github/",
     "CLAUDE.md",
     ".claude/",
+    "e2e/",
     "release-please-config.json",
     ".release-please-manifest.json",
 ]
