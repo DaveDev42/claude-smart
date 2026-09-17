@@ -43,19 +43,21 @@ clap          = { version = "4", features = ["derive", "env"] }
 clap_complete = "4"
 
 # human timestamps (MM-DD HH:MM), reset-epoch parse ("Jun 4 at 9pm (Asia/Seoul)"),
-# stale-age for the hub-down picker
+# stale-age annotation for the account picker when usage data is stale or unfetchable
 chrono    = { version = "0.4", features = ["serde"] }
-chrono-tz = "0.9"   # IANA zone table for resets_to_epoch (~3 MB binary overhead, acceptable)
+# IANA zone table: account/reset.rs's resets_to_epoch_at parser (compat payloads) and
+# usage/local/display.rs's reset formatting (always active). ~3 MB binary overhead, acceptable.
+chrono-tz = "0.10"
 
 uuid = { version = "1", features = ["v4"] }   # newuuid: lowercase UUID v4
-dirs = "5"                                     # cross-platform ~/ resolution for Paths
+dirs = "7"                                     # cross-platform ~/ resolution for Paths
 
 # liveness check on every target (replaces the external POSIX `ps -o comm=` spawn).
 # Only TARGETED refresh_process(Pid) — never a full sweep on the hot Stop path.
 sysinfo = { version = "0.30", default-features = false }  # no "process" feature in 0.30; process APIs always present
 
 anyhow    = "1"   # bin error propagation
-thiserror = "1"   # library-style errors in session/account/usage (UsageError, FetchError, SidecarError…)
+thiserror = "2"   # library-style errors in session/account/usage (UsageError, FetchError, SidecarError…)
 
 # In-process fuzzy picker (replaces the external `fzf` shell-out). nucleo-matcher
 # is the standalone scoring core of helix's nucleo (pure Rust, no worker threads);
@@ -64,12 +66,12 @@ thiserror = "1"   # library-style errors in session/account/usage (UsageError, F
 # so the picker behaves like fzf even with redirected stdio. No ratatui: we render
 # the small bounded list ourselves.
 nucleo-matcher = "0.3"
-crossterm      = "0.28"
+crossterm      = "0.29"
 
 # ─── local usage collection (src/usage/local/) ────────────────────────────────
 # derive the macOS Keychain service name Claude Code itself uses:
 # "Claude Code-credentials-" + sha256(NFC(config_dir)).hex[..8]
-sha2 = "0.10"
+sha2 = "0.11"
 # NFC-normalize the config-dir string before hashing (creds::service_name) —
 # Claude Code hashes the NFC form, so a path with combining-character
 # sequences must match byte-for-byte or the derived service name misses.
@@ -98,7 +100,7 @@ features         = ["json", "blocking", "rustls-tls"]
 # ─── POSIX-only ──────────────────────────────────────────────────────────────
 # tcsetpgrp/setpgid (foreground supervisor), kill() (hook SIGTERM), isatty (TTY gate)
 [target.'cfg(unix)'.dependencies]
-nix = { version = "0.29", features = ["hostname", "process", "signal", "term", "fs"] }
+nix = { version = "0.31", features = ["hostname", "process", "signal", "term", "fs"] }
 
 # ─── Windows-only ────────────────────────────────────────────────────────────
 # GenerateConsoleCtrlEvent, SetConsoleCtrlHandler, WaitFor*Object, CreateProcess

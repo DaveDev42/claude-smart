@@ -80,11 +80,9 @@ pub(crate) fn profile_name_for_dir(dir: &Path, profiles: &account::ProfileMap) -
 pub(crate) fn is_interactive() -> bool {
     #[cfg(unix)]
     {
-        // Use raw fd numbers (STDIN_FILENO=0, STDOUT_FILENO=1) — `nix::unistd::isatty`
-        // takes a `RawFd` (i32), not an I/O handle.
         use nix::unistd::isatty;
-        let stdin_ok = isatty(0).unwrap_or(false);
-        let stdout_ok = isatty(1).unwrap_or(false);
+        let stdin_ok = isatty(std::io::stdin()).unwrap_or(false);
+        let stdout_ok = isatty(std::io::stdout()).unwrap_or(false);
         stdin_ok && stdout_ok
     }
     #[cfg(not(unix))]
