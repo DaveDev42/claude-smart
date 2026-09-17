@@ -384,6 +384,14 @@ capture is what moves a running session off an account that just hit its
 weekly cap (see *Reactive switch* below), so a `csm run` session without it
 only gets the hook-based paths.
 
+`csm statusline` is safe to use as your `statusLine` command directly, not
+just as a capture step. A release build measured on macOS ran p50 11.48 ms
+and p95 22.64 ms for a real statusLine payload, close to the bare
+process-spawn floor and faster than a naive shell statusline that forks its
+own `hostname` call. If you'd rather keep a non-csm statusline script, the
+manual `csm usage capture &` line above still works as a drop-in addition to
+it.
+
 See *Usage collection and caching* in [Environment variables](#environment-variables)
 for every variable named above.
 

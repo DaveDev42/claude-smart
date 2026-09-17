@@ -220,11 +220,14 @@ is needed.
   switch the session `.jsonl` is complete, not truncated. Until both pass on a
   real Windows console the relaunch loop stays gated off and Windows falls back
   to launch-without-relaunch. See `src/platform/windows.rs`'s module doc.
-- **`csm statusline` cold-start latency is unmeasured.** The *capture* side is
-  live and operative — the statusline tick is the switch path for subscription
-  caps (`hook::run_from_statusline`). The *render* side (`<profile>@<host>`) is
-  not yet recommended as the default `statusLine` command: it sits on the prompt
-  hot path and has never been benchmarked against a shell statusline.
+- **`csm statusline` render-side latency, measured.** E1 measured a release
+  build on an Apple-silicon laptop (macOS, no host name; n=200 after a 10-run
+  warmup): `csm statusline` with a real statusLine payload on stdin ran p50
+  11.48 ms / p95 22.64 ms, only ~1.3 ms above the bare process-spawn floor
+  (`csm --version` p50 10.18 ms) and faster than a naive shell statusline
+  (`zsh -c 'echo "..."'` p50 18.87 ms). These numbers are macOS-only; Linux,
+  WSL and Windows are unmeasured. Render-side latency no longer blocks
+  recommending `csm statusline` as the default `statusLine` command.
 - **Windows `is_interactive()`** uses an env-var heuristic, not `GetConsoleMode`.
 
 ## Don't touch / out of scope
