@@ -371,10 +371,10 @@ fn render_menu(profiles: &ProfileMap) {
 /// `csm profiles use` / `cas use`).
 fn apply_default(name: &str, profiles: &ProfileMap) -> anyhow::Result<()> {
     crate::cas::write_default_profile(name, profiles)?;
-    if let Some(dir) = profiles.get(name) {
-        if let Err(e) = crate::cas::platform::apply_global(name, dir) {
-            eprintln!("  (platform floor warning: {e})");
-        }
+    if let Some(dir) = profiles.get(name)
+        && let Err(e) = crate::cas::platform::apply_global(name, dir)
+    {
+        eprintln!("  (platform floor warning: {e})");
     }
     Ok(())
 }

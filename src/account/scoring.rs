@@ -179,15 +179,15 @@ pub fn is_viable_pcts(
     if session_pct >= lim {
         return false;
     }
-    if let Some(w) = week_all_pct {
-        if w >= sat {
-            return false;
-        }
+    if let Some(w) = week_all_pct
+        && w >= sat
+    {
+        return false;
     }
-    if let Some(f) = week_fable_pct {
-        if f >= sat {
-            return false;
-        }
+    if let Some(f) = week_fable_pct
+        && f >= sat
+    {
+        return false;
     }
     true
 }
@@ -1127,10 +1127,10 @@ mod tests {
     /// excluded when it is present in `errors`, or when its pcts fail
     /// `is_viable_pcts`.
     fn is_excluded(data: &UsageData, profile: &str) -> bool {
-        if let Some(errors) = &data.errors {
-            if errors.contains_key(profile) {
-                return true;
-            }
+        if let Some(errors) = &data.errors
+            && errors.contains_key(profile)
+        {
+            return true;
         }
 
         if let Some(pu) = data.profiles.get(profile) {

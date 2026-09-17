@@ -170,17 +170,16 @@ fn check_freshness(
     force: bool,
     ttl_secs: i64,
 ) -> Freshness {
-    if !force {
-        if let Some(captured) = captured_at_epoch {
-            if now_epoch - captured < ttl_secs {
-                return Freshness::Fresh;
-            }
-        }
+    if !force
+        && let Some(captured) = captured_at_epoch
+        && now_epoch - captured < ttl_secs
+    {
+        return Freshness::Fresh;
     }
-    if let Some(cooldown) = cooldown_until {
-        if cooldown > now_epoch {
-            return Freshness::Cooldown(cooldown);
-        }
+    if let Some(cooldown) = cooldown_until
+        && cooldown > now_epoch
+    {
+        return Freshness::Cooldown(cooldown);
     }
     Freshness::NeedsProbe
 }
@@ -381,14 +380,14 @@ fn roll_over_expired_sections(usage: &ProfileUsage, now: DateTime<Utc>) -> Profi
         .into_iter()
         .flatten()
     {
-        if let Some(epoch) = s.resets_at {
-            if epoch < now_epoch {
-                *s = UsageSection {
-                    pct: 0,
-                    resets: None,
-                    resets_at: None,
-                };
-            }
+        if let Some(epoch) = s.resets_at
+            && epoch < now_epoch
+        {
+            *s = UsageSection {
+                pct: 0,
+                resets: None,
+                resets_at: None,
+            };
         }
     }
     out
@@ -679,10 +678,10 @@ fn apply_resolution(
         }
     }
 
-    if let Some(until) = set_cooldown {
-        if let Err(e) = store::set_cooldown(name, until) {
-            eprintln!("csm: warning: could not write usage cooldown for {name}: {e}");
-        }
+    if let Some(until) = set_cooldown
+        && let Err(e) = store::set_cooldown(name, until)
+    {
+        eprintln!("csm: warning: could not write usage cooldown for {name}: {e}");
     }
 }
 

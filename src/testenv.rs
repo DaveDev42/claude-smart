@@ -18,11 +18,15 @@
 //! tests touching different variables still run in parallel.
 //!
 //! `set_var`/`remove_var` here are the crate's only two call sites for
-//! `std::env::set_var`/`remove_var` — every fixture goes through
-//! `with_env_var`/`with_env_vars`, which call these two functions and
-//! nothing else touches the raw `std::env` mutators. That makes a future
-//! edition bump (where those `std::env` functions become `unsafe`) a
-//! two-function change instead of one scattered across every test module.
+//! `std::env::set_var`/`remove_var` — nothing else touches the raw `std::env`
+//! mutators. Most fixtures reach them through `with_env_var`/`with_env_vars`;
+//! a few RAII fixtures (`hook`'s `EnvFixture` and `spawn_fake_managed_process`,
+//! `usage::local::refresh`'s `TokenUrlEnv`) call `set_var`/`remove_var`
+//! directly but still hold `lock_for(name)` for their whole set→act→restore
+//! span, so the same per-name serialization holds regardless of call path.
+//! That makes a future edition bump (where those `std::env` functions become
+//! `unsafe`) a two-function change instead of one scattered across every test
+//! module.
 //!
 //! Every lock is acquired with `.unwrap_or_else(|e| e.into_inner())` so one
 //! panicking test never poisons the lock for every other test that touches
@@ -54,13 +58,23 @@ pub(crate) fn lock_for(name: &'static str) -> std::sync::MutexGuard<'static, ()>
 /// The crate's one `std::env::set_var` call site for tests.
 #[cfg(test)]
 pub(crate) fn set_var(name: &str, value: &str) {
-    std::env::set_var(name, value);
+    // SAFETY: test-only. Every caller — `with_env_var`/`with_env_vars` and
+    // the RAII fixtures in `hook` and `usage::local::refresh` — holds
+    // `lock_for(name)` for the whole set->act->restore sequence, so no other
+    // test mutates or reads this variable concurrently, and nothing but
+    // `cargo test` threads runs in this process.
+    unsafe { std::env::set_var(name, value) };
 }
 
 /// The crate's one `std::env::remove_var` call site for tests.
 #[cfg(test)]
 pub(crate) fn remove_var(name: &str) {
-    std::env::remove_var(name);
+    // SAFETY: test-only. Every caller — `with_env_var`/`with_env_vars` and
+    // the RAII fixtures in `hook` and `usage::local::refresh` — holds
+    // `lock_for(name)` for the whole set->act->restore sequence, so no other
+    // test mutates or reads this variable concurrently, and nothing but
+    // `cargo test` threads runs in this process.
+    unsafe { std::env::remove_var(name) };
 }
 
 /// Run `f` with `name` set to `value` (or removed, for `None`), holding

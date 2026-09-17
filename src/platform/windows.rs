@@ -63,8 +63,10 @@ unsafe extern "system" fn console_ctrl_handler(ctrl_type: u32) -> BOOL {
     match ctrl_type {
         CTRL_C_EVENT => {
             if pgid != 0 {
-                // Forward the interrupt to claude's process group.
-                let _ = GenerateConsoleCtrlEvent(CTRL_C_EVENT, pgid);
+                // SAFETY: `pgid` is a checked-nonzero group id loaded from
+                // `CHILD_PGID`, which is only ever set to a live child pid; the
+                // call has no aliasing requirement.
+                let _ = unsafe { GenerateConsoleCtrlEvent(CTRL_C_EVENT, pgid) };
             }
             TRUE // handled — do not let the default handler kill us
         }
@@ -72,7 +74,8 @@ unsafe extern "system" fn console_ctrl_handler(ctrl_type: u32) -> BOOL {
         // use the supervisor's own break path for keyboard breaks.
         CTRL_BREAK_EVENT => {
             if pgid != 0 {
-                let _ = GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, pgid);
+                // SAFETY: see the CTRL_C_EVENT arm above — same `pgid`, same call.
+                let _ = unsafe { GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, pgid) };
             }
             TRUE
         }

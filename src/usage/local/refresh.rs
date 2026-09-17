@@ -564,12 +564,11 @@ fn has_live_session(sessions_dir: &Path, mut is_live: impl FnMut(u32) -> bool) -
 /// to the numeric file stem (`<pid>.json`) when the body is missing the field
 /// or doesn't parse.
 fn pid_from_session_file(path: &Path) -> Option<u32> {
-    if let Ok(text) = read_capped(path, SESSION_FILE_CAP_BYTES) {
-        if let Ok(v) = serde_json::from_str::<Value>(&text) {
-            if let Some(pid) = v.get("pid").and_then(|p| p.as_u64()) {
-                return u32::try_from(pid).ok();
-            }
-        }
+    if let Ok(text) = read_capped(path, SESSION_FILE_CAP_BYTES)
+        && let Ok(v) = serde_json::from_str::<Value>(&text)
+        && let Some(pid) = v.get("pid").and_then(|p| p.as_u64())
+    {
+        return u32::try_from(pid).ok();
     }
     path.file_stem()
         .and_then(|s| s.to_str())

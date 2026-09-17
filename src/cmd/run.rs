@@ -361,12 +361,11 @@ fn launch_attention_lines(
         .profiles
         .get(current_profile)
         .and_then(|pu| pu.attention.as_ref())
+        && attention.kind == usage::model::AttentionKind::NeedsLogin
     {
-        if attention.kind == usage::model::AttentionKind::NeedsLogin {
-            out.push(format!(
+        out.push(format!(
                 "csm: warning: current profile '{current_profile}' needs login — claude will show /login"
             ));
-        }
     }
     out
 }

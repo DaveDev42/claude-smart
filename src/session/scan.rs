@@ -71,6 +71,14 @@ pub fn scan_sessions(cwd: &Path) -> Vec<SessionRow> {
     let mut all_transcripts: Vec<PathBuf> = Vec::new();
     for dir in &dirs {
         reindex_scan_dir(dir);
+        // 2024-edition note: `cargo fix --edition` flags this `if let` as a
+        // "relative drop order changing" site (the `ReadDir` iterator's drop
+        // moves marginally earlier in the loop body under 2024 tail-expression
+        // scoping). Equivalent here: the only `Drop` involved is std's
+        // `ReadDir`, which just closes the directory handle, it is dropped at
+        // the end of the same `for dir in &dirs` iteration either way, it
+        // holds no lock and has no ordering-sensitive side effect, and the
+        // push order into `all_transcripts` is unchanged.
         if let Ok(entries) = fs::read_dir(dir) {
             for entry in entries.flatten() {
                 let p = entry.path();
@@ -438,39 +446,36 @@ pub(crate) fn extract_label_and_mode(transcript_path: &Path) -> (String, String)
         let record_type = obj.get("type").and_then(|t| t.as_str()).unwrap_or("");
 
         // ai-title record: {"type":"ai-title","aiTitle":"..."}
-        if record_type == "ai-title" {
-            if let Some(t) = obj.get("aiTitle").and_then(|v| v.as_str()) {
-                if !t.is_empty() {
-                    ai_title = Some(t.to_owned());
-                }
-            }
+        if record_type == "ai-title"
+            && let Some(t) = obj.get("aiTitle").and_then(|v| v.as_str())
+            && !t.is_empty()
+        {
+            ai_title = Some(t.to_owned());
         }
 
         // last-prompt record: {"type":"last-prompt","lastPrompt":"..."}
-        if record_type == "last-prompt" {
-            if let Some(t) = obj.get("lastPrompt").and_then(|v| v.as_str()) {
-                if !t.is_empty() {
-                    last_prompt = Some(t.to_owned());
-                }
-            }
+        if record_type == "last-prompt"
+            && let Some(t) = obj.get("lastPrompt").and_then(|v| v.as_str())
+            && !t.is_empty()
+        {
+            last_prompt = Some(t.to_owned());
         }
 
         // permissionMode: in "permission-mode" or "user" records
-        if record_type == "permission-mode" || record_type == "user" {
-            if let Some(pm) = obj.get("permissionMode").and_then(|v| v.as_str()) {
-                if !pm.is_empty() {
-                    last_mode = Some(pm.to_owned());
-                }
-            }
+        if (record_type == "permission-mode" || record_type == "user")
+            && let Some(pm) = obj.get("permissionMode").and_then(|v| v.as_str())
+            && !pm.is_empty()
+        {
+            last_mode = Some(pm.to_owned());
         }
 
         // First user message (fallback label): type=="user"
-        if record_type == "user" && first_user.is_none() {
-            if let Some(text) = extract_user_text(obj) {
-                if !text.is_empty() {
-                    first_user = Some(text);
-                }
-            }
+        if record_type == "user"
+            && first_user.is_none()
+            && let Some(text) = extract_user_text(obj)
+            && !text.is_empty()
+        {
+            first_user = Some(text);
         }
     }
 

@@ -99,10 +99,8 @@ pub fn fetch_with(force: bool, refresh_oauth: bool) -> Result<UsageData, FetchEr
     let negative_cooldown = negative_cooldown_secs();
 
     // Step 1 — positive TTL cache (< POSITIVE_TTL_SECS), skipped under force.
-    if !force {
-        if let Some(data) = try_positive_cache(positive_ttl)? {
-            return Ok(data);
-        }
+    if !force && let Some(data) = try_positive_cache(positive_ttl)? {
+        return Ok(data);
     }
 
     // Step 2 — user-supplied usage command (`CSM_USAGE_CMD`), if set.

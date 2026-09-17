@@ -266,10 +266,10 @@ impl UsageData {
     /// Absent `session.pct` is encoded as `-1` in the scoring logic.
     pub fn current_usage(&self, profile: &str) -> Option<(i64, i64)> {
         // If this profile is in the errors map, it has no usable data.
-        if let Some(errors) = &self.errors {
-            if errors.contains_key(profile) {
-                return None;
-            }
+        if let Some(errors) = &self.errors
+            && errors.contains_key(profile)
+        {
+            return None;
         }
         let pu = self.profiles.get(profile)?;
         let sess_pct = pu.session.as_ref().map(|s| s.pct).unwrap_or(-1);

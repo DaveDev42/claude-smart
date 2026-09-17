@@ -359,16 +359,16 @@ pub fn parse_blob(text: &str, now: DateTime<Utc>) -> Result<OauthToken, CredErro
     let oauth = blob.claude_ai_oauth.ok_or(CredError::NotFound)?;
     let access_token = oauth.access_token.ok_or(CredError::NotFound)?;
 
-    if let Some(expires_at_ms) = oauth.expires_at {
-        if expires_at_ms <= now.timestamp_millis() {
-            let refresh_alive = oauth
-                .refresh_token_expires_at
-                .is_some_and(|r| r > now.timestamp_millis());
-            return Err(CredError::Expired {
-                refresh_alive,
-                expired_at_ms: expires_at_ms,
-            });
-        }
+    if let Some(expires_at_ms) = oauth.expires_at
+        && expires_at_ms <= now.timestamp_millis()
+    {
+        let refresh_alive = oauth
+            .refresh_token_expires_at
+            .is_some_and(|r| r > now.timestamp_millis());
+        return Err(CredError::Expired {
+            refresh_alive,
+            expired_at_ms: expires_at_ms,
+        });
     }
 
     Ok(OauthToken {

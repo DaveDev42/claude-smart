@@ -819,10 +819,11 @@ pub(crate) fn usage_threshold_hit(
     if week_pct >= 0 && week_pct >= limit_pct {
         return Some(format!("week_all {week_pct}%"));
     }
-    if let Some(fable_pct) = week_fable_pct {
-        if fable_pct >= 0 && fable_pct >= limit_pct {
-            return Some(format!("week_fable {fable_pct}%"));
-        }
+    if let Some(fable_pct) = week_fable_pct
+        && fable_pct >= 0
+        && fable_pct >= limit_pct
+    {
+        return Some(format!("week_fable {fable_pct}%"));
     }
     None
 }
@@ -954,14 +955,12 @@ fn prune_detected_markers() {
         if !name_str.ends_with(".detected") {
             continue;
         }
-        if let Ok(meta) = entry.metadata() {
-            if let Ok(modified) = meta.modified() {
-                if let Ok(age) = now.duration_since(modified) {
-                    if age.as_secs() > seven_days_secs {
-                        let _ = std::fs::remove_file(entry.path());
-                    }
-                }
-            }
+        if let Ok(meta) = entry.metadata()
+            && let Ok(modified) = meta.modified()
+            && let Ok(age) = now.duration_since(modified)
+            && age.as_secs() > seven_days_secs
+        {
+            let _ = std::fs::remove_file(entry.path());
         }
     }
 }

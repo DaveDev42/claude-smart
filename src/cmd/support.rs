@@ -35,10 +35,10 @@ pub(crate) fn resolve_profile_dir(
 /// Return the current profile dir from `$CLAUDE_CONFIG_DIR`, or the default
 /// resolved from the registry (`~/.config/claude-as/{profiles.json,default}`).
 pub(crate) fn current_profile_dir(profiles: &account::ProfileMap) -> PathBuf {
-    if let Ok(dir) = std::env::var("CLAUDE_CONFIG_DIR") {
-        if !dir.is_empty() {
-            return PathBuf::from(dir);
-        }
+    if let Ok(dir) = std::env::var("CLAUDE_CONFIG_DIR")
+        && !dir.is_empty()
+    {
+        return PathBuf::from(dir);
     }
     profiles.default_dir()
 }
