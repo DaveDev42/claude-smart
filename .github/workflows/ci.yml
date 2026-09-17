@@ -65,6 +65,22 @@ jobs:
         shell: bash
         run: cargo test --target ${{ matrix.target }}
 
+  # rust-version in Cargo.toml is a published contract (cargo install,
+  # cargo-binstall) that the check job above does not enforce — dtolnay/rust-toolchain@stable
+  # always resolves to the latest stable, not the floor. Pin the literal here
+  # to the same value as Cargo.toml's rust-version and keep it in the job name
+  # so drift between the two is visible at a glance.
+  msrv:
+    name: msrv (1.95)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@1.95
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: msrv
+      - run: cargo check --all-targets
+
   # Formatting is host-agnostic — one cheap job, not per-target.
   fmt:
     name: fmt
