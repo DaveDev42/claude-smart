@@ -156,6 +156,77 @@ pub(crate) fn rank(
         .collect()
 }
 
+/// Which flavor of the shared render/input loop is running: single-select
+/// (Enter returns one row, no toggle state) or multi-select (Space/Tab/Ctrl-A
+/// toggle, Enter confirms the whole selection).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PickerMode {
+    Single,
+    Multi,
+}
+
+/// Help line drawn under the list in [`PickerMode::Multi`] only.
+const HELP_LINE: &str = "  ⏎ confirm · space/tab toggle · ⌃a all · esc cancel";
+
+/// Rows of terminal chrome the loop reserves above the row list: the query
+/// line alone for Single, plus a status/help line for Multi.
+pub(crate) fn chrome_lines(mode: PickerMode) -> usize {
+    match mode {
+        PickerMode::Single => 1,
+        PickerMode::Multi => 2,
+    }
+}
+
+/// Render the top query line: the prompt/query alone for Single, with a
+/// `[n selected]` suffix for Multi.
+pub(crate) fn render_header(
+    mode: PickerMode,
+    prompt: &str,
+    query: &str,
+    selected_count: usize,
+) -> String {
+    match mode {
+        PickerMode::Single => format!("{prompt}{query}"),
+        PickerMode::Multi => format!("{prompt}{query}    [{selected_count} selected]"),
+    }
+}
+
+/// Render one row of the list: a 2-char cursor marker for Single, a 6-char
+/// cursor+checkbox marker for Multi. `text` is truncated to fit `cols` after
+/// the marker (a `cols` of 0, as a fresh pty reports before `TIOCSWINSZ`,
+/// truncates to empty rather than panicking).
+pub(crate) fn render_row(
+    mode: PickerMode,
+    is_cursor: bool,
+    is_selected: bool,
+    text: &str,
+    cols: u16,
+) -> String {
+    match mode {
+        PickerMode::Single => {
+            let max = (cols as usize).saturating_sub(2);
+            let text: String = if text.chars().count() > max {
+                text.chars().take(max).collect()
+            } else {
+                text.to_string()
+            };
+            let marker = if is_cursor { "> " } else { "  " };
+            format!("{marker}{text}")
+        }
+        PickerMode::Multi => {
+            let max = (cols as usize).saturating_sub(6);
+            let text: String = if text.chars().count() > max {
+                text.chars().take(max).collect()
+            } else {
+                text.to_string()
+            };
+            let cursor_mark = if is_cursor { ">" } else { " " };
+            let check = if is_selected { "x" } else { " " };
+            format!("{cursor_mark} [{check}] {text}")
+        }
+    }
+}
+
 /// Interactive single-select fuzzy picker over `rows`. See the module contract.
 ///
 /// Returns `Unavailable` for empty `rows` or no usable terminal (so the caller
@@ -170,7 +241,7 @@ pub fn run_picker(rows: &[String], opts: &PickerOpts) -> PickerOutcome {
     }
     // A terminal I/O error degrades to `Unavailable` (caller falls back) rather
     // than bubbling up — a picker failure must never abort the launch.
-    run_picker_inner(rows, opts).unwrap_or(PickerOutcome::Unavailable)
+    run_loop(rows, opts, PickerMode::Single).unwrap_or(PickerOutcome::Unavailable)
 }
 
 /// Interactive **multi-select** fuzzy picker over `rows`. See the module contract.
@@ -192,7 +263,7 @@ pub fn run_multi_picker(rows: &[String], opts: &PickerOpts) -> PickerOutcome {
     if !terminal_available() {
         return PickerOutcome::Unavailable;
     }
-    run_multi_picker_inner(rows, opts).unwrap_or(PickerOutcome::Unavailable)
+    run_loop(rows, opts, PickerMode::Multi).unwrap_or(PickerOutcome::Unavailable)
 }
 
 /// Toggle every row index in `filtered` within `selected` (Ctrl-A semantics).
@@ -213,7 +284,13 @@ pub(crate) fn toggle_all(filtered: &[usize], selected: &mut std::collections::BT
     }
 }
 
-fn run_multi_picker_inner(rows: &[String], opts: &PickerOpts) -> io::Result<PickerOutcome> {
+/// The shared render/input loop behind both [`run_picker`] and
+/// [`run_multi_picker`]. `mode` gates the handful of behaviors that differ
+/// between single- and multi-select: `chrome_lines`/`render_header`/
+/// `render_row` for drawing, the help line, Enter's two return shapes, and the
+/// Space/Tab/Ctrl-A toggle bindings. Everything else — cursor motion, query
+/// editing, cancel keys — is unconditional.
+fn run_loop(rows: &[String], opts: &PickerOpts, mode: PickerMode) -> io::Result<PickerOutcome> {
     use std::collections::BTreeSet;
 
     let _guard = TermGuard::enter()?;
@@ -223,12 +300,13 @@ fn run_multi_picker_inner(rows: &[String], opts: &PickerOpts) -> io::Result<Pick
     let mut query = String::new();
     let mut filtered: Vec<usize> = rank(rows, &query, opts, &mut matcher);
     let mut cursor_pos: usize = 0; // index into `filtered`
-    let mut selected: BTreeSet<usize> = BTreeSet::new(); // original row indices
+    let mut selected: BTreeSet<usize> = BTreeSet::new(); // original row indices; Multi only
 
     loop {
         let (cols, term_rows) = terminal::size().unwrap_or((80, 24));
-        // 2 lines of chrome: the query line + a help/status line.
-        let list_capacity = (term_rows as usize).saturating_sub(2).max(1);
+        let list_capacity = (term_rows as usize)
+            .saturating_sub(chrome_lines(mode))
+            .max(1);
         let visible = filtered.len().min(list_capacity);
         if visible == 0 {
             cursor_pos = 0;
@@ -240,38 +318,26 @@ fn run_multi_picker_inner(rows: &[String], opts: &PickerOpts) -> io::Result<Pick
         queue!(out, cursor::MoveTo(0, 0), Clear(ClearType::All))?;
         queue!(
             out,
-            Print(format!(
-                "{}{}    [{} selected]",
-                opts.prompt,
-                query,
-                selected.len()
-            ))
+            Print(render_header(mode, &opts.prompt, &query, selected.len()))
         )?;
         for (screen_row, &row_idx) in filtered.iter().take(list_capacity).enumerate() {
-            let mut text = project_display(&rows[row_idx], opts);
-            // Marker is 6 chars: "> [x] " / "  [ ] ".
-            let max = (cols as usize).saturating_sub(6);
-            if text.chars().count() > max {
-                text = text.chars().take(max).collect();
-            }
-            let cursor_mark = if screen_row == cursor_pos { ">" } else { " " };
-            let check = if selected.contains(&row_idx) {
-                "x"
-            } else {
-                " "
-            };
+            let text = project_display(&rows[row_idx], opts);
+            let is_cursor = screen_row == cursor_pos;
+            let is_selected = selected.contains(&row_idx);
             queue!(
                 out,
                 cursor::MoveTo(0, (screen_row + 1) as u16),
-                Print(format!("{cursor_mark} [{check}] {text}"))
+                Print(render_row(mode, is_cursor, is_selected, &text, cols))
             )?;
         }
-        // Help line at the bottom of the list.
-        queue!(
-            out,
-            cursor::MoveTo(0, (visible + 1) as u16),
-            Print("  ⏎ confirm · space/tab toggle · ⌃a all · esc cancel")
-        )?;
+        if mode == PickerMode::Multi {
+            // Help line at the bottom of the list.
+            queue!(
+                out,
+                cursor::MoveTo(0, (visible + 1) as u16),
+                Print(HELP_LINE)
+            )?;
+        }
         out.flush()?;
 
         // ── input ───────────────────────────────────────────────────────────
@@ -283,16 +349,28 @@ fn run_multi_picker_inner(rows: &[String], opts: &PickerOpts) -> io::Result<Pick
                     KeyCode::Char('c') if ctrl => return Ok(PickerOutcome::Cancelled),
                     KeyCode::Char('g') if ctrl => return Ok(PickerOutcome::Cancelled),
                     KeyCode::Enter => {
-                        // Confirm: recover col1 of every selected row, in
-                        // original `rows` order (BTreeSet iterates ascending).
-                        let keys: Vec<String> = selected
-                            .iter()
-                            .map(|&i| recover_col1(&rows[i], opts.delimiter))
-                            .collect();
-                        return Ok(PickerOutcome::SelectedMulti(keys));
+                        return Ok(match mode {
+                            // Confirm: recover col1 of every selected row, in
+                            // original `rows` order (BTreeSet iterates ascending).
+                            PickerMode::Multi => {
+                                let keys: Vec<String> = selected
+                                    .iter()
+                                    .map(|&i| recover_col1(&rows[i], opts.delimiter))
+                                    .collect();
+                                PickerOutcome::SelectedMulti(keys)
+                            }
+                            PickerMode::Single => match filtered.get(cursor_pos) {
+                                Some(&i) => {
+                                    PickerOutcome::Selected(recover_col1(&rows[i], opts.delimiter))
+                                }
+                                // Enter with no match in view → nothing to select; degrade.
+                                None => PickerOutcome::Unavailable,
+                            },
+                        });
                     }
-                    // Toggle the row under the cursor (Space or Tab).
-                    KeyCode::Char(' ') | KeyCode::Tab => {
+                    // Toggle the row under the cursor (Space or Tab). In Single
+                    // mode, Space falls through to the query-char arm below.
+                    KeyCode::Char(' ') | KeyCode::Tab if mode == PickerMode::Multi => {
                         if let Some(&row_idx) = filtered.get(cursor_pos) {
                             if !selected.remove(&row_idx) {
                                 selected.insert(row_idx);
@@ -304,7 +382,7 @@ fn run_multi_picker_inner(rows: &[String], opts: &PickerOpts) -> io::Result<Pick
                         }
                     }
                     // Ctrl-A: toggle all currently-filtered rows.
-                    KeyCode::Char('a') if ctrl => {
+                    KeyCode::Char('a') if ctrl && mode == PickerMode::Multi => {
                         toggle_all(&filtered, &mut selected);
                     }
                     KeyCode::Up => cursor_pos = cursor_pos.saturating_sub(1),
@@ -324,8 +402,8 @@ fn run_multi_picker_inner(rows: &[String], opts: &PickerOpts) -> io::Result<Pick
                         filtered = rank(rows, &query, opts, &mut matcher);
                         cursor_pos = 0;
                     }
-                    // Printable chars extend the query. Space is reserved for
-                    // toggle above, so it never reaches here.
+                    // Printable chars extend the query. In Multi mode Space is
+                    // reserved for toggle above, so it never reaches here.
                     KeyCode::Char(c) if !ctrl => {
                         query.push(c);
                         filtered = rank(rows, &query, opts, &mut matcher);
@@ -334,6 +412,7 @@ fn run_multi_picker_inner(rows: &[String], opts: &PickerOpts) -> io::Result<Pick
                     _ => {}
                 }
             }
+            // Resize → re-render on the next loop iteration with fresh dimensions.
             Event::Resize(_, _) => {}
             _ => {}
         }
@@ -359,98 +438,6 @@ impl Drop for TermGuard {
         let mut w = io::stderr();
         let _ = execute!(w, cursor::Show, LeaveAlternateScreen);
         let _ = disable_raw_mode();
-    }
-}
-
-fn run_picker_inner(rows: &[String], opts: &PickerOpts) -> io::Result<PickerOutcome> {
-    let _guard = TermGuard::enter()?;
-    let mut out = io::stderr();
-    let mut matcher = Matcher::new(Config::DEFAULT);
-
-    let mut query = String::new();
-    let mut filtered: Vec<usize> = rank(rows, &query, opts, &mut matcher);
-    let mut cursor_pos: usize = 0; // index into `filtered`
-
-    loop {
-        let (cols, term_rows) = terminal::size().unwrap_or((80, 24));
-        let list_capacity = (term_rows as usize).saturating_sub(1).max(1); // 1 line for the query
-        let visible = filtered.len().min(list_capacity);
-        if visible == 0 {
-            cursor_pos = 0;
-        } else if cursor_pos >= visible {
-            cursor_pos = visible - 1;
-        }
-
-        // ── render ──────────────────────────────────────────────────────────
-        queue!(out, cursor::MoveTo(0, 0), Clear(ClearType::All))?;
-        queue!(out, Print(format!("{}{}", opts.prompt, query)))?;
-        for (screen_row, &row_idx) in filtered.iter().take(list_capacity).enumerate() {
-            let mut text = project_display(&rows[row_idx], opts);
-            // Truncate to terminal width (minus the 2-char marker) to avoid wrap.
-            let max = (cols as usize).saturating_sub(2);
-            if text.chars().count() > max {
-                text = text.chars().take(max).collect();
-            }
-            let marker = if screen_row == cursor_pos { "> " } else { "  " };
-            queue!(
-                out,
-                cursor::MoveTo(0, (screen_row + 1) as u16),
-                Print(format!("{marker}{text}"))
-            )?;
-        }
-        out.flush()?;
-
-        // ── input ───────────────────────────────────────────────────────────
-        // crossterm's global event source reads from the controlling terminal.
-        match event::read()? {
-            Event::Key(k) if k.kind == KeyEventKind::Press => {
-                let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
-                match k.code {
-                    KeyCode::Esc => return Ok(PickerOutcome::Cancelled),
-                    KeyCode::Char('c') if ctrl => return Ok(PickerOutcome::Cancelled), // Ctrl-C
-                    KeyCode::Char('g') if ctrl => return Ok(PickerOutcome::Cancelled), // Ctrl-G
-                    KeyCode::Enter => {
-                        return Ok(match filtered.get(cursor_pos) {
-                            Some(&i) => {
-                                PickerOutcome::Selected(recover_col1(&rows[i], opts.delimiter))
-                            }
-                            // Enter with no match in view → nothing to select; degrade.
-                            None => PickerOutcome::Unavailable,
-                        });
-                    }
-                    KeyCode::Up => {
-                        cursor_pos = cursor_pos.saturating_sub(1);
-                    }
-                    KeyCode::Char('p') if ctrl => {
-                        cursor_pos = cursor_pos.saturating_sub(1);
-                    }
-                    KeyCode::Down => {
-                        if cursor_pos + 1 < visible {
-                            cursor_pos += 1;
-                        }
-                    }
-                    KeyCode::Char('n') if ctrl => {
-                        if cursor_pos + 1 < visible {
-                            cursor_pos += 1;
-                        }
-                    }
-                    KeyCode::Backspace => {
-                        query.pop();
-                        filtered = rank(rows, &query, opts, &mut matcher);
-                        cursor_pos = 0;
-                    }
-                    KeyCode::Char(c) if !ctrl => {
-                        query.push(c);
-                        filtered = rank(rows, &query, opts, &mut matcher);
-                        cursor_pos = 0;
-                    }
-                    _ => {}
-                }
-            }
-            // Resize → re-render on the next loop iteration with fresh dimensions.
-            Event::Resize(_, _) => {}
-            _ => {}
-        }
     }
 }
 
@@ -605,5 +592,76 @@ mod tests {
             .collect();
         // BTreeSet iterates ascending → keys are in original row order.
         assert_eq!(keys, vec!["100".to_string(), "300".to_string()]);
+    }
+
+    // ── headless render core (PickerMode) ─────────────────────────────────────
+
+    #[test]
+    fn chrome_lines_by_mode() {
+        assert_eq!(chrome_lines(PickerMode::Single), 1);
+        assert_eq!(chrome_lines(PickerMode::Multi), 2);
+    }
+
+    #[test]
+    fn render_header_by_mode() {
+        assert_eq!(
+            render_header(PickerMode::Single, "p > ", "abc", 0),
+            "p > abc"
+        );
+        // Single ignores selected_count — it is unused by the format.
+        assert_eq!(
+            render_header(PickerMode::Single, "p > ", "abc", 5),
+            "p > abc"
+        );
+        assert_eq!(
+            render_header(PickerMode::Multi, "p > ", "abc", 0),
+            "p > abc    [0 selected]"
+        );
+        assert_eq!(
+            render_header(PickerMode::Multi, "p > ", "abc", 3),
+            "p > abc    [3 selected]"
+        );
+    }
+
+    #[test]
+    fn render_row_single_truncates_by_cols() {
+        // Marker is 2 chars ("> " / "  "); cols 0 and 2 leave no room for text.
+        assert_eq!(
+            render_row(PickerMode::Single, true, false, "hello", 0),
+            "> "
+        );
+        assert_eq!(
+            render_row(PickerMode::Single, false, false, "hello", 2),
+            "  "
+        );
+        assert_eq!(
+            render_row(PickerMode::Single, true, false, "hello", 3),
+            "> h"
+        );
+        assert_eq!(
+            render_row(PickerMode::Single, false, false, "hello", 80),
+            "  hello"
+        );
+    }
+
+    #[test]
+    fn render_row_multi_truncates_by_cols_and_shows_checkbox() {
+        // Marker is 6 chars ("> [x] " / "  [ ] "); cols 0 and 6 leave no room.
+        assert_eq!(
+            render_row(PickerMode::Multi, true, true, "hello", 0),
+            "> [x] "
+        );
+        assert_eq!(
+            render_row(PickerMode::Multi, false, false, "hello", 6),
+            "  [ ] "
+        );
+        assert_eq!(
+            render_row(PickerMode::Multi, true, false, "hello", 7),
+            "> [ ] h"
+        );
+        assert_eq!(
+            render_row(PickerMode::Multi, false, true, "hello", 80),
+            "  [x] hello"
+        );
     }
 }
