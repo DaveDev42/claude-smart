@@ -84,7 +84,14 @@ fn decision_log_line(kind: &str, sid_short: &str, detail: &str, via: Option<&str
 pub fn run(owner_dir: &Path) -> anyhow::Result<()> {
     // Parse hook input from stdin.
     let input = detect::parse_stdin().context("failed to parse hook stdin JSON")?;
+    run_with_input(owner_dir, input)
+}
 
+/// The body of [`run`] after stdin has been parsed into a [`detect::HookInput`].
+/// Split out so tests can drive it with a synthetic input instead of the
+/// process's real stdin (`run` itself blocks on `detect::parse_stdin()` when
+/// stdin is an interactive terminal or a pipe that never closes).
+pub(crate) fn run_with_input(owner_dir: &Path, input: detect::HookInput) -> anyhow::Result<()> {
     // session_id is required — exit 0 silently if missing (hook contract).
     let sid = match &input.session_id {
         Some(s) if !s.is_empty() => s.clone(),
@@ -559,14 +566,19 @@ mod tests {
 
     #[test]
     fn run_exits_ok_without_session_id() {
-        // `run` reads real stdin via `detect::parse_stdin()`. Under `cargo
-        // test` stdin is not a live hook payload, so it reads to EOF as
-        // empty/blank input, which parses to an all-`None` `HookInput` —
-        // exactly the "no session_id" case the hook contract requires to
-        // exit 0 silently, with no smart_dir I/O at all.
+        // `run` itself reads real process stdin via `detect::parse_stdin()`,
+        // which blocks forever under a non-EOF stdin (an interactive
+        // terminal, or a pipe that never closes) — so this test drives
+        // `run_with_input` directly with the empty-input `HookInput`
+        // (`detect::parse_input("")` parses blank input to all-`None`
+        // fields), exactly the "no session_id" case the hook contract
+        // requires to exit 0 silently, with no smart_dir I/O at all.
         let home = tempfile::tempdir().unwrap();
         let result = crate::testenv::with_test_home(home.path(), || {
-            run(Path::new("/Users/example/.claude.home"))
+            run_with_input(
+                Path::new("/Users/example/.claude.home"),
+                detect::parse_input("").unwrap(),
+            )
         });
 
         assert!(

@@ -108,6 +108,19 @@ pub fn run(_args: &[OsString]) -> Result<()> {
     } else {
         None
     };
+    run_with_capture(captured)
+}
+
+/// The body of [`run`] after the piggybacked stdin capture has been resolved.
+/// Split out so tests can drive it with `None` instead of exercising
+/// `should_capture_stdin`/`read_stdin_capped`, which spawn a real
+/// stdin-reading thread that outlives the test when the test process's stdin
+/// is not at EOF (an interactive terminal, or a pipe that never closes) — the
+/// thread holds `Stdin`'s internal lock for the rest of its blocking read, so
+/// any later test that touches stdin then hangs waiting on that lock.
+pub(crate) fn run_with_capture(
+    captured: Option<(String, usage::local::StatuslineCapture)>,
+) -> Result<()> {
     let segment = render_segment()?;
     println!("{segment}");
     // The limit-switch trigger runs after the segment is out: it may end
@@ -162,9 +175,12 @@ const CAPTURE_STDIN_DEADLINE: std::time::Duration = std::time::Duration::from_mi
 /// early — but it is harmless to leak until the process exits shortly after
 /// this call returns (`run()` prints the segment next and returns).
 ///
-/// Mirrors `main::read_stdin_capped`'s byte-cap contract; duplicated rather
-/// than shared because `main` is a binary crate root, not a library other
-/// modules import from.
+/// Mirrors `cmd::support::read_stdin_capped`'s byte-cap contract; duplicated
+/// rather than shared because that twin has no need for the deadline thread
+/// here — `csm usage capture` reads from a pipe Claude Code always closes
+/// promptly, while this command's stdin gate (`should_capture_stdin`) is
+/// broader ("not a terminal") and can see a caller-owned pipe that never
+/// closes, so only this copy needs the timeout to avoid hanging on it.
 fn read_stdin_capped(max_bytes: u64) -> String {
     use std::io::Read;
     use std::sync::mpsc;
@@ -713,11 +729,17 @@ mod tests {
 
     #[test]
     fn run_does_not_panic_or_error() {
+        // `run` itself may spawn the stdin-reading thread inside
+        // `read_stdin_capped`, which blocks past the test if the test
+        // process's stdin never reaches EOF — so this drives
+        // `run_with_capture` directly with no capture, exactly what
+        // `should_capture_stdin` returning false (or a timed-out read)
+        // produces.
         crate::testenv::with_env_var("CLAUDE_CONFIG_DIR", Some("/tmp/.claude.test"), || {
-            let result = run(&[]);
+            let result = run_with_capture(None);
             assert!(
                 result.is_ok(),
-                "run() returned Err: {:?}",
+                "run_with_capture(None) returned Err: {:?}",
                 result.unwrap_err()
             );
         });
