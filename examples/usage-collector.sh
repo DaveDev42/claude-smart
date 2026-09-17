@@ -40,9 +40,12 @@
 #   - skip if week_fable.pct >= CLAUDE_PICK_SATURATION_PCT (same variable; only
 #     when the profile has a week_fable section at all — absence is never read
 #     as "limited")
-#   - among survivors: soonest week_all reset wins (budget on the account
-#     that refills first is the cheapest to spend; a known reset beats an
-#     unknown one); ties broken by highest week_all.pct.
+#   - among survivors: rank by the binding weekly reset epoch, which is the
+#     LATER of week_all's and week_fable's reset (a candidate is only fully
+#     fresh once BOTH windows roll over) — soonest binding epoch wins, and a
+#     known reset beats an unknown one (budget on the account that refills
+#     first is the cheapest to spend); ties break to the highest week_all.pct,
+#     then to name order.
 #
 # ── Three ways to source the facts ───────────────────────────────────────────
 # Pick ONE strategy below (A is simplest; C is the fully self-contained shape).
@@ -77,7 +80,7 @@ set -eu
 # (an API call, parsing a billing export, etc.). The loop assembles valid JSON.
 #
 # Profiles come from the csm registry so this stays in sync with `csm profiles`.
-REGISTRY="${CLAUDE_CONFIG_HOME:-$HOME/.config/claude-as}/profiles.json"
+REGISTRY="$HOME/.config/claude-as/profiles.json"
 
 # Echo "<session_pct> <week_pct> <session_reset> <week_reset>" for a profile,
 # or print nothing + return non-zero if it cannot be read (→ goes to "errors").

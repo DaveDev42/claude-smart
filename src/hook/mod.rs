@@ -1,8 +1,7 @@
 //! `csm hook` — Claude Code Stop/SubagentStop/SessionEnd hook handler.
 //!
 //! Invoked by Claude Code as a hook process with the event JSON on stdin.
-//! This is the **`csm hook` subcommand** — there is no separate `csm-hook` binary
-//! (single-binary form, per locked scaffold decision).
+//! This is the **`csm hook` subcommand** — there is no separate `csm-hook` binary.
 //!
 //! Commit ordering (matches the legacy shell implementation):
 //!   1. merge-sidecar hop
@@ -12,9 +11,14 @@
 //!   5. write `<sid>.stop` flag (Windows) / `kill(pid, SIGTERM)` (POSIX)
 //!      — stop is LAST: supervisor must see a complete sentinel before being asked to stop.
 //!
+//! The statusline entry point ([`run_from_statusline`]) claims `.switched`
+//! *before* committing ([`stop::claim_switched`], see below), so on that path
+//! the on-disk order is `.switched` → `.relaunch` → `.last-switch`
+//! (confirmed against a live limit switch).
+//!
 //! `--owner <dir>` is the CLAUDE_CONFIG_DIR of the profile that owns this hook instance.
-//! It is baked into the per-profile shim deployed by ansible; the hook uses it to locate
-//! the correct profile context.
+//! It is baked into the per-profile shim deployed outside this crate; the hook uses it
+//! to locate the correct profile context.
 //!
 //! # Second entry point: the statusline tick
 //!

@@ -45,10 +45,10 @@ pub struct StaleProfileData {
     /// Machine-native reset epoch (`week_all.resets_at`), when the cache was
     /// written by the local collector. `None` for an older cache that predates
     /// the field, or when the section itself is absent. Ranking prefers this
-    /// over re-parsing `resets` — see `main::account_row_rank`.
+    /// over re-parsing `resets` — see `cmd::run::account_row_rank`.
     pub resets_at: Option<i64>,
     /// Weekly PER-MODEL-TIER (`week_fable`) usage percentage, or `None` when
-    /// this profile carries no model-scoped weekly cap. `main::account_row_rank`
+    /// this profile carries no model-scoped weekly cap. `cmd::run::account_row_rank`
     /// treats a `Some(pct) >= SATURATION_PCT` reading the same as a saturated
     /// `week_all_pct` (see `scoring::is_viable_pcts`) — `None` never
     /// constrains viability.

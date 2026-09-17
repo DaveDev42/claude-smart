@@ -26,7 +26,11 @@ see *Invariants*.
 - `src/cmd/` — one module per subcommand: `run.rs`, `hook.rs`, `cas.rs`,
   `config.rs`, `profiles.rs`, `usage.rs`, `pick_account.rs`, `scan.rs`,
   `sidecar.rs`, `completions.rs`, plus `support.rs` (profile-dir / stdin / tty
-  helpers shared across subcommands).
+  helpers shared across subcommands). Four reserved words dispatch outside
+  `src/cmd/` instead: `reap` → `reaper::cmd` (`src/reaper/mod.rs`),
+  `statusline` → `statusline::run` (`src/statusline.rs`), `current-usage` →
+  `cmd::pick_account::cmd_current_usage`, and `newuuid` → inline in `main()`
+  (see the match in `src/main.rs`).
 - `src/cli/` — `parser.rs` (hand-rolled `csm run` flag loop, NOT clap, so
   claude flags forward verbatim), `completions.rs` (clap tree used ONLY for
   `csm completions`, never to parse real argv), `reserved.rs` (the reserved
@@ -35,10 +39,12 @@ see *Invariants*.
 - `src/account/` — `profiles.rs` (`ProfileMap` = the registry authority),
   `scoring.rs` (pick-best thresholds: `LIMIT_PCT=99`, `SATURATION_PCT=95`;
   `is_viable_pcts` is the ONE viability predicate over session / week_all /
-  week_fable — `pick_best_at`, `main::account_row_rank`, and the hook's target
-  pick all route through it; never add a second inline threshold check; also
-  the shared `effective_reset_epoch`), `reset.rs` (compat parser for
-  `resets`-only payloads), `mod.rs` (`pick_account`, `current_usage`).
+  week_fable — `pick_best_at`, `cmd::run::account_row_rank`, and the hook's
+  target pick all route through it; never add a second inline threshold check;
+  also the shared `effective_reset_epoch`), `reset.rs` (compat parser for
+  `resets`-only payloads), `mod.rs` (`pick_account`, `pick_account_gated` —
+  what the hook's target pick calls, see `src/hook/detect.rs` —
+  `current_usage`).
 - `src/cas/` — profile switcher: `types.rs`, `eval.rs` (`eval_emit` for the
   shell-shim machine interface), `manage.rs` (`manage_emit` for registry
   verbs), `edit.rs` (interactive editor: pure `apply_edit_action` + thin
@@ -106,8 +112,9 @@ cargo run --bin csm -- <args>
 ```
 
 Run `/verify` before every commit (test + clippy + fmt + leak guard + a
-windows-gnu clippy cross-check, in one pass; `cargo info` and
-`rustup target add` are allow-listed for that step).
+windows-gnu clippy cross-check, in one pass; `rustup target add` is
+allow-listed for the windows-gnu step, and `cargo info` is allow-listed for
+dependency/MSRV checks).
 
 > Fallback only if a sandbox/PATH issue makes `cargo` resolve wrong: pin the
 > toolchain explicitly —
@@ -120,10 +127,13 @@ windows-gnu clippy cross-check, in one pass; `cargo info` and
    hub/host names, account-profile names, real home paths, or personal email —
    anywhere under `src/`, **including `#[cfg(test)]` fixtures**. Examples use
    neutral placeholders (`work`, `home`, `/Users/example`, `Acme-…`). Usage data
-   comes from Anthropic's own OAuth usage API. There is no hub, and the only
-   endpoint is `https://api.anthropic.com` (overridable via `CSM_USAGE_API_BASE`
-   for tests); any host-naming convention is injected via `CSM_HOST_REPLACE`,
-   never compiled in. Profile names come from `ProfileMap`
+   comes from Anthropic's own OAuth usage API. There is no hub. Two endpoints
+   are compiled in: the usage API at `https://api.anthropic.com` (overridable
+   via `CSM_USAGE_API_BASE` for tests) and, only when the opt-in OAuth refresh
+   (`CSM_OAUTH_REFRESH`) is on, the token endpoint at
+   `https://platform.claude.com/v1/oauth/token` (overridable via
+   `CSM_OAUTH_TOKEN_URL`); any host-naming convention is injected via
+   `CSM_HOST_REPLACE`, never compiled in. Profile names come from `ProfileMap`
    (the registry), never literals. `cargo test` runs `tests/no_private_names.rs`,
    which scans every line of `src/` and fails on any leak (its forbidden list is
    assembled from fragments so the guard file itself stays clean).
@@ -148,7 +158,8 @@ windows-gnu clippy cross-check, in one pass; `cargo info` and
 ## CLI surface (collision-safe)
 
 `run, hook, profiles {list|add|set|rm|use|edit|dir|bootstrap|doctor},
-config {show|get|set|unset launch-command}, usage [--json|--no-fetch],
+config {show|get|set|unset launch-command},
+usage [--json] [--no-fetch] [--refresh] [--refresh-oauth] | usage capture,
 pick-account, scan, sidecar, statusline, completions, reap, newuuid` + machine
 interface `cas` (+ back-compat `cas <verb>` aliases, `current-usage`). The
 collision analysis against claude's own subcommands is Invariant 2 above.
@@ -168,8 +179,10 @@ TL;DR: conventional commits on `main` → release-please opens/updates a release
 that bumps `Cargo.toml` + `Cargo.lock` + CHANGELOG → merging that PR tags
 `vX.Y.Z`, runs the 4-target build matrix, attaches assets + `SHA256SUMS.txt`,
 publishes the GitHub release, and bumps the Homebrew tap formula. **crates.io
-publish is NOT in CI** — the first publish is a local `cargo publish` (interactive
-crates.io login), then Trusted Publishing is registered and an OIDC job re-added.
+publish is in CI**: the `publish-crate` job authenticates with Trusted
+Publishing (OIDC, no static token) after the build matrix succeeds on a
+release, and skips when the version is already on the index — nothing manual
+is needed.
 
 ## Known gaps
 

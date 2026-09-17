@@ -129,8 +129,8 @@ pub fn titles_tsv() -> PathBuf {
 }
 
 /// `~/.config/claude-as/profiles.json` — cross-platform profile→dir map.
-/// Personal-only; absent on toss machines → binary falls back to current
-/// `CLAUDE_CONFIG_DIR` and disables CAS/pick features.
+/// The registry is optional: when the file is absent, csm falls back to the
+/// current `CLAUDE_CONFIG_DIR` and disables the switch/pick features.
 pub fn profiles_json() -> PathBuf {
     claude_as_dir().join("profiles.json")
 }

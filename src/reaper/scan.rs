@@ -4,9 +4,9 @@
 //! (`&[ProcRow]`) plus a session anchor (`Session`), it decides which processes
 //! are reap candidates. No syscalls, no I/O, no clock — the I/O shell in
 //! `reaper/mod.rs` captures the snapshot (sysinfo + `getpgid`) and the current
-//! time, then calls in here. This split is the project's "pure core + thin I/O"
-//! invariant (CLAUDE.md §4) and is what makes the selection logic unit-testable
-//! against a synthetic `Vec<ProcRow>`.
+//! time, then calls in here. This split follows the *pure core + thin I/O
+//! shell* invariant in CLAUDE.md and is what makes the selection logic
+//! unit-testable against a synthetic `Vec<ProcRow>`.
 //!
 //! ## What counts as a candidate
 //!

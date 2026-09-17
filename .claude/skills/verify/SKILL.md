@@ -5,7 +5,7 @@ description: Run the full csm verification gate — cargo test (incl. the no_pri
 
 # /verify — the pre-commit gate for claude-smart
 
-Run all three checks and report ONE clear verdict. Do not commit on a FAIL.
+Run all four checks and report ONE clear verdict. Do not commit on a FAIL.
 
 ## Steps
 

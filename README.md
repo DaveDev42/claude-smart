@@ -157,7 +157,7 @@ on Windows) so that GUI / launchd / non-shell launches of `claude` land on the
 real profile too, not just shells that sourced the `cas` function. On systems
 without such a mechanism the floor step is a no-op.
 
-### Shared plugins (provisioning)
+### Shared plugins and projects (provisioning)
 
 Claude Code stores its plugins and marketplace cache *under* `CLAUDE_CONFIG_DIR`.
 If each profile kept its own copy, switching profiles would leave the active
@@ -166,14 +166,15 @@ to load marketplaces (`cache-miss`, "Run /reload-plugins"). To avoid that, `csm`
 makes every profile's `plugins/` a symlink to one shared store at
 `~/.claude.shared/plugins` (the same `~/.claude.shared` root that already holds
 your transcripts and history), so the marketplace cache stays consistent across
-switches.
+switches. The same mechanism also links each profile's `projects/` to
+`~/.claude.shared/projects`, so every profile sees the same transcript history.
 
 This is **provisioned automatically**: every launch / profile switch / registry
-add ensures the symlink exists (idempotent, best-effort — a hiccup never blocks
-the launch). You can also do it explicitly:
+add ensures both symlinks exist (idempotent, best-effort — a hiccup never
+blocks the launch). You can also do it explicitly:
 
 ```sh
-csm profiles bootstrap --all     # provision every profile (dir + shared plugins)
+csm profiles bootstrap --all     # provision every profile (dir + shared plugins/projects)
 csm profiles doctor              # read-only: report what's broken
 csm profiles doctor --fix        # repair anything unhealthy
 csm profiles doctor --fix-home   # repair the ~/.claude shim (see below)
@@ -306,7 +307,10 @@ change that is the explicit opt-in in *Headless collectors* below.
 1. **Positive cache** (`CLAUDE_USAGE_TTL` / `CSM_USAGE_TTL_SECS`, default 60s):
    served as-is, no work done.
 2. **`CSM_USAGE_CMD`**, if set: your own override command (see below).
-3. **Local collection**: for each profile, serve a fresh per-profile store
+3. **Negative cooldown**: after a total collection failure (every profile
+   failed), `csm` serves nothing new until `CLAUDE_USAGE_FAIL_COOLDOWN`
+   (default 120s) lapses, rather than re-hammering local collection.
+4. **Local collection**: for each profile, serve a fresh per-profile store
    record, or probe the live credentials + API, or serve a stale record with
    window decay, or record an error. This is the terminal layer; see below.
 
@@ -483,8 +487,7 @@ live-supervisor check, and the per-session hop cap. The machine-wide switch
 cooldown (`CLAUDE_SWITCH_COOLDOWN`) only throttles the `Stop` percentage
 path; the statusline tick and `StopFailure` are each session's own live
 evidence, so several sessions sharing an exhausted account can all move off
-it. Transcript-text detection is kept as a fallback, but Claude Code does not
-currently write usage-limit notices into transcripts. The model-scoped weekly
+it. The model-scoped weekly
 percentage refreshes only when the per-profile usage-API probe runs
 (`CSM_USAGE_PROFILE_TTL`, default 300s), so a cap on that dimension alone can
 take up to about five minutes to register on the tick and `Stop` paths; the

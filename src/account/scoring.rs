@@ -5,7 +5,7 @@
 //! 1. Build candidate rows: profiles NOT in errors{}, with a numeric week_all.pct.
 //! 2. Exclusions (in order) — see [`is_viable_pcts`], the SINGLE viability
 //!    authority every caller (this module's own ranking, the stale-usage
-//!    picker's `main::account_row_rank` — see [`crate::picker::account`])
+//!    picker's `cmd::run::account_row_rank` — see [`crate::picker::account`])
 //!    routes through:
 //!    - `session.pct >= LIMIT_PCT(99)` → skip (absent session.pct = -1, never fires).
 //!    - `week_all.pct >= SATURATION_PCT(95)` → skip.
@@ -150,7 +150,7 @@ fn data_too_stale_at(data: &UsageData, max_age_secs: u64, now: DateTime<Utc>) ->
 /// percentages is a legitimate pick candidate.
 ///
 /// This is the single authority for "is this profile viable" — [`pick_best_at`]
-/// (below) and `main::account_row_rank` (the stale-usage picker rows)
+/// (below) and `cmd::run::account_row_rank` (the stale-usage picker rows)
 /// both route through it rather than each hand-rolling the same three checks,
 /// so a profile whose model-scoped weekly cap is exhausted is skipped
 /// everywhere a pick or a recommendation is made, not just in one of the two
@@ -197,7 +197,7 @@ pub fn is_viable_pcts(
 /// windows roll over). `i64::MAX` when neither is known, so a known reset
 /// always beats an unknown one.
 ///
-/// Shared by [`pick_best_at`]'s ranking and `main::account_row_rank` (the
+/// Shared by [`pick_best_at`]'s ranking and `cmd::run::account_row_rank` (the
 /// stale-usage picker's rank), which resolve their `week_all`/`week_fable`
 /// epochs from different sources (`UsageSection::reset_instant` vs. the
 /// picker's cached `resets_at`/`resets` fields) but must apply the same
@@ -1087,7 +1087,7 @@ mod tests {
 
     /// Ranking: when both `week_all` and `week_fable` resets are known for a
     /// viable candidate, the LATER of the two is the binding constraint —
-    /// mirrors `main::account_row_rank`'s identical `max()` rule.
+    /// mirrors `cmd::run::account_row_rank`'s identical `max()` rule.
     #[test]
     fn ranking_uses_later_of_week_all_and_fable_reset() {
         let mut profiles = HashMap::new();
