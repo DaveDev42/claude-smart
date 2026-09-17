@@ -2,7 +2,7 @@
 name         = "claude-smart"
 version      = "0.3.2"
 edition      = "2021"
-rust-version = "1.88"
+rust-version = "1.95"  # floor set by sysinfo 0.39.6's MSRV (highest among current deps)
 default-run  = "csm"
 description  = "Cross-platform Claude Code smart session manager"
 license      = "BSD-3-Clause"
@@ -54,7 +54,10 @@ dirs = "7"                                     # cross-platform ~/ resolution fo
 
 # liveness check on every target (replaces the external POSIX `ps -o comm=` spawn).
 # Only TARGETED refresh_process(Pid) — never a full sweep on the hot Stop path.
-sysinfo = { version = "0.30", default-features = false }  # no "process" feature in 0.30; process APIs always present
+# Targeted single-pid refresh on the hot Stop path (never a full sweep) plus the
+# reaper's one off-path table sweep. Only `system` is needed; disk / network /
+# component / user stay off.
+sysinfo = { version = "0.39", default-features = false, features = ["system"] }
 
 anyhow    = "1"   # bin error propagation
 thiserror = "2"   # library-style errors in session/account/usage (UsageError, FetchError, SidecarError…)

@@ -152,9 +152,13 @@ fn pgid_of(_pid: u32) -> Option<u32> {
 }
 
 /// Join a command line into a single-line snippet, truncated for display.
-fn cmd_snippet(cmd: &[String]) -> String {
+fn cmd_snippet(cmd: &[std::ffi::OsString]) -> String {
     const MAX: usize = 60;
-    let joined = cmd.join(" ");
+    let joined = cmd
+        .iter()
+        .map(|s| s.to_string_lossy())
+        .collect::<Vec<_>>()
+        .join(" ");
     let one_line = joined.replace(['\n', '\t'], " ");
     if one_line.chars().count() > MAX {
         let kept: String = one_line.chars().take(MAX.saturating_sub(1)).collect();
@@ -371,7 +375,7 @@ mod tests {
 
     #[test]
     fn cmd_snippet_truncates_long_lines() {
-        let long = vec!["node".to_string(), "x".repeat(100)];
+        let long: Vec<std::ffi::OsString> = vec!["node".into(), "x".repeat(100).into()];
         let s = cmd_snippet(&long);
         assert!(
             s.chars().count() <= 60,
@@ -386,7 +390,7 @@ mod tests {
 
     #[test]
     fn cmd_snippet_collapses_newlines() {
-        let multi = vec!["a\nb".to_string(), "c\td".to_string()];
+        let multi: Vec<std::ffi::OsString> = vec!["a\nb".into(), "c\td".into()];
         let s = cmd_snippet(&multi);
         assert!(
             !s.contains('\n') && !s.contains('\t'),
