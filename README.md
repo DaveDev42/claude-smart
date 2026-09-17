@@ -617,8 +617,8 @@ test`. `bash e2e/run.sh` runs the end-to-end limit-switch harness: it builds
 `csm` and a fake, sleeping `claude` binary, drives both through an isolated
 sandbox HOME with no network access, and exercises the hook-driven and
 statusline-tick-driven profile-switch paths (relaunch argv, cooldowns, the
-`CLAUDE_AUTO_SWITCH`/`CLAUDE_AUTO_SWITCH_RELAUNCH` kill-switches) across 10
-scenarios. See [`e2e/README.md`](e2e/README.md) for what each scenario covers
+`CLAUDE_AUTO_SWITCH`/`CLAUDE_AUTO_SWITCH_RELAUNCH` kill-switches, and the
+flags a relaunch carries) across 12 scenarios. See [`e2e/README.md`](e2e/README.md) for what each scenario covers
 and how to run it against a prebuilt binary.
 
 ## License

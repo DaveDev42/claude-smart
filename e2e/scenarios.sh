@@ -392,4 +392,90 @@ fi
 safe_term "$SUP_PID"
 rpt ""
 
+# ═══════════════════════════════════════════════════════════════════════════
+rpt "----- Scenario 11: relaunch carries the launch's session-shaping flags, not its prompt -----"
+CUR_FIXTURE="$FIX_HEALTHY"
+set_last_switch_fresh
+EXTRA_DIR="$SANDBOX/extra-dir"
+mkdir -p "$EXTRA_DIR"
+# --add-dir's values end at the next flag, so the prompt here is a plain
+# positional: carried flags yes, prompt no, and no separator needed.
+start_supervisor "s11" "$FIX_HEALTHY" \
+  --add-dir "$EXTRA_DIR" --dangerously-skip-permissions "do the thing"
+if [[ -n "$SID" ]]; then
+  TP="$TRANSCRIPTS_DIR/$SID.jsonl"
+  JSON=$(cat <<EOF
+{"session_id":"$SID","transcript_path":"$TP","cwd":"/tmp/e2e-cwd-s11","permission_mode":"default","hook_event_name":"StopFailure","error":"rate_limit","error_details":"You have reached your weekly limit for Fable."}
+EOF
+)
+  run_hook "$A_DIR" "$JSON"
+  rpt "  hook exit=$HOOK_EXIT stdout=$HOOK_STDOUT"
+  wait_for_invocation_count "$FAKE_LOG" 2 10
+  N=$(count_invocations "$FAKE_LOG")
+  rpt "  invocation count now: $N"
+  CARRIES_SKIP=no; CARRIES_ADDDIR=no; CARRIES_DIR=no; CARRIES_PROMPT=no
+  if (( N >= 2 )); then
+    RELAUNCH_PID=$(get_invocation_pid "$FAKE_LOG" 2)
+    invocation_has_arg "$FAKE_LOG" 2 "--dangerously-skip-permissions" && CARRIES_SKIP=yes
+    invocation_has_arg "$FAKE_LOG" 2 "--add-dir" && CARRIES_ADDDIR=yes
+    invocation_has_arg "$FAKE_LOG" 2 "$EXTRA_DIR" && CARRIES_DIR=yes
+    invocation_has_arg "$FAKE_LOG" 2 "do the thing" && CARRIES_PROMPT=yes
+    rpt "  relaunch argv: $(get_invocation_argv "$FAKE_LOG" 2 | tail -n +2 | tr '\n' ' ')"
+    rpt "  carries: skip-permissions=$CARRIES_SKIP add-dir=$CARRIES_ADDDIR dir=$CARRIES_DIR prompt=$CARRIES_PROMPT (prompt must be no)"
+  fi
+  rpt "  limit-switch.log dropped line: $(grep 'dropped passthru' "$SMART_DIR/limit-switch.log" 2>/dev/null | tail -1)"
+  # The log names flags and counts everything else -- it must never quote the prompt.
+  PROMPT_IN_LOG=no
+  grep -q 'do the thing' "$SMART_DIR/limit-switch.log" 2>/dev/null && PROMPT_IN_LOG=yes
+  rpt "  prompt text in limit-switch.log? $PROMPT_IN_LOG (must be no)"
+  if (( N >= 2 )) && [[ "$CARRIES_SKIP" == yes && "$CARRIES_ADDDIR" == yes && "$CARRIES_DIR" == yes \
+        && "$CARRIES_PROMPT" == no && "$PROMPT_IN_LOG" == no ]]; then
+    rpt "  VERDICT: PASS"
+  else
+    rpt "  VERDICT: FAIL"
+  fi
+  if (( N >= 2 )); then safe_term "$RELAUNCH_PID"; else safe_term "$CHILD_PID"; fi
+fi
+safe_term "$SUP_PID"
+rpt ""
+
+# ═══════════════════════════════════════════════════════════════════════════
+rpt "----- Scenario 12: an open --add-dir run is closed with -- before the handoff -----"
+CUR_FIXTURE="$FIX_HEALTHY"
+set_last_switch_fresh
+# --add-dir last: claude would read the handoff prompt as one more directory,
+# so the hop must emit `--` between them.
+start_supervisor "s12" "$FIX_HEALTHY" --add-dir "$EXTRA_DIR"
+if [[ -n "$SID" ]]; then
+  TP="$TRANSCRIPTS_DIR/$SID.jsonl"
+  JSON=$(cat <<EOF
+{"session_id":"$SID","transcript_path":"$TP","cwd":"/tmp/e2e-cwd-s12","permission_mode":"default","hook_event_name":"StopFailure","error":"rate_limit","error_details":"You have reached your weekly limit for Fable."}
+EOF
+)
+  run_hook "$A_DIR" "$JSON"
+  rpt "  hook exit=$HOOK_EXIT stdout=$HOOK_STDOUT"
+  wait_for_invocation_count "$FAKE_LOG" 2 10
+  N=$(count_invocations "$FAKE_LOG")
+  rpt "  invocation count now: $N"
+  SEP_BEFORE_HANDOFF=no
+  if (( N >= 2 )); then
+    RELAUNCH_PID=$(get_invocation_pid "$FAKE_LOG" 2)
+    RELAUNCH_ARGV=$(get_invocation_argv "$FAKE_LOG" 2)
+    rpt "  relaunch argv: $(printf '%s\n' "$RELAUNCH_ARGV" | tail -n +2 | tr '\n' ' ')"
+    # the last two tokens must be `--` then the handoff prompt
+    if [[ "$(printf '%s\n' "$RELAUNCH_ARGV" | tail -2 | head -1)" == "--" ]]; then
+      SEP_BEFORE_HANDOFF=yes
+    fi
+    rpt "  separator immediately before the handoff? $SEP_BEFORE_HANDOFF"
+  fi
+  if (( N >= 2 )) && [[ "$SEP_BEFORE_HANDOFF" == yes ]]; then
+    rpt "  VERDICT: PASS"
+  else
+    rpt "  VERDICT: FAIL"
+  fi
+  if (( N >= 2 )); then safe_term "$RELAUNCH_PID"; else safe_term "$CHILD_PID"; fi
+fi
+safe_term "$SUP_PID"
+rpt ""
+
 }

@@ -78,6 +78,18 @@ get_invocation_configdir() {
   ' "$f" | sed -E 's/.*config_dir=([^ ]+) ===/\1/'
 }
 
+# get_invocation_argv <log> <idx>  -> every argv value of that block, one per
+# line, argv[0] first. The INVOCATION header is not numbered in the log, so the
+# block has to be counted the same way get_invocation_field counts it.
+get_invocation_argv() {
+  local f="$1" idx="$2"
+  awk -v want="$idx" '
+    /^=== INVOCATION/{n++}
+    n==want && /^argv\[[0-9]+\]=/ { sub(/^argv\[[0-9]+\]=/, ""); print }
+    n==want && /^=== END/ {exit}
+  ' "$f"
+}
+
 invocation_has_arg() {
   # invocation_has_arg <log> <idx> <value>  -> exit 0 if some argv[i]=<value> in that block
   local f="$1" idx="$2" val="$3"

@@ -19,7 +19,8 @@ a log file and blocks on `SIGTERM`:
   percentages), the path a subscription cap actually takes since Claude Code
   parks that case in an auto-retry wait with no hook at all.
 
-10 scenarios, numbered to match the original standalone harness:
+12 scenarios; the first ten keep the numbering of the original
+standalone harness:
 
 1. `StopFailure rate_limit`, profile `a` capped, `b` healthy, switch cooldown
    already active → still switches (the `StopFailure` path bypasses the
@@ -42,6 +43,13 @@ a log file and blocks on `SIGTERM`:
    that in and still switches.
 10. Statusline tick with `CLAUDE_AUTO_SWITCH=0` → records usage but the
     kill-switch suppresses the switch entirely.
+11. A launch carrying `--add-dir <dir> --dangerously-skip-permissions` plus an
+    initial prompt → the relaunch argv has both flags and the directory, has
+    no prompt (`--resume` already carries that conversation), and the dropped
+    prompt is counted in `limit-switch.log` rather than quoted.
+12. A launch ending in `--add-dir <dir>` → the relaunch argv puts `--`
+    between the directory and the handoff prompt, so claude cannot read the
+    handoff as one more directory.
 
 ## Running it
 
@@ -72,7 +80,7 @@ Whole run takes well under a minute locally.
 - `run.sh` — entry point (sandbox setup, build, teardown).
 - `lib.sh` — polling/assertion/process helpers, plus the `csm hook` /
   `csm usage capture` / supervisor-launch wrappers each scenario calls.
-- `scenarios.sh` — the 10 scenarios themselves.
+- `scenarios.sh` — the 12 scenarios themselves.
 - `fake-claude/claude.c` — the fake `claude`: logs its invocation, blocks on
   `SIGTERM`. POSIX-only (the relaunch loop it exercises is a POSIX
   fork/signal path); built fresh by `run.sh` for every run, never committed as

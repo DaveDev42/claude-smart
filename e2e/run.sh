@@ -4,7 +4,7 @@
 # Builds (or reuses) a `csm` binary and a fake, sleeping `claude` binary,
 # stands up an isolated sandbox (its own HOME, its own profile registry, no
 # network -- CSM_USAGE_API_BASE points at an unrouted local port), runs the
-# 10 limit-switch scenarios against it, prints the report, and tears down:
+# 12 limit-switch scenarios against it, prints the report, and tears down:
 # only PIDs this script itself started are ever signalled, and the sandbox is
 # removed unless --keep is given. Never runs the real `claude`.
 #
