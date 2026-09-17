@@ -132,6 +132,7 @@ pub(crate) fn run_with_input(owner_dir: &Path, input: detect::HookInput) -> anyh
             ref handoff,
             ref cwd,
             born,
+            dimension: _,
         } => {
             // Full limit-switch commit sequence (matches the legacy shell
             // implementation's ordering): notify first (stdout before any
@@ -212,6 +213,7 @@ pub fn run_from_statusline(raw: &str, capture: &crate::usage::local::StatuslineC
             ref handoff,
             ref cwd,
             born,
+            dimension: _,
         } => {
             if !stop::claim_switched(&sid) {
                 return;

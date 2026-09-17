@@ -180,6 +180,31 @@ where
     Ok(v.as_str().map(str::to_string))
 }
 
+// ─── limit dimension ──────────────────────────────────────────────────────────
+
+/// Which usage window a limit verdict was tripped by. `Unknown` covers every
+/// signal this crate cannot yet attribute to a specific window: tier-0
+/// (`StopFailure`'s payload carries no dimension at all) and the statusline
+/// tick's `live_limit` string (already reduced to a message by its caller).
+/// Tier-2 and the statusline pre-gate's own pure core ([`usage_threshold_hit_at`],
+/// [`statusline_limit_hit`]) are the only paths that can tag a real dimension.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LimitDimension {
+    Session,
+    WeekAll,
+    WeekFable,
+    Unknown,
+}
+
+/// A limit verdict paired with the dimension that tripped it. Introduced so a
+/// future caller can branch on `dimension` without re-parsing `message`'s
+/// free text — see the module's `LimitDimension` doc.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LimitHit {
+    pub dimension: LimitDimension,
+    pub message: String,
+}
+
 // ─── decision type ────────────────────────────────────────────────────────────
 
 /// Outcome of [`classify`] — what the hook should do.
@@ -211,6 +236,11 @@ pub enum Decision {
         cwd: String,
         /// Born epoch from the PID file (carried into the sentinel).
         born: i64,
+        /// The dimension that tripped this verdict. Not read by any caller
+        /// yet — both `run_with_input` and `run_from_statusline` bind it as
+        /// `dimension: _` — this is the plumbing a later commit branches on.
+        #[allow(dead_code)]
+        dimension: LimitDimension,
     },
 }
 
@@ -350,7 +380,7 @@ pub fn classify_with(
 
     // ── 4. No limit → exit (no side effects) ─────────────────────────────────
     // Shell: the legacy shell implementation
-    let (limited_msg, definitive) = match detect_limit(input, owner_dir, live_limit) {
+    let (limited_msg, definitive, dimension) = match detect_limit(input, owner_dir, live_limit) {
         Detection::NotLimit => {
             // StopFailure for a non-limit API error (overloaded,
             // authentication_failed, invalid_request, ...). Not something to
@@ -370,7 +400,8 @@ pub fn classify_with(
         Detection::Limited {
             message,
             definitive,
-        } => (message, definitive),
+            dimension,
+        } => (message, definitive, dimension),
     };
 
     // ──────────────── Limit detected from this point on ──────────────────────
@@ -485,6 +516,7 @@ pub fn classify_with(
         handoff,
         cwd: cwd_str,
         born: born_epoch,
+        dimension,
     })
 }
 
@@ -530,8 +562,14 @@ enum Detection {
     NoSignal,
     /// A limit was detected. `definitive` is true for tier-0 (StopFailure or
     /// the statusline tick's `live_limit`), false for tier-2 (usage-cache
-    /// threshold).
-    Limited { message: String, definitive: bool },
+    /// threshold). `dimension` is `LimitDimension::Unknown` for tier-0 and the
+    /// `live_limit` case (neither carries a typed dimension yet); tier-2
+    /// tags its real dimension via `detect_usage_threshold_hit`.
+    Limited {
+        message: String,
+        definitive: bool,
+        dimension: LimitDimension,
+    },
 }
 
 /// Steps 3-4: tier-0 StopFailure / tier-2 usage-cache check.
@@ -540,16 +578,19 @@ fn detect_limit(input: &HookInput, owner_dir: &Path, live_limit: Option<&str>) -
         (Some(msg), _) => Detection::Limited {
             message: msg.to_string(),
             definitive: true,
+            dimension: LimitDimension::Unknown,
         },
         (None, StopFailureVerdict::Limit(msg)) => Detection::Limited {
             message: msg,
             definitive: true,
+            dimension: LimitDimension::Unknown,
         },
         (None, StopFailureVerdict::NotLimit) => Detection::NotLimit,
-        (None, StopFailureVerdict::NotApplicable) => match detect_usage_threshold(owner_dir) {
-            Some(msg) => Detection::Limited {
-                message: msg,
+        (None, StopFailureVerdict::NotApplicable) => match detect_usage_threshold_hit(owner_dir) {
+            Some(hit) => Detection::Limited {
+                message: hit.message,
                 definitive: false,
+                dimension: hit.dimension,
             },
             None => Detection::NoSignal,
         },
@@ -744,10 +785,10 @@ pub(crate) fn cooldown_should_block(definitive: bool, window_blocked: bool) -> b
 /// session%, week_all%, or the model-scoped week_fable% is at or above the
 /// configured threshold.
 ///
-/// Returns `Some(description)` if any dimension is exceeded, `None` otherwise.
+/// Returns `Some(hit)` if any dimension is exceeded, `None` otherwise.
 ///
 /// I/O shell: fetches the fleet's [`crate::usage::UsageData`] once and hands the
-/// three raw pcts to the pure [`usage_threshold_hit`] decision core (invariant:
+/// three raw pcts to the pure [`usage_threshold_hit_at`] decision core (invariant:
 /// pure core + thin I/O shell). `week_fable_pct` is `None` when the profile
 /// carries no model-scoped weekly cap (e.g. `week_fable` is absent) — that
 /// dimension then never constrains the verdict.
@@ -755,8 +796,13 @@ pub(crate) fn cooldown_should_block(definitive: bool, window_blocked: bool) -> b
 /// Reproduces the tier-2 block from the legacy shell implementation, extended
 /// with the week_fable dimension (never a hardcoded model name — the fleet's
 /// `week_fable` field name is what's fixed, the model it measures is data,
-/// carried separately in `week_model_label`).
-fn detect_usage_threshold(owner_dir: &Path) -> Option<String> {
+/// carried separately in `week_model_label`). Named `_hit` (rather than kept
+/// as a bare `detect_usage_threshold`) because [`detect_limit`] needs the
+/// tagged [`LimitHit`], not just its message — there is no remaining caller
+/// that wants the String-only form, so no message-returning twin exists here
+/// (contrast [`usage_threshold_hit`], whose twin is kept for its own
+/// directly-tested `Option<String>` contract).
+fn detect_usage_threshold_hit(owner_dir: &Path) -> Option<LimitHit> {
     let profile = owner_dir_to_profile_name(owner_dir);
     let data = crate::usage::fetch().ok()?;
     let (session_pct, week_pct) = data.current_usage(&profile)?;
@@ -768,7 +814,7 @@ fn detect_usage_threshold(owner_dir: &Path) -> Option<String> {
 
     let limit_pct = crate::envvar::i64_or("CLAUDE_LIMIT_PCT", LIMIT_PCT);
 
-    usage_threshold_hit(session_pct, week_pct, week_fable_pct, limit_pct)
+    usage_threshold_hit_at(session_pct, week_pct, week_fable_pct, limit_pct)
 }
 
 /// The statusline tick's limit test: reduce the profile's merged reading
@@ -782,13 +828,24 @@ pub(crate) fn statusline_limit(usage: &crate::usage::model::ProfileUsage) -> Opt
     statusline_limit_at(usage, limit_pct)
 }
 
-/// [`statusline_limit`] with the threshold passed in (the pure core).
+/// [`statusline_limit`] with the threshold passed in. Delegates to
+/// [`statusline_limit_hit`] and collapses the result to its message, so
+/// existing callers/tests keep seeing exactly the same `Option<String>`.
 pub(crate) fn statusline_limit_at(
     usage: &crate::usage::model::ProfileUsage,
     limit_pct: i64,
 ) -> Option<String> {
+    statusline_limit_hit(usage, limit_pct).map(|hit| hit.message)
+}
+
+/// [`statusline_limit_at`]'s pure core: same reduction, but returns the typed
+/// [`LimitHit`] instead of collapsing straight to a message string.
+pub(crate) fn statusline_limit_hit(
+    usage: &crate::usage::model::ProfileUsage,
+    limit_pct: i64,
+) -> Option<LimitHit> {
     let pct = |s: &Option<crate::usage::model::UsageSection>| s.as_ref().map_or(-1, |s| s.pct);
-    usage_threshold_hit(
+    usage_threshold_hit_at(
         pct(&usage.session),
         pct(&usage.week_all),
         usage.week_fable.as_ref().map(|s| s.pct),
@@ -807,23 +864,52 @@ pub(crate) fn statusline_limit_at(
 /// Checked in order: session, then week_all, then week_fable (first hit wins;
 /// order only affects which description string comes back, not whether one
 /// does).
+///
+/// Since C43, no production call site uses this `Option<String>` form
+/// directly ([`detect_usage_threshold_hit`] and [`statusline_limit_hit`] both
+/// call [`usage_threshold_hit_at`] instead so they can keep the dimension
+/// tag) — this wrapper is kept solely so the pre-C43 tests below stay
+/// byte-for-byte unmodified.
+#[allow(dead_code)]
 pub(crate) fn usage_threshold_hit(
     session_pct: i64,
     week_pct: i64,
     week_fable_pct: Option<i64>,
     limit_pct: i64,
 ) -> Option<String> {
+    usage_threshold_hit_at(session_pct, week_pct, week_fable_pct, limit_pct).map(|hit| hit.message)
+}
+
+/// [`usage_threshold_hit`]'s pure core, extended to tag which dimension
+/// tripped: same three-dimension check (session, then week_all, then
+/// week_fable — first hit wins), but returns a [`LimitHit`] instead of
+/// collapsing straight to a message string.
+pub(crate) fn usage_threshold_hit_at(
+    session_pct: i64,
+    week_pct: i64,
+    week_fable_pct: Option<i64>,
+    limit_pct: i64,
+) -> Option<LimitHit> {
     if session_pct >= 0 && session_pct >= limit_pct {
-        return Some(format!("session {session_pct}%"));
+        return Some(LimitHit {
+            dimension: LimitDimension::Session,
+            message: format!("session {session_pct}%"),
+        });
     }
     if week_pct >= 0 && week_pct >= limit_pct {
-        return Some(format!("week_all {week_pct}%"));
+        return Some(LimitHit {
+            dimension: LimitDimension::WeekAll,
+            message: format!("week_all {week_pct}%"),
+        });
     }
     if let Some(fable_pct) = week_fable_pct
         && fable_pct >= 0
         && fable_pct >= limit_pct
     {
-        return Some(format!("week_fable {fable_pct}%"));
+        return Some(LimitHit {
+            dimension: LimitDimension::WeekFable,
+            message: format!("week_fable {fable_pct}%"),
+        });
     }
     None
 }
@@ -1640,6 +1726,19 @@ mod tests {
         );
     }
 
+    /// The typed core tags the same case with `LimitDimension::WeekFable`,
+    /// not just the reduced message string `statusline_limit_at` returns.
+    #[test]
+    fn statusline_limit_hit_tags_week_fable() {
+        assert_eq!(
+            statusline_limit_hit(&reading(Some(10), Some(60), Some(100)), 99),
+            Some(LimitHit {
+                dimension: LimitDimension::WeekFable,
+                message: "week_fable 100%".to_string(),
+            })
+        );
+    }
+
     #[test]
     fn statusline_limit_at_absent_sections_never_fire() {
         assert_eq!(statusline_limit_at(&reading(None, None, None), 99), None);
@@ -1734,6 +1833,56 @@ mod tests {
     fn usage_threshold_hit_session_reported_before_fable() {
         let hit = usage_threshold_hit(99, 10, Some(99), 99);
         assert_eq!(hit.as_deref(), Some("session 99%"));
+    }
+
+    // ── usage_threshold_hit_at (the LimitHit-tagged pure core, C43) ───────────
+
+    /// The typed core tags each of the three dimensions correctly, and still
+    /// returns `None` when nothing crosses the threshold.
+    #[test]
+    fn usage_threshold_hit_at_tags_each_dimension() {
+        assert_eq!(
+            usage_threshold_hit_at(99, 10, Some(5), 99),
+            Some(LimitHit {
+                dimension: LimitDimension::Session,
+                message: "session 99%".to_string(),
+            })
+        );
+        assert_eq!(
+            usage_threshold_hit_at(10, 99, None, 99),
+            Some(LimitHit {
+                dimension: LimitDimension::WeekAll,
+                message: "week_all 99%".to_string(),
+            })
+        );
+        assert_eq!(
+            usage_threshold_hit_at(10, 20, Some(99), 99),
+            Some(LimitHit {
+                dimension: LimitDimension::WeekFable,
+                message: "week_fable 99%".to_string(),
+            })
+        );
+        assert_eq!(usage_threshold_hit_at(10, 20, Some(30), 99), None);
+    }
+
+    /// `usage_threshold_hit` (the pre-existing `Option<String>` API) must
+    /// still return byte-identical messages after being rewritten as a thin
+    /// wrapper over `usage_threshold_hit_at`.
+    #[test]
+    fn usage_threshold_hit_still_returns_identical_strings() {
+        assert_eq!(
+            usage_threshold_hit(99, 10, Some(5), 99).as_deref(),
+            Some("session 99%")
+        );
+        assert_eq!(
+            usage_threshold_hit(10, 99, None, 99).as_deref(),
+            Some("week_all 99%")
+        );
+        assert_eq!(
+            usage_threshold_hit(10, 20, Some(99), 99).as_deref(),
+            Some("week_fable 99%")
+        );
+        assert_eq!(usage_threshold_hit(10, 20, Some(30), 99), None);
     }
 
     // ── resolve_target_from_pick (single viability authority pass-through) ────
