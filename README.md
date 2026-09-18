@@ -10,9 +10,10 @@ Cross-platform smart session manager for [Claude Code](https://claude.ai/code).
   directory;
 - **profile management** — multiple isolated Claude Code config homes
   (`CLAUDE_CONFIG_DIR`) with a one-command switcher;
-- **account scoring + auto-switch** — pick the viable account (session,
-  weekly, and model-scoped weekly caps all under threshold) whose weekly
-  quota resets soonest, and relaunch on a rate-limit hit;
+- **account scoring + auto-switch** — pick the viable account (session and
+  weekly caps under threshold; a model-scoped weekly cap alone falls back to
+  another model on the same account instead) whose weekly quota resets
+  soonest, and relaunch on a rate-limit hit;
 - **usage metering**: a multi-profile usage table, collected locally per
   profile (see *Usage metering*);
 - a **limit-detection hook** and a **relaunch/handoff loop**.
@@ -477,22 +478,29 @@ fall through to a default.
 
 ### What counts as a viable account
 
-Anthropic reports up to three usage windows per account, and `csm` weighs all
-three wherever it picks or ranks a profile:
+Anthropic reports up to three usage windows per account. Two of them gate
+whether `csm` considers a profile viable at all; the third, model-scoped one
+no longer does — a cap there falls back to another model on the same account
+instead of excluding it (see *Reactive switch* below):
 
 | Window | Field | Not viable when |
 |---|---|---|
 | 5-hour session | `session` | `>= 99%` (`CLAUDE_LIMIT_PCT`) |
 | weekly, all models | `week_all` | `>= 95%` (`CLAUDE_PICK_SATURATION_PCT`) |
-| weekly, one model tier | `week_fable` (tier name from the API, shown as the table's tier column) | `>= 95%` (same variable) |
+| weekly, one model tier | `week_fable` (tier name from the API, shown as the table's tier column) | never excludes on its own — see below |
 
 A profile the API reports no model-scoped window for is simply not
-constrained by that dimension; absence is never read as "limited". One
-predicate (`scoring::is_viable_pcts`) makes this call for the launch-time
-auto-pick, `csm pick-account`, the account picker's ordering, and the Stop
-hook's relaunch target, so an account whose model-scoped weekly cap is
-exhausted is skipped everywhere even while its session and all-model weekly
-readings look healthy.
+constrained by that dimension; absence is never read as "limited". A model
+tier at or over `CLAUDE_PICK_SATURATION_PCT` still shows its raw percentage
+(`model NN%`) in the usage table and account picker, but does not lower the
+profile's rank or exclude it from auto-pick — the account's session and
+all-model weekly headroom are what determine whether it can still take work.
+One predicate (`scoring::is_viable_pcts`) makes the session/week_all call for
+the launch-time auto-pick, `csm pick-account`, and the account picker's
+ordering; the Stop hook's relaunch target uses the same predicate for
+picking a different *account*, and separately checks `week_fable` on its own
+to decide whether to fall back to a model on the *current* account instead
+(see `hook::detect::fable_fallback_model`).
 
 **Reactive switch while a session is running.** Three paths feed the same
 decision; all of them end with the `csm run` supervisor restarting
@@ -565,12 +573,39 @@ matters:
 percentages against `CLAUDE_LIMIT_PCT` instead, which catches a cap crossed
 during a turn that still succeeded.
 
-All three honour `CLAUDE_AUTO_SWITCH`, `CLAUDE_AUTO_SWITCH_RELAUNCH`, the
-live-supervisor check, and the per-session hop cap. The machine-wide switch
-cooldown (`CLAUDE_SWITCH_COOLDOWN`) only throttles the `Stop` percentage
-path; the statusline tick and `StopFailure` are each session's own live
-evidence, so several sessions sharing an exhausted account can all move off
-it. The model-scoped weekly
+*Model fallback on a Fable-only cap.* When the dimension that tripped is
+`week_fable` and nothing else, the statusline tick and the `Stop` hook's
+percentage check relaunch the same session under the same profile with
+`--model` set to `CLAUDE_FABLE_FALLBACK_MODEL` (default `opus`), instead of
+switching accounts — the account itself still has headroom, so spending a
+switch hop to move to a different account would be wasted. Only these two
+paths can make that call: they read the three percentages directly and know
+which one tripped. The `StopFailure` hook cannot — a raw 429 carries no
+dimension, only `error: "rate_limit"` — so it always falls through to the
+ordinary account-switch path, never a model fallback.
+This is one-shot per weekly window, tracked by a `<sid>.model-fallback`
+marker: a further `week_fable` trip while that marker is still fresh for the
+current window is suppressed silently, not escalated to a switch and not
+notified again, since the reading typically stays capped for days and
+switching on it would just undo the fallback on the very next tick; once the
+window rolls over the marker no longer counts and a fresh fallback can fire
+again. A later cap on
+`session` or `week_all` still switches accounts normally regardless of the
+marker. Set `CLAUDE_FABLE_FALLBACK=0` to disable the fallback outright and
+fall through to the ordinary account-switch path instead (which excludes the
+current profile the same as any other cap and may itself end in a
+notify-only if nothing else has headroom).
+
+All three honour `CLAUDE_AUTO_SWITCH`, `CLAUDE_AUTO_SWITCH_RELAUNCH`, and the
+live-supervisor check. The per-session hop cap (`CLAUDE_MAX_HOPS`) also
+applies to all three — except a model fallback itself, which spends no hop
+and so is not counted or limited by it; a later account switch still counts
+against the same budget as always. The machine-wide switch cooldown
+(`CLAUDE_SWITCH_COOLDOWN`) only throttles the `Stop` percentage path; the
+statusline tick and `StopFailure` are each session's own live evidence, so
+several sessions sharing an exhausted account can all move off it. A model
+fallback neither claims nor is blocked by this cooldown either, since it
+switches no account. The model-scoped weekly
 percentage refreshes only when the per-profile usage-API probe runs
 (`CSM_USAGE_PROFILE_TTL`, default 300s), so a cap on that dimension alone can
 take up to about five minutes to register on the tick and `Stop` paths; the
@@ -630,12 +665,14 @@ Defaults shown are what applies when the variable is unset or unparseable.
 | Variable | Meaning |
 |---|---|
 | `CLAUDE_LIMIT_PCT` | The 5-hour session window's "not viable" threshold, percent (default `99`). Gates both scoring/pick and the hook's/statusline tick's rate-limit check. See *What counts as a viable account*. |
-| `CLAUDE_PICK_SATURATION_PCT` | The weekly (all-model and model-scoped) "not viable" threshold, percent (default `95`). |
+| `CLAUDE_PICK_SATURATION_PCT` | The all-model weekly window's "not viable" threshold, percent (default `95`). Does not gate the model-scoped `week_fable` window — see `CLAUDE_FABLE_FALLBACK` below and *What counts as a viable account*. |
 | `CLAUDE_USAGE_MAX_AGE` / `CSM_USAGE_MAX_AGE_SECS` | Max age, in seconds, of usage data that auto-pick will still trust (default `1800`); `0` disables the gate. `CLAUDE_USAGE_MAX_AGE` wins if both are set. |
 | `CLAUDE_AUTO_SWITCH` | `0` disables the whole limit-switch decision (a kill-switch). Anything else, or unset, leaves it enabled. |
 | `CLAUDE_AUTO_SWITCH_RELAUNCH` | `1` (default) actually relaunches under the target profile on a switch. Any other value only notifies — it prints the manual switch command instead of relaunching. |
 | `CLAUDE_SWITCH_COOLDOWN` | Seconds the machine-wide switch cooldown enforces between percentage-based switches (default `300`). Throttles the `Stop` percentage path only — never the statusline tick or a `StopFailure(rate_limit)` hit, each of which is a session's own live evidence. See *Reactive switch*. |
 | `CLAUDE_MAX_HOPS` | Max switch hops one session chain may take before the hook gives up and skips (default `1`). |
+| `CLAUDE_FABLE_FALLBACK` | `1` (default) falls back to another model on the same account when a `week_fable` cap trips alone, instead of switching accounts. `0` disables the fallback and lets that cap fall through to the ordinary account-switch path. See *Model fallback on a Fable-only cap*. |
+| `CLAUDE_FABLE_FALLBACK_MODEL` | The model alias the fallback relaunches with (default `opus`). |
 | `CLAUDE_SMART_RESUME_PROMPT` | Overrides the handoff message injected into a session after a switch. Unset = `csm`'s default handoff text; set to an empty string = no handoff prompt at all; any other value is used verbatim. |
 | `CLAUDE_SWITCH_GRACE_MS` | Milliseconds the process supervisor waits for the launched child to exit gracefully after a stop signal before escalating (default `5000`). |
 

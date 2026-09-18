@@ -4,8 +4,8 @@
     "a": {
       "captured_at": "2026-09-14T10:05:19Z",
       "session": { "pct": 10, "resets": "9pm (Asia/Seoul)", "resets_at": 1789985119 },
-      "week_all": { "pct": 40, "resets": "Sep 21 at 9pm (Asia/Seoul)", "resets_at": 1789985119 },
-      "week_fable": { "pct": 100, "resets": "Sep 21 at 9pm (Asia/Seoul)", "resets_at": 1789985119 },
+      "week_all": { "pct": 100, "resets": "Sep 21 at 9pm (Asia/Seoul)", "resets_at": 1789985119 },
+      "week_fable": { "pct": 20, "resets": "Sep 21 at 9pm (Asia/Seoul)", "resets_at": 1789985119 },
       "week_model_label": "Fable",
       "session_stats": [],
       "source": "cmd"
@@ -13,8 +13,8 @@
     "b": {
       "captured_at": "2026-09-14T10:05:19Z",
       "session": { "pct": 8, "resets": "9pm (Asia/Seoul)", "resets_at": 1789985119 },
-      "week_all": { "pct": 35, "resets": "Sep 21 at 9pm (Asia/Seoul)", "resets_at": 1789985119 },
-      "week_fable": { "pct": 100, "resets": "Sep 21 at 9pm (Asia/Seoul)", "resets_at": 1789985119 },
+      "week_all": { "pct": 97, "resets": "Sep 21 at 9pm (Asia/Seoul)", "resets_at": 1789985119 },
+      "week_fable": { "pct": 20, "resets": "Sep 21 at 9pm (Asia/Seoul)", "resets_at": 1789985119 },
       "week_model_label": "Fable",
       "session_stats": [],
       "source": "cmd"

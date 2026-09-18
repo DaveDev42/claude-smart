@@ -37,29 +37,51 @@ pub use crate::platform::relaunch::RelaunchSentinel;
 /// `handoff`        — handoff prompt string forwarded to the resumed session.
 /// `cwd`            — working directory from the hook input (not owner_dir).
 /// `born`           — born epoch read from the PID file by classify().
+/// `model_override` — `Some(model)` for a same-account model fallback (see
+///                     `crate::hook::detect::fable_fallback_model`);
+///                     `None` for an ordinary account switch.
 ///
-/// The commit ordering (matches the legacy shell implementation):
+/// The commit ordering (matches the legacy shell implementation) for an
+/// ordinary account switch (`model_override: None`):
 ///   1. merge-sidecar hop
 ///   2. write .relaunch sentinel (atomic tmp+rename)
 ///   3. noclobber-create .switched marker
 ///   4. re-stamp .last-switch
 ///   5. stop signal LAST (POSIX SIGTERM / Windows .stop flag)
+///
+/// `model_override: Some(_)` skips steps 1, 3, and 4 — the account-switch hop
+/// bump, `.switched` marker, and machine-wide cooldown restamp all belong to
+/// the account-switch path and must stay untouched by a relaunch that never
+/// switched accounts (see `fable_fallback_model`'s loop-safety doc). In their
+/// place it (re)writes `<sid>.model-fallback` — exclusively claimed first on
+/// the statusline entry point, see `claim_model_fallback` — and writes the
+/// sentinel with `hop` equal to the *current* sidecar hop (unchanged, not
+/// bumped).
+/// Step 2 (sentinel) and step 5 (stop signal) run exactly as before either
+/// way.
 pub fn commit_and_stop(
     sid: &str,
     target_profile: &str,
     handoff: &str,
     cwd: &str,
     born: i64,
+    model_override: Option<&str>,
 ) -> anyhow::Result<()> {
     use crate::paths;
 
     // ── Step 1: read current hop from sidecar, compute next_hop ──────────────
+    // A model fallback never bumps the hop or touches the sidecar — the
+    // sentinel's hop stays exactly what it already was.
     let current_hop = crate::hook::read_sidecar_hop(sid);
-    let next_hop = current_hop + 1;
-
-    // Merge next_hop back into the sidecar (merge-not-clobber: preserve other fields).
-    // Shell: `"$HELPER" merge-sidecar "$session_id" hop "$next_hop"`
-    merge_sidecar_hop(sid, next_hop)?;
+    let hop = if model_override.is_some() {
+        current_hop
+    } else {
+        let next_hop = current_hop + 1;
+        // Merge next_hop back into the sidecar (merge-not-clobber: preserve other fields).
+        // Shell: `"$HELPER" merge-sidecar "$session_id" hop "$next_hop"`
+        merge_sidecar_hop(sid, next_hop)?;
+        next_hop
+    };
 
     // ── Step 2: write .relaunch sentinel (atomic) ─────────────────────────────
     // Shell: `"$HELPER" write-relaunch ...`
@@ -75,24 +97,45 @@ pub fn commit_and_stop(
         target_profile: target_profile.to_string(),
         cwd: cwd.to_string(),
         handoff: handoff.to_string(),
-        hop: next_hop,
+        hop,
         born: actual_born,
+        model_override: model_override.map(str::to_string),
     };
 
     crate::platform::relaunch::write_relaunch(&paths::relaunch(sid), &sentinel)?;
 
-    // ── Step 3: noclobber .switched marker ───────────────────────────────────
-    let switched_path = paths::switched(sid);
-    if !switched_path.exists() {
-        let epoch = now_epoch();
-        // Write epoch string; ignore EEXIST (noclobber semantics: first write wins).
-        let _ = write_noclobber(&switched_path, &format!("{epoch}"));
-    }
+    if model_override.is_some() {
+        // Marker: this session fell back to the fallback model on a Fable
+        // cap, current as of now. The statusline entry point
+        // ([`crate::hook::run_from_statusline`]) already exclusively claimed
+        // this marker via `claim_model_fallback` before ever calling here —
+        // by the time `classify_with` returned this decision it had already
+        // established no marker for the CURRENT week_fable window survives
+        // (a stale or corrupt one is removed at that point, see
+        // `crate::hook::detect::model_fallback_marker_is_stale`), so this
+        // call is always writing into a slot that is either freshly claimed
+        // or empty. The direct hook entry point never claims first, so this
+        // write is what actually creates the marker there. Either way this
+        // just (re)writes the current epoch, atomically (tmp + rename) so a
+        // reader never observes a partially written file. Deliberately NOT
+        // `.switched`/`.last-switch` — those belong to the account-switch
+        // hop budget and cooldown, which a same-account model change must
+        // never consume.
+        let _ = write_atomic(&paths::model_fallback(sid), &now_epoch().to_string());
+    } else {
+        // ── Step 3: noclobber .switched marker ───────────────────────────────
+        let switched_path = paths::switched(sid);
+        if !switched_path.exists() {
+            let epoch = now_epoch();
+            // Write epoch string; ignore EEXIST (noclobber semantics: first write wins).
+            let _ = write_noclobber(&switched_path, &format!("{epoch}"));
+        }
 
-    // ── Step 4: re-stamp .last-switch ────────────────────────────────────────
-    let epoch = now_epoch();
-    std::fs::write(paths::last_switch(), format!("{epoch}"))
-        .context("failed to write .last-switch")?;
+        // ── Step 4: re-stamp .last-switch ────────────────────────────────────
+        let epoch = now_epoch();
+        std::fs::write(paths::last_switch(), format!("{epoch}"))
+            .context("failed to write .last-switch")?;
+    }
 
     // ── Step 5: stop the managed process (LAST) ───────────────────────────────
     stop_managed_process(sid)?;
@@ -236,18 +279,77 @@ pub(crate) fn claim_switched(sid: &str) -> bool {
     claim_marker(&crate::paths::switched(sid))
 }
 
-/// `create_new` the marker with the current epoch. `true` iff this call
-/// created it; any failure (already present, unwritable dir) is `false`.
+/// Claim the `.model-fallback` marker for `sid` *before* committing — for a
+/// same-account model fallback (see
+/// [`crate::hook::detect::fable_fallback_model`]). Deliberately a SEPARATE
+/// marker/claim from `.switched`: a model fallback must never touch
+/// `.switched`, or it would burn this session's one-shot account-switch
+/// budget on a relaunch that never switched accounts.
+///
+/// Same exclusivity as [`claim_switched`] — a plain [`claim_marker`] claim:
+/// `true` means this caller owns the fallback and must commit; `false` means
+/// another overlapping tick already claimed it and this caller must do
+/// nothing. Two overlapping ticks for the same session must never both
+/// commit (each would write its own relaunch sentinel and send its own stop
+/// signal to the same supervised process). A leftover marker from an EARLIER
+/// `week_fable` window is not this function's concern: `classify_with`
+/// removes a stale or unparseable marker itself, before ever reaching a
+/// `LimitSwitch` decision with `model_override: Some(_)` (see
+/// [`crate::hook::detect::model_fallback_marker_is_stale`]), so by the time a
+/// caller reaches here the marker, if any, is either fresh (another tick's
+/// legitimate claim, which this call must lose to) or absent.
+pub(crate) fn claim_model_fallback(sid: &str) -> bool {
+    claim_marker(&crate::paths::model_fallback(sid))
+}
+
+/// Exclusively claim `path` with the current epoch as content. `true` iff
+/// this call created it; `false` on any failure, including "already
+/// exists" (another claimant got there first) and an unwritable parent dir.
+///
+/// Writes the content to a private sibling tmp file first, then atomically
+/// links it into place (`hard_link` fails with `AlreadyExists` exactly like
+/// `create_new` would, so exclusivity is unchanged) rather than
+/// `create_new` + `write_all` directly. That ordering means a claimant can
+/// never observe a truncated/partial marker if the process dies between
+/// opening the file and finishing the write — a failure mode a plain
+/// `create_new` + `write_all` on `.model-fallback` would have left
+/// reachable (see [`crate::hook::detect::model_fallback_marker_epoch`]'s
+/// doc).
 fn claim_marker(path: &Path) -> bool {
-    use std::fs::OpenOptions;
-    use std::io::Write as _;
-    match OpenOptions::new().write(true).create_new(true).open(path) {
-        Ok(mut f) => {
-            let _ = f.write_all(now_epoch().to_string().as_bytes());
-            true
-        }
-        Err(_) => false,
+    let tmp = tmp_sibling(path);
+    if std::fs::write(&tmp, now_epoch().to_string()).is_err() {
+        let _ = std::fs::remove_file(&tmp);
+        return false;
     }
+    let claimed = std::fs::hard_link(&tmp, path).is_ok();
+    let _ = std::fs::remove_file(&tmp);
+    claimed
+}
+
+/// A private sibling path next to `path`, namespaced by this process's PID
+/// so concurrent claimants (separate processes — see [`claim_marker`]'s doc)
+/// never write each other's tmp file. Shared by [`claim_marker`] and
+/// [`write_atomic`].
+fn tmp_sibling(path: &Path) -> std::path::PathBuf {
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("marker");
+    path.with_file_name(format!("{name}.tmp-{}", std::process::id()))
+}
+
+/// Write `content` to `path` atomically via tmp + rename (the same pattern
+/// [`crate::platform::relaunch::write_relaunch`] uses), overwriting whatever
+/// was there. Unlike [`claim_marker`] this makes no exclusivity claim — it
+/// is for a caller that already owns the slot (or knows no one else can be
+/// writing it) and just wants to refresh its content without a reader ever
+/// observing a partial write.
+fn write_atomic(path: &Path, content: &str) -> std::io::Result<()> {
+    let tmp = tmp_sibling(path);
+    std::fs::write(&tmp, content)?;
+    std::fs::rename(&tmp, path).inspect_err(|_| {
+        let _ = std::fs::remove_file(&tmp);
+    })
 }
 
 /// Write `content` to `path` only if the file does not already exist (noclobber semantics).
@@ -303,6 +405,31 @@ mod tests {
         assert!(!claim_marker(&path));
     }
 
+    /// `claim_model_fallback` must have the same exclusivity `claim_switched`
+    /// has: two overlapping claims for the same session, exactly one wins
+    /// and the loser must not overwrite. Drives
+    /// the real public entry point (keyed by `sid` via
+    /// `paths::model_fallback`, which reads `HOME`), not just the shared
+    /// `claim_marker` primitive.
+    #[test]
+    fn claim_model_fallback_first_caller_wins() {
+        let home = TempDir::new().unwrap();
+        std::fs::create_dir_all(home.path().join(".claude.shared").join("smart")).unwrap();
+        crate::testenv::with_test_home(home.path(), || {
+            let sid = "sid-claim-race-0001";
+            assert!(claim_model_fallback(sid), "first claimant must win");
+            assert!(
+                !claim_model_fallback(sid),
+                "an overlapping second claimant must lose, not overwrite"
+            );
+            let content = std::fs::read_to_string(crate::paths::model_fallback(sid)).unwrap();
+            assert!(
+                content.parse::<i64>().is_ok(),
+                "marker holds a complete, parseable epoch: {content:?}"
+            );
+        });
+    }
+
     /// write_noclobber: first write succeeds; second write is silently ignored.
     #[test]
     fn noclobber_first_write_wins() {
@@ -324,6 +451,7 @@ mod tests {
             handoff: "resume".to_string(),
             hop: 1,
             born: 1718000000,
+            model_override: None,
         };
         let json = serde_json::to_string(&sentinel).unwrap();
         // hop must be a JSON number (not a string) in .relaunch

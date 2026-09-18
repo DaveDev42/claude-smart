@@ -10,9 +10,11 @@ use crate::account;
 /// Exits 1 on fetch failure.
 ///
 /// Routes through `account::pick_account` → `scoring::pick_best_at`, which
-/// scores on all three usage dimensions (session, week_all, and the
-/// model-scoped weekly `week_fable`) — a profile whose `week_fable` is
-/// saturated is skipped exactly like a session- or week_all-limited one.
+/// scores on session and week_all. Since C44, the model-scoped weekly
+/// `week_fable` no longer excludes a profile here — a model-scoped-only cap
+/// still leaves the account usable on another model; the Stop hook handles
+/// that case with a same-account model fallback instead (see
+/// `src/hook/detect.rs`).
 pub(crate) fn cmd_pick_account(args: &[OsString]) -> anyhow::Result<()> {
     let mut current = String::new();
     let mut include_current = false;

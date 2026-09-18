@@ -48,10 +48,12 @@ pub struct StaleProfileData {
     /// over re-parsing `resets` — see `cmd::run::account_row_rank`.
     pub resets_at: Option<i64>,
     /// Weekly PER-MODEL-TIER (`week_fable`) usage percentage, or `None` when
-    /// this profile carries no model-scoped weekly cap. `cmd::run::account_row_rank`
-    /// treats a `Some(pct) >= SATURATION_PCT` reading the same as a saturated
-    /// `week_all_pct` (see `scoring::is_viable_pcts`) — `None` never
-    /// constrains viability.
+    /// this profile carries no model-scoped weekly cap. Since C44,
+    /// `cmd::run::account_row_rank` (via `scoring::is_viable_pcts`) no longer
+    /// lets this field constrain viability — a model-scoped-only cap still
+    /// leaves the row usable on another model, so it never sinks the row on
+    /// its own. Still feeds the row's displayed `model NN%` reading and the
+    /// effective-reset ranking (`scoring::effective_reset_epoch`).
     pub week_fable_pct: Option<i64>,
     /// Machine-native reset epoch for the `week_fable` section
     /// (`week_fable.resets_at`), when known. `None` when absent (no cap for

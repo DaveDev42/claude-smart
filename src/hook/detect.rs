@@ -74,8 +74,9 @@
 //! while a turn is parked in the auto-retry wait above. The payload carries
 //! the session's own `rate_limits` (session + all-model weekly, off its own
 //! API responses) plus `session_id`/`cwd`/`transcript_path`; the recorder
-//! merges in the store's model-scoped weekly reading and [`statusline_limit`]
-//! reduces the three to the tier-2 test. A hit is handed to `classify_with`
+//! merges in the store's model-scoped weekly reading and
+//! [`statusline_limit_hit_default`] reduces the three to the tier-2 test. A
+//! hit is handed to `classify_with`
 //! as `live_limit`, which takes it as limited + definitive at step 3 and runs
 //! every other step unchanged. Freshness is that of the tick itself for
 //! session/week_all and of the last usage-API probe for week_fable (same
@@ -92,19 +93,55 @@
 //!    fall through to tier-2 exactly as before, `definitive = false`.
 //! 4. If not limited → exit (with user-quit log if user_quit).
 //! 5. If user_quit + limited → notify-only (deduped via .detected).
-//! 6. Pick target profile.
+//!
+//! 5b. Fable-cap same-account model fallback (sits between steps 5 and 6): a
+//! `week_fable` (model-scoped weekly cap) trip does not exclude the account
+//! or consume the account-switch hop budget — the account still has headroom
+//! on every other model. When `CLAUDE_FABLE_FALLBACK` (default on) is
+//! enabled and this session hasn't already used its one-shot fallback
+//! (`<sid>.model-fallback`, and that marker is not stale — see
+//! [`model_fallback_marker_is_stale`]), `target_profile` is set to
+//! `current_profile` and the relaunch carries `model_override` (default
+//! fallback model `CLAUDE_FABLE_FALLBACK_MODEL`, default `"opus"`) instead of
+//! picking a different account.
+//!
+//! 5c. Suppress a repeat trip within the same fallback window, silently: once
+//! the one-shot marker exists and is still fresh, a further `week_fable` trip
+//! this session is `Decision::Skip` rather than falling through to step 6 or
+//! notifying again. `week_fable` stays capped for days, so falling through to
+//! the ordinary account-switch path on the very next tick would undo the
+//! fallback within seconds of it firing, and could even land the session on
+//! another Fable-capped account now that such an account is pickable again
+//! (see the module's viability note); and the fallback itself was already
+//! logged when it fired, so the repeat trip has nothing new to say — a
+//! notify-only here would also consume the session's one-shot `.detected`
+//! slot for nothing, silently swallowing a later, genuinely new notify-only
+//! (say a `week_all` cap with no viable target) for the rest of this session.
+//! This is bounded, not permanent: once the marker goes stale (the weekly
+//! window rolled over), `already_fell_back` reads false again and 5b's
+//! fallback can fire once more. Gated on `CLAUDE_FABLE_FALLBACK` too — with
+//! the knob off the whole feature is meant to be inert, so a stale-knob
+//! marker from an earlier run must fall through to the ordinary
+//! account-switch path, not be silently swallowed. `session` and `week_all`
+//! trips never reach this step — `already_fell_back` is never set for them.
+//!
+//! 6. Pick target profile (skipped when 5b already set `target_profile`).
 //! 7. If no target → notify-only (deduped via .detected).
 //! 8. If CLAUDE_AUTO_SWITCH_RELAUNCH != "1" → notify-only (deduped via .detected).
 //! 9. Managed-session gate: check .pid file.
-//! 10. Cooldown gate (noclobber .last-switch) — EXCEPT when `definitive` from
-//!     step 3: a tier-0 or statusline-tick signal is never blocked by this cooldown (each
+//! 10. Cooldown gate (noclobber .last-switch) — skipped entirely for a 5b
+//!     fallback (a same-account model change claims no shared resource and
+//!     must not be blocked by, or stamp, another session's cooldown);
+//!     otherwise EXCEPT when `definitive` from step 3: a tier-0 or
+//!     statusline-tick signal is never blocked by this cooldown (each
 //!     csm-supervised session sharing a now-capped account gets its own
 //!     independent StopFailure and must be allowed to switch off it, not just
 //!     the first one to notice — see the step-9 comment in [`classify`]). The
-//!     stamp is still refreshed/claimed best-effort either way, so pct-based
-//!     (tier-2) detections elsewhere keep today's throttle.
-//! 11. Hop guard.
-//!     → Decision::LimitSwitch { target_profile, handoff, cwd, born }.
+//!     stamp is still refreshed/claimed best-effort either way for a
+//!     non-fallback call, so pct-based (tier-2) detections elsewhere keep
+//!     today's throttle.
+//! 11. Hop guard (skipped for a 5b fallback — see [`fable_fallback_model`]).
+//!     → Decision::LimitSwitch { target_profile, handoff, cwd, born, model_override }.
 
 use std::path::Path;
 
@@ -182,12 +219,20 @@ where
 
 // ─── limit dimension ──────────────────────────────────────────────────────────
 
-/// Which usage window a limit verdict was tripped by. `Unknown` covers every
-/// signal this crate cannot yet attribute to a specific window: tier-0
-/// (`StopFailure`'s payload carries no dimension at all) and the statusline
-/// tick's `live_limit` string (already reduced to a message by its caller).
-/// Tier-2 and the statusline pre-gate's own pure core ([`usage_threshold_hit_at`],
-/// [`statusline_limit_hit`]) are the only paths that can tag a real dimension.
+/// Which usage window a limit verdict was tripped by. `Unknown` covers the
+/// one signal this crate genuinely cannot attribute to a specific window:
+/// tier-0 (`StopFailure`'s payload carries no dimension at all — the API
+/// error kind is the same `rate_limit` string whichever window tripped it).
+/// Tier-2 ([`usage_threshold_hit_at`]) tags a real dimension directly; the
+/// statusline tick carries its own typed [`LimitHit`] straight through
+/// (`classify_with`'s `live_limit` parameter — this is the dimension the
+/// fable-fallback check at step 5b needs, since the statusline tick is the
+/// operative switch path for the model-scoped weekly cap; see the module
+/// doc's "Statusline tick" section). The caller already has the typed
+/// [`LimitHit`] from
+/// [`statusline_limit_hit`]/[`statusline_limit_hit_default`], so
+/// `classify_with` takes the dimension directly rather than re-parsing it
+/// back out of the reduced message string.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum LimitDimension {
     Session,
@@ -196,13 +241,20 @@ pub(crate) enum LimitDimension {
     Unknown,
 }
 
-/// A limit verdict paired with the dimension that tripped it. Introduced so a
+/// A limit verdict paired with the dimension that tripped it, and — for a
+/// `WeekFable` hit only — the reset epoch of that window. Introduced so a
 /// future caller can branch on `dimension` without re-parsing `message`'s
-/// free text — see the module's `LimitDimension` doc.
+/// free text — see the module's `LimitDimension` doc. `resets_at` lets 5b's
+/// marker-staleness check (see [`model_fallback_marker_is_stale`]) use the
+/// epoch the producer already read off the usage section, instead of a
+/// second, separate usage-cache read: `None` for every dimension except
+/// `WeekFable`, and `None` even for a `WeekFable` hit whose reading never
+/// carried a reset time.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct LimitHit {
     pub dimension: LimitDimension,
     pub message: String,
+    pub resets_at: Option<i64>,
 }
 
 // ─── decision type ────────────────────────────────────────────────────────────
@@ -241,6 +293,15 @@ pub enum Decision {
         /// `dimension: _` — this is the plumbing a later commit branches on.
         #[allow(dead_code)]
         dimension: LimitDimension,
+        /// `Some(model)` when this is a same-account model fallback (a
+        /// `week_fable` cap with the fallback enabled and not already used
+        /// this session — see [`fable_fallback_model`]) rather than an
+        /// account switch; `target_profile` then equals the current profile.
+        /// `None` is the ordinary account-switch path. `commit_and_stop`
+        /// branches on this to skip the account-switch bookkeeping (hop bump,
+        /// `.switched`, `.last-switch`) and write the one-shot
+        /// `.model-fallback` marker instead.
+        model_override: Option<String>,
     },
 }
 
@@ -315,13 +376,26 @@ pub fn parse_input(raw: &str) -> anyhow::Result<HookInput> {
 ///    exits immediately with `Skip`, bypassing tier-2
 /// 4. No limit signal → Skip
 /// 5. user_quit + limited → NotifyOnly (deduped via .detected)
-/// 6. Pick target profile (exclude current) via account::pick_account
+///
+/// 5b. Fable-cap same-account model fallback check (see [`fable_fallback_model`]):
+/// on `Some(model)`, `target_profile` is fixed to the current profile and
+/// steps 6, 10, and 11 are all skipped.
+///
+/// 5c. On `None` from a `week_fable` dimension while the one-shot marker is
+/// still fresh, the trip is silently suppressed (`Decision::Skip`) rather
+/// than notified or falling through — see the module doc's 5c section and
+/// [`model_fallback_marker_is_stale`]. `None` from `session`/`week_all` (or
+/// from a `week_fable` trip whose marker has gone stale, or with the fallback
+/// knob off) runs the existing path below unchanged.
+///
+/// 6. Pick target profile (exclude current) via account::pick_account — skipped by 5b
 /// 7. No viable target → NotifyOnly (deduped via .detected)
 /// 8. CLAUDE_AUTO_SWITCH_RELAUNCH != "1" → NotifyOnly (deduped via .detected)
 /// 9. Managed-session gate (.pid file)
-/// 10. Machine-wide cooldown (noclobber .last-switch) — skipped when the tier-0
-///     signal was `definitive` (see `cooldown_should_block`)
-/// 11. Hop guard
+/// 10. Machine-wide cooldown (noclobber .last-switch) — skipped entirely by a
+///     5b fallback; otherwise skipped when the tier-0 signal was
+///     `definitive` (see `cooldown_should_block`)
+/// 11. Hop guard — skipped by 5b
 ///     → LimitSwitch
 pub fn classify(input: &HookInput, owner_dir: &Path) -> anyhow::Result<Decision> {
     classify_with(input, owner_dir, None)
@@ -330,20 +404,23 @@ pub fn classify(input: &HookInput, owner_dir: &Path) -> anyhow::Result<Decision>
 /// [`classify`] with a limit the caller has already established from evidence
 /// the hook stdin does not carry.
 ///
-/// `live_limit = Some(msg)` is the statusline tick's case
+/// `live_limit = Some(hit)` is the statusline tick's case
 /// ([`crate::hook::run_from_statusline`]): the owning profile's live
-/// `rate_limits` reading crossed `CLAUDE_LIMIT_PCT`, and `msg` names the
-/// dimension (`"week_all 100%"`, ...). It short-circuits step 3 exactly like
-/// a tier-0 hit — limited, `definitive`, no transcript or usage-cache read —
-/// and is definitive for the same reason tier-0 is: it is that session's own
-/// account, read off its own API responses seconds ago, not a shared cache.
-/// Every other step (kill-switches, reason gate, target pick, relaunch
-/// switch, managed gate, cooldown, hop guard) applies unchanged. `None` is
-/// the ordinary hook path.
+/// `rate_limits` reading crossed `CLAUDE_LIMIT_PCT`, and `hit` carries the
+/// reduced message (`"week_all 100%"`, ...) already tagged with the typed
+/// dimension that tripped it — the caller already has this from
+/// [`statusline_limit_hit_default`], so `classify_with` takes it directly
+/// instead of re-parsing the message string. It short-circuits step 3
+/// exactly like a tier-0 hit — limited, `definitive`, no transcript or
+/// usage-cache read — and is definitive for the same reason
+/// tier-0 is: it is that session's own account, read off its own API
+/// responses seconds ago, not a shared cache. Every other step
+/// (kill-switches, reason gate, target pick, relaunch switch, managed gate,
+/// cooldown, hop guard) applies unchanged. `None` is the ordinary hook path.
 pub fn classify_with(
     input: &HookInput,
     owner_dir: &Path,
-    live_limit: Option<&str>,
+    live_limit: Option<&LimitHit>,
 ) -> anyhow::Result<Decision> {
     use crate::paths;
 
@@ -380,29 +457,31 @@ pub fn classify_with(
 
     // ── 4. No limit → exit (no side effects) ─────────────────────────────────
     // Shell: the legacy shell implementation
-    let (limited_msg, definitive, dimension) = match detect_limit(input, owner_dir, live_limit) {
-        Detection::NotLimit => {
-            // StopFailure for a non-limit API error (overloaded,
-            // authentication_failed, invalid_request, ...). Not something to
-            // switch accounts over — do nothing, and do NOT fall through to
-            // tier-2: that reads usage-cache state that has nothing to do with
-            // this failure and could produce an unrelated false positive on
-            // the same turn.
-            return Ok(Decision::Skip);
-        }
-        Detection::NoSignal => {
-            if user_quit {
-                // Shell: `_log "user-quit-skip" "reason=${reason}"`
-                // No notification — this is just a log entry when no limit detected.
+    let (limited_msg, definitive, dimension, week_fable_resets_at) =
+        match detect_limit(input, owner_dir, live_limit) {
+            Detection::NotLimit => {
+                // StopFailure for a non-limit API error (overloaded,
+                // authentication_failed, invalid_request, ...). Not something to
+                // switch accounts over — do nothing, and do NOT fall through to
+                // tier-2: that reads usage-cache state that has nothing to do with
+                // this failure and could produce an unrelated false positive on
+                // the same turn.
+                return Ok(Decision::Skip);
             }
-            return Ok(Decision::Skip);
-        }
-        Detection::Limited {
-            message,
-            definitive,
-            dimension,
-        } => (message, definitive, dimension),
-    };
+            Detection::NoSignal => {
+                if user_quit {
+                    // Shell: `_log "user-quit-skip" "reason=${reason}"`
+                    // No notification — this is just a log entry when no limit detected.
+                }
+                return Ok(Decision::Skip);
+            }
+            Detection::Limited {
+                message,
+                definitive,
+                dimension,
+                resets_at,
+            } => (message, definitive, dimension, resets_at),
+        };
 
     // ──────────────── Limit detected from this point on ──────────────────────
 
@@ -417,6 +496,91 @@ pub fn classify_with(
         return Ok(notify_once(sid, body));
     }
 
+    let current_profile = owner_dir_to_profile_name(owner_dir);
+
+    // ── 5b. Fable-cap same-account model fallback ─────────────────────────────
+    // A model-scoped weekly cap (week_fable) does not mean the account is out
+    // of budget — every OTHER model on it is still fine, so switching accounts
+    // would waste a healthy account's hop budget for no reason. Stay on this
+    // account and relaunch the same session on the fallback model instead,
+    // unless the knob is off or this session already used its one-shot
+    // fallback. Checked before the target pick (step 6) so a Fable-only cap
+    // never excludes an otherwise-healthy account or consumes the
+    // account-switch hop guard (step 11). See `fable_fallback_model`'s own doc
+    // for the full loop-safety reasoning.
+    // Only a `week_fable` trip can ever set `already_fell_back` — reading the
+    // marker, let alone judging its staleness, cannot change the outcome for
+    // a `session`/`week_all` trip, so skip the I/O entirely for those: no
+    // marker file read on this profile's smart_dir, and (since
+    // `week_fable_resets_at` below came from the same `LimitHit` that already
+    // told us we were limited — see `LimitHit`'s doc) no separate usage-cache
+    // read either, even on a genuine `week_fable` trip. That matters most on
+    // the statusline tick, which must stay free of any usage I/O beyond what
+    // detecting the trip itself already required.
+    let already_fell_back = if dimension == LimitDimension::WeekFable {
+        match model_fallback_marker_epoch(sid) {
+            Some(marker_epoch) => {
+                let stale = model_fallback_marker_is_stale(marker_epoch, week_fable_resets_at);
+                if stale {
+                    // Belongs to an earlier week_fable window. Remove it now,
+                    // at the moment it's judged stale, so a fresh fallback's
+                    // exclusive claim (`stop::claim_model_fallback`) lands on
+                    // an empty slot instead of the noclobber claim needlessly
+                    // failing closed against a leftover file from a window
+                    // that has already rolled over.
+                    let _ = std::fs::remove_file(paths::model_fallback(sid));
+                }
+                !stale
+            }
+            // No marker at all, OR one present that doesn't parse (garbage —
+            // a hand edit, or an older marker format; see
+            // `model_fallback_marker_epoch`'s doc). Both read as "no fallback
+            // recorded for the current window" rather than an
+            // `.exists()`-only check, which would read a corrupt marker as
+            // "definitely already fell back" and, under 5c, bar the session
+            // from ever falling back again — the only consumer of "marker
+            // present" is the staleness-bounded suppression below, and an
+            // unreadable marker proves nothing about the current window.
+            // Best-effort remove any corrupt leftover too, so the self-heal
+            // is real: a plain existence check on this same path a moment
+            // from now (in `stop::claim_model_fallback`'s exclusive claim)
+            // must not fail closed against garbage it can never parse away.
+            None => {
+                let _ = std::fs::remove_file(paths::model_fallback(sid));
+                false
+            }
+        }
+    } else {
+        false
+    };
+    let fallback_model = fable_fallback_model(
+        dimension,
+        fable_fallback_enabled(),
+        already_fell_back,
+        &fable_fallback_model_name(),
+    );
+
+    // ── 5c. Suppress a repeat WeekFable trip within the same fallback window ──
+    // Silent — `Decision::Skip`, not a notify-only — because the fallback
+    // itself was already logged when it fired, so a repeat trip has nothing
+    // new to say, and a notify-only here would consume the session's one-shot
+    // `.detected` slot for nothing, silently swallowing a later, genuinely
+    // new notify-only for the rest of this session (see the module doc's 5c
+    // section). Only a `week_fable` trip whose one-shot marker is still fresh
+    // is suppressed here — `session`/`week_all` never set `already_fell_back`,
+    // a stale marker already reads as `already_fell_back == false` above (so
+    // `fallback_model` is `Some` and this branch is never reached), and the
+    // knob-off case is excluded by `fable_fallback_enabled()` so a
+    // knob-disabled fleet still falls through to the ordinary account-switch
+    // path exactly as if this fallback feature didn't exist.
+    if dimension == LimitDimension::WeekFable
+        && fallback_model.is_none()
+        && already_fell_back
+        && fable_fallback_enabled()
+    {
+        return Ok(Decision::Skip);
+    }
+
     // ── 6. Pick target profile (exclude current, reactive hook mode) ──────────
     // Shell: the legacy shell implementation
     //
@@ -427,16 +591,22 @@ pub fn classify_with(
     // (it reads current_usage directly), so blocking the *target-pick* on the
     // same stale data would leave the user stranded on the limited profile —
     // detected-but-not-switched. Score on the freshest-known numbers instead.
-    let current_profile = owner_dir_to_profile_name(owner_dir);
-    let target_profile = match pick_target(&current_profile) {
-        Some(name) => name,
-        None => {
-            // No viable target (all saturated/errored, or fetch miss)
-            // Shell: the legacy shell implementation
-            let body = format!(
-                "[{current_profile}] hit {limited_msg} — no account with headroom to switch to"
-            );
-            return Ok(notify_once(sid, body));
+    //
+    // Skipped entirely for a 5b fallback: the target IS the current profile,
+    // by construction, never a pick result.
+    let target_profile = if fallback_model.is_some() {
+        current_profile.clone()
+    } else {
+        match pick_target(&current_profile) {
+            Some(name) => name,
+            None => {
+                // No viable target (all saturated/errored, or fetch miss)
+                // Shell: the legacy shell implementation
+                let body = format!(
+                    "[{current_profile}] hit {limited_msg} — no account with headroom to switch to"
+                );
+                return Ok(notify_once(sid, body));
+            }
         }
     };
 
@@ -446,9 +616,20 @@ pub fn classify_with(
     // MUST run before any state mutation — does NOT claim .switched or cooldown.
     if !relaunch_enabled() {
         let sid_short = crate::hook::sid_short(sid);
-        let body = format!(
-            "[{current_profile}] hit {limited_msg} → switch to [{target_profile}] (auto-relaunch OFF; csm --profile {target_profile} --resume {sid_short})"
-        );
+        // A 5b fallback never switches accounts (`target_profile ==
+        // current_profile`), so the notify text must say so and name the
+        // `--model` flag a manual resume actually needs — "switch to
+        // [x]" naming the account the user is already on would be both
+        // pointless and, missing `--model`, resume the session back onto
+        // the capped model.
+        let body = match &fallback_model {
+            Some(model) => format!(
+                "[{current_profile}] hit {limited_msg} → resume on model [{model}], same account (auto-relaunch OFF; csm --profile {current_profile} --resume {sid_short} --model {model})"
+            ),
+            None => format!(
+                "[{current_profile}] hit {limited_msg} → switch to [{target_profile}] (auto-relaunch OFF; csm --profile {target_profile} --resume {sid_short})"
+            ),
+        };
         return Ok(notify_once(sid, body));
     }
 
@@ -457,9 +638,16 @@ pub fn classify_with(
     let born_epoch = match managed_session(sid) {
         ManagedGate::NotManaged => {
             let sid_short = crate::hook::sid_short(sid);
-            let body = format!(
-                "[{current_profile}] hit {limited_msg} → switch to [{target_profile}] by hand (csm --profile {target_profile} --resume {sid_short})"
-            );
+            // Same reasoning as step 7's notify text above: a fallback names
+            // the model to resume on, not an account switch to itself.
+            let body = match &fallback_model {
+                Some(model) => format!(
+                    "[{current_profile}] hit {limited_msg} → resume on model [{model}], same account (csm --profile {current_profile} --resume {sid_short} --model {model})"
+                ),
+                None => format!(
+                    "[{current_profile}] hit {limited_msg} → switch to [{target_profile}] by hand (csm --profile {target_profile} --resume {sid_short})"
+                ),
+            };
             return Ok(notify_once(sid, body));
         }
         // Bad PID file, or PID not a live claude/node process — log and skip.
@@ -471,39 +659,75 @@ pub fn classify_with(
     // Shell: the legacy shell implementation
     // Claim with noclobber; if fails, check if within cooldown window.
     //
-    // Exception (Rust-side addition, no shell analogue): a definitive tier-0
-    // signal (StopFailure rate_limit) is never blocked by this cooldown. The
-    // cooldown exists to stop one runaway session from hammering the switch
-    // machinery on stale/borderline pct data; it was never meant to gate a
-    // SECOND session's own, independent, fresh confirmation that its account
-    // just hit a hard limit. Several csm-supervised sessions can share one
-    // account — when its model-scoped weekly cap saturates, every one of
-    // them gets its own StopFailure(rate_limit) on its next turn, and each
-    // must be allowed to switch off it rather than have all but the first be
+    // Skipped entirely for a 5b fallback (`fallback_model.is_some()`): a
+    // same-account model change consumes no shared resource, so it must
+    // neither claim this machine-wide cooldown nor be blocked by another
+    // session's recent switch. `.last-switch` is a cross-session throttle on
+    // real account switches; stamping it here would needlessly block an
+    // unrelated session's own switch for up to `CLAUDE_SWITCH_COOLDOWN`
+    // seconds, and being blocked by it would silently drop a fallback that
+    // should always happen (see `fable_fallback_model`'s loop-safety doc —
+    // `.last-switch` is explicitly named as a mechanism the fallback must
+    // NOT use).
+    //
+    // Exception for a non-fallback call (Rust-side addition, no shell
+    // analogue): a definitive tier-0 signal (StopFailure rate_limit) is
+    // never blocked by this cooldown. The cooldown exists to stop one
+    // runaway session from hammering the switch machinery on
+    // stale/borderline pct data; it was never meant to gate a SECOND
+    // session's own, independent, fresh confirmation that its account just
+    // hit a hard limit. Several csm-supervised sessions can share one
+    // account — when its all-model weekly cap saturates, every one of them
+    // gets its own StopFailure(rate_limit) on its next turn, and each must
+    // be allowed to switch off it rather than have all but the first be
     // silently Skip'd and stranded in the auto-continue wait for days. We
-    // still call `check_and_claim_cooldown` unconditionally so the stamp gets
-    // refreshed/claimed best-effort — pct-based (tier-2) detections elsewhere
-    // keep today's throttle exactly.
-    paths::smart_dir()?; // ensure dir exists before cooldown_blocks touches it
-    if cooldown_blocks(definitive) {
-        return Ok(Decision::Skip);
+    // still call `check_and_claim_cooldown` unconditionally (for a
+    // non-fallback call) so the stamp gets refreshed/claimed best-effort —
+    // pct-based (tier-2) detections elsewhere keep today's throttle exactly.
+    if fallback_model.is_none() {
+        paths::smart_dir()?; // ensure dir exists before cooldown_blocks touches it
+        if cooldown_blocks(definitive) {
+            return Ok(Decision::Skip);
+        }
     }
 
     // ── 10. Hop guard ─────────────────────────────────────────────────────────
     // Shell: the legacy shell implementation
-    let next_hop = match next_hop_within_cap(sid) {
-        Some(n) => n,
-        None => return Ok(Decision::Skip),
+    //
+    // Skipped for a 5b fallback: it doesn't touch the account-switch hop
+    // budget (see `fable_fallback_model`'s doc) — the hop carried into the
+    // handoff/sentinel stays at whatever this session already recorded.
+    let next_hop = if fallback_model.is_some() {
+        crate::hook::read_sidecar_hop(sid)
+    } else {
+        match next_hop_within_cap(sid) {
+            Some(n) => n,
+            None => return Ok(Decision::Skip),
+        }
     };
 
     // ── 11. Build the handoff prompt ──────────────────────────────────────────
     // Shell: the legacy shell implementation
+    //
+    // A 5b fallback gets its own handoff string: `build_handoff` phrases
+    // "switched from [current] to [target] account" and a hop number, which
+    // is untrue and stale when `target_profile == current_profile` (see
+    // `build_fallback_handoff`'s own doc).
     let sid_short = crate::hook::sid_short(sid);
-    let handoff = build_handoff(sid_short, &current_profile, &target_profile, next_hop);
+    let handoff = match &fallback_model {
+        Some(model) => build_fallback_handoff(sid_short, &current_profile, model),
+        None => build_handoff(sid_short, &current_profile, &target_profile, next_hop),
+    };
 
-    let message = format!(
-        "[{current_profile}] hit {limited_msg} → switching to [{target_profile}] (hop {next_hop})"
-    );
+    let message = if let Some(model) = &fallback_model {
+        format!(
+            "[{current_profile}] hit {limited_msg} → falling back to model [{model}] (same account)"
+        )
+    } else {
+        format!(
+            "[{current_profile}] hit {limited_msg} → switching to [{target_profile}] (hop {next_hop})"
+        )
+    };
     let cwd_str = input
         .cwd
         .clone()
@@ -517,6 +741,7 @@ pub fn classify_with(
         cwd: cwd_str,
         born: born_epoch,
         dimension,
+        model_override: fallback_model,
     })
 }
 
@@ -562,28 +787,36 @@ enum Detection {
     NoSignal,
     /// A limit was detected. `definitive` is true for tier-0 (StopFailure or
     /// the statusline tick's `live_limit`), false for tier-2 (usage-cache
-    /// threshold). `dimension` is `LimitDimension::Unknown` for tier-0 and the
-    /// `live_limit` case (neither carries a typed dimension yet); tier-2
-    /// tags its real dimension via `detect_usage_threshold_hit`.
+    /// threshold). `dimension` is `LimitDimension::Unknown` for the true
+    /// StopFailure case (its payload carries no dimension at all); the
+    /// `live_limit` case carries its real dimension straight through from the
+    /// caller's own [`LimitHit`] (no re-parsing), and tier-2 tags its real
+    /// dimension via `detect_usage_threshold_hit`. `resets_at` is the
+    /// `WeekFable` window's reset epoch when `dimension` is `WeekFable` and
+    /// the producer had one on hand, `None` otherwise — see [`LimitHit`]'s
+    /// doc.
     Limited {
         message: String,
         definitive: bool,
         dimension: LimitDimension,
+        resets_at: Option<i64>,
     },
 }
 
 /// Steps 3-4: tier-0 StopFailure / tier-2 usage-cache check.
-fn detect_limit(input: &HookInput, owner_dir: &Path, live_limit: Option<&str>) -> Detection {
+fn detect_limit(input: &HookInput, owner_dir: &Path, live_limit: Option<&LimitHit>) -> Detection {
     match (live_limit, stop_failure_limit(input)) {
-        (Some(msg), _) => Detection::Limited {
-            message: msg.to_string(),
+        (Some(hit), _) => Detection::Limited {
+            message: hit.message.clone(),
             definitive: true,
-            dimension: LimitDimension::Unknown,
+            dimension: hit.dimension,
+            resets_at: hit.resets_at,
         },
         (None, StopFailureVerdict::Limit(msg)) => Detection::Limited {
             message: msg,
             definitive: true,
             dimension: LimitDimension::Unknown,
+            resets_at: None,
         },
         (None, StopFailureVerdict::NotLimit) => Detection::NotLimit,
         (None, StopFailureVerdict::NotApplicable) => match detect_usage_threshold_hit(owner_dir) {
@@ -591,6 +824,7 @@ fn detect_limit(input: &HookInput, owner_dir: &Path, live_limit: Option<&str>) -
                 message: hit.message,
                 definitive: false,
                 dimension: hit.dimension,
+                resets_at: hit.resets_at,
             },
             None => Detection::NoSignal,
         },
@@ -633,6 +867,119 @@ fn pick_target(current_profile: &str) -> Option<String> {
 /// enabled); any other value means detect-only (notify, don't relaunch).
 fn relaunch_enabled() -> bool {
     std::env::var("CLAUDE_AUTO_SWITCH_RELAUNCH").unwrap_or_else(|_| "1".to_string()) == "1"
+}
+
+// ─── fable fallback (model-scoped weekly cap, same-account) ─────────────────
+
+/// `CLAUDE_FABLE_FALLBACK` defaults to `"1"` (fallback enabled); any other
+/// value disables it, so a `week_fable` trip falls through to the ordinary
+/// account-switch path exactly as it did before C44.
+fn fable_fallback_enabled() -> bool {
+    std::env::var("CLAUDE_FABLE_FALLBACK").unwrap_or_else(|_| "1".into()) == "1"
+}
+
+/// `CLAUDE_FABLE_FALLBACK_MODEL` defaults to `"opus"` — the alias for the
+/// latest Opus, never a pinned model id, so nothing here needs updating when
+/// Anthropic ships a new Opus.
+fn fable_fallback_model_name() -> String {
+    std::env::var("CLAUDE_FABLE_FALLBACK_MODEL").unwrap_or_else(|_| "opus".into())
+}
+
+/// Step 5b's pure decision core: should this trip fall back to a model on the
+/// SAME account instead of switching accounts?
+///
+/// `Some(fallback_model)` only when ALL of:
+/// - `dimension == LimitDimension::WeekFable` — the model-scoped weekly cap.
+///   A `Session` or `WeekAll` trip is never model-scoped, so Opus on the same
+///   account would free nothing; those always fall through to `None` and the
+///   ordinary account-switch path.
+/// - `enabled` — `CLAUDE_FABLE_FALLBACK` (see [`fable_fallback_enabled`]).
+/// - `!already_fell_back` — this session hasn't used its one-shot fallback
+///   yet (`<sid>.model-fallback`, see [`crate::paths::model_fallback`]).
+///
+/// # Loop safety
+///
+/// `week_fable` is carried forward from the last usage-API probe
+/// (`src/usage/local/statusline.rs`), so after a fallback relaunch the SAME
+/// capped reading is still on record and would trip the next statusline tick
+/// again. Two existing anti-loop mechanisms do not help here: `.switched`
+/// would burn the session's account-switch budget for good if the fallback
+/// wrote it (it's for the wrong kind of relaunch), and `.last-switch` is a
+/// machine-wide cooldown that a same-account model change has no business
+/// stamping (it would needlessly throttle other sessions' real account
+/// switches) — `commit_and_stop` and `classify_with`'s cooldown check both
+/// skip it for a fallback. So the fallback gets its own one-shot marker,
+/// checked here via `already_fell_back`: once it is set (and still fresh —
+/// see [`model_fallback_marker_is_stale`]), this function returns `None` for
+/// any further `WeekFable` trip.
+///
+/// That `None` IS special-cased by the caller (`classify_with`'s step 5c —
+/// see the module doc's 5c section): a further `WeekFable` trip while the
+/// marker is still fresh is silently suppressed (`Decision::Skip`), not
+/// escalated to the ordinary account-switch path and not notified again,
+/// because `week_fable` stays capped for days and falling through would undo
+/// the fallback on the very next tick. It is bounded, not permanent — once
+/// the marker goes stale, `already_fell_back` is `false` again and this
+/// function resumes returning `Some`. `Session` and `WeekAll` never set
+/// `already_fell_back` in the first place, so they are unaffected either way
+/// and keep falling through to the ordinary account-switch path.
+pub(crate) fn fable_fallback_model(
+    dimension: LimitDimension,
+    enabled: bool,
+    already_fell_back: bool,
+    fallback_model: &str,
+) -> Option<String> {
+    if dimension == LimitDimension::WeekFable && enabled && !already_fell_back {
+        Some(fallback_model.to_string())
+    } else {
+        None
+    }
+}
+
+/// Is a `<sid>.model-fallback` marker written at `marker_epoch` stale — from
+/// an earlier `week_fable` weekly window rather than the current one? Without
+/// this, 5c's suppression (see the module doc) would be permanent: a
+/// `--resume`d session keeps its session id indefinitely, so the marker
+/// (keyed by sid, never deleted) would bar that session from ever falling
+/// back again, even after the capped window has long since reset.
+///
+/// The weekly window is 7 days and `week_fable_resets_at` is the END of the
+/// CURRENT window, so a marker written before `resets_at - 7*86400` was
+/// written during an EARLIER window and must be treated as absent — that
+/// earlier fallback spent its one shot against a cap that has since reset,
+/// not this one. `saturating_sub` keeps that subtraction in range for an
+/// extreme `resets_at` near `i64::MIN` instead of overflowing (a debug build
+/// panics on overflow).
+///
+/// `week_fable_resets_at: None` (no reset epoch known — the profile's
+/// `week_fable` reading has never carried one) never expires the marker;
+/// current behaviour, unchanged. There is no window boundary to compare
+/// against, and guessing one would risk expiring a marker that is genuinely
+/// still within its window.
+pub(crate) fn model_fallback_marker_is_stale(
+    marker_epoch: i64,
+    week_fable_resets_at: Option<i64>,
+) -> bool {
+    match week_fable_resets_at {
+        Some(resets_at) => marker_epoch < resets_at.saturating_sub(7 * 86_400),
+        None => false,
+    }
+}
+
+/// I/O shell for [`model_fallback_marker_is_stale`]: read `<sid>.model-fallback`'s
+/// stored epoch, if the marker exists and parses. `None` covers both "no
+/// marker" and "marker present but unparseable" — the writer
+/// ([`crate::hook::stop::claim_model_fallback`]) always claims the marker via
+/// a private tmp file hard-linked into place, so a reader never observes a
+/// half-written file from that path; an unparseable marker here means
+/// something else wrote or edited the file directly. `classify_with` treats
+/// both cases the same way, as "no fallback recorded for the current
+/// window", rather than trying to tell them apart.
+fn model_fallback_marker_epoch(sid: &str) -> Option<i64> {
+    use crate::paths;
+    std::fs::read_to_string(paths::model_fallback(sid))
+        .ok()
+        .and_then(|s| s.trim().parse::<i64>().ok())
 }
 
 /// Outcome of the managed-session gate (banner 8).
@@ -801,56 +1148,66 @@ pub(crate) fn cooldown_should_block(definitive: bool, window_blocked: bool) -> b
 /// tagged [`LimitHit`], not just its message — there is no remaining caller
 /// that wants the String-only form, so no message-returning twin exists here
 /// (contrast [`usage_threshold_hit`], whose twin is kept for its own
-/// directly-tested `Option<String>` contract).
+/// directly-tested `Option<String>` contract). For a `WeekFable` hit,
+/// `resets_at` is patched in afterward from the same profile lookup — see
+/// [`LimitHit`]'s doc.
 fn detect_usage_threshold_hit(owner_dir: &Path) -> Option<LimitHit> {
     let profile = owner_dir_to_profile_name(owner_dir);
     let data = crate::usage::fetch().ok()?;
     let (session_pct, week_pct) = data.current_usage(&profile)?;
-    let week_fable_pct = data
+    let week_fable = data
         .profiles
         .get(&profile)
-        .and_then(|pu| pu.week_fable.as_ref())
-        .map(|s| s.pct);
+        .and_then(|pu| pu.week_fable.as_ref());
+    let week_fable_pct = week_fable.map(|s| s.pct);
 
     let limit_pct = crate::envvar::i64_or("CLAUDE_LIMIT_PCT", LIMIT_PCT);
 
-    usage_threshold_hit_at(session_pct, week_pct, week_fable_pct, limit_pct)
+    let mut hit = usage_threshold_hit_at(session_pct, week_pct, week_fable_pct, limit_pct)?;
+    if hit.dimension == LimitDimension::WeekFable {
+        hit.resets_at = week_fable.and_then(|s| s.resets_at);
+    }
+    Some(hit)
 }
 
 /// The statusline tick's limit test: reduce the profile's merged reading
 /// (this tick's `session`/`week_all` plus the store's carried-forward
-/// `week_fable`) to the same three-dimension check tier-2 uses. Absent
-/// `session`/`week_all` map to `-1` so they never fire, matching the shell
-/// contract [`usage_threshold_hit`] documents. Pure, so the tick's whole
-/// decision about *whether to even run `classify`* is unit-tested here.
-pub(crate) fn statusline_limit(usage: &crate::usage::model::ProfileUsage) -> Option<String> {
-    let limit_pct = crate::envvar::i64_or("CLAUDE_LIMIT_PCT", LIMIT_PCT);
-    statusline_limit_at(usage, limit_pct)
-}
-
-/// [`statusline_limit`] with the threshold passed in. Delegates to
-/// [`statusline_limit_hit`] and collapses the result to its message, so
-/// existing callers/tests keep seeing exactly the same `Option<String>`.
-pub(crate) fn statusline_limit_at(
+/// `week_fable`) to the same three-dimension check tier-2 uses, returning the
+/// typed [`LimitHit`] — what [`crate::hook::run_from_statusline`] passes
+/// straight through to `classify_with`'s `live_limit` parameter, instead of
+/// re-parsing the dimension back out of a message string. For a `WeekFable`
+/// hit, `resets_at` is filled straight from `usage.week_fable`'s own reading
+/// — no extra I/O, since that section is already in memory (see [`LimitHit`]'s
+/// doc, and the module doc's "Statusline tick" section on why this path must
+/// stay I/O-free). Absent `session`/`week_all` map to `-1` so they never
+/// fire, matching the shell contract [`usage_threshold_hit`] documents. Pure,
+/// so the tick's whole decision about *whether to even run `classify`* is
+/// unit-tested here.
+pub(crate) fn statusline_limit_hit_default(
     usage: &crate::usage::model::ProfileUsage,
-    limit_pct: i64,
-) -> Option<String> {
-    statusline_limit_hit(usage, limit_pct).map(|hit| hit.message)
+) -> Option<LimitHit> {
+    let limit_pct = crate::envvar::i64_or("CLAUDE_LIMIT_PCT", LIMIT_PCT);
+    statusline_limit_hit(usage, limit_pct)
 }
 
-/// [`statusline_limit_at`]'s pure core: same reduction, but returns the typed
-/// [`LimitHit`] instead of collapsing straight to a message string.
+/// [`statusline_limit_hit_default`] with the threshold passed in, for
+/// tests — the typed reduction, same rule as tier-2, with the threshold as a
+/// parameter instead of read from `CLAUDE_LIMIT_PCT`.
 pub(crate) fn statusline_limit_hit(
     usage: &crate::usage::model::ProfileUsage,
     limit_pct: i64,
 ) -> Option<LimitHit> {
     let pct = |s: &Option<crate::usage::model::UsageSection>| s.as_ref().map_or(-1, |s| s.pct);
-    usage_threshold_hit_at(
+    let mut hit = usage_threshold_hit_at(
         pct(&usage.session),
         pct(&usage.week_all),
         usage.week_fable.as_ref().map(|s| s.pct),
         limit_pct,
-    )
+    )?;
+    if hit.dimension == LimitDimension::WeekFable {
+        hit.resets_at = usage.week_fable.as_ref().and_then(|s| s.resets_at);
+    }
+    Some(hit)
 }
 
 /// Pure decision core for tier-2: given the three usage-pct dimensions and the
@@ -894,12 +1251,14 @@ pub(crate) fn usage_threshold_hit_at(
         return Some(LimitHit {
             dimension: LimitDimension::Session,
             message: format!("session {session_pct}%"),
+            resets_at: None,
         });
     }
     if week_pct >= 0 && week_pct >= limit_pct {
         return Some(LimitHit {
             dimension: LimitDimension::WeekAll,
             message: format!("week_all {week_pct}%"),
+            resets_at: None,
         });
     }
     if let Some(fable_pct) = week_fable_pct
@@ -909,6 +1268,7 @@ pub(crate) fn usage_threshold_hit_at(
         return Some(LimitHit {
             dimension: LimitDimension::WeekFable,
             message: format!("week_fable {fable_pct}%"),
+            resets_at: None,
         });
     }
     None
@@ -1000,6 +1360,39 @@ pub(crate) fn build_handoff(
             // Unset = use the Korean default handoff string
             format!(
                 "이전 세션({sid_short})이 사용량 한도에 걸려 [{current_profile}]에서 [{target_profile}] 계정으로 자동 전환됐어. (hop {next_hop}) 직전까지 하던 작업을 그대로 이어서 진행해줘."
+            )
+        }
+    }
+}
+
+/// Build the handoff prompt string for a same-account model fallback (5b —
+/// see [`fable_fallback_model`]), where `target_profile == current_profile`
+/// by construction and there is no hop to report.
+///
+/// [`build_handoff`]'s default template says "switched from [current] to
+/// [target] account (hop N)"; fed the same profile on both sides it would
+/// read as an account switch that never happened and repeat a hop number
+/// nothing actually bumped. This is its own default string instead, still
+/// honouring `CLAUDE_SMART_RESUME_PROMPT`'s empty-string-suppresses /
+/// explicit-override semantics exactly like `build_handoff`.
+pub(crate) fn build_fallback_handoff(
+    sid_short: &str,
+    current_profile: &str,
+    model: &str,
+) -> String {
+    match std::env::var("CLAUDE_SMART_RESUME_PROMPT") {
+        Ok(v) if v.is_empty() => {
+            // Explicit empty = suppress handoff
+            String::new()
+        }
+        Ok(v) => {
+            // Explicit non-empty override
+            v
+        }
+        Err(_) => {
+            // Unset = use the Korean default fallback-handoff string
+            format!(
+                "이전 세션({sid_short})이 [{current_profile}] 계정의 모델별 주간 한도에 걸려 {model} 모델로 자동 전환됐어 (계정은 그대로 유지). 직전까지 하던 작업을 그대로 이어서 진행해줘."
             )
         }
     }
@@ -1269,7 +1662,12 @@ mod tests {
     fn classify_with_live_limit_but_no_session_id_is_skip() {
         let input = parse_input(r#"{"cwd": "/Users/example/Projects/foo"}"#).unwrap();
         let dir = tempfile::TempDir::new().unwrap();
-        let decision = classify_with(&input, dir.path(), Some("week_all 100%")).unwrap();
+        let hit = LimitHit {
+            dimension: LimitDimension::WeekAll,
+            message: "week_all 100%".to_string(),
+            resets_at: None,
+        };
+        let decision = classify_with(&input, dir.path(), Some(&hit)).unwrap();
         assert!(matches!(decision, Decision::Skip));
     }
 
@@ -1436,6 +1834,43 @@ mod tests {
             Some("custom prompt here"),
             || {
                 let h = build_handoff("01234567", "home", "work", 1);
+                assert_eq!(h, "custom prompt here");
+            },
+        );
+    }
+
+    // ── build_fallback_handoff (C44 same-account model fallback, 5b) ──────────
+
+    /// The default fallback handoff must name the CURRENT profile once (not
+    /// as a "from [x] to [y]" pair — there is only one account here), name
+    /// the fallback model, and must NOT claim any account was switched or
+    /// report a hop number.
+    #[test]
+    fn build_fallback_handoff_default_korean() {
+        crate::testenv::with_env_var("CLAUDE_SMART_RESUME_PROMPT", None, || {
+            let h = build_fallback_handoff("01234567", "home", "opus");
+            assert!(h.contains("01234567"), "should contain sid_short: {h}");
+            assert!(h.contains("home"), "should contain current profile: {h}");
+            assert!(h.contains("opus"), "should contain fallback model: {h}");
+            assert!(!h.contains("hop"), "a fallback never reports a hop: {h}");
+        });
+    }
+
+    #[test]
+    fn build_fallback_handoff_empty_suppresses() {
+        crate::testenv::with_env_var("CLAUDE_SMART_RESUME_PROMPT", Some(""), || {
+            let h = build_fallback_handoff("01234567", "home", "opus");
+            assert!(h.is_empty(), "empty env var should suppress handoff");
+        });
+    }
+
+    #[test]
+    fn build_fallback_handoff_custom_override() {
+        crate::testenv::with_env_var(
+            "CLAUDE_SMART_RESUME_PROMPT",
+            Some("custom prompt here"),
+            || {
+                let h = build_fallback_handoff("01234567", "home", "opus");
                 assert_eq!(h, "custom prompt here");
             },
         );
@@ -1670,7 +2105,7 @@ mod tests {
         assert_eq!(born, 1_718_000_000);
     }
 
-    // ── statusline_limit_at (the tick's pre-gate) ───────────────────────────
+    // ── statusline_limit_hit (the tick's pre-gate) ──────────────────────────
 
     fn reading(
         session: Option<i64>,
@@ -1692,42 +2127,41 @@ mod tests {
     }
 
     #[test]
-    fn statusline_limit_at_all_healthy_is_none() {
+    fn statusline_limit_hit_all_healthy_is_none() {
         assert_eq!(
-            statusline_limit_at(&reading(Some(21), Some(80), Some(90)), 99),
+            statusline_limit_hit(&reading(Some(21), Some(80), Some(90)), 99),
             None
         );
     }
 
     #[test]
-    fn statusline_limit_at_week_all_capped() {
+    fn statusline_limit_hit_week_all_capped() {
         // The live case: session fine, all-model weekly at 100.
         assert_eq!(
-            statusline_limit_at(&reading(Some(21), Some(100), Some(100)), 99),
-            Some("week_all 100%".to_string())
+            statusline_limit_hit(&reading(Some(21), Some(100), Some(100)), 99),
+            Some(LimitHit {
+                dimension: LimitDimension::WeekAll,
+                message: "week_all 100%".to_string(),
+                resets_at: None,
+            })
         );
     }
 
     #[test]
-    fn statusline_limit_at_session_capped_wins_over_week() {
+    fn statusline_limit_hit_session_capped_wins_over_week() {
         assert_eq!(
-            statusline_limit_at(&reading(Some(99), Some(100), None), 99),
-            Some("session 99%".to_string())
+            statusline_limit_hit(&reading(Some(99), Some(100), None), 99),
+            Some(LimitHit {
+                dimension: LimitDimension::Session,
+                message: "session 99%".to_string(),
+                resets_at: None,
+            })
         );
     }
 
-    #[test]
-    fn statusline_limit_at_week_fable_only_from_store() {
-        // statusLine stdin never carries the model-scoped window; it rides in
-        // from the store's carried-forward record and must still fire.
-        assert_eq!(
-            statusline_limit_at(&reading(Some(10), Some(60), Some(100)), 99),
-            Some("week_fable 100%".to_string())
-        );
-    }
-
-    /// The typed core tags the same case with `LimitDimension::WeekFable`,
-    /// not just the reduced message string `statusline_limit_at` returns.
+    /// statusLine stdin never carries the model-scoped window; it rides in
+    /// from the store's carried-forward record and must still fire, tagged
+    /// with `LimitDimension::WeekFable`, not just a reduced message string.
     #[test]
     fn statusline_limit_hit_tags_week_fable() {
         assert_eq!(
@@ -1735,24 +2169,77 @@ mod tests {
             Some(LimitHit {
                 dimension: LimitDimension::WeekFable,
                 message: "week_fable 100%".to_string(),
+                resets_at: None,
+            })
+        );
+    }
+
+    /// A `WeekFable` hit's `resets_at` is threaded straight from
+    /// `usage.week_fable`'s own reading, with no extra I/O — the whole point
+    /// of carrying it on `LimitHit` (see the module's `LimitHit` doc).
+    #[test]
+    fn statusline_limit_hit_carries_week_fable_resets_at() {
+        use crate::usage::model::UsageSection;
+        let usage = crate::usage::model::ProfileUsage {
+            week_fable: Some(UsageSection {
+                pct: 100,
+                resets: None,
+                resets_at: Some(1_789_646_400),
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            statusline_limit_hit(&usage, 99),
+            Some(LimitHit {
+                dimension: LimitDimension::WeekFable,
+                message: "week_fable 100%".to_string(),
+                resets_at: Some(1_789_646_400),
+            })
+        );
+    }
+
+    /// A `Session` or `WeekAll` hit never carries `resets_at`, even when the
+    /// tripped dimension's own section has one — only a `WeekFable` hit's
+    /// epoch is ever meaningful to the marker-staleness check that reads it.
+    #[test]
+    fn statusline_limit_hit_session_hit_never_carries_resets_at() {
+        use crate::usage::model::UsageSection;
+        let usage = crate::usage::model::ProfileUsage {
+            session: Some(UsageSection {
+                pct: 99,
+                resets: None,
+                resets_at: Some(1_789_646_400),
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            statusline_limit_hit(&usage, 99),
+            Some(LimitHit {
+                dimension: LimitDimension::Session,
+                message: "session 99%".to_string(),
+                resets_at: None,
             })
         );
     }
 
     #[test]
-    fn statusline_limit_at_absent_sections_never_fire() {
-        assert_eq!(statusline_limit_at(&reading(None, None, None), 99), None);
+    fn statusline_limit_hit_absent_sections_never_fire() {
+        assert_eq!(statusline_limit_hit(&reading(None, None, None), 99), None);
         assert_eq!(
-            statusline_limit_at(&reading(None, None, Some(50)), 99),
+            statusline_limit_hit(&reading(None, None, Some(50)), 99),
             None
         );
     }
 
     #[test]
-    fn statusline_limit_at_honours_threshold() {
+    fn statusline_limit_hit_honours_threshold() {
         assert_eq!(
-            statusline_limit_at(&reading(Some(50), Some(10), None), 50),
-            Some("session 50%".to_string())
+            statusline_limit_hit(&reading(Some(50), Some(10), None), 50),
+            Some(LimitHit {
+                dimension: LimitDimension::Session,
+                message: "session 50%".to_string(),
+                resets_at: None,
+            })
         );
     }
 
@@ -1846,6 +2333,7 @@ mod tests {
             Some(LimitHit {
                 dimension: LimitDimension::Session,
                 message: "session 99%".to_string(),
+                resets_at: None,
             })
         );
         assert_eq!(
@@ -1853,6 +2341,7 @@ mod tests {
             Some(LimitHit {
                 dimension: LimitDimension::WeekAll,
                 message: "week_all 99%".to_string(),
+                resets_at: None,
             })
         );
         assert_eq!(
@@ -1860,9 +2349,44 @@ mod tests {
             Some(LimitHit {
                 dimension: LimitDimension::WeekFable,
                 message: "week_fable 99%".to_string(),
+                resets_at: None,
             })
         );
         assert_eq!(usage_threshold_hit_at(10, 20, Some(30), 99), None);
+    }
+
+    // ── detect_limit's live_limit branch (the caller hands over a typed
+    //    LimitHit directly, so detect_limit never re-parses the dimension
+    //    out of the message text) ───────────────────────────────────────────
+
+    #[test]
+    fn detect_limit_live_limit_tags_week_fable_not_unknown() {
+        let input = HookInput {
+            session_id: Some("s1".to_string()),
+            cwd: None,
+            reason: None,
+            transcript_path: None,
+            hook_event_name: Some("Stop".to_string()),
+            error: None,
+            error_details: None,
+        };
+        let hit = LimitHit {
+            dimension: LimitDimension::WeekFable,
+            message: "week_fable 100%".to_string(),
+            resets_at: Some(1_789_646_400),
+        };
+        // owner_dir is unread on the live_limit branch (it's the tier-2 file
+        // path), so any path works — Path::new(".") avoids a tempfile dep.
+        let detection = detect_limit(&input, Path::new("."), Some(&hit));
+        assert_eq!(
+            detection,
+            Detection::Limited {
+                message: "week_fable 100%".to_string(),
+                definitive: true,
+                dimension: LimitDimension::WeekFable,
+                resets_at: Some(1_789_646_400),
+            }
+        );
     }
 
     /// `usage_threshold_hit` (the pre-existing `Option<String>` API) must
@@ -1883,6 +2407,128 @@ mod tests {
             Some("week_fable 99%")
         );
         assert_eq!(usage_threshold_hit(10, 20, Some(30), 99), None);
+    }
+
+    // ── fable_fallback_model (5b, same-account model fallback, C44) ──────────
+
+    /// `session` and `week_all` trips never fall back to a model — neither is
+    /// model-scoped, so a different model on the same account frees nothing;
+    /// both keep switching accounts exactly as before.
+    #[test]
+    fn fable_fallback_model_returns_none_for_week_all_and_session() {
+        assert_eq!(
+            fable_fallback_model(LimitDimension::Session, true, false, "opus"),
+            None
+        );
+        assert_eq!(
+            fable_fallback_model(LimitDimension::WeekAll, true, false, "opus"),
+            None
+        );
+    }
+
+    /// A second `week_fable` trip after the fallback already fired returns
+    /// `None`, even though everything else about the call still qualifies —
+    /// what the caller does with that `None` (fall through to an account
+    /// switch, or suppress it under 5c when the marker is still fresh) is
+    /// `classify_with`'s decision, not this pure core's.
+    #[test]
+    fn fable_fallback_model_none_when_marker_present() {
+        assert_eq!(
+            fable_fallback_model(LimitDimension::WeekFable, true, true, "opus"),
+            None
+        );
+    }
+
+    /// `CLAUDE_FABLE_FALLBACK` off (the `enabled` flag false) disables the
+    /// fallback regardless of dimension or marker state.
+    #[test]
+    fn fable_fallback_model_none_when_knob_disabled() {
+        assert_eq!(
+            fable_fallback_model(LimitDimension::WeekFable, false, false, "opus"),
+            None
+        );
+    }
+
+    /// A `week_fable` trip, enabled, with no prior fallback this session,
+    /// returns `Some(fallback_model)` with whatever model name the caller
+    /// passed — never a hardcoded `"opus"` inside the pure core itself.
+    #[test]
+    fn fable_fallback_model_honours_custom_model_name() {
+        assert_eq!(
+            fable_fallback_model(LimitDimension::WeekFable, true, false, "opus"),
+            Some("opus".to_string())
+        );
+        assert_eq!(
+            fable_fallback_model(LimitDimension::WeekFable, true, false, "claude-opus-4-5"),
+            Some("claude-opus-4-5".to_string())
+        );
+    }
+
+    // ── model_fallback_marker_is_stale ────────────────────────────────────────
+
+    /// A marker written more than 7 days before the current window's reset is
+    /// from an earlier window — stale, must be treated as absent.
+    #[test]
+    fn marker_is_stale_when_written_before_the_prior_window() {
+        let resets_at = 1_718_000_000;
+        let marker_epoch = resets_at - 8 * 86_400;
+        assert!(model_fallback_marker_is_stale(
+            marker_epoch,
+            Some(resets_at)
+        ));
+    }
+
+    /// A marker written within the current 7-day window is fresh.
+    #[test]
+    fn marker_is_not_stale_within_the_current_window() {
+        let resets_at = 1_718_000_000;
+        let marker_epoch = resets_at - 3 * 86_400;
+        assert!(!model_fallback_marker_is_stale(
+            marker_epoch,
+            Some(resets_at)
+        ));
+    }
+
+    /// Exactly at the boundary (`resets_at - 7*86400`) the marker still
+    /// counts as belonging to the current window — the comparison is a
+    /// strict `<`, not `<=`.
+    #[test]
+    fn marker_is_not_stale_exactly_at_the_boundary() {
+        let resets_at = 1_718_000_000;
+        let marker_epoch = resets_at - 7 * 86_400;
+        assert!(!model_fallback_marker_is_stale(
+            marker_epoch,
+            Some(resets_at)
+        ));
+    }
+
+    /// One second past the boundary, it is stale.
+    #[test]
+    fn marker_is_stale_one_second_past_the_boundary() {
+        let resets_at = 1_718_000_000;
+        let marker_epoch = resets_at - 7 * 86_400 - 1;
+        assert!(model_fallback_marker_is_stale(
+            marker_epoch,
+            Some(resets_at)
+        ));
+    }
+
+    /// No known `resets_at` — never expire the marker; there is no window
+    /// boundary to compare against.
+    #[test]
+    fn marker_never_stale_when_resets_at_unknown() {
+        assert!(!model_fallback_marker_is_stale(0, None));
+        assert!(!model_fallback_marker_is_stale(i64::MAX, None));
+    }
+
+    /// An extreme `resets_at` near `i64::MIN` must not overflow the
+    /// `resets_at - 7*86400` subtraction (a debug build panics on overflow) —
+    /// `saturating_sub` clamps it instead, so this must return cleanly rather
+    /// than panicking.
+    #[test]
+    fn marker_never_stale_with_extreme_negative_resets_at_no_overflow() {
+        let resets_at = i64::MIN + 10;
+        assert!(!model_fallback_marker_is_stale(i64::MIN, Some(resets_at)));
     }
 
     // ── resolve_target_from_pick (single viability authority pass-through) ────

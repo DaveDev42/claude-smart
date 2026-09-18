@@ -46,11 +46,15 @@ see *Invariants*.
   completions, and the disjointness test).
 - `src/account/` — `profiles.rs` (`ProfileMap` = the registry authority),
   `scoring.rs` (pick-best thresholds: `LIMIT_PCT=99`, `SATURATION_PCT=95`;
-  `is_viable_pcts` is the ONE viability predicate over session / week_all /
-  week_fable — `pick_best_at`, `cmd::run::account_row_rank`, and the hook's
-  target pick all route through it; never add a second inline threshold check;
-  also the shared `effective_reset_epoch`), `reset.rs` (compat parser for
-  `resets`-only payloads), `mod.rs` (`pick_account`, `pick_account_gated` —
+  `is_viable_pcts` is the ONE viability predicate over session and week_all
+  (`week_fable` no longer feeds it: a model-scoped-only cap leaves the
+  account itself viable, and the hook's `fable_fallback_model` in
+  `src/hook/detect.rs` handles that case with a same-account model swap
+  instead); `pick_best_at`, `cmd::run::account_row_rank`, and the hook's
+  account-switch target pick all route through it; never add a second inline
+  threshold check; also the shared `effective_reset_epoch`), `reset.rs`
+  (compat parser for `resets`-only payloads), `mod.rs` (`pick_account`,
+  `pick_account_gated` —
   what the hook's target pick calls, see `src/hook/detect.rs` —
   `current_usage`).
 - `src/cas/` — profile switcher: `types.rs`, `eval.rs` (`eval_emit` for the
@@ -77,6 +81,11 @@ see *Invariants*.
   tick (`csm usage capture` / `csm statusline`) — that is the operative switch
   path for the weekly and model-scoped caps. The former tier-1
   (transcript-text) and tier-3 (malformed-in-tail) checks have been deleted.
+  A `week_fable`-only cap does not switch accounts: `detect::classify_with`
+  relaunches the same session on the same profile with a `--model` override
+  instead (`fable_fallback_model`, gated by `CLAUDE_FABLE_FALLBACK` and a
+  one-shot `<sid>.model-fallback` marker), since the account itself still has
+  headroom on every other model.
 - `src/picker/` — `engine.rs`, `account.rs`, `session.rs`: in-process fuzzy
   picker (nucleo + crossterm).
 - `src/reaper/` — `mod.rs`, `scan.rs`, `kill.rs`: the `csm reap` orphan killer.
@@ -220,11 +229,11 @@ is needed.
   switch the session `.jsonl` is complete, not truncated. Until both pass on a
   real Windows console the relaunch loop stays gated off and Windows falls back
   to launch-without-relaunch. See `src/platform/windows.rs`'s module doc.
-- **`csm statusline` render-side latency, measured.** E1 measured a release
-  build on an Apple-silicon laptop (macOS, no host name; n=200 after a 10-run
-  warmup): `csm statusline` with a real statusLine payload on stdin ran p50
-  11.48 ms / p95 22.64 ms, only ~1.3 ms above the bare process-spawn floor
-  (`csm --version` p50 10.18 ms) and faster than a naive shell statusline
+- **`csm statusline` render-side latency, measured.** A measurement of a
+  release build on an Apple-silicon laptop (macOS, no host name; n=200 after
+  a 10-run warmup): `csm statusline` with a real statusLine payload on stdin
+  ran p50 11.48 ms / p95 22.64 ms, only ~1.3 ms above the bare process-spawn
+  floor (`csm --version` p50 10.18 ms) and faster than a naive shell statusline
   (`zsh -c 'echo "..."'` p50 18.87 ms). These numbers are macOS-only; Linux,
   WSL and Windows are unmeasured. Render-side latency no longer blocks
   recommending `csm statusline` as the default `statusLine` command.

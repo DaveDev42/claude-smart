@@ -423,11 +423,11 @@ fn print_launch_attention_warnings(profile_dir: &Path, profiles: &account::Profi
 ///
 /// Pick guard (matches the legacy shell implementation's behavior):
 /// - `pick_account(current, include_current=true)` → scoring pick, which
-///   weighs all THREE usage dimensions (session, week_all, and the
-///   model-scoped weekly `week_fable`) through `scoring::is_viable_pcts` — a
-///   current profile whose `week_fable` is saturated is treated as limited
-///   just like a session- or week_all-limited one, so this proactively picks
-///   a switch away from it.
+///   weighs session and week_all through `scoring::is_viable_pcts`. Since
+///   C44, `week_fable` (the model-scoped weekly cap) no longer factors into
+///   viability at all — a current profile whose only exhausted window is
+///   `week_fable` is left in place here; the Stop hook handles that case with
+///   a same-account model fallback instead of a proactive account switch.
 /// - `Err(FetchFailed)` (usage collection failed) or `Err(NoUsableData)` (fetch
 ///   ok but no scorable usage) + interactive → stale-usage account picker.
 /// - same errors + non-interactive → silent fail-safe to current.
@@ -554,13 +554,15 @@ fn run_account_picker(
 ///
 /// Viability is delegated to `scoring::is_viable_pcts` — the SINGLE viability
 /// authority also used by `pick_best_at` — rather than a second hand-rolled
-/// check, so a row whose model-scoped weekly cap (`week_fable_pct`) is
-/// saturated sinks exactly like one whose `session_pct`/`week_all_pct` is.
+/// check. Since C44, `week_fable_pct` no longer sinks a row on its own (a
+/// model-scoped-only cap still leaves the row usable on another model); only
+/// `session_pct`/`week_all_pct` do.
 ///
 /// Returns a sort key where SMALLER sorts first:
 /// - `0` bucket = viable candidate (no error, has week_all.pct, and
 ///   `is_viable_pcts(session_pct, week_all_pct, week_fable_pct)` is `true` —
-///   i.e. none of session/week_all/week_fable is at or over its threshold).
+///   i.e. neither session nor week_all is at or over its threshold;
+///   `week_fable_pct` is passed through but no longer read by the predicate).
 ///   Within it, SOONER effective weekly reset epoch ranks first (`i64::MAX`
 ///   when unknown, so a known reset beats an unknown one), then HIGHER
 ///   week_all.pct (negated), matching `pick_best`'s ranking. The "effective"
@@ -1107,23 +1109,44 @@ mod tests {
     }
 
     // ── model-scoped weekly (week_fable) gate ──────────────────────────────
-    // account_row_rank must sink a fable-saturated row exactly like a
-    // session- or week_all-saturated one: it routes through the same
-    // `scoring::is_viable_pcts` authority `pick_best_at` uses.
+    // Since C44, account_row_rank no longer sinks a fable-saturated row: it
+    // routes through the same `scoring::is_viable_pcts` authority
+    // `pick_best_at` uses, and that predicate dropped the week_fable branch
+    // (a model-scoped-only cap is handled by the Stop hook's same-account
+    // model fallback instead of exclusion — see `src/hook/detect.rs`).
 
     #[test]
-    fn fable_saturated_row_sinks_below_viable() {
+    fn fable_saturated_row_no_longer_sinks_below_viable() {
+        // A single fable-saturated row, alone: if `account_row_rank` still
+        // sank it to bucket 1, it would still be the only row and this
+        // assertion would pass for the wrong reason with two rows present
+        // (name-order luck). Alone, only bucket-0 placement produces a
+        // `viable_sooner_reset_leads`-style top rank; assert on the rank
+        // tuple directly so bucket 0 (viable) is checked, not just presence.
+        let (bucket, ..) = account_row_rank(
+            "zzz_fable_capped",
+            &data_with_fable(Some(5), Some(10), None, Some(100)),
+            rank_now(),
+        );
+        assert_eq!(
+            bucket, 0,
+            "a fable-saturated row must land in the viable bucket (0), not sink to bucket 1"
+        );
+
+        // And with a second, uncapped row present, both are viable and tie on
+        // rank — names are picked so the fable-capped one sorts LAST, so a
+        // win here cannot be name-order luck landing on the row under test.
         let order = ranked_order(vec![
+            ("avail", data_with_fable(Some(5), Some(10), None, None)),
             (
-                "fable_capped",
+                "zzz_fable_capped",
                 data_with_fable(Some(5), Some(10), None, Some(100)),
             ),
-            ("healthy", data_with_fable(Some(5), Some(10), None, None)),
         ]);
         assert_eq!(
             order,
-            vec!["healthy", "fable_capped"],
-            "a fable-saturated row must sink even with healthy session/week_all"
+            vec!["avail", "zzz_fable_capped"],
+            "both rows are viable now; identical rank key ties to name order"
         );
     }
 
@@ -1149,13 +1172,21 @@ mod tests {
     }
 
     #[test]
-    fn only_fable_difference_uncapped_row_leads() {
-        // Two rows identical except for fable saturation — the uncapped one
-        // must rank first (row 0, what Enter selects).
+    fn only_fable_difference_no_longer_affects_row_rank() {
+        // Two rows identical except for fable saturation. Before C44 the
+        // uncapped one always led because the capped one was excluded
+        // outright; since C44 both are viable and tie on rank (same reset,
+        // same week_pct), so name order breaks the tie. This is a
+        // consequence of dropping the viability branch, not a ranking change.
+        //
+        // Names are picked so the alphabetically-first one ("avail") carries
+        // the WORSE (higher) fable pct: if rank tracked fable pct instead of
+        // name — the regression this test exists to catch — "fable_ok" (the
+        // lower pct) would lead instead, not silently agree.
         let resets = Some("Jun 20 at 9pm (Asia/Seoul)");
         let order = ranked_order(vec![
             (
-                "fable_capped",
+                "avail",
                 data_with_fable(Some(5), Some(30), resets, Some(99)),
             ),
             (
@@ -1163,7 +1194,7 @@ mod tests {
                 data_with_fable(Some(5), Some(30), resets, Some(20)),
             ),
         ]);
-        assert_eq!(order, vec!["fable_ok", "fable_capped"]);
+        assert_eq!(order, vec!["avail", "fable_ok"]);
     }
 
     #[test]

@@ -1,17 +1,22 @@
 #!/usr/bin/env bash
-# e2e/scenarios.sh -- the 10 limit-switch scenarios, ported 1:1 from the
-# original standalone harness (same assertions, same numbering). Sourced by
-# run.sh after lib.sh; expects the same globals as lib.sh plus FIX_HEALTHY and
-# FIX_BOTH (paths to the two fixture JSON files).
+# e2e/scenarios.sh -- the 14 numbered limit-switch scenarios (plus 9b, 15
+# VERDICT blocks in total), ported 1:1 from the original standalone harness
+# (same assertions, same numbering). Sourced by run.sh after lib.sh; expects
+# the same globals as lib.sh plus FIX_HEALTHY and FIX_BOTH (paths to the two
+# fixture JSON files).
 #
 # Coverage: 1/3/4 = hook-driven switch (StopFailure rate_limit / Stop
 # usage-pct, with and without the cooldown stamp); 2 = StopFailure overloaded
 # must NOT switch; 5 = both profiles capped -> notify-only, no relaunch; 6 =
 # two concurrent supervisors on profile a both switch independently; 7 =
-# CLAUDE_AUTO_SWITCH_RELAUNCH=0 detect-only; 8/9/10 = the statusline-tick
-# switch path (cold-launch --model/--effort carry, merge of a stored
-# model-scoped cap, duplicate-tick no-op, and the CLAUDE_AUTO_SWITCH=0
-# kill-switch).
+# CLAUDE_AUTO_SWITCH_RELAUNCH=0 detect-only; 8/10 = the statusline-tick
+# switch path (cold-launch --model/--effort carry and the CLAUDE_AUTO_SWITCH=0
+# kill-switch); 9/9b = a stored model-scoped (week_fable) cap relaxing to a
+# same-account model fallback, and a repeat tick on the same reading staying
+# suppressed rather than relaunching again; 11/12/13/14 = argv-forwarding
+# details (session-shaping flags without the prompt, closing an open
+# --add-dir before the handoff, a plain `csm --profile b claude <args>`
+# passthrough, and a global --profile in front of a csm subcommand).
 
 run_all_scenarios() {
 
@@ -334,8 +339,13 @@ safe_term "$SUP_PID"
 rpt ""
 
 # ═══════════════════════════════════════════════════════════════════════════
-rpt "----- Scenario 9: statusline tick, seven_day healthy but stored week_fable 100% on a -----"
+rpt "----- Scenario 9: statusline tick, seven_day healthy but stored week_fable 100% on a -> same-account model fallback, not a switch -----"
 CUR_FIXTURE="$FIX_HEALTHY"
+# Reset before this scenario runs so its own teardown line (shared with 9b,
+# below) never acts on a PID or count left over from Scenario 8 if
+# start_supervisor here fails to produce a SID.
+N=0
+RELAUNCH_PID=""
 clear_last_switch
 mkdir -p "$SMART_DIR/usage"
 # seed a's store with an api probe that saw the model-scoped cap; the tick
@@ -345,29 +355,83 @@ cat > "$SMART_DIR/usage/a.json" <<EOF
 EOF
 start_supervisor "s9" "$FIX_HEALTHY"
 if [[ -n "$SID" ]]; then
+  # `week_fable` alone must relax to a same-account model fallback (C44),
+  # never an account switch: this cap doesn't say anything about `b`'s
+  # headroom, and switching away would waste a hop the account doesn't need.
   run_capture "$A_DIR" "$(statusline_json "$SID" /tmp/e2e-cwd-s9 12 45)"
   rpt "  tick exit=$CAP_EXIT stdout='$CAP_STDOUT'"
   wait_for_pattern "$FAKE_LOG" "SIGTERM pid=$CHILD_PID" 10
   wait_for_invocation_count "$FAKE_LOG" 2 10
   N=$(count_invocations "$FAKE_LOG")
   rpt "  invocation count now: $N"
+  FLAGS_OK=no
   if (( N >= 2 )); then
     RELAUNCH_CFG=$(get_invocation_configdir "$FAKE_LOG" 2)
     RELAUNCH_VERB=$(get_invocation_field "$FAKE_LOG" 2 1)
     RELAUNCH_SID=$(get_invocation_field "$FAKE_LOG" 2 2)
     RELAUNCH_PID=$(get_invocation_pid "$FAKE_LOG" 2)
     rpt "  relaunch: verb=$RELAUNCH_VERB sid=$RELAUNCH_SID config_dir=$RELAUNCH_CFG pid=$RELAUNCH_PID"
+    # Adjacency, not just presence: `--model` must be IMMEDIATELY followed by
+    # `opus` in the argv, not merely present somewhere alongside it.
+    if get_invocation_argv "$FAKE_LOG" 2 \
+      | awk '/^--model$/{getline; if ($0=="opus") found=1} END{exit !found}'; then
+      FLAGS_OK=yes
+    fi
+    rpt "  relaunch carries --model opus adjacent? $FLAGS_OK"
   fi
   rpt "  limit-switch.log tail:"
   rpt "$(tail -2 "$SMART_DIR/limit-switch.log" 2>/dev/null)"
-  if (( N >= 2 )) && [[ "$RELAUNCH_VERB" == "--resume" && "$RELAUNCH_SID" == "$SID" && "$RELAUNCH_CFG" == "$B_DIR" ]] \
-     && tail -2 "$SMART_DIR/limit-switch.log" | grep -q "week_fable 100%.*via=statusline\|limit-switch sid=.*via=statusline"; then
+  rpt "  .switched marker present? $(test -f "$SMART_DIR/$SID.switched" && echo yes || echo no) (must be no -- a fallback is not an account switch)"
+  rpt "  .model-fallback marker present? $(test -f "$SMART_DIR/$SID.model-fallback" && echo yes || echo no)"
+  S9_PASS=no
+  if (( N >= 2 )) && [[ "$RELAUNCH_VERB" == "--resume" && "$RELAUNCH_SID" == "$SID" && "$RELAUNCH_CFG" == "$A_DIR" ]] \
+     && [[ "$FLAGS_OK" == yes ]] && [[ ! -f "$SMART_DIR/$SID.switched" ]] && [[ -f "$SMART_DIR/$SID.model-fallback" ]] \
+     && tail -2 "$SMART_DIR/limit-switch.log" | grep -q "model-fallback=opus account=a.*via=statusline"; then
+    rpt "  VERDICT: PASS"
+    S9_PASS=yes
+  else
+    rpt "  VERDICT: FAIL"
+  fi
+fi
+rpt ""
+
+# ═══════════════════════════════════════════════════════════════════════════
+rpt "----- Scenario 9b: a second statusline tick on the same still-capped week_fable reading is suppressed, not a duplicate relaunch -----"
+# Continues straight from Scenario 9's state, same live relaunched process
+# (never torn down above): its .model-fallback marker is fresh (the
+# fixture's resets_at is days away, well inside the 7-day window), and a's
+# stored week_fable reading is still 100% -- nothing here has changed it. A
+# second tick on that same unchanged reading must NOT relaunch again.
+if [[ -n "$SID" ]] && [[ "$S9_PASS" == yes ]]; then
+  PRE_N=$(count_invocations "$FAKE_LOG")
+  PRE_LOG_LINES=$(wc -l < "$SMART_DIR/limit-switch.log" 2>/dev/null || echo 0)
+  run_capture "$A_DIR" "$(statusline_json "$SID" /tmp/e2e-cwd-s9 12 45)"
+  rpt "  second tick exit=$CAP_EXIT stdout='$CAP_STDOUT'"
+  # Bounded poll for a THIRD invocation instead of a bare sleep, so a slow
+  # duplicate relaunch cannot race past a short fixed sleep and score PASS.
+  # Success here means a bug (a duplicate relaunch did appear), so the exit
+  # code is inverted below.
+  if wait_for_invocation_count "$FAKE_LOG" $((PRE_N + 1)) 5; then
+    DUPLICATE_RELAUNCH=yes
+  else
+    DUPLICATE_RELAUNCH=no
+  fi
+  POST_N=$(count_invocations "$FAKE_LOG")
+  POST_LOG_LINES=$(wc -l < "$SMART_DIR/limit-switch.log" 2>/dev/null || echo 0)
+  rpt "  invocation count: before=$PRE_N after=$POST_N (expect unchanged -- no duplicate relaunch)"
+  rpt "  limit-switch.log line count: before=$PRE_LOG_LINES after=$POST_LOG_LINES (expect unchanged -- fully silent)"
+  rpt "  .switched marker present? $(test -f "$SMART_DIR/$SID.switched" && echo yes || echo no) (must be no -- no account switch)"
+  if [[ "$DUPLICATE_RELAUNCH" == no ]] && [[ "$POST_N" == "$PRE_N" ]] && [[ -z "$CAP_STDOUT" ]] \
+     && [[ "$POST_LOG_LINES" == "$PRE_LOG_LINES" ]] && [[ ! -f "$SMART_DIR/$SID.switched" ]]; then
     rpt "  VERDICT: PASS"
   else
     rpt "  VERDICT: FAIL"
   fi
-  if (( N >= 2 )); then safe_term "$RELAUNCH_PID"; else safe_term "$CHILD_PID"; fi
+else
+  rpt "  SKIPPED: Scenario 9 did not leave a live relaunched process to continue from"
+  rpt "  VERDICT: FAIL"
 fi
+if (( N >= 2 )); then safe_term "$RELAUNCH_PID"; else safe_term "$CHILD_PID"; fi
 safe_term "$SUP_PID"
 rpt ""
 

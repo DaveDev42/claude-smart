@@ -45,6 +45,15 @@ pub struct RelaunchSentinel {
     pub hop: i64,
     /// Unix epoch (seconds).  Consume only when `sentinel.born >= launch_born`.
     pub born: i64,
+    /// `Some(model)` for a same-account model fallback (a `week_fable` cap —
+    /// see `crate::hook::detect::fable_fallback_model`): the hop resumes the
+    /// SAME session on this model instead of switching profiles.  `None` is
+    /// an ordinary account switch, the pre-C44 shape.  `#[serde(default)]` so
+    /// an older sentinel written before this field existed still reads back
+    /// as `None`, never a parse error (rollback safety, same contract as
+    /// every other field here).
+    #[serde(default)]
+    pub model_override: Option<String>,
 }
 
 /// Maximum number of limit-switch hops before the relaunch loop breaks.
@@ -308,6 +317,23 @@ fn build_next_cli(
     sentinel: &RelaunchSentinel,
     remembered: &crate::sidecar::Sidecar,
 ) -> (Vec<OsString>, Vec<String>) {
+    // A same-account model fallback (`sentinel.model_override`, see
+    // `crate::hook::detect::fable_fallback_model`) overrides the remembered
+    // model for this hop only — clone-and-replace, never a sidecar rewrite,
+    // so a LATER hop that carries no override still replays whatever model
+    // the session actually launched with. `sidecar_flags()` (below) is the
+    // FIRST thing appended after the session id, ahead of all carried
+    // passthru, so `--model` always lands in the same argv position whether
+    // it came from the sidecar or from this override.
+    let remembered = match &sentinel.model_override {
+        Some(m) => {
+            let mut c = remembered.clone();
+            c.model = Some(m.clone());
+            c
+        }
+        None => remembered.clone(),
+    };
+
     let mut cli: Vec<OsString> = Vec::new();
     cli.push(OsString::from("--resume"));
     cli.push(OsString::from(sid));
@@ -387,6 +413,7 @@ mod tests {
             handoff: handoff.to_string(),
             hop: 1,
             born: 1,
+            model_override: None,
         }
     }
 
@@ -564,6 +591,66 @@ mod tests {
         );
     }
 
+    /// A same-account model fallback (`sentinel.model_override`) overrides
+    /// the remembered model for this hop — the resumed session gets exactly
+    /// one `--model` flag, the fallback model, not the sidecar's original one.
+    #[test]
+    fn sentinel_model_override_emits_exactly_one_model_flag() {
+        let remembered = crate::sidecar::Sidecar {
+            model: Some("some-model".to_string()),
+            effort: Some("high".to_string()),
+            ..Default::default()
+        };
+        let mut s = sentinel("carry on");
+        s.model_override = Some("opus".to_string());
+        let (cli, dropped) = build_next_cli("abc123", &s, &remembered);
+        assert_eq!(
+            strs(&cli),
+            [
+                "--resume", "abc123", "--effort", "high", "--model", "opus", "carry on",
+            ]
+        );
+        assert_eq!(
+            cli.iter().filter(|a| *a == "--model").count(),
+            1,
+            "exactly one --model flag, never both the sidecar's and the override's"
+        );
+        assert!(dropped.is_empty());
+    }
+
+    /// No `model_override` (the ordinary account-switch sentinel, `None`) —
+    /// the hop replays whatever model the sidecar remembers, exactly as
+    /// before this field existed.
+    #[test]
+    fn sentinel_without_model_override_replays_sidecar_model() {
+        let remembered = crate::sidecar::Sidecar {
+            model: Some("some-model".to_string()),
+            ..Default::default()
+        };
+        let (cli, _) = build_next_cli("abc123", &sentinel("carry on"), &remembered);
+        assert_eq!(
+            strs(&cli),
+            ["--resume", "abc123", "--model", "some-model", "carry on"]
+        );
+    }
+
+    /// Rollback safety: a `.relaunch` written by an OLDER binary (no
+    /// `model_override` key at all) must still parse, with the field reading
+    /// back as `None` — the same `#[serde(default)]` contract as every other
+    /// forward-compat field on this type. Mirrors
+    /// `read_compat_unknown_future_field_is_ignored_not_fatal`, but for a
+    /// field THIS version knows and an OLDER file lacks, not the reverse.
+    #[test]
+    fn read_compat_old_file_without_model_override_defaults_to_none() {
+        let json = r#"{
+            "session_id":"sid-9","target_profile":"work","cwd":"/tmp",
+            "handoff":"resume","hop":1,"born":1700000000
+        }"#;
+        let s: RelaunchSentinel =
+            serde_json::from_str(json).expect("a sentinel without model_override must still parse");
+        assert_eq!(s.model_override, None);
+    }
+
     #[test]
     fn roundtrip_sentinel() {
         let sentinel = RelaunchSentinel {
@@ -573,6 +660,7 @@ mod tests {
             handoff: "resume".to_string(),
             hop: 1,
             born: 1_718_000_000,
+            model_override: None,
         };
         let json = serde_json::to_string(&sentinel).unwrap();
         let back: RelaunchSentinel = serde_json::from_str(&json).unwrap();
@@ -661,6 +749,7 @@ mod tests {
             handoff: "resume".to_string(),
             hop: 0,
             born: 1_718_100_000,
+            model_override: None,
         };
         write_relaunch(&path, &sentinel).unwrap();
         let back = read_relaunch(&path)
@@ -716,6 +805,7 @@ mod tests {
             handoff: "resume".to_string(),
             hop: 2,
             born: 1,
+            model_override: None,
         };
         let sentinel_json = serde_json::to_value(&sentinel).unwrap();
         assert!(
