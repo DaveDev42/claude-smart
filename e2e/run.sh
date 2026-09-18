@@ -4,7 +4,7 @@
 # Builds (or reuses) a `csm` binary and a fake, sleeping `claude` binary,
 # stands up an isolated sandbox (its own HOME, its own profile registry, no
 # network -- CSM_USAGE_API_BASE points at an unrouted local port), runs the
-# 12 limit-switch scenarios against it, prints the report, and tears down:
+# 14 scenarios against it, prints the report, and tears down:
 # only PIDs this script itself started are ever signalled, and the sandbox is
 # removed unless --keep is given. Never runs the real `claude`.
 #
@@ -143,6 +143,21 @@ for pid in "${ALL_PIDS[@]:-}"; do
     kill -TERM "$pid" 2>/dev/null
   fi
 done
+# The supervisors' own children are not in ALL_PIDS -- the supervisor spawned
+# them, not this script. They are still addressable by pid rather than by name,
+# because the fake claude logs its own pid on every invocation. Under load a
+# scenario can finish while one of them is between SIGTERM and exit, which is
+# how a run occasionally left a sleeping fake behind.
+for f in "$LOG_DIR"/*.fakeclaude.log; do
+  [[ -e "$f" ]] || continue
+  while read -r logged_pid; do
+    if [[ -n "$logged_pid" ]] && kill -0 "$logged_pid" 2>/dev/null; then
+      rpt "  WARNING: fake claude pid $logged_pid still alive, sending TERM (pid from $f)"
+      kill -TERM "$logged_pid" 2>/dev/null
+    fi
+  done < <(awk '/^=== INVOCATION/{for(i=1;i<=NF;i++) if($i ~ /^pid=[0-9]+$/){sub(/^pid=/,"",$i); print $i}}' "$f")
+done
+sleep 1
 rpt "  ps check (this sandbox's binaries only):"
 rpt "$(ps -ax -o pid,ppid,stat,command 2>/dev/null | grep -E "$SANDBOX/(bin/claude)" | grep -v grep || echo '  (none found)')"
 rpt ""
