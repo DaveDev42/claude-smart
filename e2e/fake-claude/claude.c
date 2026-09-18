@@ -8,7 +8,14 @@
  * POSIX-only (fork/signal semantics the harness depends on: SIGTERM delivery,
  * pause()). Built fresh by e2e/run.sh with `cc -std=c11 -Wall -Wextra`; must
  * stay warning-free on both gcc and clang.
+ *
+ * -std=c11 asks for strict ISO C, and under it glibc hides everything POSIX
+ * adds unless a feature-test macro asks for it -- sigaction and its struct
+ * among them, which is a hard compile error on Linux. Apple's libc exposes
+ * them regardless, so this has to be declared rather than discovered.
  */
+#define _POSIX_C_SOURCE 200809L
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
