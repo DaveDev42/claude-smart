@@ -478,4 +478,53 @@ fi
 safe_term "$SUP_PID"
 rpt ""
 
+# ═══════════════════════════════════════════════════════════════════════════
+rpt "----- Scenario 13: csm --profile b claude <args> runs claude under b, verbatim -----"
+CUR_FIXTURE="$FIX_HEALTHY"
+S13_LOG="$LOG_DIR/s13.fakeclaude.log"
+rm -f "$S13_LOG"
+run_csm_bg "$S13_LOG" --profile b claude --version --dangerously-skip-permissions
+S13_CFG=""; S13_ARGV=""
+if wait_for_invocation_count "$S13_LOG" 1 10; then
+  S13_CFG=$(get_invocation_configdir "$S13_LOG" 1)
+  S13_ARGV=$(get_invocation_argv "$S13_LOG" 1 | tail -n +2 | tr '\n' ' ')
+fi
+rpt "  config_dir=$S13_CFG (expect $B_DIR)"
+rpt "  argv after the binary: $S13_ARGV"
+# verbatim means exactly what was typed: no --session-id, no --resume, no
+# handoff prompt, nothing the launcher would have added.
+if [[ "$S13_CFG" == "$B_DIR" && "$S13_ARGV" == "--version --dangerously-skip-permissions " ]]; then
+  rpt "  VERDICT: PASS"
+else
+  rpt "  VERDICT: FAIL"
+fi
+safe_term "$CSM_BG_PID"
+rpt ""
+
+# ═══════════════════════════════════════════════════════════════════════════
+rpt "----- Scenario 14: a global --profile in front of a subcommand belongs to csm -----"
+CUR_FIXTURE="$FIX_HEALTHY"
+S14_LOG="$LOG_DIR/s14.fakeclaude.log"
+rm -f "$S14_LOG"
+# The bug: everything here used to be forwarded to claude, so the subcommand
+# never ran and a claude process started instead.
+run_csm "$S14_LOG" --profile b newuuid
+S14_UUID_OUT="$CSM_STDOUT"; S14_UUID_EXIT="$CSM_EXIT"
+S14_N=$(count_invocations "$S14_LOG")
+rpt "  newuuid exit=$S14_UUID_EXIT stdout=$S14_UUID_OUT claude invocations=$S14_N (expect 0)"
+# `csm run --help` is the other half: run's own help, not claude's.
+run_csm "$S14_LOG" run --help
+S14_HELP_OUT="$CSM_STDOUT"; S14_HELP_EXIT="$CSM_EXIT"
+S14_N2=$(count_invocations "$S14_LOG")
+rpt "  run --help exit=$S14_HELP_EXIT first line: $(printf '%s\n' "$S14_HELP_OUT" | head -1)"
+rpt "  claude invocations after both calls=$S14_N2 (expect 0)"
+if [[ "$S14_UUID_EXIT" == 0 && "$S14_N" == 0 && "$S14_N2" == 0 && "$S14_HELP_EXIT" == 0 ]] \
+   && [[ "$S14_UUID_OUT" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]] \
+   && printf '%s\n' "$S14_HELP_OUT" | grep -q 'csm run \[csm-flags\]'; then
+  rpt "  VERDICT: PASS"
+else
+  rpt "  VERDICT: FAIL"
+fi
+rpt ""
+
 }

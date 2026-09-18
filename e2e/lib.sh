@@ -156,6 +156,48 @@ start_supervisor() {
   return 0
 }
 
+# csm_env <fake_log>  -> the sandbox environment every direct csm call needs,
+# printed as `env` arguments. CLAUDE_CONFIG_DIR is unset so the call has to
+# resolve a profile the way a real shell would.
+csm_env() {
+  printf '%s\0' -u CLAUDE_CONFIG_DIR \
+    "HOME=$HOME_DIR" \
+    "CSM_USAGE_API_BASE=http://127.0.0.1:9" \
+    "CLAUDE_SMART_CLAUDE_BIN=$FAKE_BIN" \
+    "CSM_USAGE_CMD=$USAGE_CMD_SCRIPT" \
+    "CSM_USAGE_FIXTURE=${CUR_FIXTURE}" \
+    "CLAUDE_USAGE_TTL=0" "CSM_USAGE_TTL_SECS=0" \
+    "FAKE_LOG=$1"
+}
+
+# run_csm <fake_log> <args...> -- run csm directly (no supervisor) in the
+# sandbox. For calls that return; a call that reaches the fake claude blocks
+# until SIGTERM and must be backgrounded instead.
+# Sets globals: CSM_STDOUT, CSM_EXIT
+run_csm() {
+  local fake_log="$1"; shift
+  local outfile
+  outfile=$(mktemp "$LOG_DIR/csmout.XXXXXX")
+  local -a envargs=()
+  while IFS= read -r -d '' a; do envargs+=("$a"); done < <(csm_env "$fake_log")
+  env "${envargs[@]}" "$CSM_BIN" "$@" >"$outfile" 2>&1
+  CSM_EXIT=$?
+  CSM_STDOUT=$(cat "$outfile")
+  rm -f "$outfile"
+}
+
+# run_csm_bg <fake_log> <args...> -- same, but backgrounded, for a call that
+# ends in the fake claude (which blocks until SIGTERM).
+# Sets globals: CSM_BG_PID
+run_csm_bg() {
+  local fake_log="$1"; shift
+  local -a envargs=()
+  while IFS= read -r -d '' a; do envargs+=("$a"); done < <(csm_env "$fake_log")
+  env "${envargs[@]}" "$CSM_BIN" "$@" > "$LOG_DIR/csmbg.log" 2>&1 &
+  CSM_BG_PID=$!
+  ALL_PIDS+=("$CSM_BG_PID")
+}
+
 # run_hook <owner_dir> <json_payload> [extra env "K=V" ...]
 # Sets globals: HOOK_STDOUT, HOOK_STDERR, HOOK_EXIT
 run_hook() {
