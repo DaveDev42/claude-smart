@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.6](https://github.com/DaveDev42/claude-smart/compare/v0.3.5...v0.3.6) (2026-09-19)
+
+
+### Bug Fixes
+
+* **hook:** stop stranding a switched session on a capped Fable model ([0fb017d](https://github.com/DaveDev42/claude-smart/commit/0fb017d91021a4995834be21762d1c32ab91f0c6))
+
 ## [0.3.5](https://github.com/DaveDev42/claude-smart/compare/v0.3.4...v0.3.5) (2026-09-19)
 
 
