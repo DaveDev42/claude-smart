@@ -680,7 +680,7 @@ mod tests {
     fn registry(names: &[&str]) -> ProfileMap {
         let mut m = HashMap::new();
         for n in names {
-            m.insert((*n).to_owned(), format!("/tmp/.claude.{n}"));
+            m.insert((*n).to_owned(), format!("/Users/example/.claude.{n}"));
         }
         ProfileMap(m)
     }

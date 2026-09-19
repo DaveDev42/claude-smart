@@ -119,8 +119,8 @@ mod tests {
     /// do not depend on the real home directory.
     fn test_profiles() -> ProfileMap {
         let mut m = HashMap::new();
-        m.insert("home".to_owned(), "/tmp/.claude.home".to_owned());
-        m.insert("work".to_owned(), "/tmp/.claude.work".to_owned());
+        m.insert("home".to_owned(), "/Users/example/.claude.home".to_owned());
+        m.insert("work".to_owned(), "/Users/example/.claude.work".to_owned());
         ProfileMap(m)
     }
 

@@ -287,7 +287,7 @@ mod tests {
 
     #[test]
     fn dispatch_explicit_hook() {
-        let a = argv(&["csm", "hook", "--owner", "/tmp/.claude.home"]);
+        let a = argv(&["csm", "hook", "--owner", "/Users/example/.claude.home"]);
         let d = dispatch_subcommand(&a);
         assert_eq!(d.subcommand, "hook");
         assert_eq!(d.rest_len, 2);

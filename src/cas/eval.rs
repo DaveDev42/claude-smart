@@ -299,8 +299,8 @@ mod tests {
     /// do not depend on the real home directory.
     fn test_profiles() -> ProfileMap {
         let mut m = HashMap::new();
-        m.insert("home".to_owned(), "/tmp/.claude.home".to_owned());
-        m.insert("work".to_owned(), "/tmp/.claude.work".to_owned());
+        m.insert("home".to_owned(), "/Users/example/.claude.home".to_owned());
+        m.insert("work".to_owned(), "/Users/example/.claude.work".to_owned());
         ProfileMap(m)
     }
 
@@ -314,14 +314,14 @@ mod tests {
     fn resolve_profile_personal_in_map() {
         let profiles = test_profiles();
         let result = resolve_profile("home", &profiles);
-        assert_eq!(result.unwrap(), "/tmp/.claude.home");
+        assert_eq!(result.unwrap(), "/Users/example/.claude.home");
     }
 
     #[test]
     fn resolve_profile_work_in_map() {
         let profiles = test_profiles();
         let result = resolve_profile("work", &profiles);
-        assert_eq!(result.unwrap(), "/tmp/.claude.work");
+        assert_eq!(result.unwrap(), "/Users/example/.claude.work");
     }
 
     #[test]
@@ -411,7 +411,7 @@ mod tests {
         // _CLAUDE_AS_PREV="home"), then runs `cas -`.
         // The shim resolves _CLAUDE_AS_PREV to "home" and calls csm with "home".
         let result = resolve_profile("home", &profiles);
-        assert_eq!(result.unwrap(), "/tmp/.claude.home");
+        assert_eq!(result.unwrap(), "/Users/example/.claude.home");
     }
 
     /// Toggle to "work" (the other direction).
@@ -421,7 +421,7 @@ mod tests {
         // Simulate: user was on "work", _CLAUDE_AS_PREV="work", `cas -`.
         // Actually: if current is personal and prev was work, toggle → work.
         let result = resolve_profile("work", &profiles);
-        assert_eq!(result.unwrap(), "/tmp/.claude.work");
+        assert_eq!(result.unwrap(), "/Users/example/.claude.work");
     }
 
     // ── resync logic ──────────────────────────────────────────────────────────
@@ -436,7 +436,10 @@ mod tests {
         let profile = "home";
         let dir = resolve_profile(profile, &profiles).unwrap();
         let line = Shell::Zsh.export_line(&dir);
-        assert_eq!(line, "export CLAUDE_CONFIG_DIR='/tmp/.claude.home'");
+        assert_eq!(
+            line,
+            "export CLAUDE_CONFIG_DIR='/Users/example/.claude.home'"
+        );
     }
 
     #[test]
@@ -444,7 +447,10 @@ mod tests {
         let profiles = test_profiles();
         let dir = resolve_profile("work", &profiles).unwrap();
         let line = Shell::Pwsh.export_line(&dir);
-        assert_eq!(line, "$env:CLAUDE_CONFIG_DIR = '/tmp/.claude.work'");
+        assert_eq!(
+            line,
+            "$env:CLAUDE_CONFIG_DIR = '/Users/example/.claude.work'"
+        );
     }
 
     // ── golden tests: eval_emit_to exact stdout bytes (test-05) ──────────────
@@ -488,7 +494,10 @@ mod tests {
             &profiles,
         );
         r.unwrap();
-        assert_eq!(out, "export CLAUDE_CONFIG_DIR='/tmp/.claude.home'\n");
+        assert_eq!(
+            out,
+            "export CLAUDE_CONFIG_DIR='/Users/example/.claude.home'\n"
+        );
     }
 
     #[test]
@@ -502,7 +511,10 @@ mod tests {
             &profiles,
         );
         r.unwrap();
-        assert_eq!(out, "$env:CLAUDE_CONFIG_DIR = '/tmp/.claude.work'\n");
+        assert_eq!(
+            out,
+            "$env:CLAUDE_CONFIG_DIR = '/Users/example/.claude.work'\n"
+        );
     }
 
     #[test]
@@ -640,7 +652,10 @@ mod tests {
             let profiles = test_profiles();
             let (out, r) = emit(Shell::Zsh, &Op::Resync, &profiles);
             r.unwrap();
-            assert_eq!(out, "export CLAUDE_CONFIG_DIR='/tmp/.claude.home'\n");
+            assert_eq!(
+                out,
+                "export CLAUDE_CONFIG_DIR='/Users/example/.claude.home'\n"
+            );
         });
     }
 
@@ -650,24 +665,31 @@ mod tests {
             let profiles = test_profiles();
             let (out, r) = emit(Shell::Pwsh, &Op::Resync, &profiles);
             r.unwrap();
-            assert_eq!(out, "$env:CLAUDE_CONFIG_DIR = '/tmp/.claude.home'\n");
+            assert_eq!(
+                out,
+                "$env:CLAUDE_CONFIG_DIR = '/Users/example/.claude.home'\n"
+            );
         });
     }
 
     #[test]
     fn golden_status_print_current_known() {
-        crate::testenv::with_env_var("CLAUDE_CONFIG_DIR", Some("/tmp/.claude.work"), || {
-            let profiles = test_profiles();
-            let (out, r) = emit(
-                Shell::Zsh,
-                &Op::Status {
-                    print_current: true,
-                },
-                &profiles,
-            );
-            r.unwrap();
-            assert_eq!(out, "work\n");
-        });
+        crate::testenv::with_env_var(
+            "CLAUDE_CONFIG_DIR",
+            Some("/Users/example/.claude.work"),
+            || {
+                let profiles = test_profiles();
+                let (out, r) = emit(
+                    Shell::Zsh,
+                    &Op::Status {
+                        print_current: true,
+                    },
+                    &profiles,
+                );
+                r.unwrap();
+                assert_eq!(out, "work\n");
+            },
+        );
     }
 
     #[test]
@@ -688,28 +710,32 @@ mod tests {
 
     #[test]
     fn golden_status_full_display() {
-        crate::testenv::with_env_var("CLAUDE_CONFIG_DIR", Some("/tmp/.claude.work"), || {
-            with_isolated_home(|_home| {
-                let profiles = test_profiles();
-                let (out, r) = emit(
-                    Shell::Zsh,
-                    &Op::Status {
-                        print_current: false,
-                    },
-                    &profiles,
-                );
-                r.unwrap();
-                // Isolated HOME → no state file → default is "home" (alphabetical-first).
-                assert_eq!(
-                    out,
-                    "current shell:  work (/tmp/.claude.work)\n\
-                     global default: home (/tmp/.claude.home)\n\
+        crate::testenv::with_env_var(
+            "CLAUDE_CONFIG_DIR",
+            Some("/Users/example/.claude.work"),
+            || {
+                with_isolated_home(|_home| {
+                    let profiles = test_profiles();
+                    let (out, r) = emit(
+                        Shell::Zsh,
+                        &Op::Status {
+                            print_current: false,
+                        },
+                        &profiles,
+                    );
+                    r.unwrap();
+                    // Isolated HOME → no state file → default is "home" (alphabetical-first).
+                    assert_eq!(
+                        out,
+                        "current shell:  work (/Users/example/.claude.work)\n\
+                     global default: home (/Users/example/.claude.home)\n\
                      available:\n\
-                     \x20  d home         /tmp/.claude.home\n\
-                     \x20 *  work         /tmp/.claude.work\n\
+                     \x20  d home         /Users/example/.claude.home\n\
+                     \x20 *  work         /Users/example/.claude.work\n\
                      (legend: * = current shell, d = global default)\n"
-                );
-            });
-        });
+                    );
+                });
+            },
+        );
     }
 }

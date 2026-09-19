@@ -735,14 +735,18 @@ mod tests {
         // `run_with_capture` directly with no capture, exactly what
         // `should_capture_stdin` returning false (or a timed-out read)
         // produces.
-        crate::testenv::with_env_var("CLAUDE_CONFIG_DIR", Some("/tmp/.claude.test"), || {
-            let result = run_with_capture(None);
-            assert!(
-                result.is_ok(),
-                "run_with_capture(None) returned Err: {:?}",
-                result.unwrap_err()
-            );
-        });
+        crate::testenv::with_env_var(
+            "CLAUDE_CONFIG_DIR",
+            Some("/Users/example/.claude.test"),
+            || {
+                let result = run_with_capture(None);
+                assert!(
+                    result.is_ok(),
+                    "run_with_capture(None) returned Err: {:?}",
+                    result.unwrap_err()
+                );
+            },
+        );
     }
 
     #[test]

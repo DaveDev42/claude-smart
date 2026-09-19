@@ -414,7 +414,7 @@ mod tests {
             &mut p,
             Action::Add {
                 name: "work".into(),
-                dir: Some("/tmp/.claude.work".into()),
+                dir: Some("/Users/example/.claude.work".into()),
             },
         );
         assert!(matches!(
@@ -424,7 +424,7 @@ mod tests {
                 ..
             }
         ));
-        assert_eq!(p.get("work"), Some("/tmp/.claude.work"));
+        assert_eq!(p.get("work"), Some("/Users/example/.claude.work"));
     }
 
     #[test]
