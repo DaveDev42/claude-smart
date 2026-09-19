@@ -27,6 +27,18 @@
 //! but does **not** prevent the live-shell export from succeeding. This matches
 //! the legacy shell implementation's `… 2>/dev/null` suppression.
 //!
+//! # Registry gate
+//!
+//! [`apply_global`] refuses to publish a `CLAUDE_CONFIG_DIR` that is neither
+//! registered in [`ProfileMap`] nor shaped like `$HOME/.claude` /
+//! `$HOME/.claude.<name>` (the dir [`crate::paths::synthesize_profile_dir`]
+//! invents for an unregistered name, which must keep working on a toss machine
+//! whose registry is empty). The floor is machine-wide and outlives the
+//! process that set it, so a stray path reaching it strands every GUI-launched
+//! `claude` — including third-party wrappers — on a config dir with no
+//! `projects/` and no hooks, with no error anywhere. `/tmp/...` and other
+//! out-of-tree paths are rejected here even when a caller asks for them.
+//!
 //! # Inert under `cfg(test)`
 //!
 //! Both setters return before touching launchd / HKCU when the crate is
@@ -45,11 +57,83 @@
 /// (logged to stderr, not returned as errors) so a missing launchctl or a
 /// locked registry key does not prevent the shell export from succeeding.
 ///
+/// `dir` is gated first: see *Registry gate* in the module doc. A dir that is
+/// neither registered nor `$HOME/.claude*` is refused with a warning, and the
+/// platform side-effect never runs.
+///
 /// Arguments:
 /// - `profile` — the canonical profile name (for error messages / logging)
 /// - `dir`     — the resolved `CLAUDE_CONFIG_DIR` path to broadcast
 pub fn apply_global(profile: &str, dir: &str) -> std::io::Result<()> {
+    let profiles = match crate::account::ProfileMap::load() {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!(
+                "cas: profile registry unreadable ({e}) — skipping the machine-wide setenv for {profile}"
+            );
+            return Ok(());
+        }
+    };
+    let home = crate::paths::home_dir();
+    if !dir_is_broadcastable(&profiles, home.as_deref(), dir) {
+        eprintln!(
+            "cas: refusing to publish CLAUDE_CONFIG_DIR={dir} machine-wide — \
+             not a registered profile dir and not $HOME/.claude*"
+        );
+        return Ok(());
+    }
     apply_global_impl(profile, dir)
+}
+
+/// Is `dir` allowed to become the machine-wide `CLAUDE_CONFIG_DIR`?
+///
+/// True when it is a dir some profile is registered at, or when it has the
+/// conventional shape `<home>/.claude` / `<home>/.claude.<name>`. Everything
+/// else is rejected — see *Registry gate* in the module doc.
+///
+/// Pure: the registry and the home dir are both passed in, so the decision is
+/// unit-testable without touching the filesystem or the environment.
+pub(crate) fn dir_is_broadcastable(
+    profiles: &crate::account::ProfileMap,
+    home: Option<&std::path::Path>,
+    dir: &str,
+) -> bool {
+    use std::path::Path;
+
+    let want = normalize_dir(dir);
+    if want.is_empty() {
+        return false;
+    }
+    if profiles.iter().any(|(_, d)| normalize_dir(d) == want) {
+        return true;
+    }
+    let Some(home) = home else {
+        return false;
+    };
+    let candidate = Path::new(want.as_str());
+    let Some(parent) = candidate.parent() else {
+        return false;
+    };
+    let home_norm = normalize_dir(&home.to_string_lossy());
+    if parent != Path::new(home_norm.as_str()) {
+        return false;
+    }
+    candidate
+        .file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| n == ".claude" || n.starts_with(".claude."))
+}
+
+/// Trim surrounding whitespace and any trailing path separators so
+/// `…/.claude.work` and `…/.claude.work/` compare equal.
+fn normalize_dir(dir: &str) -> String {
+    let trimmed = dir.trim();
+    let stripped = trimmed.trim_end_matches(['/', '\\']);
+    if stripped.is_empty() {
+        trimmed.to_owned()
+    } else {
+        stripped.to_owned()
+    }
 }
 
 // ─── macOS ────────────────────────────────────────────────────────────────────
@@ -229,6 +313,21 @@ fn apply_global_impl(_profile: &str, _dir: &str) -> std::io::Result<()> {
 mod tests {
     use super::*;
 
+    use crate::account::ProfileMap;
+    use std::collections::HashMap;
+    use std::path::Path;
+
+    fn registry(pairs: &[(&str, &str)]) -> ProfileMap {
+        ProfileMap(
+            pairs
+                .iter()
+                .map(|(n, d)| ((*n).to_owned(), (*d).to_owned()))
+                .collect::<HashMap<_, _>>(),
+        )
+    }
+
+    const HOME: &str = "/Users/example";
+
     /// `apply_global` must not panic or return a hard error on any platform.
     /// Under `cfg(test)` the macOS / Windows setters are inert (module doc),
     /// so this never touches launchd or HKCU; the path is deliberately one
@@ -240,5 +339,110 @@ mod tests {
             result.is_ok(),
             "apply_global must not return a hard error: {result:?}"
         );
+    }
+
+    #[test]
+    fn registered_dir_is_broadcastable() {
+        let pm = registry(&[("work", "/Users/example/.claude.work")]);
+        assert!(dir_is_broadcastable(
+            &pm,
+            Some(Path::new(HOME)),
+            "/Users/example/.claude.work"
+        ));
+    }
+
+    /// A dir registered somewhere unconventional is still allowed: the
+    /// registry is the authority (Invariant 3), the shape check is only the
+    /// fallback for names it does not carry.
+    #[test]
+    fn registered_dir_outside_home_is_broadcastable() {
+        let pm = registry(&[("work", "/opt/profiles/work")]);
+        assert!(dir_is_broadcastable(
+            &pm,
+            Some(Path::new(HOME)),
+            "/opt/profiles/work"
+        ));
+    }
+
+    /// An empty registry (toss machine / first boot) must not break
+    /// `synthesize_profile_dir`'s `~/.claude.<name>`.
+    #[test]
+    fn synthesized_home_dir_is_broadcastable_without_a_registry() {
+        let pm = registry(&[]);
+        assert!(dir_is_broadcastable(
+            &pm,
+            Some(Path::new(HOME)),
+            "/Users/example/.claude.work"
+        ));
+        assert!(dir_is_broadcastable(
+            &pm,
+            Some(Path::new(HOME)),
+            "/Users/example/.claude"
+        ));
+    }
+
+    /// Regression: an out-of-tree path must never reach the machine-wide
+    /// floor. A unit test once published one through `launchctl setenv`,
+    /// stranding every GUI-launched `claude` on a config dir with no
+    /// `projects/` and no hooks until the next login.
+    #[test]
+    fn out_of_tree_dir_is_refused() {
+        let pm = registry(&[("work", "/Users/example/.claude.work")]);
+        for dir in [
+            "/tmp/.claude.work",
+            "/var/folders/t/T/.tmpXXXX/.claude.work",
+            "/Users/example/nested/.claude.work",
+            "/Users/other/.claude.work",
+        ] {
+            assert!(
+                !dir_is_broadcastable(&pm, Some(Path::new(HOME)), dir),
+                "{dir} must not be broadcastable"
+            );
+        }
+    }
+
+    /// The shape check is `.claude` / `.claude.<name>`, not any dotfile.
+    #[test]
+    fn unrelated_home_dir_is_refused() {
+        let pm = registry(&[]);
+        for dir in ["/Users/example/.config", "/Users/example/claude", HOME] {
+            assert!(
+                !dir_is_broadcastable(&pm, Some(Path::new(HOME)), dir),
+                "{dir} must not be broadcastable"
+            );
+        }
+    }
+
+    #[test]
+    fn trailing_separator_and_blank_are_handled() {
+        let pm = registry(&[("work", "/Users/example/.claude.work/")]);
+        assert!(dir_is_broadcastable(
+            &pm,
+            Some(Path::new(HOME)),
+            "/Users/example/.claude.work"
+        ));
+        assert!(dir_is_broadcastable(
+            &pm,
+            Some(Path::new("/Users/example/")),
+            "/Users/example/.claude.work/"
+        ));
+        assert!(!dir_is_broadcastable(&pm, Some(Path::new(HOME)), ""));
+        assert!(!dir_is_broadcastable(&pm, Some(Path::new(HOME)), "   "));
+    }
+
+    /// With no resolvable home, only the registry can authorise a dir.
+    #[test]
+    fn without_a_home_only_the_registry_authorises() {
+        let pm = registry(&[("work", "/Users/example/.claude.work")]);
+        assert!(dir_is_broadcastable(
+            &pm,
+            None,
+            "/Users/example/.claude.work"
+        ));
+        assert!(!dir_is_broadcastable(
+            &pm,
+            None,
+            "/Users/example/.claude.home"
+        ));
     }
 }
