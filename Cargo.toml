@@ -1,6 +1,6 @@
 [package]
 name         = "claude-smart"
-version      = "0.3.3"
+version      = "0.3.4"
 edition      = "2024"
 rust-version = "1.95"  # floor set by sysinfo 0.39.6's MSRV (highest among current deps)
 default-run  = "csm"

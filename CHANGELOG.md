@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.3.4](https://github.com/DaveDev42/claude-smart/compare/v0.3.3...v0.3.4) (2026-09-18)
+
+
+### Features
+
+* **cli:** add a claude passthrough verb — csm claude &lt;args...&gt; ([66aecbd](https://github.com/DaveDev42/claude-smart/commit/66aecbd60d3be766f4dbf166253ab95d763ba9ad)), closes [#26](https://github.com/DaveDev42/claude-smart/issues/26)
+* **relaunch:** carry a launch's session-shaping claude flags across a limit switch ([fc278f9](https://github.com/DaveDev42/claude-smart/commit/fc278f9a90cc186d92230f99a97ff7af219ca805))
+
+
+### Bug Fixes
+
+* **cas:** keep unit tests off the machine-wide CLAUDE_CONFIG_DIR floor — the launchctl/HKCU setters are inert under cfg(test) ([2b5a213](https://github.com/DaveDev42/claude-smart/commit/2b5a2137d7048e24bdeeef64b3d8a0be55ef5297))
+* **cli:** accept a global --profile in front of a subcommand word ([37e00ce](https://github.com/DaveDev42/claude-smart/commit/37e00ce8bab56a8f4397aa4d8db9f5b837a7973a)), closes [#25](https://github.com/DaveDev42/claude-smart/issues/25)
+* **run:** print run's own help instead of forwarding --help to claude ([95b2b53](https://github.com/DaveDev42/claude-smart/commit/95b2b53af39a682aaa313ea1607bee5670708cc0)), closes [#25](https://github.com/DaveDev42/claude-smart/issues/25)
+
 ## [0.3.3](https://github.com/DaveDev42/claude-smart/compare/v0.3.2...v0.3.3) (2026-09-17)
 
 
