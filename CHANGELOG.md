@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.3.5](https://github.com/DaveDev42/claude-smart/compare/v0.3.4...v0.3.5) (2026-09-19)
+
+
+### Features
+
+* **cmd:** decide Windows interactivity with GetConsoleMode instead of an env guess ([c1332d6](https://github.com/DaveDev42/claude-smart/commit/c1332d625c7d3c6b2695c8a6c94e05fe58558522))
+* **hook:** fall back to the latest Opus on a Fable cap instead of switching accounts ([87a6f46](https://github.com/DaveDev42/claude-smart/commit/87a6f46c13dc09bcf0a0bccf0397aaeb50487e74))
+
+
+### Bug Fixes
+
+* **cas:** refuse a CLAUDE_CONFIG_DIR outside the registry or $HOME — the floor is machine-wide ([fd0c55a](https://github.com/DaveDev42/claude-smart/commit/fd0c55ac96b576dc3248e7f5f7756fe7b18558aa))
+
 ## [0.3.4](https://github.com/DaveDev42/claude-smart/compare/v0.3.3...v0.3.4) (2026-09-18)
 
 
