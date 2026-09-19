@@ -241,7 +241,7 @@ pub fn run_from_statusline(raw: &str, capture: &crate::usage::local::StatuslineC
             // blocking a real account switch this same session might still
             // need later (see `detect::fable_fallback_model`'s doc).
             let claimed = match model_override {
-                Some(_) => stop::claim_model_fallback(&sid),
+                Some(_) => stop::claim_model_fallback(&sid, target_profile),
                 None => stop::claim_switched(&sid),
             };
             if !claimed {
@@ -682,7 +682,7 @@ mod tests {
         );
     }
 
-    // ── run_from_statusline: C44 fable-cap same-account model fallback ────────
+    // ── run_from_statusline: fable-cap same-account model fallback ───────────
 
     /// A week_fable-only cap must relaunch the SAME profile with
     /// `model_override: Some("opus")`, must NOT touch `.switched`, and must
@@ -731,6 +731,87 @@ mod tests {
              it consumes no shared resource and must not throttle another \
              session's real account switch (classify_with's step 9 skips \
              cooldown_blocks entirely when fallback_model.is_some())"
+        );
+    }
+
+    /// Kill-switch 1c (`.switched`) exists to stop account-switch loops, not
+    /// to block the fallback: a session that already switched accounts once
+    /// this run must still fall back on a later `week_fable` trip. Before
+    /// this behaviour, a `.switched` session landing on a Fable-saturated
+    /// account (now a pickable target) would be stranded on a capped Fable
+    /// model with no rescue.
+    #[test]
+    fn run_from_statusline_fable_cap_falls_back_even_with_switched_marker_present() {
+        let _guard_cmd = crate::testenv::lock_for("CSM_USAGE_CMD");
+        let _guard_bin = crate::testenv::lock_for("CLAUDE_SMART_CLAUDE_BIN");
+        let mut fixture = isolated_env(&usage_with_no_viable_target());
+        let sid = "sid-switched-then-fable-0001";
+        spawn_fake_managed_process(&mut fixture, sid);
+
+        let smart_dir = fixture.home.path().join(".claude.shared").join("smart");
+        std::fs::create_dir_all(&smart_dir).expect("create smart_dir");
+        std::fs::write(smart_dir.join(format!("{sid}.switched")), "1700000000")
+            .expect("pre-write the .switched marker as if a prior hop already fired");
+
+        let capture = week_fable_capped_capture("/Users/example/.claude.limited", None);
+        run_from_statusline(
+            &format!(r#"{{"session_id": "{sid}", "cwd": "/tmp/proj"}}"#),
+            &capture,
+        );
+
+        let sentinel =
+            crate::platform::relaunch::read_relaunch(&smart_dir.join(format!("{sid}.relaunch")))
+                .expect("relaunch sentinel readable")
+                .expect("a pre-existing .switched marker must not block the fallback");
+        assert_eq!(sentinel.target_profile, "limited");
+        assert_eq!(
+            sentinel.model_override.as_deref(),
+            Some("opus"),
+            "the fallback must still fire even though .switched already exists"
+        );
+    }
+
+    /// The flip side: a `.switched` marker still blocks an ordinary
+    /// (non-fallback) trip exactly as before — only a `WeekFable` dimension
+    /// passes kill-switch 1c. A `week_all` cap on a session that already
+    /// switched must stay `Decision::Skip`, never a second account switch.
+    #[test]
+    fn run_from_statusline_week_all_cap_still_blocked_by_switched_marker() {
+        let _guard_cmd = crate::testenv::lock_for("CSM_USAGE_CMD");
+        let _guard_bin = crate::testenv::lock_for("CLAUDE_SMART_CLAUDE_BIN");
+        let mut fixture = isolated_env(&usage_with_one_viable_target());
+        let sid = "sid-switched-then-week-all-0001";
+        spawn_fake_managed_process(&mut fixture, sid);
+
+        let smart_dir = fixture.home.path().join(".claude.shared").join("smart");
+        std::fs::create_dir_all(&smart_dir).expect("create smart_dir");
+        std::fs::write(smart_dir.join(format!("{sid}.switched")), "1700000000")
+            .expect("pre-write the .switched marker as if a prior hop already fired");
+
+        let capture = capped_capture("/Users/example/.claude.limited");
+        run_from_statusline(
+            &format!(r#"{{"session_id": "{sid}", "cwd": "/tmp/proj"}}"#),
+            &capture,
+        );
+
+        assert!(
+            !smart_dir.join(format!("{sid}.relaunch")).exists(),
+            "a week_all trip on an already-switched session must stay blocked \
+             by kill-switch 1c, exactly as before this fallback existed"
+        );
+        // The pre-existing `.switched` file would ALSO make the later,
+        // unconditional exclusive claim in `run_from_statusline` fail on its
+        // own (it noclobber-creates the same path) — so the absence of
+        // `.relaunch` alone cannot tell kill-switch 1c firing early apart
+        // from 1c doing nothing and the claim failing instead further down.
+        // `.last-switch` (the machine-wide cooldown) is only ever touched at
+        // step 9, well after 1c's step 4b — so its absence is the real
+        // proof classify_with returned `Decision::Skip` at 4b and never
+        // reached the claim at all.
+        assert!(
+            !smart_dir.join(".last-switch").exists(),
+            "1c must return Skip at step 4b, before the cooldown at step 9 \
+             is ever touched"
         );
     }
 
@@ -913,9 +994,22 @@ mod tests {
 
         let log_path = smart_dir.join("limit-switch.log");
         let log = std::fs::read_to_string(&log_path).expect("limit-switch.log written");
+        let notify_lines: Vec<&str> = log.lines().filter(|l| l.contains("notify-only")).collect();
+        assert_eq!(
+            notify_lines.len(),
+            1,
+            "exactly one notify-only line — trip 2's suppression must be fully \
+             silent, not a second notify-only: {log:?}"
+        );
         assert!(
-            log.lines().any(|l| l.contains("notify-only")),
-            "trip 3's genuine notify-only must still be logged: {log:?}"
+            notify_lines[0].contains("week_all"),
+            "trip 3's notify-only must name week_all, the dimension that actually \
+             tripped it: {log:?}"
+        );
+        assert!(
+            !notify_lines.iter().any(|l| l.contains("week_fable")),
+            "no notify-only line may name week_fable — trip 2's suppressed repeat \
+             must never have produced one: {log:?}"
         );
         assert_eq!(
             log.lines().filter(|l| l.contains("limit-switch")).count(),
@@ -972,7 +1066,10 @@ mod tests {
         // exactly, so both checks below would catch it.
         const OLD_MARKER_EPOCH: i64 = 1_000_000_000; // 2001-09-09, long before any real run
         std::fs::remove_file(&relaunch_path).expect("remove first trip's sentinel");
-        std::fs::write(&marker_path, OLD_MARKER_EPOCH.to_string())
+        // Same profile ("limited") as the session is still on — this pins
+        // the STALENESS axis specifically, not the separate "different
+        // profile" axis `model_fallback_marker_is_current` also checks.
+        std::fs::write(&marker_path, format!("{OLD_MARKER_EPOCH} limited"))
             .expect("rewrite marker with an old epoch");
 
         spawn_fake_managed_process(&mut fixture, sid);
@@ -1014,14 +1111,20 @@ mod tests {
         // value (rather than "greater or equal", which a no-op would also
         // satisfy since the file would be untouched) proves the second
         // commit really happened.
-        let second_marker_epoch: i64 = std::fs::read_to_string(&marker_path)
-            .expect("marker still present after the renewed fallback")
-            .trim()
-            .parse()
+        let second_marker_content = std::fs::read_to_string(&marker_path)
+            .expect("marker still present after the renewed fallback");
+        let second_marker_epoch: i64 = second_marker_content
+            .split_whitespace()
+            .next()
+            .and_then(|s| s.parse().ok())
             .expect("marker holds an epoch");
         assert_ne!(
             second_marker_epoch, OLD_MARKER_EPOCH,
             "the renewed fallback must overwrite the marker with a current epoch"
+        );
+        assert!(
+            second_marker_content.trim().ends_with("limited"),
+            "the renewed marker must still record the current profile: {second_marker_content:?}"
         );
 
         // Each fresh fallback logs its own limit-switch line; a suppressed
@@ -1035,6 +1138,66 @@ mod tests {
                 .count(),
             2,
             "both the first fallback and the renewed one after staleness must log: {log:?}"
+        );
+    }
+
+    /// A `.model-fallback` marker written for a DIFFERENT profile must never
+    /// suppress a fallback on the CURRENT one: the marker belongs to the
+    /// account it was written on, not to the session id alone. Without this,
+    /// a session that switched accounts once (replaying the same sidecar
+    /// model onto the new account, since the fallback never touches it)
+    /// would find the old account's still-fresh marker and stay silently
+    /// stranded on the new account's own capped Fable model.
+    #[test]
+    fn run_from_statusline_fable_cap_foreign_profile_marker_does_not_suppress() {
+        let _guard_cmd = crate::testenv::lock_for("CSM_USAGE_CMD");
+        let _guard_bin = crate::testenv::lock_for("CLAUDE_SMART_CLAUDE_BIN");
+        let mut fixture = isolated_env(&usage_with_no_viable_target());
+        let sid = "sid-foreign-marker-0001";
+        spawn_fake_managed_process(&mut fixture, sid);
+
+        let smart_dir = fixture.home.path().join(".claude.shared").join("smart");
+        std::fs::create_dir_all(&smart_dir).expect("create smart_dir");
+        let marker_path = smart_dir.join(format!("{sid}.model-fallback"));
+        // 3 days before the reset this tick reports — comfortably inside
+        // the current 7-day window (so `model_fallback_marker_is_stale`
+        // alone reads it as fresh), but written for "other" — an account
+        // this session is NOT on. This isolates the profile axis from the
+        // separate staleness axis: only the profile mismatch can explain a
+        // suppression here.
+        const RESETS_AT: i64 = 4_100_000_000;
+        std::fs::write(&marker_path, format!("{} other", RESETS_AT - 3 * 86_400))
+            .expect("pre-write a marker for a different profile");
+
+        let capture = week_fable_capped_capture("/Users/example/.claude.limited", Some(RESETS_AT));
+        run_from_statusline(
+            &format!(r#"{{"session_id": "{sid}", "cwd": "/tmp/proj"}}"#),
+            &capture,
+        );
+
+        let sentinel =
+            crate::platform::relaunch::read_relaunch(&smart_dir.join(format!("{sid}.relaunch")))
+                .expect("relaunch sentinel readable")
+                .expect("a foreign-profile marker must not suppress the fallback");
+        assert_eq!(sentinel.target_profile, "limited");
+        assert_eq!(
+            sentinel.model_override.as_deref(),
+            Some("opus"),
+            "the fallback must fire on the current account despite the foreign marker"
+        );
+
+        // The fallback rewrites the marker for the CURRENT profile — a
+        // reader a moment from now must see this account's own claim, not
+        // the leftover "other" one.
+        let content =
+            std::fs::read_to_string(&marker_path).expect("marker present after the fallback");
+        assert!(
+            content.trim().ends_with("limited"),
+            "the marker must now record the current profile, not the foreign one: {content:?}"
+        );
+        assert!(
+            !content.trim().ends_with("other"),
+            "the foreign profile's claim must not survive: {content:?}"
         );
     }
 
@@ -1076,9 +1239,17 @@ mod tests {
 
         let content =
             std::fs::read_to_string(&marker_path).expect("marker present after self-heal");
+        let mut fields = content.split_whitespace();
         assert!(
-            content.trim().parse::<i64>().is_ok(),
+            fields
+                .next()
+                .is_some_and(|epoch| epoch.parse::<i64>().is_ok()),
             "the self-healed marker must hold a valid, complete epoch: {content:?}"
+        );
+        assert_eq!(
+            fields.next(),
+            Some("limited"),
+            "the self-healed marker must record the current profile: {content:?}"
         );
     }
 
@@ -1104,7 +1275,10 @@ mod tests {
             // Tick A: wins the claim and commits successfully — no pidfile
             // is needed for `commit_and_stop` to succeed (an unmanaged
             // session is a no-op stop, not a failure).
-            assert!(stop::claim_model_fallback(sid), "tick A must win the claim");
+            assert!(
+                stop::claim_model_fallback(sid, "limited"),
+                "tick A must win the claim"
+            );
             stop::commit_and_stop(sid, "limited", "resume", "/tmp/proj", 0, Some("opus"))
                 .expect("tick A's commit succeeds");
             let marker_path = smart_dir.join(format!("{sid}.model-fallback"));
@@ -1112,7 +1286,7 @@ mod tests {
 
             // Tick B: an overlapping claim for the SAME session must lose.
             assert!(
-                !stop::claim_model_fallback(sid),
+                !stop::claim_model_fallback(sid, "limited"),
                 "tick B must lose the claim — tick A already holds the marker"
             );
             let after_b = std::fs::read_to_string(&marker_path).expect("marker still present");
@@ -1124,8 +1298,8 @@ mod tests {
     }
 
     /// A week_all cap (an ordinary account-saturation signal, not a
-    /// model-scoped one) must still switch accounts exactly as before C44:
-    /// no `model_override`, hop bumped, `.switched` claimed.
+    /// model-scoped one) must still switch accounts exactly as it always
+    /// has: no `model_override`, hop bumped, `.switched` claimed.
     #[test]
     fn run_from_statusline_week_all_cap_still_switches_accounts() {
         let _guard_cmd = crate::testenv::lock_for("CSM_USAGE_CMD");

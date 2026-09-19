@@ -80,11 +80,20 @@
 //! as `live_limit`, which takes it as limited + definitive at step 3 and runs
 //! every other step unchanged. Freshness is that of the tick itself for
 //! session/week_all and of the last usage-API probe for week_fable (same
-//! bound as tier-2).
+//! bound as tier-2). This path must do no usage I/O of its own from here on:
+//! the merged reading was already assembled by the capture step before
+//! `classify_with` ever runs, so 5b's marker check reads `resets_at` straight
+//! off the `LimitHit` this section produced rather than opening the usage
+//! cache a second time (see [`LimitHit`]'s doc) — a tick that runs about once
+//! a second for every live session cannot afford an extra read on top of the
+//! one the capture step already did.
 //!
 //! # Flow (matches the legacy shell implementation exactly)
 //!
-//! 1. Kill-switches (env var, file marker, .switched marker).
+//! 1. Kill-switches 1a/1b (env var, file marker) — cheap and
+//!    dimension-independent, so they still run first. 1c (the `.switched`
+//!    marker) needs the tripped dimension to decide anything, so it moves to
+//!    step 4b, right after detection.
 //! 2. Reason gate → user_quit flag (doesn't exit yet — detection still runs).
 //! 3. Detect (tier-0 / tier-2). Tier-0 short-circuits the other two outcomes:
 //!    `NotLimit` → immediate `Skip` (a non-limit StopFailure is never a limit,
@@ -92,56 +101,77 @@
 //!    limited, `definitive = true`; `NotApplicable` (not a StopFailure) →
 //!    fall through to tier-2 exactly as before, `definitive = false`.
 //! 4. If not limited → exit (with user-quit log if user_quit).
+//!
+//! 4b. Kill-switch 1c: a `.switched` marker already on disk for this session
+//! blocks every dimension EXCEPT `WeekFable` while the fallback is enabled
+//! (see [`switched_marker_blocks`]). 1c exists to stop account-switch loops;
+//! a `WeekFable` trip that goes on to fall back at 5b never switches an
+//! account, spends no hop, and carries its own one-shot marker, so it must
+//! not be stopped by a switch an EARLIER, different-dimension trip already
+//! made on this same session. With the fallback disabled
+//! (`CLAUDE_FABLE_FALLBACK=0`) a `WeekFable` trip is blocked here exactly
+//! like any other dimension, matching the pre-fallback behaviour the knob is
+//! meant to restore.
+//!
 //! 5. If user_quit + limited → notify-only (deduped via .detected).
 //!
 //! 5b. Fable-cap same-account model fallback (sits between steps 5 and 6): a
 //! `week_fable` (model-scoped weekly cap) trip does not exclude the account
 //! or consume the account-switch hop budget — the account still has headroom
 //! on every other model. When `CLAUDE_FABLE_FALLBACK` (default on) is
-//! enabled and this session hasn't already used its one-shot fallback
-//! (`<sid>.model-fallback`, and that marker is not stale — see
-//! [`model_fallback_marker_is_stale`]), `target_profile` is set to
+//! enabled and this session hasn't already used its one-shot fallback on the
+//! CURRENT profile (`<sid>.model-fallback`, current for this profile and not
+//! stale — see [`model_fallback_marker_is_stale`] and
+//! [`model_fallback_marker_is_current`]), `target_profile` is set to
 //! `current_profile` and the relaunch carries `model_override` (default
 //! fallback model `CLAUDE_FABLE_FALLBACK_MODEL`, default `"opus"`) instead of
-//! picking a different account.
+//! picking a different account. A marker written on a DIFFERENT profile (an
+//! ordinary account switch moved this session off the account that wrote it)
+//! does not count either — see [`model_fallback_marker_is_current`] — so a
+//! fresh fallback can fire and rewrite it for the account the session is on
+//! now.
 //!
 //! 5c. Suppress a repeat trip within the same fallback window, silently: once
-//! the one-shot marker exists and is still fresh, a further `week_fable` trip
-//! this session is `Decision::Skip` rather than falling through to step 6 or
-//! notifying again. `week_fable` stays capped for days, so falling through to
-//! the ordinary account-switch path on the very next tick would undo the
-//! fallback within seconds of it firing, and could even land the session on
-//! another Fable-capped account now that such an account is pickable again
-//! (see the module's viability note); and the fallback itself was already
-//! logged when it fired, so the repeat trip has nothing new to say — a
-//! notify-only here would also consume the session's one-shot `.detected`
-//! slot for nothing, silently swallowing a later, genuinely new notify-only
-//! (say a `week_all` cap with no viable target) for the rest of this session.
-//! This is bounded, not permanent: once the marker goes stale (the weekly
-//! window rolled over), `already_fell_back` reads false again and 5b's
+//! the one-shot marker exists, is current for this profile, and is still
+//! fresh, a further `week_fable` trip this session is `Decision::Skip`
+//! rather than falling through to step 6 or notifying again. `week_fable`
+//! stays capped for days, so falling through to the ordinary account-switch
+//! path on the very next tick would undo the fallback within seconds of it
+//! firing, and could even land the session on another Fable-capped account
+//! now that such an account is pickable again — week_fable no longer
+//! constrains viability at all, see `scoring::is_viable_pcts`'s doc; and the
+//! fallback itself was already logged when it fired, so the repeat trip has
+//! nothing new to say — a notify-only here would also consume the session's
+//! one-shot `.detected` slot for nothing, silently swallowing a later,
+//! genuinely new notify-only (say a `week_all` cap with no viable target) for
+//! the rest of this session. This is bounded, not permanent: once the marker
+//! goes stale (the weekly window rolled over) or belongs to a profile this
+//! session has since left, `already_fell_back` reads false again and 5b's
 //! fallback can fire once more. Gated on `CLAUDE_FABLE_FALLBACK` too — with
 //! the knob off the whole feature is meant to be inert, so a stale-knob
 //! marker from an earlier run must fall through to the ordinary
 //! account-switch path, not be silently swallowed. `session` and `week_all`
 //! trips never reach this step — `already_fell_back` is never set for them.
 //!
-//! 6. Pick target profile (skipped when 5b already set `target_profile`).
-//! 7. If no target → notify-only (deduped via .detected).
-//! 8. If CLAUDE_AUTO_SWITCH_RELAUNCH != "1" → notify-only (deduped via .detected).
-//! 9. Managed-session gate: check .pid file.
-//! 10. Cooldown gate (noclobber .last-switch) — skipped entirely for a 5b
-//!     fallback (a same-account model change claims no shared resource and
-//!     must not be blocked by, or stamp, another session's cooldown);
-//!     otherwise EXCEPT when `definitive` from step 3: a tier-0 or
-//!     statusline-tick signal is never blocked by this cooldown (each
-//!     csm-supervised session sharing a now-capped account gets its own
-//!     independent StopFailure and must be allowed to switch off it, not just
-//!     the first one to notice — see the step-9 comment in [`classify`]). The
-//!     stamp is still refreshed/claimed best-effort either way for a
-//!     non-fallback call, so pct-based (tier-2) detections elsewhere keep
-//!     today's throttle.
-//! 11. Hop guard (skipped for a 5b fallback — see [`fable_fallback_model`]).
-//!     → Decision::LimitSwitch { target_profile, handoff, cwd, born, model_override }.
+//! 6. Pick target profile (skipped when 5b already set `target_profile`; no
+//!    viable target → notify-only, deduped via .detected).
+//! 7. If CLAUDE_AUTO_SWITCH_RELAUNCH != "1" → notify-only (deduped via .detected).
+//! 8. Managed-session gate: check .pid file.
+//! 9. Cooldown gate (noclobber .last-switch) — skipped entirely for a 5b
+//!    fallback (a same-account model change claims no shared resource and
+//!    must not be blocked by, or stamp, another session's cooldown);
+//!    otherwise EXCEPT when `definitive` from step 3: a tier-0 or
+//!    statusline-tick signal is never blocked by this cooldown (each
+//!    csm-supervised session sharing a now-capped account gets its own
+//!    independent StopFailure and must be allowed to switch off it, not just
+//!    the first one to notice — see the step-9 comment in [`classify`]). The
+//!    stamp is still refreshed/claimed best-effort either way for a
+//!    non-fallback call, so pct-based (tier-2) detections elsewhere keep
+//!    today's throttle.
+//! 10. Hop guard (skipped for a 5b fallback — see [`fable_fallback_model`]).
+//! 11. Build the handoff prompt (a 5b fallback gets its own wording — see
+//!     [`build_fallback_handoff`]) → `Decision::LimitSwitch { target_profile,
+//!     handoff, cwd, born, model_override }`.
 
 use std::path::Path;
 
@@ -180,8 +210,8 @@ pub struct HookInput {
 
     /// Path to the `.jsonl` transcript file for this session. Claude Code
     /// still sends this on every event (part of the stdin contract in the
-    /// module doc above); nothing in this crate reads it since C13 deleted
-    /// the tier-1/tier-3 transcript scanners that used to.
+    /// module doc above); nothing in this crate reads it since the tier-1 and
+    /// tier-3 transcript scanners that used to were deleted.
     #[allow(dead_code)]
     pub transcript_path: Option<String>,
 
@@ -370,32 +400,42 @@ pub fn parse_input(raw: &str) -> anyhow::Result<HookInput> {
 /// Reproduces the full legacy shell implementation's flow exactly, plus a tier-0 step
 /// (StopFailure) the shell source predates:
 ///
-/// 1. Kill-switches (env, file, .switched marker)
+/// 1. Kill-switches 1a/1b (env, file) — cheap, dimension-independent
 /// 2. Reason gate (user_quit flag — note: does NOT short-circuit yet, detection still runs)
 /// 3. Detect (tier-0 StopFailure / tier-2) — a tier-0 `NotLimit` verdict
 ///    exits immediately with `Skip`, bypassing tier-2
 /// 4. No limit signal → Skip
+///
+/// 4b. Kill-switch 1c: a `.switched` marker for this session blocks every
+/// dimension except `WeekFable` while the fallback is enabled — see
+/// [`switched_marker_blocks`]. Moved here (rather than into step 1) because
+/// it needs the dimension `Detect` just produced.
+///
 /// 5. user_quit + limited → NotifyOnly (deduped via .detected)
 ///
 /// 5b. Fable-cap same-account model fallback check (see [`fable_fallback_model`]):
 /// on `Some(model)`, `target_profile` is fixed to the current profile and
-/// steps 6, 10, and 11 are all skipped.
+/// steps 6, 9, and 10 are all skipped.
 ///
 /// 5c. On `None` from a `week_fable` dimension while the one-shot marker is
-/// still fresh, the trip is silently suppressed (`Decision::Skip`) rather
-/// than notified or falling through — see the module doc's 5c section and
-/// [`model_fallback_marker_is_stale`]. `None` from `session`/`week_all` (or
-/// from a `week_fable` trip whose marker has gone stale, or with the fallback
-/// knob off) runs the existing path below unchanged.
+/// still current for this profile and fresh, the trip is silently suppressed
+/// (`Decision::Skip`) rather than notified or falling through — see the
+/// module doc's 5c section, [`model_fallback_marker_is_stale`] and
+/// [`model_fallback_marker_is_current`]. `None` from `session`/`week_all`
+/// (or from a `week_fable` trip whose marker has gone stale, belongs to a
+/// different profile, or with the fallback knob off) runs the existing path
+/// below unchanged.
 ///
-/// 6. Pick target profile (exclude current) via account::pick_account — skipped by 5b
-/// 7. No viable target → NotifyOnly (deduped via .detected)
-/// 8. CLAUDE_AUTO_SWITCH_RELAUNCH != "1" → NotifyOnly (deduped via .detected)
-/// 9. Managed-session gate (.pid file)
-/// 10. Machine-wide cooldown (noclobber .last-switch) — skipped entirely by a
-///     5b fallback; otherwise skipped when the tier-0 signal was
-///     `definitive` (see `cooldown_should_block`)
-/// 11. Hop guard — skipped by 5b
+/// 6. Pick target profile (exclude current) via account::pick_account —
+///    skipped by 5b; no viable target → NotifyOnly (deduped via .detected)
+/// 7. CLAUDE_AUTO_SWITCH_RELAUNCH != "1" → NotifyOnly (deduped via .detected)
+/// 8. Managed-session gate (.pid file)
+/// 9. Machine-wide cooldown (noclobber .last-switch) — skipped entirely by a
+///    5b fallback; otherwise skipped when the tier-0 signal was
+///    `definitive` (see `cooldown_should_block`)
+/// 10. Hop guard — skipped by 5b
+/// 11. Build the handoff prompt — 5b gets its own wording (see
+///     [`build_fallback_handoff`])
 ///     → LimitSwitch
 pub fn classify(input: &HookInput, owner_dir: &Path) -> anyhow::Result<Decision> {
     classify_with(input, owner_dir, None)
@@ -429,9 +469,11 @@ pub fn classify_with(
         _ => return Ok(Decision::Skip),
     };
 
-    // ── 1. Kill-switches (cheapest checks first) ──────────────────────────────
+    // ── 1. Kill-switches 1a/1b (cheapest checks first) ────────────────────────
     // Shell: the legacy shell implementation
-    if kill_switches_engaged(sid) {
+    // 1c (the `.switched` marker) is deferred to step 4b below — it needs the
+    // tripped dimension, which isn't known yet at this point.
+    if kill_switches_engaged() {
         return Ok(Decision::Skip);
     }
 
@@ -485,6 +527,18 @@ pub fn classify_with(
 
     // ──────────────── Limit detected from this point on ──────────────────────
 
+    // ── 4b. Kill-switch 1c: `.switched` (deferred until the dimension is known) ──
+    // Shell: the legacy shell implementation blocked on `.switched` at step 1
+    // unconditionally; this crate defers that block to here so a `WeekFable`
+    // trip — which never switches an account itself — isn't stopped by a
+    // switch an earlier, different-dimension trip already made on this same
+    // session. See `switched_marker_blocks`'s doc and the module doc's 4b
+    // section.
+    if paths::switched(sid).exists() && switched_marker_blocks(dimension, fable_fallback_enabled())
+    {
+        return Ok(Decision::Skip);
+    }
+
     // ── 5. User-quit + limited → one-shot notify (deduped via .detected) ─────
     // Shell: the legacy shell implementation
     // NEVER kill/relaunch on a session the user explicitly closed.
@@ -506,35 +560,50 @@ pub fn classify_with(
     // unless the knob is off or this session already used its one-shot
     // fallback. Checked before the target pick (step 6) so a Fable-only cap
     // never excludes an otherwise-healthy account or consumes the
-    // account-switch hop guard (step 11). See `fable_fallback_model`'s own doc
+    // account-switch hop guard (step 10). See `fable_fallback_model`'s own doc
     // for the full loop-safety reasoning.
     // Only a `week_fable` trip can ever set `already_fell_back` — reading the
-    // marker, let alone judging its staleness, cannot change the outcome for
-    // a `session`/`week_all` trip, so skip the I/O entirely for those: no
-    // marker file read on this profile's smart_dir, and (since
-    // `week_fable_resets_at` below came from the same `LimitHit` that already
-    // told us we were limited — see `LimitHit`'s doc) no separate usage-cache
-    // read either, even on a genuine `week_fable` trip. That matters most on
-    // the statusline tick, which must stay free of any usage I/O beyond what
-    // detecting the trip itself already required.
+    // marker, let alone judging its staleness or which profile it belongs to,
+    // cannot change the outcome for a `session`/`week_all` trip, so skip the
+    // I/O entirely for those: no marker file read on this profile's
+    // smart_dir, and (since `week_fable_resets_at` below came from the same
+    // `LimitHit` that already told us we were limited — see `LimitHit`'s doc)
+    // no separate usage-cache read either, even on a genuine `week_fable`
+    // trip. That matters most on the statusline tick, which must stay free
+    // of any usage I/O beyond what detecting the trip itself already
+    // required.
+    //
+    // The marker belongs to the account it was written on (see
+    // `model_fallback_marker_is_current`'s doc): a marker written while this
+    // session was on a DIFFERENT profile does not count,
+    // exactly like a stale one, because an ordinary account-switch cap
+    // (`session`/`week_all`) can move this session off the account the
+    // marker was written for without ever touching `.model-fallback` itself.
     let already_fell_back = if dimension == LimitDimension::WeekFable {
-        match model_fallback_marker_epoch(sid) {
-            Some(marker_epoch) => {
-                let stale = model_fallback_marker_is_stale(marker_epoch, week_fable_resets_at);
-                if stale {
-                    // Belongs to an earlier week_fable window. Remove it now,
-                    // at the moment it's judged stale, so a fresh fallback's
-                    // exclusive claim (`stop::claim_model_fallback`) lands on
-                    // an empty slot instead of the noclobber claim needlessly
-                    // failing closed against a leftover file from a window
-                    // that has already rolled over.
+        match model_fallback_marker_read(sid) {
+            Some((marker_epoch, marker_profile)) => {
+                let current = model_fallback_marker_is_current(
+                    &marker_profile,
+                    &current_profile,
+                    marker_epoch,
+                    week_fable_resets_at,
+                );
+                if !current {
+                    // Belongs to an earlier week_fable window, or to a
+                    // profile this session has since left. Remove it now, at
+                    // the moment it's judged not current, so a fresh
+                    // fallback's exclusive claim
+                    // (`stop::claim_model_fallback`) lands on an empty slot
+                    // instead of the noclobber claim needlessly failing
+                    // closed against a leftover file from a window or
+                    // account that no longer applies.
                     let _ = std::fs::remove_file(paths::model_fallback(sid));
                 }
-                !stale
+                current
             }
             // No marker at all, OR one present that doesn't parse (garbage —
             // a hand edit, or an older marker format; see
-            // `model_fallback_marker_epoch`'s doc). Both read as "no fallback
+            // `model_fallback_marker_read`'s doc). Both read as "no fallback
             // recorded for the current window" rather than an
             // `.exists()`-only check, which would read a corrupt marker as
             // "definitely already fell back" and, under 5c, bar the session
@@ -751,8 +820,9 @@ pub fn classify_with(
 // with no new seams beyond `classify_with`'s own pre-existing section
 // boundaries.
 
-/// Step 1 (banners 1a/1b/1c): the three kill-switches, cheapest first.
-fn kill_switches_engaged(sid: &str) -> bool {
+/// Step 1 (banners 1a/1b): the two kill-switches that do not depend on the
+/// tripped dimension, cheapest first. Kill-switch 1c runs at step 4b.
+fn kill_switches_engaged() -> bool {
     use crate::paths;
 
     // 1a. Env var kill-switch: CLAUDE_AUTO_SWITCH=0
@@ -768,12 +838,27 @@ fn kill_switches_engaged(sid: &str) -> bool {
         return true;
     }
 
-    // 1c. Already switched this session: .switched marker (fast path)
-    if paths::switched(sid).exists() {
-        return true;
-    }
-
+    // 1c (the `.switched` marker) is checked separately, at step 4b, once the
+    // tripped dimension is known — see `switched_marker_blocks`.
     false
+}
+
+/// Step 4b (kill-switch 1c, deferred): does an existing `.switched` marker
+/// block this trip?
+///
+/// `true` for every dimension except `WeekFable` while the fallback is
+/// enabled. 1c exists to cap how often ONE session can switch accounts; a
+/// `WeekFable` trip that goes on to fall back at 5b never switches an
+/// account, spends no hop, and is guarded by its own one-shot
+/// `.model-fallback` marker instead, so an EARLIER, different-dimension
+/// switch's `.switched` marker must not strand it — that is the stranding
+/// bug this predicate fixes (see the module doc's 4b section). With the
+/// fallback disabled (`enabled == false`), a `WeekFable` trip is blocked here
+/// exactly like any other dimension: the whole fallback feature is meant to
+/// be inert with the knob off, so `.switched` must keep doing what it always
+/// did.
+pub(crate) fn switched_marker_blocks(dimension: LimitDimension, enabled: bool) -> bool {
+    !(dimension == LimitDimension::WeekFable && enabled)
 }
 
 /// Outcome of the tier-0/tier-2 limit check (banners 3-4).
@@ -832,7 +917,7 @@ fn detect_limit(input: &HookInput, owner_dir: &Path, live_limit: Option<&LimitHi
 }
 
 /// Banners 5/6/7/8 tails: the one-shot notify deduped via the `.detected`
-/// noclobber marker, repeated verbatim at four exits in the pre-C15 fn.
+/// noclobber marker, shared by the four exits that used to repeat it inline.
 fn notify_once(sid: &str, body: String) -> Decision {
     use crate::paths;
 
@@ -858,8 +943,9 @@ fn pick_target(current_profile: &str) -> Option<String> {
     // Single viability authority: `resolve_target_from_pick` is a pure pass-through
     // over `account::pick_account_gated`'s verdict — the hook never recomputes or
     // second-guesses which profile is viable. Whatever `scoring::pick_best`
-    // excludes (session-limited, week_all-saturated, or — once fable-aware —
-    // week_fable-saturated) can therefore never come back as a relaunch target.
+    // excludes (session-limited or week_all-saturated — `week_fable` no
+    // longer constrains viability at all, see `scoring::is_viable_pcts`'s
+    // doc) can therefore never come back as a relaunch target.
     resolve_target_from_pick(target_result)
 }
 
@@ -873,7 +959,8 @@ fn relaunch_enabled() -> bool {
 
 /// `CLAUDE_FABLE_FALLBACK` defaults to `"1"` (fallback enabled); any other
 /// value disables it, so a `week_fable` trip falls through to the ordinary
-/// account-switch path exactly as it did before C44.
+/// account-switch path, whose target pick no longer excludes a
+/// Fable-saturated account either.
 fn fable_fallback_enabled() -> bool {
     std::env::var("CLAUDE_FABLE_FALLBACK").unwrap_or_else(|_| "1".into()) == "1"
 }
@@ -966,20 +1053,57 @@ pub(crate) fn model_fallback_marker_is_stale(
     }
 }
 
-/// I/O shell for [`model_fallback_marker_is_stale`]: read `<sid>.model-fallback`'s
-/// stored epoch, if the marker exists and parses. `None` covers both "no
-/// marker" and "marker present but unparseable" — the writer
-/// ([`crate::hook::stop::claim_model_fallback`]) always claims the marker via
-/// a private tmp file hard-linked into place, so a reader never observes a
-/// half-written file from that path; an unparseable marker here means
-/// something else wrote or edited the file directly. `classify_with` treats
-/// both cases the same way, as "no fallback recorded for the current
-/// window", rather than trying to tell them apart.
-fn model_fallback_marker_epoch(sid: &str) -> Option<i64> {
+/// Does a `<sid>.model-fallback` marker written on `marker_profile` at
+/// `marker_epoch` still count as "already fell back" for `current_profile`?
+///
+/// Sibling to [`model_fallback_marker_is_stale`], which handles the OTHER
+/// staleness axis (the weekly window elapsing). Both must hold for the
+/// marker to suppress a further fallback: it must be for the SAME account
+/// the session is on now, and not stale.
+///
+/// Without the profile check, a marker survives an ordinary account switch
+/// it never recorded: session S falls back to a model on account A, writing
+/// the marker; a later `week_all` cap on A switches S to B; the marker is
+/// still on disk (the fallback path never touches it, and an account switch
+/// never clears it) and still fresh, so if B's own `week_fable` later trips,
+/// A's marker would wrongly suppress the fallback S needs on B — 5c would
+/// fire silently and S would be stuck on a capped model with the actual
+/// fallback path never having run for its current account. Treating a
+/// foreign-profile marker exactly like a stale one — it doesn't count, it's
+/// removed, a fresh one may be written — closes that gap.
+pub(crate) fn model_fallback_marker_is_current(
+    marker_profile: &str,
+    current_profile: &str,
+    marker_epoch: i64,
+    week_fable_resets_at: Option<i64>,
+) -> bool {
+    marker_profile == current_profile
+        && !model_fallback_marker_is_stale(marker_epoch, week_fable_resets_at)
+}
+
+/// I/O shell for [`model_fallback_marker_is_current`]: read
+/// `<sid>.model-fallback`'s stored `<epoch> <profile>`, if the marker exists
+/// and parses. `None` covers "no marker" and "marker present but
+/// unparseable" alike — both the initial claim
+/// ([`crate::hook::stop::claim_model_fallback`]) and every later refresh
+/// ([`crate::hook::stop::commit_and_stop`]) write the exact same
+/// `"<epoch> <profile>"` shape, atomically (private tmp file hard-linked or
+/// renamed into place), so a reader never observes a half-written file, or
+/// one with an epoch but no profile, from either path; an unparseable marker
+/// here means something else wrote or edited the file directly.
+/// `classify_with` treats all of those cases the same way, as "no fallback
+/// recorded for the current window on this profile", rather than trying to
+/// tell them apart.
+fn model_fallback_marker_read(sid: &str) -> Option<(i64, String)> {
     use crate::paths;
-    std::fs::read_to_string(paths::model_fallback(sid))
-        .ok()
-        .and_then(|s| s.trim().parse::<i64>().ok())
+    let content = std::fs::read_to_string(paths::model_fallback(sid)).ok()?;
+    let mut parts = content.trim().splitn(2, ' ');
+    let epoch: i64 = parts.next()?.parse().ok()?;
+    let profile = parts.next()?.trim();
+    if profile.is_empty() {
+        return None;
+    }
+    Some((epoch, profile.to_string()))
 }
 
 /// Outcome of the managed-session gate (banner 8).
@@ -1222,10 +1346,10 @@ pub(crate) fn statusline_limit_hit(
 /// order only affects which description string comes back, not whether one
 /// does).
 ///
-/// Since C43, no production call site uses this `Option<String>` form
+/// No production call site uses this `Option<String>` form
 /// directly ([`detect_usage_threshold_hit`] and [`statusline_limit_hit`] both
 /// call [`usage_threshold_hit_at`] instead so they can keep the dimension
-/// tag) — this wrapper is kept solely so the pre-C43 tests below stay
+/// tag) — this wrapper is kept solely so the older tests below stay
 /// byte-for-byte unmodified.
 #[allow(dead_code)]
 pub(crate) fn usage_threshold_hit(
@@ -1281,7 +1405,8 @@ pub(crate) fn usage_threshold_hit_at(
 ///
 /// `Ok(Some(name))` → `name` IS the target; this function never recomputes,
 /// re-ranks, or filters it — whatever viability rule `scoring::pick_best`
-/// applies (session/week_all/week_fable) is the ONLY rule that ever runs.
+/// applies (session/week_all — `week_fable` no longer constrains viability,
+/// see `scoring::is_viable_pcts`'s doc) is the ONLY rule that ever runs.
 /// `Ok(None)` (no-op winner, not expected with `include_current=false` but
 /// handled defensively) or `Err(_)` (all saturated / fetch failed) → `None`,
 /// meaning no viable target: the caller must fall back to notify-only rather
@@ -1839,7 +1964,7 @@ mod tests {
         );
     }
 
-    // ── build_fallback_handoff (C44 same-account model fallback, 5b) ──────────
+    // ── build_fallback_handoff (same-account model fallback, 5b) ─────────────
 
     /// The default fallback handoff must name the CURRENT profile once (not
     /// as a "from [x] to [y]" pair — there is only one account here), name
@@ -2322,7 +2447,61 @@ mod tests {
         assert_eq!(hit.as_deref(), Some("session 99%"));
     }
 
-    // ── usage_threshold_hit_at (the LimitHit-tagged pure core, C43) ───────────
+    // ── detect_usage_threshold_hit (the Stop-hook tier-2 producer) ────────────
+
+    /// The Stop-hook tier-2 path must carry `week_fable`'s own `resets_at`
+    /// onto the `LimitHit` it produces, exactly like `statusline_limit_hit`
+    /// does for the statusline path — 5b's staleness check and 2's
+    /// per-account currency check both key off it, so a hit with `resets_at:
+    /// None` can never expire the one-shot fallback marker.
+    #[test]
+    fn detect_usage_threshold_hit_week_fable_carries_resets_at() {
+        let _guard = crate::testenv::lock_for("CSM_USAGE_CMD");
+        let home = tempfile::TempDir::new().unwrap();
+
+        let mut profiles = std::collections::HashMap::new();
+        profiles.insert(
+            "limited".to_string(),
+            crate::usage::model::ProfileUsage {
+                week_fable: Some(crate::usage::model::UsageSection {
+                    pct: 100,
+                    resets: None,
+                    resets_at: Some(1_700_000_000),
+                }),
+                ..Default::default()
+            },
+        );
+        let usage = crate::usage::model::UsageData {
+            captured_at: None,
+            profiles,
+            errors: None,
+            ..Default::default()
+        };
+        let usage_file = home.path().join("usage-cmd.json");
+        std::fs::write(&usage_file, serde_json::to_string(&usage).unwrap()).unwrap();
+
+        let prior_cmd = std::env::var_os("CSM_USAGE_CMD");
+        crate::testenv::set_var("CSM_USAGE_CMD", &format!("cat {}", usage_file.display()));
+
+        let hit = crate::testenv::with_test_home(home.path(), || {
+            detect_usage_threshold_hit(Path::new("/Users/example/.claude.limited"))
+        });
+
+        match prior_cmd {
+            Some(v) => crate::testenv::set_var("CSM_USAGE_CMD", &v.to_string_lossy()),
+            None => crate::testenv::remove_var("CSM_USAGE_CMD"),
+        }
+
+        let hit = hit.expect("week_fable at 100% must trip the tier-2 check");
+        assert_eq!(hit.dimension, LimitDimension::WeekFable);
+        assert_eq!(
+            hit.resets_at,
+            Some(1_700_000_000),
+            "the hit must carry week_fable's own resets_at, not None"
+        );
+    }
+
+    // ── usage_threshold_hit_at (the LimitHit-tagged pure core) ────────────────
 
     /// The typed core tags each of the three dimensions correctly, and still
     /// returns `None` when nothing crosses the threshold.
@@ -2409,7 +2588,7 @@ mod tests {
         assert_eq!(usage_threshold_hit(10, 20, Some(30), 99), None);
     }
 
-    // ── fable_fallback_model (5b, same-account model fallback, C44) ──────────
+    // ── fable_fallback_model (5b, same-account model fallback) ───────────────
 
     /// `session` and `week_all` trips never fall back to a model — neither is
     /// model-scoped, so a different model on the same account frees nothing;
@@ -2531,6 +2710,125 @@ mod tests {
         assert!(!model_fallback_marker_is_stale(i64::MIN, Some(resets_at)));
     }
 
+    // ── model_fallback_marker_is_current (per-account marker currency) ──────
+
+    /// Same profile, fresh epoch: counts.
+    #[test]
+    fn marker_is_current_when_same_profile_and_fresh() {
+        let resets_at = 1_718_000_000;
+        let marker_epoch = resets_at - 3 * 86_400;
+        assert!(model_fallback_marker_is_current(
+            "work",
+            "work",
+            marker_epoch,
+            Some(resets_at)
+        ));
+    }
+
+    /// A marker written on a DIFFERENT profile never counts, even with a
+    /// fresh epoch — the account it was written for is not the one the
+    /// session is on now.
+    #[test]
+    fn marker_is_not_current_for_a_different_profile() {
+        let resets_at = 1_718_000_000;
+        let marker_epoch = resets_at - 3 * 86_400;
+        assert!(!model_fallback_marker_is_current(
+            "work",
+            "home",
+            marker_epoch,
+            Some(resets_at)
+        ));
+    }
+
+    /// Same profile but a stale epoch never counts — the other axis
+    /// (`model_fallback_marker_is_stale`) still applies.
+    #[test]
+    fn marker_is_not_current_when_stale() {
+        let resets_at = 1_718_000_000;
+        let marker_epoch = resets_at - 8 * 86_400;
+        assert!(!model_fallback_marker_is_current(
+            "work",
+            "work",
+            marker_epoch,
+            Some(resets_at)
+        ));
+    }
+
+    // ── model_fallback_marker_read (parses "<epoch> <profile>") ──────────────
+
+    /// A well-formed marker parses to (epoch, profile) — driven through the
+    /// public path via a real file, since the fn itself is private.
+    #[test]
+    fn marker_read_parses_epoch_and_profile() {
+        let home = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(home.path().join(".claude.shared").join("smart")).unwrap();
+        crate::testenv::with_test_home(home.path(), || {
+            let sid = "sid-marker-read-0001";
+            std::fs::write(crate::paths::model_fallback(sid), "1700000000 work").unwrap();
+            assert_eq!(
+                model_fallback_marker_read(sid),
+                Some((1_700_000_000, "work".to_string()))
+            );
+        });
+    }
+
+    /// An old-format, epoch-only marker (no profile field) does not parse —
+    /// the on-disk shape changed to carry the profile, and since this feature
+    /// has never shipped in a release there is no back-compat obligation for
+    /// the old shape; it must self-heal like any other unparseable marker.
+    #[test]
+    fn marker_read_rejects_epoch_only_old_shape() {
+        let home = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(home.path().join(".claude.shared").join("smart")).unwrap();
+        crate::testenv::with_test_home(home.path(), || {
+            let sid = "sid-marker-read-old-shape-0001";
+            std::fs::write(crate::paths::model_fallback(sid), "1700000000").unwrap();
+            assert_eq!(model_fallback_marker_read(sid), None);
+        });
+    }
+
+    /// Missing marker file: no panic, reads as `None`.
+    #[test]
+    fn marker_read_missing_file_is_none() {
+        let home = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(home.path().join(".claude.shared").join("smart")).unwrap();
+        crate::testenv::with_test_home(home.path(), || {
+            assert_eq!(
+                model_fallback_marker_read("sid-marker-read-missing-0001"),
+                None
+            );
+        });
+    }
+
+    // ── switched_marker_blocks (1c passes a WeekFable trip through) ─────────
+
+    /// A `WeekFable` trip with the fallback enabled passes through — it goes
+    /// on to 5b, which never switches an account.
+    #[test]
+    fn switched_marker_does_not_block_week_fable_when_fallback_enabled() {
+        assert!(!switched_marker_blocks(LimitDimension::WeekFable, true));
+    }
+
+    /// A `WeekFable` trip with the fallback DISABLED is blocked exactly like
+    /// any other dimension — the knob-off case must restore pre-fallback
+    /// behaviour.
+    #[test]
+    fn switched_marker_blocks_week_fable_when_fallback_disabled() {
+        assert!(switched_marker_blocks(LimitDimension::WeekFable, false));
+    }
+
+    /// `Session` and `WeekAll` trips are always blocked, regardless of the
+    /// fallback knob — only a fallback-bound `WeekFable` trip is ever let
+    /// through.
+    #[test]
+    fn switched_marker_blocks_every_other_dimension_regardless_of_knob() {
+        assert!(switched_marker_blocks(LimitDimension::Session, true));
+        assert!(switched_marker_blocks(LimitDimension::WeekAll, true));
+        assert!(switched_marker_blocks(LimitDimension::Unknown, true));
+        assert!(switched_marker_blocks(LimitDimension::Session, false));
+        assert!(switched_marker_blocks(LimitDimension::WeekAll, false));
+    }
+
     // ── resolve_target_from_pick (single viability authority pass-through) ────
 
     /// A viable winner from pick_account passes straight through as the target.
@@ -2548,12 +2846,11 @@ mod tests {
         assert!(resolve_target_from_pick(result).is_none());
     }
 
-    /// `Err(AllSaturated)` — every profile is session/week_all/week_fable
-    /// capped — resolves to no target. This is the case a fable-only-capped
-    /// fleet (every account healthy on session/week_all but exhausted on the
-    /// model-scoped weekly cap) must land in once `scoring::pick_best`
-    /// excludes on week_fable: classify() must NOT write a relaunch sentinel
-    /// pointing at a capped profile — it must fall back to notify-only.
+    /// `Err(AllSaturated)` — every profile is session- or week_all-saturated
+    /// (`week_fable` no longer constrains viability, see
+    /// `scoring::is_viable_pcts`'s doc) — resolves to no target: classify()
+    /// must NOT write a relaunch sentinel pointing at a capped profile — it
+    /// must fall back to notify-only.
     #[test]
     fn resolve_target_none_on_all_saturated_err() {
         let result: crate::account::scoring::ScoringResult =

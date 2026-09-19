@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# e2e/scenarios.sh -- the 14 numbered limit-switch scenarios (plus 9b, 15
+# e2e/scenarios.sh -- the 15 numbered limit-switch scenarios (plus 9b, 16
 # VERDICT blocks in total), ported 1:1 from the original standalone harness
 # (same assertions, same numbering). Sourced by run.sh after lib.sh; expects
 # the same globals as lib.sh plus FIX_HEALTHY and FIX_BOTH (paths to the two
@@ -16,7 +16,9 @@
 # suppressed rather than relaunching again; 11/12/13/14 = argv-forwarding
 # details (session-shaping flags without the prompt, closing an open
 # --add-dir before the handoff, a plain `csm --profile b claude <args>`
-# passthrough, and a global --profile in front of a csm subcommand).
+# passthrough, and a global --profile in front of a csm subcommand); 15 = an
+# account switch followed by a same-account fallback on the NEW account,
+# proving the fallback survives a session that already spent its switch.
 
 run_all_scenarios() {
 
@@ -355,9 +357,9 @@ cat > "$SMART_DIR/usage/a.json" <<EOF
 EOF
 start_supervisor "s9" "$FIX_HEALTHY"
 if [[ -n "$SID" ]]; then
-  # `week_fable` alone must relax to a same-account model fallback (C44),
-  # never an account switch: this cap doesn't say anything about `b`'s
-  # headroom, and switching away would waste a hop the account doesn't need.
+  # `week_fable` alone must relax to a same-account model fallback, never an
+  # account switch: this cap doesn't say anything about `b`'s headroom, and
+  # switching away would waste a hop the account doesn't need.
   run_capture "$A_DIR" "$(statusline_json "$SID" /tmp/e2e-cwd-s9 12 45)"
   rpt "  tick exit=$CAP_EXIT stdout='$CAP_STDOUT'"
   wait_for_pattern "$FAKE_LOG" "SIGTERM pid=$CHILD_PID" 10
@@ -398,10 +400,11 @@ rpt ""
 # ═══════════════════════════════════════════════════════════════════════════
 rpt "----- Scenario 9b: a second statusline tick on the same still-capped week_fable reading is suppressed, not a duplicate relaunch -----"
 # Continues straight from Scenario 9's state, same live relaunched process
-# (never torn down above): its .model-fallback marker is fresh (the
-# fixture's resets_at is days away, well inside the 7-day window), and a's
-# stored week_fable reading is still 100% -- nothing here has changed it. A
-# second tick on that same unchanged reading must NOT relaunch again.
+# (never torn down above): its .model-fallback marker was just written this
+# same run, so it is fresh against the fixture's week_fable resets_at
+# regardless of when this suite happens to run, and a's stored week_fable
+# reading is still 100% -- nothing here has changed it. A second tick on that
+# same unchanged reading must NOT relaunch again.
 if [[ -n "$SID" ]] && [[ "$S9_PASS" == yes ]]; then
   PRE_N=$(count_invocations "$FAKE_LOG")
   PRE_LOG_LINES=$(wc -l < "$SMART_DIR/limit-switch.log" 2>/dev/null || echo 0)
@@ -589,6 +592,87 @@ if [[ "$S14_UUID_EXIT" == 0 && "$S14_N" == 0 && "$S14_N2" == 0 && "$S14_HELP_EXI
 else
   rpt "  VERDICT: FAIL"
 fi
+rpt ""
+
+# ═══════════════════════════════════════════════════════════════════════════
+rpt "----- Scenario 15: a rate-limit switch (a->b), then b's own stored week_fable falls back on b -----"
+CUR_FIXTURE="$FIX_HEALTHY"
+clear_last_switch
+mkdir -p "$SMART_DIR/usage"
+rm -f "$SMART_DIR/usage/a.json" "$SMART_DIR/usage/b.json"
+# b is already Fable-saturated before the switch even happens -- the user's
+# real flow: a fable-saturated account stays a pick candidate, so an
+# ordinary account switch off a can land the session on it.
+cat > "$SMART_DIR/usage/b.json" <<EOF
+{"profile":"b","captured_at":"2026-09-14T10:00:00Z","source":"api","api_captured_at":"2026-09-14T10:00:00Z","cooldown_until":null,"usage":{"captured_at":"2026-09-14T10:00:00Z","session":{"pct":10,"resets":null,"resets_at":1789985119},"week_all":{"pct":40,"resets":null,"resets_at":1789985119},"week_fable":{"pct":100,"resets":null,"resets_at":1789985119},"week_model_label":"Fable","session_stats":[],"source":"api","attention":null}}
+EOF
+start_supervisor "s15" "$FIX_HEALTHY"
+if [[ -n "$SID" ]]; then
+  TP="$TRANSCRIPTS_DIR/$SID.jsonl"
+  JSON=$(cat <<EOF
+{"session_id":"$SID","transcript_path":"$TP","cwd":"/tmp/e2e-cwd-s15","permission_mode":"default","hook_event_name":"StopFailure","error":"rate_limit","error_details":"You have reached your weekly limit."}
+EOF
+)
+  run_hook "$A_DIR" "$JSON"
+  rpt "  switch hook exit=$HOOK_EXIT stdout=$HOOK_STDOUT"
+  wait_for_pattern "$FAKE_LOG" "SIGTERM pid=$CHILD_PID" 10
+  wait_for_invocation_count "$FAKE_LOG" 2 10
+  N=$(count_invocations "$FAKE_LOG")
+  rpt "  invocation count after the switch: $N"
+  S15_SWITCH_OK=no
+  if (( N >= 2 )); then
+    RELAUNCH_CFG=$(get_invocation_configdir "$FAKE_LOG" 2)
+    RELAUNCH_VERB=$(get_invocation_field "$FAKE_LOG" 2 1)
+    RELAUNCH_SID=$(get_invocation_field "$FAKE_LOG" 2 2)
+    RELAUNCH_PID=$(get_invocation_pid "$FAKE_LOG" 2)
+    rpt "  switch relaunch: verb=$RELAUNCH_VERB sid=$RELAUNCH_SID config_dir=$RELAUNCH_CFG pid=$RELAUNCH_PID"
+    [[ "$RELAUNCH_VERB" == "--resume" && "$RELAUNCH_SID" == "$SID" && "$RELAUNCH_CFG" == "$B_DIR" ]] && S15_SWITCH_OK=yes
+  fi
+  rpt "  .switched marker present? $(test -f "$SMART_DIR/$SID.switched" && echo yes || echo no) (must be yes -- this session already spent its switch)"
+
+  if [[ "$S15_SWITCH_OK" == yes ]]; then
+    # b's own tick: session/week_all healthy on this reading, but the store
+    # still carries b's week_fable at 100% from before the switch, merged in
+    # exactly like Scenario 9 -- only now on the account this session just
+    # switched TO, with .switched already on disk from the hop above. This
+    # is the fix under test: kill-switch 1c must let a WeekFable trip
+    # through despite .switched, and the marker it writes must be judged
+    # against the CURRENT account, not suppressed by a stale idea of one.
+    run_capture "$B_DIR" "$(statusline_json "$SID" /tmp/e2e-cwd-s15 12 45)"
+    rpt "  b tick exit=$CAP_EXIT stdout='$CAP_STDOUT'"
+    wait_for_pattern "$FAKE_LOG" "SIGTERM pid=$RELAUNCH_PID" 10
+    wait_for_invocation_count "$FAKE_LOG" 3 10
+    N2=$(count_invocations "$FAKE_LOG")
+    rpt "  invocation count after b's tick: $N2"
+    FLAGS_OK=no
+    if (( N2 >= 3 )); then
+      FALLBACK_CFG=$(get_invocation_configdir "$FAKE_LOG" 3)
+      FALLBACK_VERB=$(get_invocation_field "$FAKE_LOG" 3 1)
+      FALLBACK_SID=$(get_invocation_field "$FAKE_LOG" 3 2)
+      FALLBACK_PID=$(get_invocation_pid "$FAKE_LOG" 3)
+      rpt "  fallback relaunch: verb=$FALLBACK_VERB sid=$FALLBACK_SID config_dir=$FALLBACK_CFG pid=$FALLBACK_PID"
+      if get_invocation_argv "$FAKE_LOG" 3 \
+        | awk '/^--model$/{getline; if ($0=="opus") found=1} END{exit !found}'; then
+        FLAGS_OK=yes
+      fi
+      rpt "  fallback carries --model opus adjacent? $FLAGS_OK"
+    fi
+    rpt "  limit-switch.log tail:"
+    rpt "$(tail -3 "$SMART_DIR/limit-switch.log" 2>/dev/null)"
+    if (( N2 >= 3 )) && [[ "$FALLBACK_VERB" == "--resume" && "$FALLBACK_SID" == "$SID" && "$FALLBACK_CFG" == "$B_DIR" ]] \
+       && [[ "$FLAGS_OK" == yes ]]; then
+      rpt "  VERDICT: PASS"
+    else
+      rpt "  VERDICT: FAIL"
+    fi
+    if (( N2 >= 3 )); then safe_term "$FALLBACK_PID"; else safe_term "$RELAUNCH_PID"; fi
+  else
+    rpt "  SKIPPED: the a->b switch did not commit, cannot test b's own fallback"
+    rpt "  VERDICT: FAIL"
+    safe_term "$RELAUNCH_PID"
+  fi
+fi
+safe_term "$SUP_PID"
 rpt ""
 
 }

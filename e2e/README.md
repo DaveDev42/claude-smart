@@ -19,7 +19,7 @@ a log file and blocks on `SIGTERM`:
   percentages), the path a subscription cap actually takes since Claude Code
   parks that case in an auto-retry wait with no hook at all.
 
-14 scenarios; the first ten keep the numbering of the original
+15 scenarios; the first ten keep the numbering of the original
 standalone harness:
 
 1. `StopFailure rate_limit`, profile `a` capped, `b` healthy, switch cooldown
@@ -56,6 +56,11 @@ standalone harness:
 14. `csm --profile b newuuid` and `csm run --help` → both run csm's own code
     and start no claude at all, which is what the global `--profile` bug and
     the forwarded `--help` used to get wrong.
+15. `a` hits a rate limit and switches to `b`, whose seeded store already
+    shows `week_fable` at 100% (a Fable-saturated account stays a pick
+    candidate). A statusline tick on `b` then falls back to Opus on `b`
+    itself instead of being blocked by the switch `a` already spent — the
+    fallback and the account-switch budget are independent.
 
 ## Running it
 
@@ -73,7 +78,7 @@ fresh `mktemp -d` sandbox with its own `HOME` and its own
 `~/.config/claude-as/profiles.json` (two profiles, `a` and `b`, registered
 exactly the way `csm profiles add` does it — plugins/projects symlinked to a
 shared SSOT, same as a real install), points `CSM_USAGE_API_BASE` at an
-unrouted local port so no scenario can ever reach the network, runs all 10
+unrouted local port so no scenario can ever reach the network, runs all
 scenarios, prints the full report, and tears down: only PIDs the harness
 itself started and recorded are ever signalled (never a name-based
 `pkill`/`killall`), and the sandbox is removed unless `--keep`. Exits non-zero
@@ -86,7 +91,7 @@ Whole run takes well under a minute locally.
 - `run.sh` — entry point (sandbox setup, build, teardown).
 - `lib.sh` — polling/assertion/process helpers, plus the `csm hook` /
   `csm usage capture` / supervisor-launch wrappers each scenario calls.
-- `scenarios.sh` — the 14 scenarios themselves.
+- `scenarios.sh` — the 15 scenarios themselves.
 - `fake-claude/claude.c` — the fake `claude`: logs its invocation, blocks on
   `SIGTERM`. POSIX-only (the relaunch loop it exercises is a POSIX
   fork/signal path); built fresh by `run.sh` for every run, never committed as

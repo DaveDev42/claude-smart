@@ -584,17 +584,23 @@ which one tripped. The `StopFailure` hook cannot — a raw 429 carries no
 dimension, only `error: "rate_limit"` — so it always falls through to the
 ordinary account-switch path, never a model fallback.
 This is one-shot per weekly window, tracked by a `<sid>.model-fallback`
-marker: a further `week_fable` trip while that marker is still fresh for the
-current window is suppressed silently, not escalated to a switch and not
-notified again, since the reading typically stays capped for days and
-switching on it would just undo the fallback on the very next tick; once the
-window rolls over the marker no longer counts and a fresh fallback can fire
-again. A later cap on
-`session` or `week_all` still switches accounts normally regardless of the
-marker. Set `CLAUDE_FABLE_FALLBACK=0` to disable the fallback outright and
-fall through to the ordinary account-switch path instead (which excludes the
-current profile the same as any other cap and may itself end in a
-notify-only if nothing else has headroom).
+marker recorded together with the account it was written for: a further
+`week_fable` trip is suppressed silently, not escalated to a switch and not
+notified again, only while that marker is both fresh for the current window
+AND for the account the session is on right now, since the reading typically
+stays capped for days and switching on it would just undo the fallback on
+the very next tick. Once the window rolls over, or an ordinary account
+switch has since moved the session to a different account, the marker no
+longer counts and a fresh fallback can fire again for whichever account the
+session is on. A later cap on `session` or `week_all` still switches
+accounts normally regardless of the marker, and a session that already
+switched accounts once can still fall back afterward: the `.switched` marker
+that stops a repeat account switch on the same session never blocks a model
+fallback, since a fallback spends no hop and switches no account. Set
+`CLAUDE_FABLE_FALLBACK=0` to disable the fallback outright and fall through
+to the ordinary account-switch path instead (which excludes the current
+profile the same as any other cap and may itself end in a notify-only if
+nothing else has headroom).
 
 All three honour `CLAUDE_AUTO_SWITCH`, `CLAUDE_AUTO_SWITCH_RELAUNCH`, and the
 live-supervisor check. The per-session hop cap (`CLAUDE_MAX_HOPS`) also
@@ -704,7 +710,7 @@ test`. `bash e2e/run.sh` runs the end-to-end limit-switch harness: it builds
 sandbox HOME with no network access, and exercises the hook-driven and
 statusline-tick-driven profile-switch paths (relaunch argv, cooldowns, the
 `CLAUDE_AUTO_SWITCH`/`CLAUDE_AUTO_SWITCH_RELAUNCH` kill-switches, and the
-flags a relaunch carries, the passthrough verb) across 14 scenarios. See [`e2e/README.md`](e2e/README.md) for what each scenario covers
+flags a relaunch carries, the passthrough verb) across 15 scenarios. See [`e2e/README.md`](e2e/README.md) for what each scenario covers
 and how to run it against a prebuilt binary.
 
 ## License

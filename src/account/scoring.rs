@@ -13,11 +13,11 @@
 //!      reports under `kind=weekly_scoped`, labelled by `week_model_label`)
 //!      does NOT constrain viability, however high it reads — an account
 //!      whose only exhausted window is the model-scoped weekly cap is still
-//!      fully usable on another model. As of C44 that case is handled by the
+//!      fully usable on another model. That case is handled by the
 //!      Stop hook falling back to the latest Opus on the SAME account instead
 //!      of excluding it from picking (see `src/hook/detect.rs`'s
 //!      `fable_fallback_model`); this predicate never sees `week_fable` at
-//!      all. (Behaviour change from the pre-C44 rule, where a saturated
+//!      all. (Behaviour change from the earlier rule, where a saturated
 //!      `week_fable` excluded the profile exactly like `week_all`.)
 //! 3. Among the survivors, choose the one whose weekly reset returns SOONEST:
 //!    a known reset epoch beats an unknown one, and a smaller (sooner) epoch
@@ -167,9 +167,10 @@ fn data_too_stale_at(data: &UsageData, max_age_secs: u64, now: DateTime<Utc>) ->
 ///   so never trips this gate.
 /// - `week_all_pct` present and `>= SATURATION_PCT` → not viable.
 /// - `week_fable_pct` (the model-scoped weekly cap) never constrains
-///   viability, however high it reads. **Behaviour change (C44):** before
-///   this commit a saturated `week_fable_pct` excluded the profile exactly
-///   like `week_all_pct`; the user chose to keep such an account pickable,
+///   viability, however high it reads. **User-visible behaviour change:**
+///   this predicate used to treat a saturated `week_fable_pct` exactly
+///   like `week_all_pct` and exclude the profile; the user chose to keep
+///   such an account pickable instead,
 ///   since a model-scoped-only cap still leaves the account fully usable on
 ///   another model — the Stop hook now handles that case with a same-account
 ///   model fallback instead of excluding the profile (see
@@ -966,10 +967,10 @@ mod tests {
     }
 
     // ─── model-scoped weekly (week_fable) gate ────────────────────────────────
-    // Since C44, week_fable no longer constrains viability at all (a Fable-only
+    // week_fable no longer constrains viability at all (a Fable-only
     // cap is handled by the Stop hook's same-account model fallback instead —
-    // see `src/hook/detect.rs`). These tests now pin the OPPOSITE of the
-    // pre-C44 rule: a saturated week_fable reading must NOT exclude a profile.
+    // see `src/hook/detect.rs`). These tests pin that rule: a saturated
+    // week_fable reading must NOT exclude a profile.
 
     /// `is_viable_pcts` sanity: the three dimensions in isolation and combined.
     #[test]
@@ -978,7 +979,7 @@ mod tests {
         assert!(is_viable_pcts(10, Some(50), Some(50)));
         // week_fable absent → does not constrain viability.
         assert!(is_viable_pcts(10, Some(50), None));
-        // week_fable saturated no longer constrains viability (C44) — still
+        // week_fable saturated no longer constrains viability — still
         // viable even at 100%, as long as session/week_all are fine.
         assert!(is_viable_pcts(10, Some(50), Some(SATURATION_PCT)));
         assert!(is_viable_pcts(10, Some(50), Some(100)));
@@ -987,7 +988,7 @@ mod tests {
     }
 
     /// A profile whose model-scoped weekly cap (week_fable) is fully
-    /// exhausted (100%) stays pickable (C44 behaviour change) as long as its
+    /// exhausted (100%) stays pickable as long as its
     /// session and week_all readings are healthy — dropping the week_fable
     /// branch from `is_viable_pcts` leaves it viable. Proven independent of
     /// any tie-break: the OTHER profile is passed as `current_profile` with
@@ -1011,7 +1012,7 @@ mod tests {
         assert_eq!(
             result.as_deref(),
             Some("zzz_fable_capped"),
-            "a fable-saturated profile must stay pickable since C44 — a model-scoped-only cap \
+            "a fable-saturated profile must stay pickable — a model-scoped-only cap \
              leaves the account usable on another model"
         );
     }
@@ -1044,7 +1045,7 @@ mod tests {
         assert_eq!(result.as_deref(), Some("almost_capped"));
     }
 
-    /// `week_fable.pct == SATURATION_PCT` (95%) no longer excludes (C44) —
+    /// `week_fable.pct == SATURATION_PCT` (95%) no longer excludes —
     /// same `>=` rule as `week_all` used to apply, but this dimension is out
     /// of `is_viable_pcts` entirely now. Same exclusion-based proof as
     /// `fable_saturated_no_longer_excludes_with_healthy_session_and_week_all`:
@@ -1066,10 +1067,11 @@ mod tests {
         assert_eq!(result.as_deref(), Some("zzz_capped"));
     }
 
-    /// Two profiles differ ONLY in their fable saturation. Before C44 the
-    /// uncapped one always won because the capped one was excluded outright;
-    /// since C44 both are viable and rank identically (same reset, same
-    /// week_pct), so the winner is whichever tie-break — name order — favours.
+    /// Two profiles differ ONLY in their fable saturation. When a
+    /// model-scoped-only cap used to exclude a profile outright, the
+    /// uncapped one always won; now both are viable and rank identically
+    /// (same reset, same week_pct), so the winner is whichever tie-break —
+    /// name order — favours.
     /// RANKING ITSELF IS UNCHANGED by this commit: this expectation flips only
     /// because dropping the viability branch puts both candidates in the race.
     ///
@@ -1101,8 +1103,8 @@ mod tests {
     /// The CURRENT profile is excluded in reactive mode
     /// (`include_current=false`, mirroring the hook) regardless of its own
     /// viability — this is the reactive-current exclusion, not the
-    /// `is_viable_pcts` gate (fable saturation no longer excludes anything
-    /// since C44; this test just confirms that unrelated gate still holds
+    /// `is_viable_pcts` gate (fable saturation no longer excludes anything;
+    /// this test just confirms that unrelated gate still holds
     /// when the current profile happens to be fable-capped).
     #[test]
     fn fable_capped_current_is_skipped_in_reactive_mode() {
@@ -1228,7 +1230,7 @@ mod tests {
         let data = make_data(profiles);
         assert!(
             !is_excluded(&data, "p"),
-            "week_fable saturation no longer excludes a profile since C44"
+            "week_fable saturation no longer excludes a profile"
         );
     }
 

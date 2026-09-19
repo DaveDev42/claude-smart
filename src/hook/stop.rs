@@ -106,22 +106,30 @@ pub fn commit_and_stop(
 
     if model_override.is_some() {
         // Marker: this session fell back to the fallback model on a Fable
-        // cap, current as of now. The statusline entry point
-        // ([`crate::hook::run_from_statusline`]) already exclusively claimed
-        // this marker via `claim_model_fallback` before ever calling here —
-        // by the time `classify_with` returned this decision it had already
-        // established no marker for the CURRENT week_fable window survives
-        // (a stale or corrupt one is removed at that point, see
-        // `crate::hook::detect::model_fallback_marker_is_stale`), so this
+        // cap, current as of now, on THIS account. The statusline entry
+        // point ([`crate::hook::run_from_statusline`]) already exclusively
+        // claimed this marker via `claim_model_fallback` before ever calling
+        // here — by the time `classify_with` returned this decision it had
+        // already established no marker for the CURRENT week_fable window on
+        // the CURRENT profile survives (a stale one, or one for a different
+        // profile, is removed at that point — see
+        // `crate::hook::detect::model_fallback_marker_is_stale` and
+        // `crate::hook::detect::model_fallback_marker_is_current`), so this
         // call is always writing into a slot that is either freshly claimed
         // or empty. The direct hook entry point never claims first, so this
         // write is what actually creates the marker there. Either way this
-        // just (re)writes the current epoch, atomically (tmp + rename) so a
-        // reader never observes a partially written file. Deliberately NOT
-        // `.switched`/`.last-switch` — those belong to the account-switch
-        // hop budget and cooldown, which a same-account model change must
-        // never consume.
-        let _ = write_atomic(&paths::model_fallback(sid), &now_epoch().to_string());
+        // just (re)writes the current epoch and profile, atomically (tmp +
+        // rename) so a reader never observes a partially written file.
+        // `target_profile` IS the profile this marker is for: `classify_with`
+        // sets it to `current_profile` by construction whenever
+        // `model_override` is `Some(_)` (5b never picks a different account).
+        // Deliberately NOT `.switched`/`.last-switch` — those belong to the
+        // account-switch hop budget and cooldown, which a same-account model
+        // change must never consume.
+        let _ = write_atomic(
+            &paths::model_fallback(sid),
+            &format!("{} {target_profile}", now_epoch()),
+        );
     } else {
         // ── Step 3: noclobber .switched marker ───────────────────────────────
         let switched_path = paths::switched(sid);
@@ -275,8 +283,18 @@ fn now_epoch() -> i64 {
 /// there first and this caller must do nothing. [`commit_and_stop`]'s own
 /// step 3 then finds the marker present and leaves it alone. The hook path
 /// keeps its commit-then-mark order: one Stop event = one hook process.
+///
+/// Plain `create_new`: the only thing anyone ever reads back from
+/// `.switched` is `.exists()` (`switched_marker_blocks`'s caller and
+/// `commit_and_stop`'s own step 3), so a torn write here was never
+/// observable and the hard-link exclusivity [`claim_marker_hardlink`] uses
+/// for `.model-fallback` buys this marker nothing — it would only mean every
+/// ordinary account switch needs hard-link support in the smart dir, and a
+/// crash between the tmp write and the link would leave an unpruned
+/// `*.tmp-<pid>` file behind. This keeps the plain, exclusivity-only
+/// behaviour `.switched` actually needs.
 pub(crate) fn claim_switched(sid: &str) -> bool {
-    claim_marker(&crate::paths::switched(sid))
+    claim_marker_create_new(&crate::paths::switched(sid), &now_epoch().to_string())
 }
 
 /// Claim the `.model-fallback` marker for `sid` *before* committing — for a
@@ -286,7 +304,6 @@ pub(crate) fn claim_switched(sid: &str) -> bool {
 /// `.switched`, or it would burn this session's one-shot account-switch
 /// budget on a relaunch that never switched accounts.
 ///
-/// Same exclusivity as [`claim_switched`] — a plain [`claim_marker`] claim:
 /// `true` means this caller owns the fallback and must commit; `false` means
 /// another overlapping tick already claimed it and this caller must do
 /// nothing. Two overlapping ticks for the same session must never both
@@ -298,13 +315,39 @@ pub(crate) fn claim_switched(sid: &str) -> bool {
 /// [`crate::hook::detect::model_fallback_marker_is_stale`]), so by the time a
 /// caller reaches here the marker, if any, is either fresh (another tick's
 /// legitimate claim, which this call must lose to) or absent.
-pub(crate) fn claim_model_fallback(sid: &str) -> bool {
-    claim_marker(&crate::paths::model_fallback(sid))
+pub(crate) fn claim_model_fallback(sid: &str, profile: &str) -> bool {
+    claim_marker_hardlink(&crate::paths::model_fallback(sid), profile)
 }
 
-/// Exclusively claim `path` with the current epoch as content. `true` iff
-/// this call created it; `false` on any failure, including "already
+/// Exclusively claim `path` with `content`, via a plain `create_new`. `true`
+/// iff this call created it; `false` on any failure, including "already
 /// exists" (another claimant got there first) and an unwritable parent dir.
+/// See [`claim_switched`]'s doc for why `.switched` uses this instead of
+/// [`claim_marker_hardlink`].
+fn claim_marker_create_new(path: &Path, content: &str) -> bool {
+    use std::io::Write as _;
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+    {
+        Ok(mut f) => {
+            let _ = f.write_all(content.as_bytes());
+            true
+        }
+        Err(_) => false,
+    }
+}
+
+/// Exclusively claim `path` with content `"<epoch> <profile>"`, for a marker
+/// whose content is later parsed back (only `.model-fallback` — `.switched`
+/// stays on [`claim_marker_create_new`] instead, since nothing ever reads its
+/// content). `true` iff this call created it; `false` on "already exists"
+/// (another claimant got there first). `profile` is the account this claim is
+/// for, so the same reader that parses the marker back
+/// ([`crate::hook::detect::model_fallback_marker_read`]) always sees an
+/// epoch AND a profile together, never one without the other — the claim and
+/// the later refresh in [`commit_and_stop`] write the exact same shape.
 ///
 /// Writes the content to a private sibling tmp file first, then atomically
 /// links it into place (`hard_link` fails with `AlreadyExists` exactly like
@@ -313,23 +356,36 @@ pub(crate) fn claim_model_fallback(sid: &str) -> bool {
 /// never observe a truncated/partial marker if the process dies between
 /// opening the file and finishing the write — a failure mode a plain
 /// `create_new` + `write_all` on `.model-fallback` would have left
-/// reachable (see [`crate::hook::detect::model_fallback_marker_epoch`]'s
-/// doc).
-fn claim_marker(path: &Path) -> bool {
+/// reachable (see [`crate::hook::detect::model_fallback_marker_read`]'s
+/// doc). The tmp file is removed on every path out of this function. If
+/// `hard_link` fails for a reason OTHER than `AlreadyExists` — most likely
+/// the smart dir's filesystem doesn't support hard links at all — this falls
+/// back to a plain `create_new` claim with the same content rather than
+/// failing every model-fallback claim outright on such a filesystem; that
+/// fallback loses exclusivity against a hard-link claimant only if the two
+/// somehow raced on a filesystem that only some of the calls saw as
+/// hard-link-incapable, which does not happen on a single mounted
+/// filesystem.
+fn claim_marker_hardlink(path: &Path, profile: &str) -> bool {
+    let content = format!("{} {profile}", now_epoch());
     let tmp = tmp_sibling(path);
-    if std::fs::write(&tmp, now_epoch().to_string()).is_err() {
+    if std::fs::write(&tmp, &content).is_err() {
         let _ = std::fs::remove_file(&tmp);
         return false;
     }
-    let claimed = std::fs::hard_link(&tmp, path).is_ok();
+    let result = std::fs::hard_link(&tmp, path);
     let _ = std::fs::remove_file(&tmp);
-    claimed
+    match result {
+        Ok(()) => true,
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => false,
+        Err(_) => claim_marker_create_new(path, &content),
+    }
 }
 
 /// A private sibling path next to `path`, namespaced by this process's PID
-/// so concurrent claimants (separate processes — see [`claim_marker`]'s doc)
-/// never write each other's tmp file. Shared by [`claim_marker`] and
-/// [`write_atomic`].
+/// so concurrent claimants (separate processes — see [`claim_marker_hardlink`]'s
+/// doc) never write each other's tmp file. Shared by [`claim_marker_hardlink`]
+/// and [`write_atomic`].
 fn tmp_sibling(path: &Path) -> std::path::PathBuf {
     let name = path
         .file_name()
@@ -340,7 +396,7 @@ fn tmp_sibling(path: &Path) -> std::path::PathBuf {
 
 /// Write `content` to `path` atomically via tmp + rename (the same pattern
 /// [`crate::platform::relaunch::write_relaunch`] uses), overwriting whatever
-/// was there. Unlike [`claim_marker`] this makes no exclusivity claim — it
+/// was there. Unlike [`claim_marker_hardlink`] this makes no exclusivity claim — it
 /// is for a caller that already owns the slot (or knows no one else can be
 /// writing it) and just wants to refresh its content without a reader ever
 /// observing a partial write.
@@ -382,15 +438,16 @@ mod tests {
     // lives in `platform::proc_check` and is tested there; this module delegates
     // to `SysinfoProcCheck` rather than re-implementing it.
 
-    /// claim_marker: exactly one of two overlapping claimants wins, and the
+    /// `claim_marker_create_new` (`.switched`'s plain, non-atomic
+    /// behaviour): exactly one of two overlapping claimants wins, and the
     /// loser sees `false` rather than an error — the statusline tick's
     /// "only one tick commits" rule.
     #[test]
-    fn claim_marker_first_caller_wins() {
+    fn claim_marker_create_new_first_caller_wins() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("sid.switched");
-        assert!(claim_marker(&path));
-        assert!(!claim_marker(&path));
+        assert!(claim_marker_create_new(&path, "1000"));
+        assert!(!claim_marker_create_new(&path, "2000"));
         let content = std::fs::read_to_string(&path).unwrap();
         assert!(
             content.parse::<i64>().is_ok(),
@@ -399,10 +456,44 @@ mod tests {
     }
 
     #[test]
-    fn claim_marker_unwritable_dir_is_false() {
+    fn claim_marker_create_new_unwritable_dir_is_false() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("no-such-subdir").join("sid.switched");
-        assert!(!claim_marker(&path));
+        assert!(!claim_marker_create_new(&path, "1000"));
+    }
+
+    /// `claim_marker_hardlink` (the `.model-fallback` claim) has the same
+    /// exclusivity as [`claim_marker_create_new`], and its content is
+    /// `"<epoch> <profile>"` — the same shape [`commit_and_stop`] later
+    /// writes — never a bare epoch, so a reader in between never sees a
+    /// marker missing its profile.
+    #[test]
+    fn claim_marker_hardlink_first_caller_wins() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("sid.model-fallback");
+        assert!(claim_marker_hardlink(&path, "limited"));
+        assert!(!claim_marker_hardlink(&path, "limited"));
+        let content = std::fs::read_to_string(&path).unwrap();
+        let mut parts = content.trim().splitn(2, ' ');
+        assert!(
+            parts
+                .next()
+                .is_some_and(|epoch| epoch.parse::<i64>().is_ok()),
+            "marker starts with an epoch: {content:?}"
+        );
+        assert_eq!(
+            parts.next(),
+            Some("limited"),
+            "marker records the profile it was claimed for: {content:?}"
+        );
+        // The private tmp file must never survive a claim, win or lose.
+        assert!(
+            std::fs::read_dir(dir.path())
+                .unwrap()
+                .filter_map(|e| e.ok())
+                .all(|e| !e.file_name().to_string_lossy().contains(".tmp-")),
+            "no leftover tmp file after either claim"
+        );
     }
 
     /// `claim_model_fallback` must have the same exclusivity `claim_switched`
@@ -410,22 +501,58 @@ mod tests {
     /// and the loser must not overwrite. Drives
     /// the real public entry point (keyed by `sid` via
     /// `paths::model_fallback`, which reads `HOME`), not just the shared
-    /// `claim_marker` primitive.
+    /// `claim_marker_hardlink` primitive.
     #[test]
     fn claim_model_fallback_first_caller_wins() {
         let home = TempDir::new().unwrap();
         std::fs::create_dir_all(home.path().join(".claude.shared").join("smart")).unwrap();
         crate::testenv::with_test_home(home.path(), || {
             let sid = "sid-claim-race-0001";
-            assert!(claim_model_fallback(sid), "first claimant must win");
             assert!(
-                !claim_model_fallback(sid),
+                claim_model_fallback(sid, "limited"),
+                "first claimant must win"
+            );
+            assert!(
+                !claim_model_fallback(sid, "limited"),
                 "an overlapping second claimant must lose, not overwrite"
             );
             let content = std::fs::read_to_string(crate::paths::model_fallback(sid)).unwrap();
+            let mut parts = content.trim().splitn(2, ' ');
             assert!(
-                content.parse::<i64>().is_ok(),
-                "marker holds a complete, parseable epoch: {content:?}"
+                parts
+                    .next()
+                    .is_some_and(|epoch| epoch.parse::<i64>().is_ok()),
+                "marker starts with a complete, parseable epoch: {content:?}"
+            );
+            assert_eq!(parts.next(), Some("limited"), "marker records the profile");
+        });
+    }
+
+    /// Regression: the initial claim (`claim_model_fallback`, which uses the
+    /// hard-link path) must write the SAME `"<epoch> <profile>"` shape
+    /// `commit_and_stop` writes later, not a bare epoch. Before this fix
+    /// `claim_marker_hardlink` wrote only an epoch, so a tick that read the
+    /// marker in the window between the claim and `commit_and_stop`'s
+    /// rewrite saw an unparseable marker, treated it as absent, deleted it,
+    /// and fired a second, overlapping fallback.
+    #[test]
+    fn claim_model_fallback_records_profile_before_commit_and_stop_runs() {
+        let home = TempDir::new().unwrap();
+        std::fs::create_dir_all(home.path().join(".claude.shared").join("smart")).unwrap();
+        crate::testenv::with_test_home(home.path(), || {
+            let sid = "sid-claim-profile-0001";
+            assert!(claim_model_fallback(sid, "limited"));
+            // Read the marker exactly as it sits right after the claim,
+            // before any `commit_and_stop` call — this is the window an
+            // overlapping tick's read can land in.
+            let content = std::fs::read_to_string(crate::paths::model_fallback(sid)).unwrap();
+            let mut parts = content.trim().splitn(2, ' ');
+            assert!(parts.next().is_some(), "epoch field present: {content:?}");
+            assert_eq!(
+                parts.next(),
+                Some("limited"),
+                "the claim alone already records the profile, matching what \
+                 `crate::hook::detect::model_fallback_marker_read` requires: {content:?}"
             );
         });
     }

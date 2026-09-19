@@ -48,10 +48,10 @@ pub struct RelaunchSentinel {
     /// `Some(model)` for a same-account model fallback (a `week_fable` cap —
     /// see `crate::hook::detect::fable_fallback_model`): the hop resumes the
     /// SAME session on this model instead of switching profiles.  `None` is
-    /// an ordinary account switch, the pre-C44 shape.  `#[serde(default)]` so
-    /// an older sentinel written before this field existed still reads back
-    /// as `None`, never a parse error (rollback safety, same contract as
-    /// every other field here).
+    /// an ordinary account switch, the shape every sentinel had before the
+    /// fallback existed.  `#[serde(default)]` so an older sentinel written
+    /// before this field existed still reads back as `None`, never a parse
+    /// error (rollback safety, same contract as every other field here).
     #[serde(default)]
     pub model_override: Option<String>,
 }

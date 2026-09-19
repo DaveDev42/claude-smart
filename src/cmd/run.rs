@@ -423,8 +423,8 @@ fn print_launch_attention_warnings(profile_dir: &Path, profiles: &account::Profi
 ///
 /// Pick guard (matches the legacy shell implementation's behavior):
 /// - `pick_account(current, include_current=true)` → scoring pick, which
-///   weighs session and week_all through `scoring::is_viable_pcts`. Since
-///   C44, `week_fable` (the model-scoped weekly cap) no longer factors into
+///   weighs session and week_all through `scoring::is_viable_pcts`.
+///   `week_fable` (the model-scoped weekly cap) no longer factors into
 ///   viability at all — a current profile whose only exhausted window is
 ///   `week_fable` is left in place here; the Stop hook handles that case with
 ///   a same-account model fallback instead of a proactive account switch.
@@ -554,7 +554,7 @@ fn run_account_picker(
 ///
 /// Viability is delegated to `scoring::is_viable_pcts` — the SINGLE viability
 /// authority also used by `pick_best_at` — rather than a second hand-rolled
-/// check. Since C44, `week_fable_pct` no longer sinks a row on its own (a
+/// check. `week_fable_pct` no longer sinks a row on its own (a
 /// model-scoped-only cap still leaves the row usable on another model); only
 /// `session_pct`/`week_all_pct` do.
 ///
@@ -1109,7 +1109,7 @@ mod tests {
     }
 
     // ── model-scoped weekly (week_fable) gate ──────────────────────────────
-    // Since C44, account_row_rank no longer sinks a fable-saturated row: it
+    // account_row_rank no longer sinks a fable-saturated row: it
     // routes through the same `scoring::is_viable_pcts` authority
     // `pick_best_at` uses, and that predicate dropped the week_fable branch
     // (a model-scoped-only cap is handled by the Stop hook's same-account
@@ -1117,14 +1117,13 @@ mod tests {
 
     #[test]
     fn fable_saturated_row_no_longer_sinks_below_viable() {
-        // A single fable-saturated row, alone: if `account_row_rank` still
-        // sank it to bucket 1, it would still be the only row and this
-        // assertion would pass for the wrong reason with two rows present
-        // (name-order luck). Alone, only bucket-0 placement produces a
-        // `viable_sooner_reset_leads`-style top rank; assert on the rank
-        // tuple directly so bucket 0 (viable) is checked, not just presence.
+        // The bucket assertion is the proof: a fable-saturated row must land
+        // in the viable bucket (0), not sink to bucket 1. This is checked
+        // directly on the rank tuple, not inferred from sort order, so
+        // nothing about naming or a second row can make it pass for the
+        // wrong reason.
         let (bucket, ..) = account_row_rank(
-            "zzz_fable_capped",
+            "fable_capped",
             &data_with_fable(Some(5), Some(10), None, Some(100)),
             rank_now(),
         );
@@ -1133,20 +1132,23 @@ mod tests {
             "a fable-saturated row must land in the viable bucket (0), not sink to bucket 1"
         );
 
-        // And with a second, uncapped row present, both are viable and tie on
-        // rank — names are picked so the fable-capped one sorts LAST, so a
-        // win here cannot be name-order luck landing on the row under test.
+        // And with a second, uncapped row present: the capped row's name
+        // sorts BEFORE the uncapped one, so if a regression reintroduced
+        // sinking (bucket 1 vs bucket 0), the capped row would visibly move
+        // to the end. Seeing it stay first is real proof both rows tied on
+        // rank, not name-order luck landing on the row under test.
         let order = ranked_order(vec![
-            ("avail", data_with_fable(Some(5), Some(10), None, None)),
             (
-                "zzz_fable_capped",
+                "aaa_fable_capped",
                 data_with_fable(Some(5), Some(10), None, Some(100)),
             ),
+            ("zzz_avail", data_with_fable(Some(5), Some(10), None, None)),
         ]);
         assert_eq!(
             order,
-            vec!["avail", "zzz_fable_capped"],
-            "both rows are viable now; identical rank key ties to name order"
+            vec!["aaa_fable_capped", "zzz_avail"],
+            "both rows are viable now; identical rank key ties to name order — a \
+             sinking regression would move the capped row to the end instead"
         );
     }
 
@@ -1173,10 +1175,10 @@ mod tests {
 
     #[test]
     fn only_fable_difference_no_longer_affects_row_rank() {
-        // Two rows identical except for fable saturation. Before C44 the
-        // uncapped one always led because the capped one was excluded
-        // outright; since C44 both are viable and tie on rank (same reset,
-        // same week_pct), so name order breaks the tie. This is a
+        // Two rows identical except for fable saturation. When a
+        // model-scoped-only cap used to exclude a profile outright, the
+        // uncapped one always led; now both are viable and tie on rank (same
+        // reset, same week_pct), so name order breaks the tie. This is a
         // consequence of dropping the viability branch, not a ranking change.
         //
         // Names are picked so the alphabetically-first one ("avail") carries

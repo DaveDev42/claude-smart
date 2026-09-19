@@ -119,7 +119,7 @@ see *Invariants*.
 - `e2e/` — the limit-switch end-to-end harness: `run.sh` builds `csm` and a
   fake, sleeping `claude` (`fake-claude/claude.c`) and drives both through an
   isolated sandbox HOME with no network access; `lib.sh` + `scenarios.sh` hold
-  the 10 scenarios. Excluded from the packaged crate (see `Cargo.toml`
+  the 15 scenarios. Excluded from the packaged crate (see `Cargo.toml`
   `exclude`). See *Testing* in `README.md` and `e2e/README.md`.
 
 ## Commands

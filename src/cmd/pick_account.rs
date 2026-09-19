@@ -10,7 +10,7 @@ use crate::account;
 /// Exits 1 on fetch failure.
 ///
 /// Routes through `account::pick_account` → `scoring::pick_best_at`, which
-/// scores on session and week_all. Since C44, the model-scoped weekly
+/// scores on session and week_all. The model-scoped weekly
 /// `week_fable` no longer excludes a profile here — a model-scoped-only cap
 /// still leaves the account usable on another model; the Stop hook handles
 /// that case with a same-account model fallback instead (see

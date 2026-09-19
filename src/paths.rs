@@ -105,15 +105,19 @@ pub fn detected(sid: &str) -> PathBuf {
     smart_dir_no_create().join(format!("{sid}.detected"))
 }
 
-/// `<smart_dir>/<sid>.model-fallback` — one-shot-per-window marker: this
-/// session already fell back to the fallback model on a `week_fable` cap, so
-/// a further trip within the same weekly window is suppressed silently
-/// instead of relaunching on the same model again or escalating to an
-/// account switch. The epoch stored here is checked for staleness against
-/// the CURRENT `week_fable` window on every read, so once that window rolls
-/// over the marker no longer counts and a fresh fallback can fire again. See
-/// `hook::detect::fable_fallback_model` and
-/// `hook::detect::model_fallback_marker_is_stale`.
+/// `<smart_dir>/<sid>.model-fallback` — one-shot-per-window-per-account
+/// marker: this session already fell back to the fallback model on a
+/// `week_fable` cap, so a further trip within the same weekly window on the
+/// SAME account is suppressed silently instead of relaunching on the same
+/// model again or escalating to an account switch. Content is `"<epoch>
+/// <profile>"`: the epoch is checked for staleness against the CURRENT
+/// `week_fable` window on every read, so once that window rolls over the
+/// marker no longer counts and a fresh fallback can fire again; the profile
+/// is checked against the account the session is CURRENTLY on, so a marker
+/// left behind by an earlier account switch never suppresses a fallback on
+/// the new account either. See `hook::detect::fable_fallback_model`,
+/// `hook::detect::model_fallback_marker_is_stale` and
+/// `hook::detect::model_fallback_marker_is_current`.
 pub fn model_fallback(sid: &str) -> PathBuf {
     smart_dir_no_create().join(format!("{sid}.model-fallback"))
 }
