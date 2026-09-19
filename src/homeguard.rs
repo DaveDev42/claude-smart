@@ -221,6 +221,9 @@ pub fn classify(
                     HomeShimVerdict::ProjectsWrongLink(t.clone())
                 }
                 Some(provision::LinkState::NotADir) => HomeShimVerdict::ProjectsNotADir,
+                // `classify_link` never reports this (only profile diagnosis
+                // probes the target), but it means exactly this verdict.
+                Some(provision::LinkState::Dangling) => HomeShimVerdict::SharedMissing,
                 // No link state to judge: this platform does not manage it.
                 None => HomeShimVerdict::Unsupported,
             }
@@ -818,6 +821,7 @@ mod tests {
                 HomeShimVerdict::ProjectsWrongLink(elsewhere.clone()),
             ),
             (LinkState::NotADir, HomeShimVerdict::ProjectsNotADir),
+            (LinkState::Dangling, HomeShimVerdict::SharedMissing),
         ];
         for (state, expected) in cases {
             assert_eq!(

@@ -203,13 +203,13 @@ pub fn scan_index_for(project_dir: &Path) -> PathBuf {
     smart_dir_no_create().join(format!("scan-meta-v2.{dir_name}.tsv"))
 }
 
-/// `$HOME/.claude.shared` — the shared config root. The smart state dir, the
-/// cross-profile plugin SSOT, and the cross-profile transcript SSOT all live
-/// under here: each profile dir's `plugins` and `projects` are symlinked here
-/// (see [`crate::provision::ensure_profile_provisioned`]) so every profile
-/// sees one marketplace cache (avoids the `cache-miss` a per-`CLAUDE_CONFIG_DIR`
-/// plugin dir causes on switch) and one session history regardless of which
-/// profile is active.
+/// `$HOME/.claude.shared` — the shared config root. The smart state dir and the
+/// three cross-profile SSOTs live under here: each profile dir's `plugins`,
+/// `projects` and `sessions` are symlinked here (see
+/// [`crate::provision::ensure_profile_provisioned`]) so every profile sees one
+/// marketplace cache (avoids the `cache-miss` a per-`CLAUDE_CONFIG_DIR` plugin
+/// dir causes on switch), one session history, and one peer registry regardless
+/// of which profile is active.
 pub fn shared_base_dir() -> PathBuf {
     home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
@@ -246,6 +246,18 @@ pub fn session_base_dir() -> PathBuf {
 /// [`crate::provision::ensure_profile_provisioned`].
 pub fn shared_plugins_dir() -> PathBuf {
     shared_base_dir().join("plugins")
+}
+
+/// `$HOME/.claude.shared/sessions` — the single source of truth for Claude
+/// Code's peer registry, the directory it enumerates to answer "which other
+/// sessions can I message". Each live session writes a `<pid>.json` there
+/// naming the socket it listens on; the sockets live outside the config dir
+/// and are reachable from every profile, but the index is not, so without this
+/// link a profile switch splits the messaging namespace and cross-session
+/// tools only see their own profile's sessions. See
+/// [`crate::provision::ensure_profile_provisioned`].
+pub fn shared_sessions_dir() -> PathBuf {
+    shared_base_dir().join("sessions")
 }
 
 // ─── cwd encoding ─────────────────────────────────────────────────────────────

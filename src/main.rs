@@ -152,7 +152,7 @@ fn print_help() {
     println!("  csm profiles edit                    interactive editor (TTY)");
     println!("  csm profiles dir  [<name>]           print a profile's dir (default if omitted)");
     println!(
-        "  csm profiles bootstrap [<name>|--all] provision profile env (dir + shared plugins/projects)"
+        "  csm profiles bootstrap [<name>|--all] provision profile env (dir + shared plugins/projects/sessions)"
     );
     println!(
         "  csm profiles doctor [--fix] [--fix-home] [<name>|--all]   check profile dirs / shared links; --fix repairs profiles, --fix-home repairs the ~/.claude shim\n"

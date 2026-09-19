@@ -79,7 +79,7 @@ csm profiles rm   <name>             unregister (refused if it is the default)
 csm profiles use  <name>             set the machine default profile (+ floor)
 csm profiles edit                    interactive editor (TTY)
 csm profiles dir  [<name>]           print a profile's config dir
-csm profiles bootstrap [<name>|--all] provision a profile's env (dir + shared plugins/projects)
+csm profiles bootstrap [<name>|--all] provision a profile's env (dir + shared plugins/projects/sessions)
 csm profiles doctor [--fix] [--fix-home] [<name>|--all]
                                      check profile dirs / shared links; --fix repairs
                                      profiles, --fix-home repairs the ~/.claude shim
@@ -199,7 +199,7 @@ on Windows) so that GUI / launchd / non-shell launches of `claude` land on the
 real profile too, not just shells that sourced the `cas` function. On systems
 without such a mechanism the floor step is a no-op.
 
-### Shared plugins and projects (provisioning)
+### Shared plugins, projects and sessions (provisioning)
 
 Claude Code stores its plugins and marketplace cache *under* `CLAUDE_CONFIG_DIR`.
 If each profile kept its own copy, switching profiles would leave the active
@@ -209,14 +209,21 @@ makes every profile's `plugins/` a symlink to one shared store at
 `~/.claude.shared/plugins` (the same `~/.claude.shared` root that already holds
 your transcripts and history), so the marketplace cache stays consistent across
 switches. The same mechanism also links each profile's `projects/` to
-`~/.claude.shared/projects`, so every profile sees the same transcript history.
+`~/.claude.shared/projects`, so every profile sees the same transcript history,
+and each profile's `sessions/` to `~/.claude.shared/sessions`. That last one is
+Claude Code's list of running sessions, the one it reads to find peers for
+cross-session messaging; with a per-profile copy, a session only sees the
+others started under the same profile. One consequence to know about: the
+opt-in OAuth refresh reads that registry to decide whether Claude Code is
+already minting tokens, so its "a session is live" check now covers the whole
+machine rather than one profile (see *Headless collectors*).
 
 This is **provisioned automatically**: every launch / profile switch / registry
-add ensures both symlinks exist (idempotent, best-effort — a hiccup never
+add ensures all three symlinks exist (idempotent, best-effort — a hiccup never
 blocks the launch). You can also do it explicitly:
 
 ```sh
-csm profiles bootstrap --all     # provision every profile (dir + shared plugins/projects)
+csm profiles bootstrap --all     # provision every profile (dir + shared plugins/projects/sessions)
 csm profiles doctor              # read-only: report what's broken
 csm profiles doctor --fix        # repair anything unhealthy
 csm profiles doctor --fix-home   # repair the ~/.claude shim (see below)
@@ -225,7 +232,14 @@ csm profiles doctor --fix-home   # repair the ~/.claude shim (see below)
 The first time a profile with an existing real `plugins/` dir is provisioned,
 `csm` seeds the shared store from it (or backs the dir up if the shared store
 already has content) before replacing it with the symlink — no plugin data is
-lost. `settings.json` stays per-profile; `doctor` is where cross-profile drift
+lost. A real `sessions/` dir is handled differently, because its entries belong
+to sessions that may still be running: `csm` swaps the symlink in first, then
+moves the entries into the shared dir. An entry it cannot place safely (a
+same-named file it does not recognise, or a subdirectory) stays in a
+`~/.claude.shared/.sessions-staging.*` dir, which `csm profiles doctor` lists.
+A run interrupted mid-move leaves one of those too; the next launch drains it,
+as does `csm profiles doctor --fix`.
+`settings.json` stays per-profile; `doctor` is where cross-profile drift
 (e.g. divergent marketplace registrations) gets surfaced. On Windows the symlink
 step is delegated to OS-native tooling and `csm` treats it as a no-op.
 
@@ -421,10 +435,13 @@ hold:
 
 - the opt-in is on for this invocation;
 - the profile's access token has expired and its refresh token has not;
-- no live Claude Code session exists for the profile (its own
-  `<profile-dir>/sessions/*.json` registry is scanned, and a live `claude`
-  or `node` process there means `csm` stands down and lets Claude Code
-  refresh);
+- no live Claude Code session exists **anywhere on the machine**
+  (`<profile-dir>/sessions/*.json` is scanned, and a live `claude` or `node`
+  process there means `csm` stands down and lets Claude Code refresh). Since
+  provisioning points every profile's `sessions` at one shared registry, and
+  its records say nothing about which profile they belong to, a session under
+  any profile holds the refresh back for all of them — the safe direction,
+  and a headless collector runs no sessions at all;
 - an exclusive lock file next to the credentials is free (60s staleness
   takeover), so two collectors can't refresh the same profile at once;
 - the platform stores credentials in `<profile-dir>/.credentials.json`.

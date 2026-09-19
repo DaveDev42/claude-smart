@@ -32,9 +32,17 @@
 //!    `creds` reads first), so writing the file there would be ignored at
 //!    best and desynchronizing at worst: macOS returns
 //!    [`RefreshOutcome::Unsupported`] and the file is never written.
-//! 4. **No live session** — `<profile_dir>/sessions/*.json` is Claude Code's
-//!    own session registry; if any recorded pid is a live claude/node
-//!    process, Claude Code itself will refresh and we stand down.
+//! 4. **No live session on the machine** — `<profile_dir>/sessions/*.json` is
+//!    Claude Code's own session registry; if any recorded pid is a live
+//!    claude/node process, Claude Code itself will refresh and we stand down.
+//!    The gate is machine-wide, not per-profile: csm links every profile's
+//!    `sessions` to one shared registry (see [`crate::provision`]) so
+//!    cross-session messaging survives a profile switch, and the records carry
+//!    no config dir, so a live session under any profile suppresses the
+//!    refresh for all of them. That is the conservative direction — the cost
+//!    is a profile of its own that stays unrefreshed while some other profile
+//!    is busy, and the headless collector this module exists for runs no
+//!    sessions at all.
 //! 5. **Single writer** — an `O_EXCL` lock file next to the credentials,
 //!    with a 60s staleness takeover, released by a [`Drop`] guard.
 //!
@@ -119,7 +127,7 @@ impl SkipReason {
             SkipReason::TokenStillValid => "access token still valid",
             SkipReason::RefreshTokenDead => "refresh token dead",
             SkipReason::NoRefreshableCredentials => "no refreshable credentials",
-            SkipReason::LiveSession => "live session present",
+            SkipReason::LiveSession => "a claude session is live on this machine",
             SkipReason::LockHeld => "lock held",
         }
     }
@@ -274,7 +282,8 @@ fn maybe_refresh_on(
         return skipped(reason);
     }
 
-    // Gate 4 — Claude Code's own session registry.
+    // Gate 4 — Claude Code's own session registry, which provisioning makes
+    // machine-wide (the `sessions` entry is a link to the shared one).
     let live = has_live_session(&dir.join("sessions"), |pid| {
         use crate::platform::proc_check::ProcCheck;
         crate::platform::PlatformProcCheck::is_live_claude_or_node(pid)
@@ -534,6 +543,11 @@ fn merge_refreshed(existing: &Value, resp: &TokenResponse, now_ms: i64) -> Value
 
 /// Does `sessions_dir` (Claude Code's own `<profile_dir>/sessions/`) hold a
 /// registry entry whose pid is a live claude/node process?
+///
+/// On a provisioned machine that directory is a symlink to the one registry
+/// every profile shares, and it is followed, so the answer is "is any claude
+/// session live here", not "is one live under this profile". The records hold
+/// no config dir to narrow it with. See the module doc's gate 4.
 ///
 /// `is_live` is injected so the whole scan is unit-testable over a temp dir.
 /// A missing directory, a non-`.json` name, and an entry with no usable pid
@@ -1145,6 +1159,38 @@ mod tests {
     fn scan_of_a_missing_directory_is_no_live_session() {
         let dir = tempfile::tempdir().unwrap();
         assert!(!has_live_session(&dir.path().join("sessions"), |_| true));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn scan_through_the_shared_registry_link_is_machine_wide() {
+        // Provisioning links every profile's `sessions` to one registry, so a
+        // session running under another profile suppresses the refresh here
+        // too. Pinned deliberately: the gate is machine-wide, and the module
+        // doc, the skip wording and the README all say so.
+        let td = tempfile::tempdir().unwrap();
+        let shared = td.path().join("shared-sessions");
+        std::fs::create_dir_all(&shared).unwrap();
+        // The record belongs to a session started under another profile;
+        // nothing in it says which one.
+        std::fs::write(shared.join("4242.json"), r#"{"pid":4242}"#).unwrap();
+
+        let profile = td.path().join("profile");
+        std::fs::create_dir_all(&profile).unwrap();
+        let link = profile.join("sessions");
+        std::os::unix::fs::symlink(&shared, &link).unwrap();
+
+        assert!(has_live_session(&link, |pid| pid == 4242));
+        assert_eq!(
+            gate(GateInputs {
+                opt_in: true,
+                platform_supported: true,
+                creds: CredState::Refreshable,
+                live_session: true,
+                lock_held: false,
+            }),
+            GateDecision::Skip(SkipReason::LiveSession)
+        );
     }
 
     // ── (d) atomic write ────────────────────────────────────────────────────

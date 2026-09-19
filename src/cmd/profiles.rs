@@ -86,10 +86,10 @@ pub(crate) fn cmd_profiles(args: &[OsString]) -> anyhow::Result<()> {
 /// `csm profiles bootstrap [<name> | --all]`
 ///
 /// Stand up / repair the provisioning invariants for one profile (or every
-/// registered profile with `--all`): the dir exists and `plugins`/`projects`
-/// are symlinks to their shared SSOTs (`~/.claude.shared/{plugins,projects}`).
-/// Idempotent — safe to re-run. With no args, bootstraps the current/default
-/// profile.
+/// registered profile with `--all`): the dir exists and `plugins`, `projects`
+/// and `sessions` are symlinks to their shared SSOTs under
+/// `~/.claude.shared/`. Idempotent — safe to re-run. With no args, bootstraps
+/// the current/default profile.
 fn cmd_profiles_bootstrap(rest: &[String]) -> anyhow::Result<()> {
     let profiles = account::ProfileMap::load()
         .context("csm profiles bootstrap: failed to load profiles.json")?;
@@ -123,10 +123,11 @@ fn cmd_profiles_bootstrap(rest: &[String]) -> anyhow::Result<()> {
         match provision::ensure_profile_provisioned(name, dir) {
             Ok(report) => {
                 println!(
-                    "bootstrap [{name}] {} → plugins: {}; projects: {}",
+                    "bootstrap [{name}] {} → plugins: {}; projects: {}; sessions: {}",
                     dir.display(),
                     describe_link(&report.plugins),
-                    describe_link(&report.projects)
+                    describe_link(&report.projects),
+                    describe_link(&report.sessions)
                 );
             }
             Err(e) => {
@@ -144,7 +145,9 @@ fn cmd_profiles_bootstrap(rest: &[String]) -> anyhow::Result<()> {
 /// `csm profiles doctor [--fix] [--fix-home] [<name> | --all]`
 ///
 /// Diagnose the provisioning invariants and report what is broken. `--fix`
-/// repairs anything unhealthy (the same code path as `bootstrap`). Without
+/// repairs anything unhealthy (the same code path as `bootstrap`) and drains
+/// any leftover sessions staging dir, which is not a profile's health and so
+/// would otherwise go unrepaired when every profile is already linked. Without
 /// `--fix` it is read-only (a dry run). Defaults to every registered profile.
 ///
 /// The `~/.claude` compatibility shim is a separate, machine-wide axis reported
@@ -189,15 +192,38 @@ fn cmd_profiles_doctor(rest: &[String]) -> anyhow::Result<()> {
             match provision::ensure_profile_provisioned(name, dir) {
                 Ok(report) => {
                     println!(
-                        "  → fixed: plugins {}; projects {}",
+                        "  → fixed: plugins {}; projects {}; sessions {}",
                         describe_link(&report.plugins),
-                        describe_link(&report.projects)
+                        describe_link(&report.projects),
+                        describe_link(&report.sessions)
                     );
                 }
                 Err(e) => {
                     eprintln!("  → fix FAILED: {e}");
                 }
             }
+        }
+    }
+
+    // Not a profile's health: every link is already right. But a staged entry
+    // must never sit there silently. Most staging dirs are transient — csm
+    // drains them on the next launch — so only `--fix`, which has just drained
+    // them, calls what is left unmergeable.
+    if fix {
+        for stage in provision::drain_leftover_sessions_staging() {
+            println!(
+                "! sessions staging dir not emptied: {} (what is left is what the \
+                 collision policy would not move; review it by hand)",
+                stage.display()
+            );
+        }
+    } else {
+        for stage in provision::leftover_sessions_staging() {
+            println!(
+                "! sessions staging dir still present: {} (csm drains it on the next \
+                 launch, or now with `csm profiles doctor --fix`)",
+                stage.display()
+            );
         }
     }
 
@@ -357,13 +383,30 @@ fn describe_link(outcome: &provision::LinkOutcome) -> String {
         Created => "linked to shared SSOT".to_owned(),
         SeededShared => "seeded shared SSOT and linked".to_owned(),
         BackedUp(p) => format!("backed up to {} and linked", p.display()),
+        Merged { moved, leftover } => {
+            let mut line = format!(
+                "moved {moved} entr{} into the shared SSOT and linked",
+                if *moved == 1 { "y" } else { "ies" }
+            );
+            if !leftover.is_empty() {
+                line.push_str(&format!(
+                    "; left in staging for review: {}",
+                    leftover
+                        .iter()
+                        .map(|p| p.display().to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ));
+            }
+            line
+        }
         Skipped => "skipped (handled OS-side)".to_owned(),
     }
 }
 
 /// One-line description of a single unhealthy [`provision::LinkState`] axis, or
 /// `None` when that axis is already healthy. `what` names the subdir
-/// (`"plugins"`/`"projects"`) and `real_dir_note` is the axis-specific
+/// (`"plugins"`/`"projects"`/`"sessions"`) and `real_dir_note` is the axis-specific
 /// consequence of it being a diverged per-profile dir.
 #[cfg(unix)]
 fn describe_link_state(
@@ -381,6 +424,9 @@ fn describe_link_state(
             t.display()
         )),
         NotADir => Some(format!("{what} is a file, not a dir/symlink")),
+        Dangling => Some(format!(
+            "{what} links to a shared dir that no longer exists (link dangles)"
+        )),
     }
 }
 
@@ -400,6 +446,11 @@ fn describe_diagnosis(diag: &provision::ProfileDiagnosis, dir: &Path) -> String 
             "projects",
             "transcripts invisible to other profiles",
             &diag.projects,
+        ),
+        describe_link_state(
+            "sessions",
+            "cross-session messaging cannot see other profiles",
+            &diag.sessions,
         ),
     ]
     .into_iter()

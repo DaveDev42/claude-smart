@@ -96,8 +96,17 @@ see *Invariants*.
   checks, statusline, canonical state paths.
 - `src/provision.rs` — profile provisioning SSOT: `ensure_profile_provisioned`
   (dir + `plugins/` → `~/.claude.shared/plugins` symlink + `projects/` →
-  `~/.claude.shared/projects` symlink) and the read-only `diagnose_profile`
-  core behind `csm profiles doctor`. Called implicitly on every
+  `~/.claude.shared/projects` symlink + `sessions/` →
+  `~/.claude.shared/sessions` symlink, the peer registry) and the read-only
+  `diagnose_profile` core behind `csm profiles doctor`. A real `sessions/` dir
+  holds live sessions' records, so `link_sessions_to_shared` renames it aside
+  to a `.sessions-staging.*` dir, links at once, then drains staging with
+  `link`+`unlink` under a per-name collision policy; anything it will not move
+  stays in staging and `doctor` lists it. Every exit from the swap loop, errors
+  included, drains what that run staged; a staging dir an interrupted run left
+  behind is drained by the next provision or by `doctor --fix`
+  (`drain_leftover_sessions_staging`). Dangling links diagnose as
+  `LinkState::Dangling` and provisioning recreates the target. Called implicitly on every
   launch/switch/register so csm maintains its own invariants; explicit via
   `bootstrap`/`doctor`. Unix-only symlink (non-unix = OS-side junction).
 - `src/homeguard.rs` — the `~/.claude` compatibility shim: keeps
