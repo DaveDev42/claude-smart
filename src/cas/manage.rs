@@ -37,11 +37,17 @@ pub fn manage_emit(op: &Op, profiles: &mut ProfileMap) -> anyhow::Result<()> {
             let dir = resolve_new_dir(name, dir.as_deref());
             std::fs::create_dir_all(&dir)
                 .map_err(|e| anyhow::anyhow!("add: cannot create dir '{dir}': {e}"))?;
+            // Register BEFORE provisioning: `ensure_provisioned_soft` now
+            // refuses a dir that is neither registered nor conventionally
+            // shaped under `$HOME` (see provision.rs's Home-floor gate), and
+            // an explicit, unconventional `<dir>` argument only clears that
+            // bar once it is on record — the registry is the authority
+            // (Invariant 3), not the shape check.
+            profiles.insert(name.clone(), dir.clone());
+            profiles.save()?;
             // Provision the new profile (dir + plugins → shared SSOT) so it is
             // consistent the moment it is registered, not only on first launch.
             crate::provision::ensure_provisioned_soft(std::path::Path::new(&dir));
-            profiles.insert(name.clone(), dir.clone());
-            profiles.save()?;
             eprintln!("added profile '{name}' → {dir}");
         }
 
@@ -56,9 +62,11 @@ pub fn manage_emit(op: &Op, profiles: &mut ProfileMap) -> anyhow::Result<()> {
             }
             std::fs::create_dir_all(dir)
                 .map_err(|e| anyhow::anyhow!("set: cannot create dir '{dir}': {e}"))?;
-            crate::provision::ensure_provisioned_soft(std::path::Path::new(dir));
+            // Register BEFORE provisioning — see the matching comment in
+            // `Op::Add` above.
             let prev = profiles.insert(name.clone(), dir.clone());
             profiles.save()?;
+            crate::provision::ensure_provisioned_soft(std::path::Path::new(dir));
             match prev {
                 Some(old) if old != *dir => eprintln!("set profile '{name}' → {dir} (was {old})"),
                 _ => eprintln!("set profile '{name}' → {dir}"),

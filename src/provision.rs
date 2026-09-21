@@ -68,6 +68,39 @@
 //! `csm profiles doctor` lists the staging dirs that could not be emptied, and
 //! `doctor --fix` drains them again.
 //!
+//! ## Home-floor gate
+//!
+//! `dir` (the profile's `CLAUDE_CONFIG_DIR`) and the SSOTs in `roots` are
+//! resolved independently — `dir` from the registry / `$CLAUDE_CONFIG_DIR`,
+//! `roots` from [`paths::home_dir`] — and nothing used to check the two
+//! agreed. A shell with `$HOME` pointed at a sandbox but `$CLAUDE_CONFIG_DIR`
+//! still naming a profile dir under the REAL home let `csm profiles
+//! bootstrap` repoint that real profile's `plugins`/`projects`/`sessions` at
+//! the sandbox's SSOT and move its live session registry there (2026-09-20
+//! incident; manually reverted, nothing broken now). [`ensure_profile_provisioned`]
+//! now refuses to provision a `dir` that is neither registered in
+//! [`crate::account::ProfileMap`] nor shaped like `<home>/.claude` /
+//! `<home>/.claude.<name>` under the resolved home — the exact question
+//! [`crate::cas::platform::dir_is_broadcastable`] already answers for the
+//! `cas -g` machine-wide floor, reused here rather than reimplemented (see
+//! [`provisioning_allowed`]).
+//!
+//! The gate lives in [`ensure_profile_provisioned`] rather than in
+//! `cmd::support::current_profile_dir` — the one call site the incident went
+//! through — because `current_profile_dir` is not the only path a dir takes
+//! to this function: `resolve_profile_dir`'s registry hit, the account
+//! picker's winner, `cas add`/`cas set`'s explicit `<dir>` argument, and
+//! `main`'s `--profile` pin all reach [`ensure_profile_provisioned`] without
+//! ever calling `current_profile_dir`. Gating the one function every
+//! provisioning path funnels through is the layer nothing can route around.
+//!
+//! Refusal is an `Err`. [`ensure_provisioned_soft`] — every implicit
+//! switch/launch/register caller — already treats any `Err` as soft (warn to
+//! stderr, keep going unprovisioned), so a launch never hard-fails over this;
+//! the explicit `csm profiles bootstrap` / `doctor --fix` verbs surface it as
+//! a loud per-profile failure instead, which is the right response to a
+//! deliberately invoked provisioning command hitting a misaimed dir.
+//!
 //! ## Platform
 //! POSIX uses `std::os::unix::fs::symlink`. On Windows, directory symlinks are
 //! privilege-gated and the relaunch loop is currently disabled there, so we make
@@ -79,6 +112,7 @@
 use std::io;
 use std::path::{Path, PathBuf};
 
+use crate::account;
 use crate::paths;
 
 /// The shared SSOT roots every profile links into, injected so tests can point
@@ -277,6 +311,31 @@ pub fn diagnose_profile_with(dir: &Path, roots: &SharedRoots) -> ProfileDiagnosi
     }
 }
 
+/// Is `dir` safe to provision — does it belong to the same `$HOME` (or
+/// registry) that the shared SSOTs are derived from?
+///
+/// This is the exact question [`crate::cas::platform::dir_is_broadcastable`]
+/// answers for the `cas -g` machine-wide floor — is `dir` a legitimate
+/// profile location, one some profile is registered at, or one shaped like
+/// `<home>/.claude` / `<home>/.claude.<name>`? Reused rather than
+/// re-implemented; see that function's doc and tests for the shape rules.
+///
+/// `registry` is `None` when [`account::ProfileMap::load`] itself failed
+/// (corrupt/unreadable `profiles.json`), and that is a refusal too, never a
+/// pass: an unreadable registry can neither confirm nor deny that `dir` is
+/// registered, so it answers "I don't know", not "go ahead". See the
+/// module-level *Home-floor gate* section for why this check exists.
+fn provisioning_allowed(
+    registry: Option<&account::ProfileMap>,
+    home: Option<&Path>,
+    dir: &Path,
+) -> bool {
+    let Some(registry) = registry else {
+        return false;
+    };
+    crate::cas::platform::dir_is_broadcastable(registry, home, &dir.to_string_lossy())
+}
+
 /// Ensure profile `name` at `dir` satisfies the provisioning invariants.
 ///
 /// Idempotent: safe to call on every switch/launch/register. Returns a report
@@ -285,7 +344,29 @@ pub fn diagnose_profile_with(dir: &Path, roots: &SharedRoots) -> ProfileDiagnosi
 /// `dir` is the profile's `CLAUDE_CONFIG_DIR` (from the registry, never a
 /// literal). `name` is informational (kept for future per-name steps and for
 /// error context).
+///
+/// Gated by [`provisioning_allowed`] first — see the module-level *Home-floor
+/// gate* section. A `dir` that fails the gate is refused with an `Err`
+/// instead of being linked into SSOTs that may belong to a different home.
 pub fn ensure_profile_provisioned(name: &str, dir: &Path) -> io::Result<ProvisionReport> {
+    let registry = account::ProfileMap::load();
+    let home = paths::home_dir();
+    if !provisioning_allowed(registry.as_ref().ok(), home.as_deref(), dir) {
+        let home_desc = match &home {
+            Some(h) => h.display().to_string(),
+            None => "<no $HOME>".to_owned(),
+        };
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "provision[{name}]: refusing to provision {} — it is not a registered \
+                 profile dir and not shaped like {home_desc}/.claude* under the resolved \
+                 $HOME; this profile dir may belong to a different $HOME than the shared \
+                 SSOT (see the Home-floor gate note in provision.rs)",
+                dir.display()
+            ),
+        ));
+    }
     ensure_profile_provisioned_with(name, dir, &SharedRoots::production())
 }
 
@@ -2062,5 +2143,102 @@ mod tests {
         };
         assert_eq!(read(&backup), "stray");
         assert!(is_symlink_to(&dir.join("sessions"), &roots.sessions));
+    }
+}
+
+/// [`provisioning_allowed`] unit tests. Platform-independent (the predicate
+/// touches neither the filesystem nor the environment), unlike `mod tests`
+/// above, which exercises the actual symlink machinery and is unix-only.
+#[cfg(test)]
+mod gate_tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    fn registry(pairs: &[(&str, &str)]) -> account::ProfileMap {
+        account::ProfileMap(
+            pairs
+                .iter()
+                .map(|(n, d)| ((*n).to_owned(), (*d).to_owned()))
+                .collect::<HashMap<_, _>>(),
+        )
+    }
+
+    const HOME: &str = "/Users/example";
+    const OTHER_HOME: &str = "/Users/other";
+
+    #[test]
+    fn registered_dir_inside_home_is_allowed() {
+        let reg = registry(&[("work", "/Users/example/.claude.work")]);
+        assert!(provisioning_allowed(
+            Some(&reg),
+            Some(Path::new(HOME)),
+            Path::new("/Users/example/.claude.work")
+        ));
+    }
+
+    #[test]
+    fn conventional_shape_dir_inside_home_is_allowed() {
+        let reg = registry(&[]);
+        assert!(provisioning_allowed(
+            Some(&reg),
+            Some(Path::new(HOME)),
+            Path::new("/Users/example/.claude.home")
+        ));
+    }
+
+    /// The incident shape: an unregistered profile dir sits under one home,
+    /// while the resolved home (and therefore the shared SSOT) is a
+    /// DIFFERENT one — e.g. `$CLAUDE_CONFIG_DIR` naming a real-home profile
+    /// while `$HOME` points at a sandbox. Must be refused.
+    #[test]
+    fn unregistered_dir_under_a_different_home_is_refused() {
+        let reg = registry(&[]);
+        assert!(!provisioning_allowed(
+            Some(&reg),
+            Some(Path::new(OTHER_HOME)),
+            Path::new("/Users/example/.claude.work")
+        ));
+    }
+
+    /// A first-boot box has no `profiles.json` yet (empty registry), but
+    /// `paths::synthesize_profile_dir` still invents `<home>/.claude.<name>`
+    /// for an unregistered name — that must keep working.
+    #[test]
+    fn empty_registry_with_conventional_dir_is_allowed() {
+        let reg = registry(&[]);
+        assert!(provisioning_allowed(
+            Some(&reg),
+            Some(Path::new(HOME)),
+            Path::new("/Users/example/.claude.new")
+        ));
+    }
+
+    /// `account::ProfileMap::load()` failing (corrupt/unreadable
+    /// `profiles.json`) must be a refusal even for an otherwise-conventional
+    /// dir — an unreadable registry cannot confirm the dir is NOT registered
+    /// somewhere unconventional, so it never gets the benefit of the doubt.
+    #[test]
+    fn unreadable_registry_is_refused_even_for_a_conventional_dir() {
+        assert!(!provisioning_allowed(
+            None,
+            Some(Path::new(HOME)),
+            Path::new("/Users/example/.claude.home")
+        ));
+    }
+
+    /// No resolvable home at all — only the registry can authorise a dir.
+    #[test]
+    fn without_a_home_only_the_registry_authorises() {
+        let reg = registry(&[("work", "/Users/example/.claude.work")]);
+        assert!(provisioning_allowed(
+            Some(&reg),
+            None,
+            Path::new("/Users/example/.claude.work")
+        ));
+        assert!(!provisioning_allowed(
+            Some(&reg),
+            None,
+            Path::new("/Users/example/.claude.home")
+        ));
     }
 }
