@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.3.7](https://github.com/DaveDev42/claude-smart/compare/v0.3.6...v0.3.7) (2026-09-21)
+
+
+### Features
+
+* **provision:** link every profile's sessions dir to one shared registry ([d762e1f](https://github.com/DaveDev42/claude-smart/commit/d762e1fe0df5fc1ce1387343097adc8eeb50b58a))
+
+
+### Bug Fixes
+
+* **provision:** refuse to provision a dir that fails the home floor ([b52bdbc](https://github.com/DaveDev42/claude-smart/commit/b52bdbc6d0205422773d381bd616de2d1152db80))
+
 ## [0.3.6](https://github.com/DaveDev42/claude-smart/compare/v0.3.5...v0.3.6) (2026-09-19)
 
 
