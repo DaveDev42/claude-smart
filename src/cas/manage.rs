@@ -17,6 +17,17 @@ use super::write_default_profile;
 ///
 /// `profiles` is loaded fresh (and mutably) by the caller so writes persist.
 pub fn manage_emit(op: &Op, profiles: &mut ProfileMap) -> anyhow::Result<()> {
+    // Orca mode: the slot can only change through `csm orca init`/`disable`,
+    // and no other profile may take its dir. Only the mutating verbs read
+    // config.json for this (an unreadable one refuses them: fail closed);
+    // `list`/`use` never did, and `edit` resolves the slot itself, once.
+    if matches!(op, Op::Add { .. } | Op::Set { .. } | Op::Remove { .. }) {
+        let slot = crate::orca::slot::slot_for_guard(profiles).map_err(|e| anyhow::anyhow!(e))?;
+        if let Some(msg) = slot_refusal(op, slot.as_ref()) {
+            anyhow::bail!("{msg}");
+        }
+    }
+
     match op {
         Op::List => {
             print_status(&mut std::io::stdout(), Shell::Zsh, profiles)?;
@@ -106,6 +117,9 @@ pub fn manage_emit(op: &Op, profiles: &mut ProfileMap) -> anyhow::Result<()> {
             eprintln!(
                 "(new shells + GUI/launchd follow this; your current shell keeps its profile until you run `cas {name}` or open a new shell)"
             );
+            // Orca mode: carry the choice to Orca (warnings only, never an
+            // error for this command).
+            crate::orca::integrate::sync_default_change(name, profiles);
         }
 
         Op::Edit => {
@@ -121,6 +135,24 @@ pub fn manage_emit(op: &Op, profiles: &mut ProfileMap) -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+/// The Orca-slot refusal for `op`, if any (pure; `slot` is `None` outside
+/// Orca mode). Routes through the one policy in
+/// [`crate::orca::slot::registry_edit_refusal`].
+fn slot_refusal(op: &Op, slot: Option<&crate::orca::slot::Slot>) -> Option<String> {
+    use crate::orca::slot::{RegistryEdit, registry_edit_refusal};
+
+    let slot = slot?;
+    match op {
+        Op::Add { name, dir } => {
+            let dir = resolve_new_dir(name, dir.as_deref());
+            registry_edit_refusal(RegistryEdit::Add { name, dir: &dir }, slot)
+        }
+        Op::Set { name, dir } => registry_edit_refusal(RegistryEdit::Repoint { name, dir }, slot),
+        Op::Remove { name } => registry_edit_refusal(RegistryEdit::Remove { name }, slot),
+        _ => None,
+    }
 }
 
 /// Resolve the dir for `cas add`: explicit `dir` if given, else the
@@ -157,5 +189,36 @@ mod tests {
         assert!(got.ends_with(".claude.work"), "got: {got}");
         let got = resolve_new_dir("work", Some(""));
         assert!(got.ends_with(".claude.work"), "got: {got}");
+    }
+
+    // ── Orca slot guards ───────────────────────────────────────────────────────
+
+    #[test]
+    fn slot_guards_refuse_slot_edits_only_in_orca_mode() {
+        let slot = crate::orca::slot::Slot {
+            name: "orca".into(),
+            dir: "/Users/example/.claude.orca".into(),
+        };
+        let rm = Op::Remove {
+            name: "orca".into(),
+        };
+        let set = Op::Set {
+            name: "orca".into(),
+            dir: "/Users/example/.claude.other".into(),
+        };
+        let add_at_slot = Op::Add {
+            name: "alias".into(),
+            dir: Some("/Users/example/.claude.orca".into()),
+        };
+        let add_ok = Op::Add {
+            name: "home".into(),
+            dir: Some("/Users/example/.claude.home".into()),
+        };
+        for op in [&rm, &set, &add_at_slot] {
+            assert!(slot_refusal(op, Some(&slot)).is_some(), "{op:?}");
+            assert!(slot_refusal(op, None).is_none(), "Orca mode off: {op:?}");
+        }
+        assert!(slot_refusal(&add_ok, Some(&slot)).is_none());
+        assert!(slot_refusal(&Op::List, Some(&slot)).is_none());
     }
 }

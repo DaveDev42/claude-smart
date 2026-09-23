@@ -54,6 +54,9 @@ pub enum Status {
     /// Credentials are dead (refresh token dead/absent, never logged in, or
     /// the server rejected the token) — see [`AttentionKind::NeedsLogin`].
     LoginRequired,
+    /// The Orca slot: not an account of its own, so no usage; the row says
+    /// which account Orca has in it instead ([`Row::orca_follow`]).
+    OrcaSlot,
 }
 
 impl Status {
@@ -68,6 +71,7 @@ impl Status {
             Status::NoData => "\u{00b7} no data",
             Status::RefreshNeeded => "REFRESH NEEDED",
             Status::LoginRequired => "LOGIN REQUIRED",
+            Status::OrcaSlot => "orca slot",
         }
     }
 }
@@ -110,6 +114,9 @@ pub struct Row {
     /// [`attention_lines`] (the footer block) and serialized verbatim into
     /// `--json`.
     pub attention: Option<Attention>,
+    /// Orca slot row only: `→ <bound profile>` / `→ (orca active: <email>)` /
+    /// `→ (orca: unknown)`, from Orca's saved state (never the socket).
+    pub orca_follow: Option<String>,
 }
 
 /// The full report: rows + freshness/config metadata for the header/footer.
@@ -275,6 +282,7 @@ fn join_one(
             status,
             error: None,
             attention: Some(attention),
+            orca_follow: None,
         };
     }
 
@@ -294,6 +302,7 @@ fn join_one(
             status: Status::Errored,
             error: Some(err.clone()),
             attention: None,
+            orca_follow: None,
         };
     }
 
@@ -343,6 +352,33 @@ fn join_one(
         status,
         error: None,
         attention: None,
+        orca_follow: None,
+    }
+}
+
+/// Turn the Orca slot's row (when the registry has one) into a follow row:
+/// no usage columns, status [`Status::OrcaSlot`], and `follow` (the
+/// [`crate::orca::integrate::slot_follow_label`] text) in the STATUS cell.
+/// Any usage the store still holds for the slot from before it became the
+/// slot is dropped: it describes whichever account Orca had in it then.
+/// Pure.
+pub fn mark_orca_slot(report: &mut Report, slot: &str, follow: &str) {
+    for r in report.rows.iter_mut().filter(|r| r.name == slot) {
+        *r = Row {
+            name: r.name.clone(),
+            registered: r.registered,
+            session_pct: None,
+            week_all_pct: None,
+            week_fable_pct: None,
+            session_resets: None,
+            session_resets_at: None,
+            week_all_resets: None,
+            week_all_resets_at: None,
+            status: Status::OrcaSlot,
+            error: None,
+            attention: None,
+            orca_follow: Some(follow.to_owned()),
+        };
     }
 }
 
@@ -491,6 +527,11 @@ fn status_cell(r: &Row, now: DateTime<Utc>) -> String {
             )
         }
         (Status::Errored, Some(msg), _) => format!("{}: {}", Status::Errored.label(), msg),
+        (Status::OrcaSlot, _, _) => format!(
+            "{} {}",
+            Status::OrcaSlot.label(),
+            r.orca_follow.as_deref().unwrap_or("→ (orca: unknown)")
+        ),
         (s, _, _) => s.label().to_owned(),
     }
 }
@@ -628,6 +669,10 @@ struct JsonRow<'a> {
     /// field sees exactly the JSON shape it always has.
     #[serde(skip_serializing_if = "Option::is_none")]
     attention: Option<&'a Attention>,
+    /// Orca slot row only (see [`Row::orca_follow`]); omitted otherwise, so
+    /// the shape is unchanged outside Orca mode.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    orca_follow: Option<&'a str>,
 }
 
 /// Render the report as pretty JSON (stable key order via `BTreeMap`).
@@ -650,6 +695,7 @@ pub fn render_json(report: &Report) -> Result<String, serde_json::Error> {
                     status: r.status,
                     error: r.error.as_deref(),
                     attention: r.attention.as_ref(),
+                    orca_follow: r.orca_follow.as_deref(),
                 },
             )
         })
@@ -1284,5 +1330,39 @@ mod tests {
                 .contains_key("attention"),
             "healthy row must omit attention, not null: {healthy_json}"
         );
+    }
+
+    // ── Orca slot row ────────────────────────────────────────────────────────
+
+    #[test]
+    fn orca_slot_row_shows_the_follow_label_and_no_usage() {
+        let mut data = sample_usage();
+        // Leftover usage from before the profile became the slot.
+        data.profiles
+            .insert("orca".into(), data.profiles["home"].clone());
+        let mut rpt = build_report(&registry(&["home", "orca"]), Some(&data), true, None);
+        mark_orca_slot(&mut rpt, "orca", "→ home");
+        let row = rpt.rows.iter().find(|r| r.name == "orca").unwrap();
+        assert_eq!(row.status, Status::OrcaSlot);
+        assert_eq!(row.session_pct, None);
+        assert_eq!(row.week_all_pct, None);
+
+        let table = render_table(&rpt, now());
+        let line = table.lines().find(|l| l.starts_with("orca ")).unwrap();
+        assert!(line.ends_with("orca slot → home"), "{line}");
+        assert!(!line.contains("12%"), "{line}");
+
+        let json: serde_json::Value = serde_json::from_str(&render_json(&rpt).unwrap()).unwrap();
+        assert_eq!(json["profiles"]["orca"]["status"], "orca_slot");
+        assert_eq!(json["profiles"]["orca"]["orca_follow"], "→ home");
+        assert!(json["profiles"]["home"].get("orca_follow").is_none());
+    }
+
+    #[test]
+    fn orca_slot_marking_without_a_slot_row_changes_nothing() {
+        let mut rpt = build_report(&registry(&["home"]), Some(&sample_usage()), true, None);
+        let before = render_json(&rpt).unwrap();
+        mark_orca_slot(&mut rpt, "orca", "→ home");
+        assert_eq!(render_json(&rpt).unwrap(), before);
     }
 }

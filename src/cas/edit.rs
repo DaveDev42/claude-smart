@@ -59,6 +59,39 @@ pub enum Outcome {
 
 // ─── pure core ─────────────────────────────────────────────────────────────────
 
+/// [`apply_edit_action`] behind the Orca-slot guard: while Orca mode is ON
+/// (`slot` is `Some`), renaming, re-pointing or deleting the slot, and
+/// pointing any other profile at the slot's dir, are refused as `NoChange`.
+/// Pure; `slot = None` is exactly [`apply_edit_action`].
+pub fn apply_edit_action_guarded(
+    profiles: &mut ProfileMap,
+    action: Action,
+    slot: Option<&crate::orca::slot::Slot>,
+) -> Outcome {
+    use crate::orca::slot::{RegistryEdit, registry_edit_refusal};
+
+    if let Some(slot) = slot {
+        let refusal = match &action {
+            Action::Add { name, dir } => {
+                let dir = synth_dir(name, dir.as_deref());
+                registry_edit_refusal(RegistryEdit::Add { name, dir: &dir }, slot)
+            }
+            Action::EditDir { name, dir } => {
+                registry_edit_refusal(RegistryEdit::Repoint { name, dir }, slot)
+            }
+            Action::Rename { from, .. } => {
+                registry_edit_refusal(RegistryEdit::Rename { from }, slot)
+            }
+            Action::Delete { name } => registry_edit_refusal(RegistryEdit::Remove { name }, slot),
+            Action::SetDefault { .. } | Action::Quit => None,
+        };
+        if let Some(msg) = refusal {
+            return Outcome::NoChange { msg };
+        }
+    }
+    apply_edit_action(profiles, action)
+}
+
 /// Apply `action` to `profiles` in memory and report the [`Outcome`].
 ///
 /// Pure: mutates only the passed map, performs no I/O (the caller persists on
@@ -206,6 +239,9 @@ pub fn run_interactive(profiles: &mut ProfileMap) -> anyhow::Result<()> {
         );
     }
 
+    let slot = crate::orca::slot::slot_for_guard(profiles)
+        .map_err(|e| anyhow::anyhow!("csm profiles edit: {e}"))?;
+
     let stdin = io::stdin();
     loop {
         render_menu(profiles);
@@ -231,13 +267,19 @@ pub fn run_interactive(profiles: &mut ProfileMap) -> anyhow::Result<()> {
             }
         };
 
-        match apply_edit_action(profiles, action) {
+        // Only an explicit set-default is carried to Orca; a rename that
+        // repoints the default is bookkeeping, not a new choice.
+        let explicit_default = matches!(action, Action::SetDefault { .. });
+        match apply_edit_action_guarded(profiles, action, slot.as_ref()) {
             Outcome::Quit => break,
             Outcome::NoChange { msg } => println!("  {msg}"),
             Outcome::Changed { msg, set_default } => {
                 profiles.save()?;
                 if let Some(def) = set_default {
                     apply_default(&def, profiles)?;
+                    if explicit_default {
+                        crate::orca::integrate::sync_default_change(&def, profiles);
+                    }
                 }
                 // For add/edit-dir, create the dir on disk (best-effort).
                 ensure_dirs(profiles);
@@ -699,5 +741,65 @@ mod tests {
         assert!(p.contains("gamma"));
         assert!(p.contains("beta"));
         assert!(!p.contains("alpha"));
+    }
+
+    // ── Orca slot guard ────────────────────────────────────────────────────────
+
+    #[test]
+    fn guarded_editor_refuses_slot_rename_repoint_and_delete() {
+        let slot = crate::orca::slot::Slot {
+            name: "orca".into(),
+            dir: "/Users/example/.claude.orca".into(),
+        };
+        let base = registry(&[
+            ("orca", "/Users/example/.claude.orca"),
+            ("work", "/Users/example/.claude.work"),
+        ]);
+        let refused = [
+            Action::Rename {
+                from: "orca".into(),
+                to: "o2".into(),
+            },
+            Action::EditDir {
+                name: "orca".into(),
+                dir: "/Users/example/.claude.x".into(),
+            },
+            Action::Delete {
+                name: "orca".into(),
+            },
+            Action::EditDir {
+                name: "work".into(),
+                dir: "/Users/example/.claude.orca".into(),
+            },
+            Action::Add {
+                name: "alias".into(),
+                dir: Some("/Users/example/.claude.orca/".into()),
+            },
+        ];
+        // Isolated home: the delete branch reads the default-state file.
+        let tmp = tempfile::tempdir().unwrap();
+        crate::testenv::with_test_home(tmp.path(), || {
+            crate::cas::write_default_profile("work", &base).unwrap();
+            for a in refused {
+                let mut p = base.clone();
+                let out = apply_edit_action_guarded(&mut p, a.clone(), Some(&slot));
+                assert!(matches!(out, Outcome::NoChange { .. }), "{a:?}");
+                assert_eq!(p.0, base.0, "registry untouched for {a:?}");
+                // Orca mode off → the plain core decides (these all change).
+                let mut p = base.clone();
+                let out = apply_edit_action_guarded(&mut p, a.clone(), None);
+                assert!(matches!(out, Outcome::Changed { .. }), "off: {a:?}");
+            }
+        });
+        let mut p = base.clone();
+        let out = apply_edit_action_guarded(
+            &mut p,
+            Action::Rename {
+                from: "work".into(),
+                to: "job".into(),
+            },
+            Some(&slot),
+        );
+        assert!(matches!(out, Outcome::Changed { .. }));
     }
 }

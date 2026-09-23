@@ -1,3 +1,4 @@
+pub(crate) mod detach;
 pub mod launcher;
 pub mod pid;
 pub(crate) mod proc;

@@ -666,7 +666,7 @@ pub fn classify_with(
     let target_profile = if fallback_model.is_some() {
         current_profile.clone()
     } else {
-        match pick_target(&current_profile) {
+        match pick_target(&current_profile, owner_dir) {
             Some(name) => name,
             None => {
                 // No viable target (all saturated/errored, or fetch miss)
@@ -934,19 +934,50 @@ fn notify_once(sid: &str, body: String) -> Decision {
 /// Step 6: pick a target profile, excluding `current_profile`, with the
 /// stale-usage gate off (reactive hook mode — see the caller's comment on
 /// why this call site must not apply that gate).
-fn pick_target(current_profile: &str) -> Option<String> {
-    let target_result = crate::account::pick_account_gated(
+///
+/// Orca mode, session running in the slot (`owner_dir` is the slot dir):
+/// the limited account is whichever one Orca has materialized there, so the
+/// pick also skips every profile sharing the identity of Orca's active
+/// account (read from Orca's saved state; the hook never opens Orca's
+/// socket). The account layer always drops the slot itself.
+fn pick_target(current_profile: &str, owner_dir: &Path) -> Option<String> {
+    let exclude = slot_owner_exclusions(owner_dir);
+    let exclude: Vec<&str> = exclude.iter().map(String::as_str).collect();
+    let target_result = crate::account::pick_account_with(
         current_profile,
-        /*include_current=*/ false,
-        /*apply_stale_gate=*/ false,
+        &crate::account::scoring::PickPolicy {
+            include_current: false,
+            apply_stale_gate: false,
+            prefer_current: false,
+            exclude: &exclude,
+        },
     );
     // Single viability authority: `resolve_target_from_pick` is a pure pass-through
-    // over `account::pick_account_gated`'s verdict — the hook never recomputes or
+    // over `account::pick_account_with`'s verdict — the hook never recomputes or
     // second-guesses which profile is viable. Whatever `scoring::pick_best`
     // excludes (session-limited or week_all-saturated — `week_fable` no
     // longer constrains viability at all, see `scoring::is_viable_pcts`'s
     // doc) can therefore never come back as a relaunch target.
     resolve_target_from_pick(target_result)
+}
+
+/// The profiles a limit switch out of `owner_dir` must skip beyond the
+/// defaults: empty unless Orca mode is ON and `owner_dir` is the slot, then
+/// the slot plus every profile sharing Orca's active account identity.
+/// Silent; offline data only.
+fn slot_owner_exclusions(owner_dir: &Path) -> Vec<String> {
+    let registry = hook_registry();
+    let Some(slot) = crate::orca::slot::for_registry(&registry) else {
+        return Vec::new();
+    };
+    if !slot.is_path(owner_dir) {
+        return Vec::new();
+    }
+    let mut out = vec![slot.name.clone()];
+    if let Some(view) = crate::orca::integrate::offline_view(&registry) {
+        out.extend(view.active_identity_profiles());
+    }
+    out
 }
 
 /// Step 7: `CLAUDE_AUTO_SWITCH_RELAUNCH` defaults to `"1"` (relaunch
@@ -1421,13 +1452,44 @@ pub(crate) fn resolve_target_from_pick(
     }
 }
 
-/// Derive the profile name from the owner dir by taking the last path segment
-/// and stripping the `.claude.` prefix.
+/// Derive the profile name for the owner dir: the last path segment with the
+/// `.claude.` prefix stripped. In Orca mode only, the registered profile
+/// whose dir it is wins first ([`owner_dir_to_profile_name_in`]), because
+/// the slot's dir need not follow the `.claude.<name>` convention. With Orca
+/// mode OFF the naming stays purely lexical, exactly as before Orca support.
 ///
 /// e.g. `/Users/example/.claude.home` → `"home"`
 ///      `/Users/example/.claude.work` → `"work"`
 ///      (unknown dir) → use the last segment as-is
 pub(crate) fn owner_dir_to_profile_name(owner_dir: &Path) -> String {
+    let registry = hook_registry();
+    if crate::orca::slot::for_registry(&registry).is_none() {
+        return lexical_profile_name(owner_dir);
+    }
+    owner_dir_to_profile_name_in(owner_dir, &registry)
+}
+
+/// [`owner_dir_to_profile_name`] against an explicit registry. Pure.
+/// Registry-aware so a profile whose dir does not follow the `.claude.<name>`
+/// convention (the Orca slot can be any dir) is still named correctly.
+pub(crate) fn owner_dir_to_profile_name_in(
+    owner_dir: &Path,
+    registry: &crate::account::ProfileMap,
+) -> String {
+    if let Some(dir) = owner_dir.to_str()
+        && let Some(name) = registry.names_sorted().into_iter().find(|n| {
+            registry
+                .get(n)
+                .is_some_and(|d| crate::cas::platform::dirs_equal(d, dir))
+        })
+    {
+        return name.to_owned();
+    }
+    lexical_profile_name(owner_dir)
+}
+
+/// The owner dir's last segment with any `.claude.` prefix stripped. Pure.
+fn lexical_profile_name(owner_dir: &Path) -> String {
     let seg = owner_dir.file_name().and_then(|n| n.to_str()).unwrap_or("");
     // Strip leading `.claude.` prefix if present
     if let Some(stripped) = seg.strip_prefix(".claude.") {
@@ -1435,6 +1497,17 @@ pub(crate) fn owner_dir_to_profile_name(owner_dir: &Path) -> String {
     } else {
         seg.to_string()
     }
+}
+
+/// The registry as the hook reads it: silent, an unreadable file reads as
+/// empty. Under `cfg(test)` without a test HOME it is empty too, so unit
+/// tests never read the developer's real registry.
+fn hook_registry() -> crate::account::ProfileMap {
+    #[cfg(test)]
+    if crate::testenv::test_home().is_none() {
+        return crate::account::ProfileMap::default();
+    }
+    crate::account::ProfileMap::load().unwrap_or_default()
 }
 
 /// Parse `"<pid> <born>"` from a pid file. Returns `None` on any parse failure.
@@ -1921,6 +1994,68 @@ mod tests {
     fn owner_dir_profile_name_work() {
         let p = Path::new("/home/you/.claude.work");
         assert_eq!(owner_dir_to_profile_name(p), "work");
+    }
+
+    #[test]
+    fn owner_dir_profile_name_stays_lexical_with_orca_mode_off() {
+        let home = tempfile::tempdir().unwrap();
+        crate::testenv::with_test_home(home.path(), || {
+            let job = home.path().join(".claude.job");
+            let mut pm = crate::account::ProfileMap::default();
+            pm.insert("work".into(), job.to_string_lossy().into_owned());
+            pm.insert(
+                "orca".into(),
+                home.path().join("orca-rt").to_string_lossy().into_owned(),
+            );
+            pm.save().unwrap();
+            // No config.json → Orca mode OFF → pre-Orca lexical naming.
+            assert_eq!(owner_dir_to_profile_name(&job), "job");
+            // Orca mode ON → the registry names it.
+            let mut cfg = crate::config::Config::default();
+            cfg.orca.slot_profile = Some("orca".into());
+            cfg.save().unwrap();
+            assert_eq!(owner_dir_to_profile_name(&job), "work");
+        });
+    }
+
+    #[test]
+    fn owner_dir_profile_name_prefers_the_registry() {
+        let mut pm = crate::account::ProfileMap::default();
+        pm.insert("orca".into(), "/Users/example/orca-runtime".into());
+        pm.insert("work".into(), "/Users/example/.claude.work".into());
+        assert_eq!(
+            owner_dir_to_profile_name_in(Path::new("/Users/example/orca-runtime/"), &pm),
+            "orca"
+        );
+        assert_eq!(
+            owner_dir_to_profile_name_in(Path::new("/Users/example/.claude.work"), &pm),
+            "work"
+        );
+        // Unregistered → lexical fallback.
+        assert_eq!(
+            owner_dir_to_profile_name_in(Path::new("/Users/example/.claude.other"), &pm),
+            "other"
+        );
+    }
+
+    #[test]
+    fn slot_owner_exclusions_only_for_the_slot_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        crate::testenv::with_test_home(home, || {
+            use crate::orca::integrate::test_support;
+            test_support::orca_home(home, &["home", "work", "alt"]);
+            test_support::write_orca_data(home, &[("a1", "alice@example.com")], Some("a1"));
+            test_support::login(home, "work", "alice@example.com");
+            test_support::login(home, "alt", "alice@example.com");
+            assert_eq!(
+                slot_owner_exclusions(&home.join(".claude.orca")),
+                vec!["orca".to_string(), "alt".to_string(), "work".to_string()]
+            );
+            assert!(slot_owner_exclusions(&home.join(".claude.home")).is_empty());
+        });
+        // Orca mode OFF (no test home → no registry): nothing extra.
+        assert!(slot_owner_exclusions(Path::new("/Users/example/.claude.orca")).is_empty());
     }
 
     #[test]

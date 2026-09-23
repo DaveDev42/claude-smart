@@ -1,6 +1,7 @@
 //! `csm cas` — the eval-class shim contract (machine interface).
 //!
-//! Parses `--eval`/`--shell`/`--print-default-dir` flags and the CAS
+//! Parses `--eval`/`--shell`/`--print-default-dir`/`--print-floor-dir` flags
+//! and the CAS
 //! operation, then dispatches to `cas::eval_emit` (profile switching, eval-able
 //! output) or `cas::manage_emit` (registry management verbs, human output).
 
@@ -31,6 +32,16 @@ pub(crate) fn cmd_cas(args: &[OsString]) -> anyhow::Result<()> {
         let profiles = account::ProfileMap::load().unwrap_or_default();
         print_default_dir_to(&mut std::io::stdout(), &profiles)?;
         return Ok(());
+    }
+
+    // `--print-floor-dir`: print the machine-wide floor dir (the Orca slot in
+    // Orca mode, else the default profile's dir) for the login-time floor
+    // writer. Additive: `--print-default-dir` above is unchanged in value and
+    // shape. An unreadable config.json OR profiles.json prints NOTHING and
+    // fails, so a caller never publishes a floor derived from state csm could
+    // not read (the same refusal `cas::platform::apply_global` makes).
+    if parsed.print_floor_dir {
+        return print_floor_dir_cmd(&mut std::io::stdout());
     }
 
     let eval_mode = parsed.eval_mode;
@@ -87,6 +98,28 @@ pub(crate) fn print_default_dir_to(
     writeln!(w, "{}", profiles.default_dir().to_string_lossy())
 }
 
+/// `--print-floor-dir`'s I/O shell: load both registries STRICTLY, then
+/// print. Either file unreadable → error with nothing written to `w`: an
+/// empty registry would hide the slot and publish the default profile's dir
+/// as the floor, where a (re)started Orca would adopt it as its runtime dir.
+pub(crate) fn print_floor_dir_cmd(w: &mut impl std::io::Write) -> anyhow::Result<()> {
+    let profiles = account::ProfileMap::load()
+        .context("csm cas --print-floor-dir: profiles.json unreadable")?;
+    let config = crate::config::Config::load()
+        .context("csm cas --print-floor-dir: config.json unreadable")?;
+    print_floor_dir_to(w, &profiles, &config)?;
+    Ok(())
+}
+
+/// Thin shell over `--print-floor-dir`'s output: [`cas::floor_dir`] + `\n`.
+pub(crate) fn print_floor_dir_to(
+    w: &mut impl std::io::Write,
+    profiles: &account::ProfileMap,
+    config: &crate::config::Config,
+) -> std::io::Result<()> {
+    writeln!(w, "{}", cas::floor_dir(profiles, config).to_string_lossy())
+}
+
 /// Parsed `csm cas` flags.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub(crate) struct CasFlags {
@@ -95,6 +128,8 @@ pub(crate) struct CasFlags {
     pub(crate) op_args: Vec<String>,
     /// `--print-default-dir`: print the resolved default dir and exit (floor SSOT).
     pub(crate) print_default_dir: bool,
+    /// `--print-floor-dir`: print the machine-wide floor dir and exit.
+    pub(crate) print_floor_dir: bool,
 }
 
 /// Parse `--eval`, `--shell`, `--print-default-dir`, and `--` sections from
@@ -116,6 +151,8 @@ pub(crate) fn parse_cas_flags(args: &[OsString]) -> anyhow::Result<CasFlags> {
             f.eval_mode = true;
         } else if s == "--print-default-dir" {
             f.print_default_dir = true;
+        } else if s == "--print-floor-dir" {
+            f.print_floor_dir = true;
         } else if s == "--shell" {
             if let Some(next) = iter.next() {
                 f.shell = Some(next.to_string_lossy().into_owned());
@@ -400,6 +437,75 @@ mod tests {
                 out.starts_with(&expected) && out.ends_with('\n'),
                 "got: {out}"
             );
+        });
+    }
+
+    // ── print_floor_dir_to ────────────────────────────────────────────────────
+
+    #[test]
+    fn parse_cas_flags_print_floor_dir() {
+        let f = parse_cas_flags(&argv(&["--print-floor-dir"])).unwrap();
+        assert!(f.print_floor_dir);
+        assert!(!f.print_default_dir);
+    }
+
+    #[test]
+    fn floor_dir_is_the_slot_in_orca_mode_and_default_dir_stays_put() {
+        with_isolated_home(|home| {
+            let work = home.join(".claude.work").to_string_lossy().into_owned();
+            let slot = home.join(".claude.orca").to_string_lossy().into_owned();
+            let mut m = std::collections::HashMap::new();
+            m.insert("work".to_owned(), work.clone());
+            m.insert("orca".to_owned(), slot.clone());
+            let profiles = account::ProfileMap(m);
+            crate::cas::write_default_profile("work", &profiles).unwrap();
+
+            let mut config = crate::config::Config::default();
+            let mut buf = Vec::new();
+            print_floor_dir_to(&mut buf, &profiles, &config).unwrap();
+            assert_eq!(String::from_utf8(buf).unwrap(), format!("{work}\n"));
+
+            config.orca.slot_profile = Some("orca".into());
+            let mut buf = Vec::new();
+            print_floor_dir_to(&mut buf, &profiles, &config).unwrap();
+            assert_eq!(String::from_utf8(buf).unwrap(), format!("{slot}\n"));
+
+            // --print-default-dir is unchanged by Orca mode.
+            let mut buf = Vec::new();
+            print_default_dir_to(&mut buf, &profiles).unwrap();
+            assert_eq!(String::from_utf8(buf).unwrap(), format!("{work}\n"));
+        });
+    }
+
+    #[test]
+    fn print_floor_dir_prints_nothing_and_fails_on_a_corrupt_registry() {
+        with_isolated_home(|_home| {
+            let p = crate::paths::profiles_json();
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(&p, "{ not json").unwrap();
+            let mut buf = Vec::new();
+            let err = print_floor_dir_cmd(&mut buf).unwrap_err();
+            assert!(format!("{err:#}").contains("profiles.json"), "{err:#}");
+            assert!(buf.is_empty(), "stdout must stay empty");
+        });
+    }
+
+    #[test]
+    fn print_floor_dir_prints_nothing_and_fails_on_a_corrupt_config() {
+        with_isolated_home(|home| {
+            let mut m = std::collections::HashMap::new();
+            m.insert(
+                "work".to_owned(),
+                home.join(".claude.work").to_string_lossy().into_owned(),
+            );
+            account::ProfileMap(m).save().unwrap();
+            let c = crate::paths::config_json();
+            std::fs::create_dir_all(c.parent().unwrap()).unwrap();
+            std::fs::write(&c, "{ not json").unwrap();
+            let mut buf = Vec::new();
+            let err = print_floor_dir_cmd(&mut buf).unwrap_err();
+            assert!(format!("{err:#}").contains("config.json"), "{err:#}");
+            assert!(buf.is_empty(), "stdout must stay empty");
         });
     }
 }

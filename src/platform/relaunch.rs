@@ -267,6 +267,17 @@ fn relaunch_loop(
         };
         profile_dir = next_dir;
 
+        // Opt-in `orca.followSwitch`: an ordinary account switch (not the
+        // same-account model fallback) also selects the target's account in
+        // Orca, before the next hop launches. Best-effort; the outcome goes
+        // to the session log only (the supervisor shares claude's terminal).
+        if sentinel.model_override.is_none()
+            && let Some(line) =
+                crate::orca::integrate::follow_switch(&sentinel.target_profile, &profiles)
+        {
+            let _ = crate::hook::notify::append_log(&sid, &line);
+        }
+
         // Build the next iteration's CLI: same sid, resume the session, re-apply
         // the launch flags the sidecar remembers, and inject the handoff prompt
         // (unless suppressed).

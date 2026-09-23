@@ -13,6 +13,11 @@
 //! not narrow what `csm <word>` can forward (see
 //! `cli::reserved::CLAUDE_RESERVED_SUBCOMMANDS`).
 //!
+//! Orca mode changes nothing here: the verb never consults Orca. An inherited
+//! `CLAUDE_CONFIG_DIR` equal to the Orca slot's dir therefore runs claude IN
+//! the slot, on whichever account Orca has materialized there; only `csm run`
+//! follows Orca's active account into that account's own profile dir.
+//!
 //! Unix replaces the process with `exec`, so claude owns the terminal outright
 //! — signals, job control and the exit status are its own and csm is gone.
 //! Windows has no exec: it spawns, waits, and exits with the child's code.
