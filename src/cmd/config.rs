@@ -207,8 +207,14 @@ mod tests {
         apply_unset(&mut cfg, Key::OrcaFollowSwitch);
         assert!(!cfg.orca.follow_switch);
 
-        apply_set(&mut cfg, Key::OrcaUserDataDir, &s(&["/Users/example/od"])).unwrap();
-        assert_eq!(cfg.orca.user_data_dir.as_deref(), Some("/Users/example/od"));
+        // `Path::is_absolute` needs a drive letter on Windows.
+        let abs = if cfg!(windows) {
+            r"C:\Users\example\od"
+        } else {
+            "/Users/example/od"
+        };
+        apply_set(&mut cfg, Key::OrcaUserDataDir, &s(&[abs])).unwrap();
+        assert_eq!(cfg.orca.user_data_dir.as_deref(), Some(abs));
         apply_set(&mut cfg, Key::OrcaUserDataDir, &s(&["~/od"])).unwrap();
         assert!(apply_set(&mut cfg, Key::OrcaUserDataDir, &s(&["relative"])).is_err());
         apply_unset(&mut cfg, Key::OrcaUserDataDir);

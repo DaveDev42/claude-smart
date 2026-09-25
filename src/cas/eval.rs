@@ -881,8 +881,14 @@ mod tests {
                     format!("{}\n", Shell::Zsh.export_line(&dir.to_string_lossy()))
                 );
                 assert_eq!(profiles.default_name(), "work");
-                let queued = crate::orca::pending::read().unwrap().unwrap();
-                assert_eq!(queued.account_id, "a1");
+                let queued = crate::orca::pending::read().unwrap();
+                if cfg!(unix) {
+                    assert_eq!(queued.expect("a queued select").account_id, "a1");
+                } else {
+                    // No select transport off unix: nothing is ever queued
+                    // (see `orca::integrate::queue`).
+                    assert!(queued.is_none());
+                }
             });
         });
     }
