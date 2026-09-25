@@ -80,7 +80,7 @@ pub(crate) fn bare_basename(id: &str) -> &str {
 /// exe basename is a version string. The process name (`p_comm` on macOS,
 /// `/proc/<pid>/stat` comm on Linux, the image name on Windows) and argv[0]
 /// keep the `claude` it was launched as.
-pub(crate) fn identity_matches(ids: &[Option<&str>], launch: &[std::ffi::OsString]) -> bool {
+fn identity_matches(ids: &[Option<&str>], launch: &[std::ffi::OsString]) -> bool {
     ids.iter()
         .flatten()
         .any(|id| is_name_for(bare_basename(id), launch))

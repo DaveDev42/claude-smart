@@ -1,21 +1,12 @@
 //! `csm`'s own global config — `~/.config/claude-smart/config.json`.
 //!
 //! Distinct from `~/.config/claude-as/` (the profile-switch contract shared with
-//! the `cas` shell shims): this file holds csm's own runtime settings — the
-//! drop-in **launch command** (run `happy`/`tp` instead of `claude`) and the
-//! **Orca interop** block (see [`OrcaConfig`] and [`crate::orca`]).
+//! the `cas` shell shims): this file holds csm's own runtime settings, currently
+//! just the drop-in **launch command** (run `happy`/`tp` instead of `claude`).
 //!
 //! Schema (JSON, like `profiles.json`):
 //! ```json
-//! {
-//!   "launchCommand": ["happy"],
-//!   "orca": {
-//!     "slotProfile": "orca",
-//!     "followSwitch": false,
-//!     "userDataDir": null,
-//!     "bindings": { "<orca-account-uuid>": "<profile>" }
-//!   }
-//! }
+//! { "launchCommand": ["happy"] }
 //! ```
 //! `launchCommand` is an argv token array, not a shell line: the first token is
 //! the binary, any remaining tokens are prepended to the claude-style argv on
@@ -27,7 +18,7 @@
 //! launches the literal `claude`); a corrupt file is an `Err` at the seam, and
 //! the launch path chooses leniency via `unwrap_or_default`.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::ffi::OsString;
 use std::io;
 use std::path::Path;
@@ -48,69 +39,11 @@ pub struct Config {
     )]
     pub launch_command: Vec<String>,
 
-    /// The Orca interop block. Omitted from the file while it is all
-    /// defaults, so a config that never touched Orca serializes unchanged.
-    #[serde(default, skip_serializing_if = "OrcaConfig::is_default")]
-    pub orca: OrcaConfig,
-
     /// Absorb any unknown keys written by future binary versions so a rollback
     /// to an older binary does not destroy unrecognised fields (mirrors
     /// `Sidecar.extra`).
     #[serde(flatten)]
     pub extra: HashMap<String, serde_json::Value>,
-}
-
-/// `config.json` → `orca`: how csm cooperates with the Orca desktop app's
-/// Claude account switching. See [`crate::orca`] for the model.
-///
-/// Orca mode is ON only while `slotProfile` is set AND names a registered
-/// profile ([`crate::orca::slot::resolve`]); every field here is inert
-/// otherwise. `slotProfile` is written only by `csm orca init` / `csm orca
-/// disable`, never by `csm config set`.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-pub struct OrcaConfig {
-    /// The registered profile whose dir is Orca's runtime dir (the "slot").
-    #[serde(
-        default,
-        rename = "slotProfile",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub slot_profile: Option<String>,
-
-    /// After a limit-triggered account switch, also select the target
-    /// account in Orca (relaunch supervisor only). Off by default: a select
-    /// swaps the slot's credentials under every process running in it.
-    #[serde(default, rename = "followSwitch", skip_serializing_if = "is_false")]
-    pub follow_switch: bool,
-
-    /// Override for Orca's userData dir (else `$ORCA_USER_DATA_PATH`, else
-    /// the platform default — see [`crate::orca::user_data_dir`]).
-    #[serde(
-        default,
-        rename = "userDataDir",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub user_data_dir: Option<String>,
-
-    /// Tie-break overrides: Orca account id → the profile it binds to when
-    /// several profiles share that account's identity.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub bindings: BTreeMap<String, String>,
-
-    /// Unknown keys from future versions, preserved across a rewrite.
-    #[serde(flatten)]
-    pub extra: HashMap<String, serde_json::Value>,
-}
-
-fn is_false(b: &bool) -> bool {
-    !*b
-}
-
-impl OrcaConfig {
-    /// `true` when nothing is set (the block is then left out of the file).
-    pub fn is_default(&self) -> bool {
-        *self == OrcaConfig::default()
-    }
 }
 
 impl Config {
@@ -151,18 +84,6 @@ impl Config {
         let tmp = path.with_extension("json.tmp");
         std::fs::write(&tmp, format!("{json}\n"))?;
         std::fs::rename(&tmp, path)
-    }
-
-    /// The Orca interop block (all defaults when absent).
-    pub fn orca(&self) -> &OrcaConfig {
-        &self.orca
-    }
-
-    /// Is Orca mode ON — `orca.slotProfile` set AND registered in `profiles`?
-    /// Delegates to [`crate::orca::slot::active_slot`], the one predicate.
-    #[allow(dead_code)] // convenience predicate; callers use `orca::slot::config_and_slot`
-    pub fn orca_mode_on(&self, profiles: &crate::account::ProfileMap) -> bool {
-        crate::orca::slot::active_slot(self, profiles).is_some()
     }
 
     /// The configured launch command as argv tokens, or `None` when unset.
@@ -279,59 +200,6 @@ mod tests {
         // Reserialize still carries the unknown key (rollback safety).
         let s = serde_json::to_string(&cfg).unwrap();
         assert!(s.contains("futureKey"), "unknown key dropped: {s}");
-    }
-
-    // ─── orca block ─────────────────────────────────────────────────────────────
-
-    #[test]
-    fn orca_block_defaults_when_absent() {
-        let cfg = parse(r#"{"launchCommand": ["happy"]}"#);
-        assert!(cfg.orca().is_default());
-        assert_eq!(cfg.orca().slot_profile, None);
-        assert!(!cfg.orca().follow_switch);
-        assert!(
-            !cfg.extra.contains_key("orca"),
-            "orca must not land in extra"
-        );
-    }
-
-    #[test]
-    fn orca_block_parses_every_field() {
-        let cfg = parse(
-            r#"{"orca": {"slotProfile": "orca", "followSwitch": true,
-                "userDataDir": "/Users/example/orca-data",
-                "bindings": {"acct-1": "work"}, "futureOrcaKey": 1}}"#,
-        );
-        let o = cfg.orca();
-        assert_eq!(o.slot_profile.as_deref(), Some("orca"));
-        assert!(o.follow_switch);
-        assert_eq!(o.user_data_dir.as_deref(), Some("/Users/example/orca-data"));
-        assert_eq!(o.bindings.get("acct-1").map(String::as_str), Some("work"));
-        assert_eq!(o.extra.get("futureOrcaKey"), Some(&serde_json::json!(1)));
-    }
-
-    #[test]
-    fn orca_block_skips_defaults_on_write() {
-        let mut cfg = Config::default();
-        cfg.orca.slot_profile = Some("orca".into());
-        let s = serde_json::to_string(&cfg).unwrap();
-        assert_eq!(s, r#"{"orca":{"slotProfile":"orca"}}"#);
-        cfg.orca.slot_profile = None;
-        assert_eq!(serde_json::to_string(&cfg).unwrap(), "{}");
-    }
-
-    #[test]
-    fn orca_mode_needs_a_registered_slot() {
-        let mut m = HashMap::new();
-        m.insert("work".to_owned(), "/Users/example/.claude.work".to_owned());
-        m.insert("orca".to_owned(), "/Users/example/.claude.orca".to_owned());
-        let profiles = crate::account::ProfileMap(m);
-        let mut cfg = Config::default();
-        assert!(!cfg.orca_mode_on(&profiles), "unset slotProfile → off");
-        cfg.orca.slot_profile = Some("orca".into());
-        assert!(cfg.orca_mode_on(&profiles));
-        cfg.orca.slot_profile = Some("missing".into());
-        assert!(!cfg.orca_mode_on(&profiles), "unregistered slot → off");
     }
 
     #[test]

@@ -7,7 +7,6 @@ mod envvar;
 mod epoch;
 mod homeguard;
 mod hook;
-mod orca;
 mod paths;
 mod picker;
 mod platform;
@@ -79,7 +78,6 @@ fn main() -> anyhow::Result<()> {
         "hook" => cmd::hook::cmd_hook(rest),
         "profiles" => cmd::profiles::cmd_profiles(rest),
         "config" => cmd::config::cmd_config(rest),
-        "orca" => cmd::orca::cmd_orca(rest),
         "usage" => cmd::usage::cmd_usage(rest),
         "cas" => cmd::cas::cmd_cas(rest),
         "pick-account" => cmd::pick_account::cmd_pick_account(rest),
@@ -165,23 +163,7 @@ fn print_help() {
     println!(
         "  csm config set launch-command <cmd>...   launch <cmd> instead of `claude` (e.g. happy)"
     );
-    println!("  csm config unset launch-command      revert to launching `claude`");
-    println!(
-        "  csm config get|set|unset orca.follow-switch|orca.user-data-dir   Orca interop settings\n"
-    );
-    println!("ORCA (desktop-app account interop)");
-    println!(
-        "  csm orca init [--slot <p>] [--dir <d>] [--no-floor] [--force]   register the slot, floor → slot"
-    );
-    println!("  csm orca disable                     Orca mode off; floor back to the default");
-    println!("  csm orca status [--json] [--strict]  diagnose the Orca setup");
-    println!("  csm orca accounts [--json]           Orca accounts + bound profiles");
-    println!(
-        "  csm orca use <profile|email|id> [--queue]   select an account in Orca (queue if not running)"
-    );
-    println!(
-        "  csm orca sync [--quiet]              apply a queued select; mirror Orca's active account\n"
-    );
+    println!("  csm config unset launch-command      revert to launching `claude`\n");
     println!("USAGE METERING (local, per profile)");
     println!(
         "  csm usage [--json] [--no-fetch] [--refresh] [--refresh-oauth]   multi-profile usage table (offline-aware)"

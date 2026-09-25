@@ -88,9 +88,6 @@ csm config [show]                    print csm's own config JSON (~/.config/clau
 csm config get launch-command        print the resolved launch command
 csm config set launch-command <cmd>...   launch <cmd> instead of `claude` (e.g. happy)
 csm config unset launch-command      revert to launching `claude`
-csm config get|set|unset orca.follow-switch|orca.user-data-dir   Orca interop settings
-
-csm orca {init|disable|status|accounts|use|sync}   Orca desktop-app interop (see Orca integration)
 
 csm usage [--json] [--no-fetch] [--refresh] [--refresh-oauth]
                                      multi-profile usage table (see Usage metering)
@@ -336,153 +333,6 @@ Resolution precedence (highest first): the `CLAUDE_SMART_CLAUDE_BIN` environment
 variable (a single binary, for tests / one-off overrides) → the config file's
 `launchCommand` → the default `claude`. An absent or empty config launches
 `claude` as before.
-
-## Orca integration
-
-The Orca desktop app keeps several Claude accounts and switches between them by
-copying the active account's login into one config dir, its *runtime dir*
-(Orca's own `CLAUDE_CONFIG_DIR`, or `~/.claude` when that is unset). `csm`
-keeps one config dir per account instead. The two cooperate through a
-dedicated profile called the **slot**.
-
-### The model
-
-- The slot is a registered profile (default name `orca`, dir `~/.claude.orca`)
-  whose dir is Orca's runtime dir. Orca mode is on while `config.json` names a
-  slot that is registered; `csm orca disable` turns it off. Disabling moves
-  the floor back to the default profile's dir, and an Orca started from that
-  floor treats it as its own runtime dir: it imports that profile's login and
-  writes its active account over it. Keep Orca quit while Orca mode is off.
-- The machine-wide floor (`launchctl setenv` on macOS, `HKCU\Environment` on
-  Windows) points at the slot, so Orca, which starts from launchd or the
-  desktop, inherits it. Shells do not change: `csm cas --print-default-dir`
-  still prints the default profile's own dir, and `cas <name>` still switches
-  the current shell.
-- The slot is never an account of its own. It gets no usage row, is never a
-  scoring candidate or a picker row, and `csm run` never falls back into it
-  unless it is the only profile registered.
-- Orca accounts are bound to profiles by identity: the account and
-  organization UUIDs Claude Code records in each profile's `.claude.json`,
-  with the email as a fallback. When two profiles are logged into the same
-  account, `orca.bindings` in `config.json` can name the one to use; otherwise
-  the alphabetically first wins. `csm orca status` lists ties.
-
-In Orca mode:
-
-- **`csm run` follows Orca.** When the shell's `CLAUDE_CONFIG_DIR` is unset,
-  the slot, or the default profile's dir, a launch asks the running Orca which
-  account is active (at most 1.2 s; a timeout is remembered for a minute so
-  the next launches skip the socket) and launches the profile bound to it, in
-  that profile's own dir. csm's default profile is updated to match, so new
-  shells follow too. The proactive pick keeps that account while it has
-  headroom and only moves off it when it is limited. A shell pinned to some
-  other profile (`cas work`) launches that profile without asking Orca.
-- **Choosing a default tells Orca.** `csm profiles use <name>`, `cas use
-  <name>`, `cas -g <name>` and the editor's set-default ask Orca to select the
-  bound account (1.5 s budget; failures are warnings, never an error exit).
-  With Orca not running, the choice is queued and applied by the next `csm run`
-  (which starts `csm orca sync --quiet` in the background) or `csm orca sync`.
-  A profile with no Orca account prints a warning and changes only csm's
-  default.
-- `csm usage` shows the slot row as `orca slot → <profile>` (the profile bound
-  to Orca's active account), `→ (orca active: <email>)` when that account has
-  no profile, or `→ (orca: unknown)`. `csm profiles list` marks the slot with
-  `[orca slot]`, bound profiles with `⇄ <email>`, and prints the floor dir.
-  Both read Orca's saved state only and never open its socket.
-- `claude -p` / `--print` launches (Orca's source-control AI runs `csm -p …`
-  with the runtime dir as `CLAUDE_CONFIG_DIR`) follow the same decision, but
-  never open a picker and never fetch usage over the network; they score on
-  the cached usage.
-- A limit hit in a session running in the slot switches to another profile,
-  skipping every profile logged into the account Orca has active.
-
-### Setup
-
-Quit Orca first, then:
-
-```sh
-csm orca init                 # register the slot (~/.claude.orca), floor → slot
-csm orca status               # check the result
-```
-
-`csm orca init` refuses while Orca runs (pass `--force` to override). Orca
-copies the current login back into its own store when it quits, which is why
-it has to be quit first. `init` then works out where Orca used to put
-accounts, lists every profile whose login Orca may have overwritten there, and
-prints what to do before starting Orca again:
-
-1. Stop every claude process running in those profiles' dirs.
-2. Log each of them in again: `csm --profile <name> claude auth login`.
-3. Only then start Orca.
-
-`--slot <name>` and `--dir <dir>` choose another slot profile or dir;
-`--no-floor` leaves the floor alone.
-
-`init` also prints the machine-side steps it does not do itself, because they
-live outside csm:
-
-- A login-time job that sets the floor should call csm by its absolute path,
-  `csm cas --print-floor-dir`, and fall back to `~/.config/claude-as/floor-dir`
-  (the last floor csm applied, one absolute path) before any hardcoded
-  default.
-- Start Orca from that same job, after the floor is set, and remove any
-  separate launch-at-login entry for Orca. Two independent entries race, and
-  Orca may start before the floor exists.
-- Shell startup keeps `CLAUDE_CONFIG_DIR=$(csm cas --print-default-dir)`. A
-  raw-file fallback may read `floor-dir` for the floor only, never for a
-  shell's dir.
-- Give `~/.claude.orca/settings.json` the same hooks and statusline as your
-  other profiles, and add the slot to whatever template creates them.
-
-### Commands
-
-```
-csm orca init [--slot <p>] [--dir <d>] [--no-floor] [--force]
-csm orca disable                    Orca mode off; the floor returns to the default profile
-csm orca status [--json] [--strict] diagnose the setup (--strict: exit 1 on errors)
-csm orca accounts [--json]          Orca's accounts and the profile bound to each
-csm orca use <profile|email|id> [--queue]   select an account in Orca (10 s budget)
-csm orca sync [--quiet]             apply a queued select; mirror Orca's active account
-csm cas --print-floor-dir           the machine-wide floor dir (the slot in Orca mode)
-csm config set orca.follow-switch true|false
-csm config set orca.user-data-dir <dir>     where Orca keeps its data, if not the default
-```
-
-### What csm never does
-
-csm never writes Orca's store: not `orca-data.json`, not the per-account
-credential stash, not Orca's keychain item, which it never reads either. It
-never asks Orca to add or remove an account, never selects "no account", and
-never prints or saves the token Orca uses to authenticate its local socket.
-The only thing csm ever asks of Orca is to select an existing account by id,
-and only after checking, from the running Orca's own environment, that Orca's
-runtime dir is the slot. If that check fails or cannot run, csm refuses.
-
-### Hazards
-
-- A plain `claude` started from the desktop (not through csm or a shell)
-  inherits the floor and runs in the slot, on whichever account Orca has
-  active. `csm claude …` behaves the same way when `CLAUDE_CONFIG_DIR` is the
-  slot.
-- Selecting an account in Orca does not restart anything that is already
-  running. A session keeps the account it started with until it exits or
-  switches on a limit.
-- `orca.follow-switch` is off by default. When on, a limit switch in `csm run`
-  also selects the new account in Orca before relaunching. Orca's select
-  rewrites the login in the slot, so it is skipped whenever another claude
-  process is running in the slot; it can also cancel an account login in
-  progress in Orca's settings. Turn it on only if you want Orca to track every
-  automatic switch.
-
-### Linux and Windows
-
-- Linux has no machine-wide floor. Start Orca with
-  `CLAUDE_CONFIG_DIR=<slot dir>` in its environment yourself. Account
-  selection works as on macOS.
-- On Windows the floor is set, but csm cannot read another process's
-  environment and does not speak Orca's named pipe, so it never selects an
-  account there: a default change only updates csm, and launches never follow
-  Orca's live account.
 
 ## Usage metering (local, per profile)
 
@@ -831,7 +681,6 @@ Defaults shown are what applies when the variable is unset or unparseable.
 | `CLAUDE_SMART_CLAUDE_BIN` | A single binary path/name that overrides what `csm run` spawns instead of `claude`. Highest precedence (above `csm config set launch-command`); mainly for tests and one-off overrides. See *Configuration*. |
 | `CSM_HOST_REPLACE` | A literal, case-insensitive, first-match `find/replace` pair (e.g. `Acme-/`) applied to the short hostname `csm statusline` shows as `<profile>@<host>`. Unset = the raw short hostname, no rewrite; `csm` carries no built-in naming convention. |
 | `CSM_NO_HOME_SHIM` | Any non-empty value turns off the launch-time create-only step for the `~/.claude` compatibility shim. `csm profiles doctor` still reports the shim and `--fix-home` still repairs it. See *Third-party integration contract*. |
-| `ORCA_USER_DATA_PATH` | Where the Orca desktop app keeps its data, when not the platform default. `orca.user-data-dir` in `config.json` takes precedence. See *Orca integration*. |
 | `CLAUDE_TITLE_INDEX_TTL` | Seconds the session title index (`titles.tsv`) is served without a rebuild (default `300`). |
 
 ### Account scoring and the limit switch

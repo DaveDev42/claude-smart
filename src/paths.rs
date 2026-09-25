@@ -145,28 +145,6 @@ pub fn titles_tsv() -> PathBuf {
     smart_dir_no_create().join("titles.tsv")
 }
 
-/// `<smart_dir>/orca-pending-select.json` — an Orca account selection queued
-/// while Orca was not running (`orca::pending`). Applied later only by
-/// `csm orca sync` / `csm orca use` / `csm profiles use`.
-pub fn orca_pending_select() -> PathBuf {
-    smart_dir_no_create().join("orca-pending-select.json")
-}
-
-/// `<smart_dir>/orca-rpc-down` — negative cache for Orca's RPC socket
-/// (`{runtimeId, until}`), written after a launch-path read timed out so the
-/// next launches skip the RPC for a short window (`orca::rpc`).
-pub fn orca_rpc_down() -> PathBuf {
-    smart_dir_no_create().join("orca-rpc-down")
-}
-
-/// `~/.config/claude-as/floor-dir` — the resolved machine-wide floor dir (one
-/// absolute path + `\n`), rewritten by every floor writer
-/// (`cas::platform::apply_global`, `csm orca init`/`disable`) for consumers
-/// that cannot run csm (a login agent under launchd's minimal `PATH`).
-pub fn floor_dir_file() -> PathBuf {
-    claude_as_dir().join("floor-dir")
-}
-
 /// `~/.config/claude-as/profiles.json` — cross-platform profile→dir map.
 /// The registry is optional: when the file is absent, csm falls back to the
 /// current `CLAUDE_CONFIG_DIR` and disables the switch/pick features.

@@ -119,12 +119,7 @@ pub(crate) fn cmd_usage(args: &[OsString]) -> anyhow::Result<()> {
         }
     };
 
-    let mut rpt = report::build_report(&profiles, data.as_ref(), configured, stale_secs);
-    // Orca mode: the slot row says which account Orca has in it (saved
-    // state only, no socket).
-    if let Some(view) = crate::orca::integrate::offline_view(&profiles) {
-        report::mark_orca_slot(&mut rpt, &view.slot.name, &view.slot_follow());
-    }
+    let rpt = report::build_report(&profiles, data.as_ref(), configured, stale_secs);
 
     if json {
         println!("{}", report::render_json(&rpt)?);

@@ -73,25 +73,6 @@ pub fn default_profile(profiles: &ProfileMap) -> String {
     profiles.default_name()
 }
 
-// ─── floor_dir — the ONE floor decision ──────────────────────────────────────
-
-/// The machine-wide floor dir (launchd / HKCU `CLAUDE_CONFIG_DIR`): the Orca
-/// slot's dir while Orca mode is on, else the default profile's dir.
-///
-/// The single place this decision lives: [`platform::apply_global`] applies
-/// it (through [`platform::floor_target`], which defers to this fn in Orca
-/// mode and publishes the caller's requested dir otherwise), `csm cas
-/// --print-floor-dir` prints it, `csm orca init`/`disable` converge on it.
-/// It is deliberately NOT what `--print-default-dir` prints —
-/// shells keep starting in the default profile's own dir; only GUI apps
-/// (Orca among them) inherit the slot.
-pub fn floor_dir(profiles: &ProfileMap, config: &crate::config::Config) -> PathBuf {
-    match crate::orca::slot::active_slot(config, profiles) {
-        Some(slot) => PathBuf::from(slot.dir),
-        None => profiles.default_dir(),
-    }
-}
-
 /// Write `profile` to the global default state file.
 ///
 /// Creates the parent directory if needed. Validates against the live registry
@@ -114,11 +95,13 @@ pub fn write_default_profile(profile: &str, profiles: &ProfileMap) -> io::Result
             ),
         ));
     }
+    let path = default_state_file();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
     // One trailing newline (matches the zsh `print -- "$profile" >` idiom;
-    // readers trim whitespace anyway). Written tmp+rename: Orca mode writes
-    // it from `csm run` and a detached `csm orca sync` while new shells read
-    // it through `--print-default-dir`, and a torn read would fall back.
-    crate::orca::atomic_write(&default_state_file(), format!("{profile}\n").as_bytes())
+    // readers trim whitespace anyway).
+    std::fs::write(&path, format!("{profile}\n"))
 }
 
 // ─── tests ────────────────────────────────────────────────────────────────────
@@ -419,34 +402,5 @@ mod tests {
         let args = ["--eval", "--shell", "zsh", "--", "-g"];
         let result = compose_parse_cas_args(&args);
         assert!(result.is_err(), "expected error for -g without profile");
-    }
-
-    // ── floor_dir ──────────────────────────────────────────────────────────────
-
-    #[test]
-    fn floor_dir_is_the_slot_in_orca_mode_else_the_default_dir() {
-        let tmp = tempfile::tempdir().unwrap();
-        crate::testenv::with_test_home(tmp.path(), || {
-            let mut m = HashMap::new();
-            m.insert("work".to_owned(), "/Users/example/.claude.work".to_owned());
-            m.insert("orca".to_owned(), "/Users/example/.claude.orca".to_owned());
-            let profiles = ProfileMap(m);
-            write_default_profile("work", &profiles).unwrap();
-            let mut config = crate::config::Config::default();
-            assert_eq!(
-                floor_dir(&profiles, &config),
-                PathBuf::from("/Users/example/.claude.work")
-            );
-            config.orca.slot_profile = Some("orca".into());
-            assert_eq!(
-                floor_dir(&profiles, &config),
-                PathBuf::from("/Users/example/.claude.orca")
-            );
-            config.orca.slot_profile = Some("unregistered".into());
-            assert_eq!(
-                floor_dir(&profiles, &config),
-                PathBuf::from("/Users/example/.claude.work")
-            );
-        });
     }
 }

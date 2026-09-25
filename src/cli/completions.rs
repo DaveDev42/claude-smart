@@ -99,12 +99,9 @@ pub enum CompletionsSubcmd {
         /// Shell dialect for the export line (zsh|bash|pwsh).
         #[arg(long, value_name = "SHELL")]
         shell: Option<String>,
-        /// Print the resolved default CLAUDE_CONFIG_DIR and exit (shell SSOT).
+        /// Print the resolved default CLAUDE_CONFIG_DIR and exit (floor SSOT).
         #[arg(long)]
         print_default_dir: bool,
-        /// Print the machine-wide floor dir (the Orca slot in Orca mode) and exit.
-        #[arg(long)]
-        print_floor_dir: bool,
         /// Operation and its arguments (after `--`, or a management verb).
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         op_args: Vec<String>,
@@ -217,13 +214,6 @@ pub enum CompletionsSubcmd {
     #[command(name = "newuuid")]
     Newuuid,
 
-    /// Orca desktop-app interop (slot setup, account follow/select, diagnosis).
-    #[command(name = "orca")]
-    Orca {
-        #[command(subcommand)]
-        verb: Option<OrcaVerb>,
-    },
-
     /// Run claude under csm's profile, arguments forwarded verbatim.
     #[command(name = "claude")]
     Claude {
@@ -288,63 +278,6 @@ pub enum ProfilesVerb {
     },
 }
 
-/// `csm orca <verb>` — Orca interop verbs.
-#[derive(clap::Subcommand)]
-pub enum OrcaVerb {
-    /// Register the slot profile, point the machine-wide floor at it.
-    #[command(name = "init")]
-    Init {
-        /// Slot profile name (default: orca).
-        #[arg(long, value_name = "PROFILE")]
-        slot: Option<String>,
-        /// Slot dir (default: ~/.claude.<slot>).
-        #[arg(long, value_name = "DIR")]
-        dir: Option<String>,
-        /// Do not move the machine-wide floor.
-        #[arg(long)]
-        no_floor: bool,
-        /// Proceed while Orca is running.
-        #[arg(long)]
-        force: bool,
-    },
-    /// Turn Orca mode off; the floor returns to the default profile.
-    #[command(name = "disable")]
-    Disable,
-    /// Diagnose the Orca setup.
-    #[command(name = "status")]
-    Status {
-        /// Machine-readable output.
-        #[arg(long)]
-        json: bool,
-        /// Exit 1 when any ERROR is found.
-        #[arg(long)]
-        strict: bool,
-    },
-    /// List Orca's Claude accounts and their bound profiles.
-    #[command(name = "accounts")]
-    Accounts {
-        /// Machine-readable output.
-        #[arg(long)]
-        json: bool,
-    },
-    /// Make an account active in Orca (by profile, email, or account id).
-    #[command(name = "use")]
-    Use {
-        /// Profile name, email, or Orca account id.
-        target: String,
-        /// Queue the selection when Orca is not running.
-        #[arg(long)]
-        queue: bool,
-    },
-    /// Apply a queued selection and mirror Orca's active account.
-    #[command(name = "sync")]
-    Sync {
-        /// Print nothing.
-        #[arg(long)]
-        quiet: bool,
-    },
-}
-
 /// `csm config <verb>` — global config verbs.
 #[derive(clap::Subcommand)]
 pub enum ConfigVerb {
@@ -354,13 +287,13 @@ pub enum ConfigVerb {
     /// Print the resolved value of a config key.
     #[command(name = "get")]
     Get {
-        /// Config key (launch-command | orca.follow-switch | orca.user-data-dir).
+        /// Config key (currently: launch-command).
         key: String,
     },
     /// Set a config key. e.g. `set launch-command happy`.
     #[command(name = "set")]
     Set {
-        /// Config key (launch-command | orca.follow-switch | orca.user-data-dir).
+        /// Config key (currently: launch-command).
         key: String,
         /// Value tokens (the launch command argv).
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
@@ -369,7 +302,7 @@ pub enum ConfigVerb {
     /// Clear a config key (revert to default). e.g. `unset launch-command`.
     #[command(name = "unset")]
     Unset {
-        /// Config key (launch-command | orca.follow-switch | orca.user-data-dir).
+        /// Config key (currently: launch-command).
         key: String,
     },
 }
@@ -477,7 +410,6 @@ mod tests {
             "completions",
             "newuuid",
             "claude",
-            "orca",
         ] {
             assert!(
                 out.contains(sub),

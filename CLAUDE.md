@@ -60,12 +60,8 @@ see *Invariants*.
 - `src/cas/` — profile switcher: `types.rs`, `eval.rs` (`eval_emit` for the
   shell-shim machine interface), `manage.rs` (`manage_emit` for registry
   verbs), `edit.rs` (interactive editor: pure `apply_edit_action` + thin
-  `run_interactive`), `platform.rs` (`apply_global`: launchctl/HKCU floor;
-  in Orca mode it publishes the slot's dir whatever it is asked, and it
-  records every applied floor in `~/.config/claude-as/floor-dir`),
-  `mod.rs` (re-exports, `default_state_file`, and `floor_dir`, the one place
-  deciding "the slot in Orca mode, else the default profile's dir", which
-  `csm cas --print-floor-dir` prints).
+  `run_interactive`), `platform.rs` (`apply_global`: launchctl/HKCU floor),
+  `mod.rs` (re-exports + `default_state_file`).
 - `src/usage/` — `model.rs` (`UsageData` serde), `transport.rs` (`fetch()` —
   positive TTL cache → `CSM_USAGE_CMD` → negative cooldown → `local::collect`),
   `report.rs` (`csm usage`: pure `build_report` + `render_table`/`render_json`),
@@ -90,26 +86,6 @@ see *Invariants*.
   instead (`fable_fallback_model`, gated by `CLAUDE_FABLE_FALLBACK` and a
   one-shot `<sid>.model-fallback` marker), since the account itself still has
   headroom on every other model.
-- `src/orca/` — interop with the Orca desktop app's account switching.
-  `mod.rs` (model doc, `Selection`/`Account`, userData + runtime metadata,
-  `live_selection_in` for the launch path with its 60 s negative cache,
-  `offline_selection_in`, and `select_account`, the one write),
-  `rpc.rs` (newline-JSON socket framing; only `accounts.list` and
-  `accounts.selectClaude` are encodable), `slot.rs` (slot resolution, the
-  silent `current`/`for_registry`/`config_and_slot` loaders, which read as
-  Orca mode OFF under `cfg(test)` without a test HOME, the registry-edit
-  guard, and the pure `csm orca status` diagnosis), `bind.rs` (account ↔
-  profile binding by identity), `identity.rs`, `data_file.rs`
-  (`orca-data.json`, read-only), `pending.rs` (the queued select),
-  `follow.rs` (`effective_current`, the pure launch decision `csm run` routes
-  every fallback through), `integrate.rs` (the offline view behind `csm
-  usage`/`profiles list`/the hook, the csm → Orca sync after an explicit
-  default change, and the relaunch supervisor's opt-in followSwitch; each a
-  thin shell over a pure planner).
-- `src/cmd/orca.rs` — `csm orca {init|disable|status|accounts|use|sync}`.
-- `src/platform/detach.rs` — `spawn_detached` (new session, stdio null,
-  reaped by a background thread); `csm run` uses it to start `csm orca sync
-  --quiet` when a queued select exists.
 - `src/picker/` — `engine.rs`, `account.rs`, `session.rs`: in-process fuzzy
   picker (nucleo + crossterm).
 - `src/reaper/` — `mod.rs`, `scan.rs`, `kill.rs`: the `csm reap` orphan killer.
@@ -213,40 +189,14 @@ dependency/MSRV checks).
    `cas/edit.rs`): the join/decision logic is a pure fn unit-tested against
    fixtures; network/stdin/stdout/clock live in `main`/the I/O shell only.
 5. **`cas` eval-class is a machine interface** (`csm cas --eval --shell … `,
-   `csm cas --print-default-dir`, and the additive `csm cas
-   --print-floor-dir`). Don't rename it — external shell shims depend on the
-   exact contract. Orca mode changes neither the shape nor the value of the
-   eval output or `--print-default-dir`; only the floor moves to the slot.
-   Human-facing verbs live under `csm profiles …` (which reuses the same
-   handlers).
-6. **csm never writes Orca's store.** No write to `orca-data.json`, the
-   `claude-accounts/` stash or Orca's keychain item (never read either), no
-   `accounts.removeClaude`/`addClaudeFromConfigDir`, no null account id, and
-   the RPC auth token is never printed, logged or persisted. The only write
-   surface is `accounts.selectClaude` with a non-null id, through
-   `orca::select_account`, after its runtime-dir check (Orca's actual
-   `CLAUDE_CONFIG_DIR`, read from its process environment, must equal the
-   slot dir; unreadable refuses). The slot is never an account: it is
-   excluded from scoring (`account::pick_account_with` adds it to every
-   exclusion list), from the picker rows, from usage collection and
-   statusline capture, and no `csm run` fallback lands in it unless it is the
-   only registered profile. The hook and statusline never open Orca's socket
-   and never print. With Orca mode OFF the launch, scoring, picker, usage,
-   eval and hook paths behave as they did before Orca support existed. The
-   deliberate OFF-mode differences are these: `apply_global` always records
-   the applied floor in `~/.config/claude-as/floor-dir`; the default state
-   file is written by tmp+rename; and a `config.json` that exists but does
-   not parse makes Orca mode unknown, so the writers that could hurt a slot
-   fail closed (`apply_global` leaves the floor alone, `csm config set/unset`
-   and `csm profiles add/set/rm/edit` refuse, `csm usage --refresh-oauth`
-   skips the refresh, `csm run` warns) while the silent readers (hook,
-   statusline, scoring) read it as OFF.
+   `csm cas --print-default-dir`). Don't rename it — external shell shims
+   depend on the exact contract. Human-facing verbs live under `csm
+   profiles …` (which reuses the same handlers).
 
 ## CLI surface (collision-safe)
 
 `run, hook, profiles {list|add|set|rm|use|edit|dir|bootstrap|doctor},
-config {show|get|set|unset launch-command|orca.follow-switch|orca.user-data-dir},
-orca {init|disable|status|accounts|use|sync},
+config {show|get|set|unset launch-command},
 usage [--json] [--no-fetch] [--refresh] [--refresh-oauth] | usage capture,
 pick-account, scan, sidecar, statusline, completions, reap, newuuid,
 claude <args…>` + machine interface `cas` (+ back-compat `cas <verb>` aliases,

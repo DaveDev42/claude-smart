@@ -32,8 +32,6 @@ pub(crate) const CSM_RESERVED_SUBCOMMANDS: &[&str] = &[
     "completions",
     "newuuid",
     "reap",
-    // Orca desktop-app interop. `claude orca` is not a claude subcommand.
-    "orca",
     // The documented passthrough verb. `claude` is NOT one of claude's own
     // subcommands (`claude claude` is not a thing), so reserving the word
     // costs nothing and gives `csm claude <args…>` — claude under csm's

@@ -7,15 +7,11 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Context as _;
 
-use crate::cmd::support::{is_interactive, newuuid, profile_name_for_dir, resolve_profile_dir};
-use crate::config::Config;
-use crate::orca::follow::{self, EffectiveDecision, EffectiveInput, Source};
-use crate::orca::slot::Slot;
-use crate::{account, cli, epoch, orca, paths, picker, platform, session, sidecar, usage};
-
-/// Budget for the launch path's one read of Orca's live selection. A timeout
-/// is recorded in the negative cache, so the next launches skip the socket.
-const LAUNCH_ORCA_READ_BUDGET: std::time::Duration = std::time::Duration::from_millis(1200);
+use crate::cmd::support::{
+    current_profile_dir, derive_current_profile_name, is_interactive, newuuid,
+    profile_name_for_dir, resolve_profile_dir,
+};
+use crate::{account, cli, epoch, paths, picker, platform, session, sidecar, usage};
 
 /// How a resolved session id should be handed to `claude`.
 ///
@@ -54,11 +50,7 @@ impl SessionResolution {
 /// Full launch path:
 ///   1. Parse args via the hand-rolled `cli::parser`.
 ///   2. Resolve profile dir: `--profile` pin > proactive `pick_account` with
-///      stale-usage picker gate > the effective current profile. That last
-///      one is [`follow::effective_current`]: the inherited
-///      `CLAUDE_CONFIG_DIR` (else the default profile) outside Orca mode;
-///      in Orca mode it may follow Orca's live active account, and it is
-///      never the slot unless the slot is the only profile.
+///      stale-usage picker gate > current `CLAUDE_CONFIG_DIR`.
 ///   3. Resolve session id: explicit `--session-id` > `--resume` > picker >
 ///      auto-resume default.
 ///   4. Build `LaunchSpec` (session_id + profile_dir + cwd + cli) and hand off
@@ -99,81 +91,38 @@ pub(crate) fn run(args: &[OsString]) -> anyhow::Result<()> {
 
     // ── 2. Resolve profile dir ─────────────────────────────────────────────────
     let profiles = account::ProfileMap::load().context("csm: failed to load profiles.json")?;
-    // Orca mode (config + slot), loaded once. `None` = Orca mode OFF, and
-    // then every step below behaves exactly as it did before Orca existed.
-    let orca_mode = orca::slot::config_and_slot(&profiles);
-    // A queued Orca select is applied by a detached `csm orca sync`. It is
-    // spawned only AFTER this launch has resolved its current profile (which
-    // reads the same pending file), so the child cannot clear the file or
-    // move Orca's active account mid-resolution.
-    let sync_pending = orca_mode.is_some() && orca::pending::exists();
-    if orca_mode.is_none() && orca::slot::config_unreadable() {
-        eprintln!(
-            "csm: warning: config.json unreadable; Orca mode cannot be determined, so an Orca \
-             slot profile (if any) is NOT excluded from this launch's pick. Fix the file, or \
-             pass --profile."
-        );
-    }
+    let current_profile_name = derive_current_profile_name(&profiles);
 
     let profile_dir: PathBuf = if let Some(pin) = &flags.profile {
         // `--profile <p>` pin — explicit choice, skip all picking (wins over -i).
-        if sync_pending {
-            spawn_orca_sync();
-        }
         let dir = resolve_profile_dir(pin, &profiles)?;
         PathBuf::from(dir)
+    } else if flags.interactive {
+        // `-i`/`--interactive` — manual pick: disable *all* auto-pick / skip.
+        // Always open the account picker (recommendation-ordered, never the
+        // silent auto-pick), regardless of whether usage collection succeeded. Empty
+        // ProfileMap (toss/first-boot) keeps current. The session picker is
+        // also forced later by the same flag.
+        match force_account_pick(&profiles)? {
+            Some(dir) => dir,
+            None => {
+                eprintln!("csm: cancelled.");
+                return Ok(());
+            }
+        }
+    } else if flags.no_pick {
+        // `--no-pick` — keep current profile without scoring.
+        current_profile_dir(&profiles)
     } else {
-        // The one effective current profile every fallback below lands on
-        // (never the Orca slot unless it is the only profile).
-        let current = resolve_effective_current(&profiles, orca_mode.as_ref());
-        if sync_pending {
-            spawn_orca_sync();
-        }
-        if let Some(name) = &current.mirror_default
-            && let Err(e) = crate::cas::write_default_profile(name, &profiles)
-        {
-            eprintln!("csm: warning: could not follow Orca's account in csm's default: {e}");
-        }
-        let ctx = PickCtx {
-            current_name: &current.name,
-            current_dir: PathBuf::from(&current.dir),
-            prefer_current: current.prefer_current,
-            slot: orca_mode.as_ref().map(|(_, s)| s),
-            // Print mode under Orca (source-control AI launches, `csm -p`):
-            // no picker, no network usage fetch.
-            print_mode: orca_mode.is_some() && is_print_mode(&parsed.passthru),
-        };
-        let dir = if flags.interactive {
-            // `-i`/`--interactive` — manual pick: disable *all* auto-pick / skip.
-            // Always open the account picker (recommendation-ordered, never the
-            // silent auto-pick), regardless of whether usage collection succeeded. Empty
-            // ProfileMap (toss/first-boot) keeps current. The session picker is
-            // also forced later by the same flag.
-            match force_account_pick(&profiles, &ctx)? {
-                Some(dir) => dir,
-                None => {
-                    eprintln!("csm: cancelled.");
-                    return Ok(());
-                }
+        // Proactive pick (include_current=true — no-op switch if already best).
+        // `None` = the stale-usage picker was cancelled with Escape → abort.
+        match proactive_pick_profile(&current_profile_name, &profiles, flags.pick_account)? {
+            Some(dir) => dir,
+            None => {
+                eprintln!("csm: cancelled.");
+                return Ok(());
             }
-        } else if flags.no_pick {
-            // `--no-pick` — keep current profile without scoring.
-            ctx.current_dir.clone()
-        } else {
-            // Proactive pick (include_current=true — no-op switch if already best).
-            // `None` = the stale-usage picker was cancelled with Escape → abort.
-            match proactive_pick_profile(&profiles, &ctx, flags.pick_account)? {
-                Some(dir) => dir,
-                None => {
-                    eprintln!("csm: cancelled.");
-                    return Ok(());
-                }
-            }
-        };
-        if let Some(line) = orca_active_line(&current, &dir) {
-            eprintln!("{line}");
         }
-        dir
     };
 
     // Print every profile's dead-credential warning, right after the pick is
@@ -465,103 +414,6 @@ fn print_launch_attention_warnings(profile_dir: &Path, profiles: &account::Profi
     }
 }
 
-// ─── effective current profile (Orca-aware) ──────────────────────────────────
-
-/// What the account-pick helpers need to know about the current profile.
-struct PickCtx<'a> {
-    /// The effective current profile's name.
-    current_name: &'a str,
-    /// Its dir: what every "keep current" fallback launches into.
-    current_dir: PathBuf,
-    /// Keep the current profile while it is viable (it came from Orca).
-    prefer_current: bool,
-    /// The Orca slot while Orca mode is ON: never a candidate or a row.
-    slot: Option<&'a Slot>,
-    /// Orca-mode print launch: cached usage only, never a picker.
-    print_mode: bool,
-}
-
-/// Is this a `claude -p` / `--print` launch? Pure.
-fn is_print_mode(passthru: &[OsString]) -> bool {
-    passthru
-        .iter()
-        .take_while(|a| a.as_os_str() != "--")
-        .any(|a| a == "-p" || a == "--print")
-}
-
-/// The I/O shell around [`follow::effective_current`]: read the inherited
-/// env dir and the default state, and (Orca mode only) the pending select
-/// plus, when the decision needs it, Orca's live selection within
-/// [`LAUNCH_ORCA_READ_BUDGET`].
-fn resolve_effective_current(
-    profiles: &account::ProfileMap,
-    orca_mode: Option<&(Config, Slot)>,
-) -> EffectiveDecision {
-    let env_dir = std::env::var("CLAUDE_CONFIG_DIR")
-        .ok()
-        .filter(|d| !d.is_empty());
-    let default_state = profiles.default_name();
-    let default_dir = profiles.default_dir().to_string_lossy().into_owned();
-    let slot = orca_mode.map(|(_, s)| s);
-    let pending = slot.and_then(|_| orca::pending::read().ok().flatten());
-    let base = EffectiveInput {
-        explicit_pin: None,
-        env_dir: env_dir.as_deref(),
-        default_state: &default_state,
-        default_dir: &default_dir,
-        slot,
-        registry: profiles,
-        pending: pending.as_ref(),
-        live: None,
-        bindings: None,
-        now: epoch::now_secs() as i64,
-    };
-    let (live, bindings) = match orca_mode {
-        Some((config, slot)) if follow::needs_live(&base) => {
-            match orca::user_data_dir_for(config.orca()) {
-                Some(ud) => match orca::live_selection_in(&ud, LAUNCH_ORCA_READ_BUDGET) {
-                    orca::OrcaState::Live(sel) => {
-                        let b = orca::bind::compute(
-                            &ud,
-                            &sel,
-                            profiles,
-                            Some(slot),
-                            &config.orca().bindings,
-                        );
-                        (Some(sel), Some(b))
-                    }
-                    _ => (None, None),
-                },
-                None => (None, None),
-            }
-        }
-        _ => (None, None),
-    };
-    follow::effective_current(&EffectiveInput {
-        live: live.as_ref(),
-        bindings: bindings.as_ref(),
-        ..base
-    })
-}
-
-/// `csm: orca active → X`, only when `X` came from Orca (live or a pending
-/// select) and is the profile actually launching. Pure.
-fn orca_active_line(current: &EffectiveDecision, launched: &Path) -> Option<String> {
-    let followed = matches!(current.source, Source::OrcaLive | Source::Pending);
-    let same = launched
-        .to_str()
-        .is_some_and(|d| crate::cas::platform::dirs_equal(d, &current.dir));
-    (followed && same).then(|| format!("csm: orca active → {}", current.name))
-}
-
-/// Start `csm orca sync --quiet` detached (new session, stdio null, never
-/// awaited) to apply a queued Orca selection. Best-effort and silent.
-fn spawn_orca_sync() {
-    if let Ok(exe) = std::env::current_exe() {
-        let _ = platform::detach::spawn_detached(&exe, &["orca", "sync", "--quiet"]);
-    }
-}
-
 /// Proactive account pick with stale-usage picker fallback.
 ///
 /// See [`crate::picker::account`] for what the stale-usage picker shows.
@@ -581,35 +433,20 @@ fn spawn_orca_sync() {
 /// - same errors + non-interactive → silent fail-safe to current.
 /// - `Err(AllSaturated)` → warn + keep current (no picker; real limits read).
 fn proactive_pick_profile(
+    current_profile: &str,
     profiles: &account::ProfileMap,
-    ctx: &PickCtx<'_>,
     _force_pick: bool,
 ) -> anyhow::Result<Option<PathBuf>> {
-    use account::scoring::{PickPolicy, ScoringError};
+    use account::scoring::ScoringError;
 
-    let current_profile = ctx.current_name;
-    let current_dir = ctx.current_dir.clone();
+    let current_dir = current_profile_dir(profiles);
 
     // No ProfileMap (toss / first-boot) — skip all picking.
     if profiles.is_empty() {
         return Ok(Some(current_dir));
     }
 
-    // Orca OFF: exactly `pick_account(current, true)`. Orca ON adds the
-    // prefer-current rule for an Orca-chosen account; the account layer
-    // excludes the slot from the candidates itself.
-    let policy = PickPolicy {
-        include_current: true,
-        apply_stale_gate: true,
-        prefer_current: ctx.prefer_current,
-        exclude: &[],
-    };
-    let picked = if ctx.print_mode {
-        account::pick_account_cached(current_profile, &policy)
-    } else {
-        account::pick_account_with(current_profile, &policy)
-    };
-    match picked {
+    match account::pick_account(current_profile, true) {
         Ok(None) => {
             // Already on the best profile — keep current.
             Ok(Some(current_dir))
@@ -632,12 +469,9 @@ fn proactive_pick_profile(
         // usage for any profile. Both mean "we could not determine the best
         // account" — never silently keep current. Open the interactive picker
         // (interactive) or fail safe to current (non-interactive), same as a
-        // stale-usage miss. A print launch never opens a picker.
+        // stale-usage miss.
         Err(ScoringError::FetchFailed(_)) | Err(ScoringError::NoUsableData) => {
-            if ctx.print_mode {
-                return Ok(Some(current_dir));
-            }
-            stale_usage_pick(profiles, ctx)
+            stale_usage_pick(profiles, &current_dir)
         }
     }
 }
@@ -651,13 +485,13 @@ fn proactive_pick_profile(
 /// pressed Escape / Ctrl-C in the picker (cancel the launch entirely).
 fn stale_usage_pick(
     profiles: &account::ProfileMap,
-    ctx: &PickCtx<'_>,
+    current_dir: &Path,
 ) -> anyhow::Result<Option<PathBuf>> {
     // TTY gate: isatty(0) && isatty(1) — matches zsh `[[ -t 0 && -t 1 ]]`.
     if !is_interactive() {
-        return Ok(Some(ctx.current_dir.clone()));
+        return Ok(Some(current_dir.to_path_buf()));
     }
-    run_account_picker(profiles, ctx, "stale-usage picker")
+    run_account_picker(profiles, current_dir, "stale-usage picker")
 }
 
 /// Forced account picker for `-i`/`--interactive` (manual pick).
@@ -669,14 +503,12 @@ fn stale_usage_pick(
 /// (Enter still takes the recommendation). The TTY gate still applies — a piped
 /// `-i` has no usable terminal for the picker, so it keeps the current profile.
 /// An empty ProfileMap (toss / first-boot) likewise keeps current, nothing to pick.
-fn force_account_pick(
-    profiles: &account::ProfileMap,
-    ctx: &PickCtx<'_>,
-) -> anyhow::Result<Option<PathBuf>> {
-    if profiles.is_empty() || !is_interactive() || ctx.print_mode {
-        return Ok(Some(ctx.current_dir.clone()));
+fn force_account_pick(profiles: &account::ProfileMap) -> anyhow::Result<Option<PathBuf>> {
+    let current_dir = current_profile_dir(profiles);
+    if profiles.is_empty() || !is_interactive() {
+        return Ok(Some(current_dir));
     }
-    run_account_picker(profiles, ctx, "manual account picker")
+    run_account_picker(profiles, &current_dir, "manual account picker")
 }
 
 /// Shared account-picker driver for [`stale_usage_pick`] and
@@ -687,13 +519,12 @@ fn force_account_pick(
 /// - Unavailable (no usable terminal / no rows) → keep current profile.
 fn run_account_picker(
     profiles: &account::ProfileMap,
-    pick: &PickCtx<'_>,
+    current_dir: &Path,
     ctx: &str,
 ) -> anyhow::Result<Option<PathBuf>> {
     use picker::engine::PickerOutcome;
 
-    let current_dir = &pick.current_dir;
-    let rows = build_account_rows(profiles, pick.slot);
+    let rows = build_account_rows(profiles);
     let ap = picker::AccountPicker::new(rows);
 
     match ap.pick() {
@@ -786,10 +617,7 @@ fn account_row_rank(
 
 /// Build `AccountRow` list for the stale-usage picker, ordered by recommendation so
 /// the top row is what `pick_best` would auto-select (Enter selects it).
-fn build_account_rows(
-    profiles: &account::ProfileMap,
-    slot: Option<&Slot>,
-) -> Vec<picker::account::AccountRow> {
+fn build_account_rows(profiles: &account::ProfileMap) -> Vec<picker::account::AccountRow> {
     use picker::account::{AccountRow, StaleProfileData};
 
     // Read the smart-dir cache (the positive TTL cache `usage::fetch` writes
@@ -798,7 +626,23 @@ fn build_account_rows(
     let cache_mtime = cache_mtime(&cache_path);
     let cache_data = crate::cmd::usage::read_usage_cache();
 
-    let all_names = account_row_names(profiles, cache_data.as_ref(), slot);
+    // Union of configured profiles + any extra profiles from cache.
+    let mut all_names: Vec<String> = profiles
+        .names_sorted()
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    if let Some(data) = &cache_data {
+        for name in data
+            .profiles
+            .keys()
+            .chain(data.errors.as_ref().map(|e| e.keys()).into_iter().flatten())
+        {
+            if !all_names.contains(name) {
+                all_names.push(name.clone());
+            }
+        }
+    }
 
     // Build (name, StaleProfileData) so we can order by recommendation before
     // rendering rows. (HashMap iteration order is non-deterministic; the rank's
@@ -872,34 +716,6 @@ fn build_account_rows(
             AccountRow::build(profile, data, cache_mtime, recommended)
         })
         .collect()
-}
-
-/// The account picker's row names: every configured profile plus any extra
-/// profile the usage cache knows, minus the Orca slot (not an account of its
-/// own). Registry names first in sorted order, then cache-only names. Pure.
-fn account_row_names(
-    profiles: &account::ProfileMap,
-    cache_data: Option<&usage::UsageData>,
-    slot: Option<&Slot>,
-) -> Vec<String> {
-    let mut all_names: Vec<String> = profiles
-        .names_sorted()
-        .iter()
-        .map(|s| s.to_string())
-        .collect();
-    if let Some(data) = cache_data {
-        for name in data
-            .profiles
-            .keys()
-            .chain(data.errors.as_ref().map(|e| e.keys()).into_iter().flatten())
-        {
-            if !all_names.contains(name) {
-                all_names.push(name.clone());
-            }
-        }
-    }
-    all_names.retain(|n| slot.is_none_or(|s| !s.is_profile(n)));
-    all_names
 }
 
 /// Modification time of a usage cache file, as a unix epoch, or `None` when
@@ -1546,156 +1362,5 @@ mod tests {
             !lines.iter().any(|l| l.contains("current profile")),
             "{lines:#?}"
         );
-    }
-
-    // ── effective current profile (Orca-aware launch path) ─────────────────
-
-    fn os(args: &[&str]) -> Vec<OsString> {
-        args.iter().map(OsString::from).collect()
-    }
-
-    #[test]
-    fn print_mode_detects_short_and_long_flag_before_the_separator() {
-        assert!(is_print_mode(&os(&["-p", "hello"])));
-        assert!(is_print_mode(&os(&["--model", "m", "--print"])));
-        assert!(!is_print_mode(&os(&["hello"])));
-        assert!(!is_print_mode(&os(&["--", "-p"])));
-        assert!(!is_print_mode(&os(&["--permission-mode", "plan"])));
-    }
-
-    fn decision(source: Source, dir: &str) -> EffectiveDecision {
-        EffectiveDecision {
-            name: "work".to_owned(),
-            dir: dir.to_owned(),
-            source,
-            prefer_current: true,
-            mirror_default: None,
-        }
-    }
-
-    #[test]
-    fn orca_active_line_only_when_the_followed_profile_launches() {
-        let d = decision(Source::OrcaLive, "/Users/example/.claude.work");
-        assert_eq!(
-            orca_active_line(&d, Path::new("/Users/example/.claude.work/")).as_deref(),
-            Some("csm: orca active → work")
-        );
-        assert_eq!(
-            orca_active_line(&d, Path::new("/Users/example/.claude.home")),
-            None,
-            "an auto-pick away from the followed profile prints nothing"
-        );
-        let p = decision(Source::Pending, "/Users/example/.claude.work");
-        assert!(orca_active_line(&p, Path::new("/Users/example/.claude.work")).is_some());
-        let legacy = decision(Source::Legacy, "/Users/example/.claude.work");
-        assert_eq!(
-            orca_active_line(&legacy, Path::new("/Users/example/.claude.work")),
-            None
-        );
-    }
-
-    #[test]
-    fn account_row_names_exclude_the_slot() {
-        let mut pm = account::ProfileMap::default();
-        pm.insert("work".into(), "/Users/example/.claude.work".into());
-        pm.insert("orca".into(), "/Users/example/.claude.orca".into());
-        let mut data = usage::UsageData::default();
-        data.profiles.insert("orca".into(), Default::default());
-        data.profiles.insert("extra".into(), Default::default());
-        let slot = Slot {
-            name: "orca".into(),
-            dir: "/Users/example/.claude.orca".into(),
-        };
-        assert_eq!(
-            account_row_names(&pm, Some(&data), Some(&slot)),
-            vec!["work".to_string(), "extra".to_string()]
-        );
-        // Orca OFF: unchanged union.
-        let mut off = account_row_names(&pm, Some(&data), None);
-        off.sort();
-        assert_eq!(off, vec!["extra", "orca", "work"]);
-    }
-
-    /// Write `profiles.json` + the default state under the test HOME.
-    fn registry_with_default(home: &Path, names: &[&str], default: &str) -> account::ProfileMap {
-        let mut pm = account::ProfileMap::default();
-        for n in names {
-            pm.insert(
-                (*n).to_owned(),
-                home.join(format!(".claude.{n}"))
-                    .to_string_lossy()
-                    .into_owned(),
-            );
-        }
-        pm.save().unwrap();
-        crate::cas::write_default_profile(default, &pm).unwrap();
-        account::ProfileMap::load().unwrap()
-    }
-
-    /// Orca mode OFF: the decision is exactly the old
-    /// `derive_current_profile_name` / `current_profile_dir` pair, for every
-    /// shape of inherited `CLAUDE_CONFIG_DIR`.
-    #[test]
-    fn effective_current_without_orca_equals_the_legacy_derivation() {
-        use crate::cmd::support::{current_profile_dir, derive_current_profile_name};
-
-        let tmp = tempfile::tempdir().unwrap();
-        let home = tmp.path();
-        let work_dir = home.join(".claude.work").to_string_lossy().into_owned();
-        let stray = home.join(".claude.stray").to_string_lossy().into_owned();
-        crate::testenv::with_test_home(home, || {
-            let pm = registry_with_default(home, &["home", "work"], "home");
-            for env in [
-                None,
-                Some(""),
-                Some(work_dir.as_str()),
-                Some(stray.as_str()),
-                Some("/"),
-            ] {
-                crate::testenv::with_env_var("CLAUDE_CONFIG_DIR", env, || {
-                    let d = resolve_effective_current(&pm, None);
-                    assert_eq!(d.name, derive_current_profile_name(&pm), "env {env:?}");
-                    assert_eq!(
-                        PathBuf::from(&d.dir),
-                        current_profile_dir(&pm),
-                        "env {env:?}"
-                    );
-                    assert_eq!(d.source, Source::Legacy);
-                    assert!(!d.prefer_current);
-                    assert_eq!(d.mirror_default, None);
-                });
-            }
-        });
-    }
-
-    /// Orca mode ON, Orca not running: an env dir of unset / the slot / the
-    /// default dir follows csm's default state, never the slot.
-    #[test]
-    fn effective_current_in_orca_mode_never_lands_in_the_slot() {
-        let tmp = tempfile::tempdir().unwrap();
-        let home = tmp.path();
-        crate::testenv::with_test_home(home, || {
-            let pm = orca::integrate::test_support::orca_home(home, &["home", "work"]);
-            crate::cas::write_default_profile("home", &pm).unwrap();
-            let pm = account::ProfileMap::load().unwrap();
-            let orca_mode = orca::slot::config_and_slot(&pm);
-            assert!(orca_mode.is_some());
-            let slot_dir = home.join(".claude.orca").to_string_lossy().into_owned();
-            let home_dir = home.join(".claude.home").to_string_lossy().into_owned();
-            let work_dir = home.join(".claude.work").to_string_lossy().into_owned();
-            for env in [None, Some(slot_dir.as_str()), Some(home_dir.as_str())] {
-                crate::testenv::with_env_var("CLAUDE_CONFIG_DIR", env, || {
-                    let d = resolve_effective_current(&pm, orca_mode.as_ref());
-                    assert_eq!(d.name, "home", "env {env:?}");
-                    assert_eq!(d.source, Source::DefaultState);
-                    assert!(!d.prefer_current);
-                });
-            }
-            // A deliberate per-shell pin is kept.
-            crate::testenv::with_env_var("CLAUDE_CONFIG_DIR", Some(&work_dir), || {
-                let d = resolve_effective_current(&pm, orca_mode.as_ref());
-                assert_eq!((d.name.as_str(), d.source), ("work", Source::EnvPin));
-            });
-        });
     }
 }

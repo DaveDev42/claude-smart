@@ -100,9 +100,7 @@ impl ProfileMap {
     /// Resolution order (testable seam — takes the state-file path explicitly):
     /// 1. state-file token, when the map is empty (toss/synth: trust the token);
     /// 2. state-file token, when it is a configured profile;
-    /// 3. otherwise [`Self::preferred_default`] — in Orca mode the first
-    ///    NON-slot profile, so a missing state file never starts shells in the
-    ///    Orca slot (the slot only when it is the one profile);
+    /// 3. otherwise [`Self::preferred_default`];
     /// 4. otherwise `""`.
     pub fn default_name_with(&self, state_file: &Path) -> String {
         let from_file = std::fs::read_to_string(state_file)
@@ -112,17 +110,7 @@ impl ProfileMap {
         match from_file {
             Some(n) if self.is_empty() => n,   // toss/synth: trust the token
             Some(n) if self.contains(&n) => n, // configured profile
-            _ => {
-                // Only this fallback consults config.json (silently; an
-                // unreadable one reads as Orca mode OFF = unchanged).
-                let slot = crate::orca::slot::for_registry(self);
-                self.names_sorted()
-                    .into_iter()
-                    .find(|n| slot.as_ref().is_none_or(|s| !s.is_profile(n)))
-                    .map(str::to_owned)
-                    .or_else(|| self.preferred_default())
-                    .unwrap_or_default()
-            }
+            _ => self.preferred_default().unwrap_or_default(),
         }
     }
 

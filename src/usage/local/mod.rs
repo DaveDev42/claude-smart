@@ -445,25 +445,7 @@ pub fn collect(
     let mut any_probe_attempted = false;
     let mut any_probe_succeeded = false;
 
-    // The Orca slot is not an account of its own: no probe, no store record.
-    let orca_slot = crate::orca::slot::for_registry(profiles);
-    // An unreadable config.json hides the slot (read as OFF above). Probing
-    // is read-only, but a refresh would rotate the refresh token of a grant
-    // Orca may own, so the opt-in refresh fails closed for this pass.
-    let refresh_oauth = if refresh_oauth && crate::orca::slot::config_unreadable() {
-        eprintln!(
-            "csm: warning: config.json unreadable, so the Orca slot cannot be identified; \
-             OAuth refresh is skipped for this run"
-        );
-        false
-    } else {
-        refresh_oauth
-    };
-
     for name in profiles.names_sorted() {
-        if orca_slot.as_ref().is_some_and(|s| s.is_profile(name)) {
-            continue;
-        }
         let Some(dir_str) = profiles.get(name) else {
             continue;
         };
@@ -823,12 +805,6 @@ pub fn record_statusline_payload(raw: &str) -> Result<Option<StatuslineCapture>,
     else {
         return Ok(None);
     };
-
-    // A claude running in the Orca slot carries whichever account Orca has
-    // materialized there; its reading belongs to no csm profile.
-    if crate::orca::slot::is_slot_dir(&dir) {
-        return Ok(None);
-    }
 
     let Some(name) = resolve_profile_name(&dir) else {
         return Ok(None);
@@ -1852,41 +1828,5 @@ mod tests {
         );
         let errors = data.errors.expect("invalid name must record an error");
         assert!(errors.contains_key("../evil"));
-    }
-
-    // ── the Orca slot is not an account of its own ──────────────────────────
-
-    #[test]
-    fn collect_skips_the_orca_slot() {
-        let tmp = tempfile::tempdir().unwrap();
-        crate::testenv::with_test_home(tmp.path(), || {
-            let pm = crate::orca::integrate::test_support::orca_home(tmp.path(), &[]);
-            let data = collect(&pm, now(), false, false);
-            assert!(data.profiles.is_empty());
-            assert!(
-                data.errors.as_ref().is_none_or(|e| !e.contains_key("orca")),
-                "the slot must not even be probed: {:?}",
-                data.errors
-            );
-        });
-    }
-
-    #[test]
-    fn statusline_capture_in_the_orca_slot_is_skipped() {
-        let tmp = tempfile::tempdir().unwrap();
-        crate::testenv::with_test_home(tmp.path(), || {
-            let pm = crate::orca::integrate::test_support::orca_home(tmp.path(), &["work"]);
-            let slot_dir = pm.get("orca").unwrap().to_owned();
-            crate::testenv::with_env_var("CLAUDE_CONFIG_DIR", Some(&slot_dir), || {
-                let result = record_statusline_payload(
-                    r#"{"rate_limits": {"five_hour": {"used_percentage": 1.0}}}"#,
-                );
-                assert!(result.unwrap().is_none());
-            });
-            assert!(
-                store::load("orca").is_none(),
-                "no store record for the slot"
-            );
-        });
     }
 }

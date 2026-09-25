@@ -155,7 +155,7 @@ fn data_too_stale_at(data: &UsageData, max_age_secs: u64, now: DateTime<Utc>) ->
 /// The ONE viability predicate: `true` when a profile with these three raw
 /// percentages is a legitimate pick candidate.
 ///
-/// This is the single authority for "is this profile viable" — [`pick_best_with`]
+/// This is the single authority for "is this profile viable" — [`pick_best_at`]
 /// (below) and `cmd::run::account_row_rank` (the stale-usage picker rows)
 /// both route through it rather than each hand-rolling the same three checks,
 /// so a profile whose model-scoped weekly cap is exhausted is skipped
@@ -207,7 +207,7 @@ pub fn is_viable_pcts(
 /// windows roll over). `i64::MAX` when neither is known, so a known reset
 /// always beats an unknown one.
 ///
-/// Shared by [`pick_best_with`]'s ranking and `cmd::run::account_row_rank` (the
+/// Shared by [`pick_best_at`]'s ranking and `cmd::run::account_row_rank` (the
 /// stale-usage picker's rank), which resolve their `week_all`/`week_fable`
 /// epochs from different sources (`UsageSection::reset_instant` vs. the
 /// picker's cached `resets_at`/`resets` fields) but must apply the same
@@ -286,7 +286,7 @@ pub type ScoringResult = Result<Option<String>, ScoringError>;
 /// already hit a limit, and the hook is non-interactive (no picker). Refusing
 /// to score on stale data there would strand the user ON the limited profile;
 /// leaving for the freshest-known best, even on slightly stale numbers, is the
-/// safer choice. See [`pick_best`] / [`pick_best_with`].
+/// safer choice. See [`pick_best`] / [`pick_best_gated`].
 ///
 /// # Ranking
 /// Soonest known weekly reset first; ties break to higher week_all.pct, then
@@ -294,21 +294,34 @@ pub type ScoringResult = Result<Option<String>, ScoringError>;
 /// source, which ranked highest-pct-first).
 ///
 /// Production callers go through [`pick_account`](crate::account::pick_account)
-/// → [`pick_best_with`]; this gate-on convenience wrapper exists for the
+/// → [`pick_best_gated`]; this gate-on convenience wrapper exists for the
 /// scoring tests only.
 #[cfg(test)]
 pub fn pick_best(data: &UsageData, current_profile: &str, include_current: bool) -> ScoringResult {
     pick_best_at(data, current_profile, include_current, true, Utc::now())
 }
 
+/// Like [`pick_best`] but with explicit control over the staleness gate.
+/// `apply_stale_gate=false` scores even on stale data (reactive-hook path).
+pub fn pick_best_gated(
+    data: &UsageData,
+    current_profile: &str,
+    include_current: bool,
+    apply_stale_gate: bool,
+) -> ScoringResult {
+    pick_best_at(
+        data,
+        current_profile,
+        include_current,
+        apply_stale_gate,
+        Utc::now(),
+    )
+}
+
 /// `now`-injected core of [`pick_best`], for deterministic staleness tests.
 /// Mirrors the `resets_to_epoch` / `resets_to_epoch_at` split in `reset.rs`.
 ///
 /// `apply_stale_gate` toggles the freshness gate (see [`pick_best`] docs).
-/// The pre-Orca policy: no current preference, no excluded names. See
-/// [`pick_best_with`] for the full policy. Test-only: production callers go
-/// through [`pick_best_with`].
-#[cfg(test)]
 pub fn pick_best_at(
     data: &UsageData,
     current_profile: &str,
@@ -316,52 +329,6 @@ pub fn pick_best_at(
     apply_stale_gate: bool,
     now: DateTime<Utc>,
 ) -> ScoringResult {
-    pick_best_with(
-        data,
-        current_profile,
-        &PickPolicy {
-            include_current,
-            apply_stale_gate,
-            prefer_current: false,
-            exclude: &[],
-        },
-        now,
-    )
-}
-
-/// How [`pick_best_with`] treats the current profile and which names it
-/// never considers.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct PickPolicy<'a> {
-    /// Whether the current profile competes as a candidate (see [`pick_best_with`]).
-    pub include_current: bool,
-    /// Whether stale usage data blocks the pick (see [`pick_best_with`]).
-    pub apply_stale_gate: bool,
-    /// With `include_current`: when the current profile is itself a viable
-    /// candidate, stay on it (`Ok(None)`) instead of ranking. Used when the
-    /// current account came from Orca's live selection, so a launch does not
-    /// hop off an account the user just picked in Orca while it still has
-    /// headroom. The staleness gate still runs first.
-    pub prefer_current: bool,
-    /// Profile names that are never candidates (the Orca slot, which is not
-    /// an account of its own, plus any caller-specific exclusions).
-    pub exclude: &'a [&'a str],
-}
-
-/// Full-policy scoring core. `pick_best_at` (test-only) is this with the pre-Orca
-/// policy; the viability predicate is still [`is_viable_pcts`] alone.
-pub fn pick_best_with(
-    data: &UsageData,
-    current_profile: &str,
-    policy: &PickPolicy<'_>,
-    now: DateTime<Utc>,
-) -> ScoringResult {
-    let PickPolicy {
-        include_current,
-        apply_stale_gate,
-        prefer_current,
-        exclude,
-    } = *policy;
     // Staleness gate (spec: proactive auto-pick must not fly on stale usage). A
     // frozen data source keeps serving the same `captured_at`; once that ages
     // past the gate we refuse to score and let the caller fall back to the
@@ -401,10 +368,6 @@ pub fn pick_best_with(
             if errors.contains_key(name.as_str()) {
                 return None;
             }
-            // excluded names (the Orca slot) are never candidates
-            if exclude.contains(&name.as_str()) {
-                return None;
-            }
             // skip profiles with no week_all section (shell line 929:
             // select((.value.week_all.pct // null) != null))
             let week_pct = pu.week_all.as_ref()?.pct;
@@ -433,18 +396,6 @@ pub fn pick_best_with(
     // naming order ensures full ties are reproducible: the strictly-smaller
     // comparison below keeps the first name among fully-tied candidates.
     candidates.sort_by(|a, b| a.name.cmp(b.name));
-
-    // Prefer-current: a viable current profile is kept as-is (no switch).
-    if include_current
-        && prefer_current
-        && !current_profile.is_empty()
-        && candidates.iter().any(|c| {
-            c.name == current_profile
-                && is_viable_pcts(c.session_pct, Some(c.week_pct), c.week_fable_pct)
-        })
-    {
-        return Ok(None);
-    }
 
     for c in &candidates {
         // Reactive (hook) mode: never target the current profile.
@@ -1541,121 +1492,5 @@ mod tests {
         // sanity: the helper picks the newer of the two
         let newest = newest_captured_at(&data).unwrap();
         assert_eq!(newest, Utc.with_ymd_and_hms(2026, 6, 29, 12, 4, 0).unwrap());
-    }
-
-    // ─── pick_best_with: prefer_current + exclude ────────────────────────────
-
-    fn heavy_light() -> UsageData {
-        let mut profiles = HashMap::new();
-        profiles.insert(
-            "heavy".to_string(),
-            make_profile(Some(27), 31, Some("Jul 9 at 8:59pm (Asia/Seoul)")),
-        );
-        profiles.insert(
-            "light".to_string(),
-            make_profile(Some(0), 0, Some("Jul 8 at 6pm (Asia/Seoul)")),
-        );
-        make_data(profiles)
-    }
-
-    fn july_now() -> DateTime<Utc> {
-        use chrono::TimeZone;
-        Utc.with_ymd_and_hms(2026, 7, 4, 12, 0, 0).unwrap()
-    }
-
-    #[test]
-    fn prefer_current_keeps_a_viable_current_profile() {
-        let policy = PickPolicy {
-            include_current: true,
-            apply_stale_gate: true,
-            prefer_current: true,
-            exclude: &[],
-        };
-        // Without the preference `light` would win (see the test above).
-        let result = pick_best_with(&heavy_light(), "heavy", &policy, july_now()).unwrap();
-        assert_eq!(result, None);
-    }
-
-    #[test]
-    fn prefer_current_still_moves_off_a_non_viable_current_profile() {
-        let mut data = heavy_light();
-        data.profiles.insert(
-            "heavy".to_string(),
-            make_profile(Some(100), 31, Some("Jul 9 at 8:59pm (Asia/Seoul)")),
-        );
-        let policy = PickPolicy {
-            include_current: true,
-            apply_stale_gate: true,
-            prefer_current: true,
-            exclude: &[],
-        };
-        let result = pick_best_with(&data, "heavy", &policy, july_now()).unwrap();
-        assert_eq!(result.as_deref(), Some("light"));
-    }
-
-    #[test]
-    fn prefer_current_is_ignored_in_reactive_mode() {
-        let policy = PickPolicy {
-            include_current: false,
-            apply_stale_gate: false,
-            prefer_current: true,
-            exclude: &[],
-        };
-        let result = pick_best_with(&heavy_light(), "heavy", &policy, july_now()).unwrap();
-        assert_eq!(result.as_deref(), Some("light"));
-    }
-
-    #[test]
-    fn excluded_profile_is_never_a_candidate() {
-        let policy = PickPolicy {
-            include_current: true,
-            apply_stale_gate: true,
-            prefer_current: false,
-            exclude: &["light"],
-        };
-        let result = pick_best_with(&heavy_light(), "heavy", &policy, july_now()).unwrap();
-        assert_eq!(result, None, "light excluded, heavy is the only winner");
-    }
-
-    #[test]
-    fn excluded_current_profile_is_not_preferred() {
-        // The Orca slot as `current` must never be kept by prefer_current.
-        let policy = PickPolicy {
-            include_current: true,
-            apply_stale_gate: true,
-            prefer_current: true,
-            exclude: &["heavy"],
-        };
-        let result = pick_best_with(&heavy_light(), "heavy", &policy, july_now()).unwrap();
-        assert_eq!(result.as_deref(), Some("light"));
-    }
-
-    #[test]
-    fn only_excluded_data_reads_as_no_usable_data() {
-        let policy = PickPolicy {
-            include_current: true,
-            apply_stale_gate: true,
-            prefer_current: false,
-            exclude: &["heavy", "light"],
-        };
-        let err = pick_best_with(&heavy_light(), "", &policy, july_now()).unwrap_err();
-        assert!(matches!(err, ScoringError::NoUsableData));
-    }
-
-    #[test]
-    fn pick_best_at_equals_default_policy() {
-        let at = pick_best_at(&heavy_light(), "heavy", true, true, july_now()).unwrap();
-        let with = pick_best_with(
-            &heavy_light(),
-            "heavy",
-            &PickPolicy {
-                include_current: true,
-                apply_stale_gate: true,
-                ..Default::default()
-            },
-            july_now(),
-        )
-        .unwrap();
-        assert_eq!(at, with);
     }
 }

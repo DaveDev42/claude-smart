@@ -114,11 +114,6 @@ pub fn eval_emit_to(
                     eprintln!(
                         "(new shells follow this via ~/.zshenv guard; running claude sessions keep their captured paths)"
                     );
-                    // 5. Orca mode: carry the choice to Orca AFTER the export
-                    //    line is out (stderr only; never changes the eval
-                    //    output or the exit status).
-                    w.flush()?;
-                    crate::orca::integrate::sync_default_change(profile, profiles);
                 }
                 Err(e) => {
                     writeln!(w, "{}", shell.error_snippet(&e.to_string()))?;
@@ -219,59 +214,8 @@ pub(super) fn resolve_profile(profile: &str, profiles: &ProfileMap) -> anyhow::R
 /// implementation's `cas` with no args.
 pub(super) fn print_status(
     w: &mut impl Write,
-    shell: Shell,
-    profiles: &ProfileMap,
-) -> anyhow::Result<()> {
-    // Orca mode adds the floor line and per-row markers, read from Orca's
-    // saved state and identity files only (never the socket).
-    let orca =
-        crate::orca::integrate::offline_view(profiles).map(|v| OrcaStatus::from_view(&v, profiles));
-    print_status_with(w, shell, profiles, orca.as_ref())
-}
-
-/// The Orca-mode extras [`print_status_with`] renders.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub(super) struct OrcaStatus {
-    /// The slot profile's name.
-    pub slot: String,
-    /// The floor dir (the slot's dir while Orca mode is ON).
-    pub floor_dir: String,
-    /// Profile name → the email of the Orca account bound to it.
-    pub emails: std::collections::BTreeMap<String, String>,
-}
-
-impl OrcaStatus {
-    fn from_view(v: &crate::orca::integrate::OfflineView, profiles: &ProfileMap) -> Self {
-        OrcaStatus {
-            slot: v.slot.name.clone(),
-            floor_dir: v.slot.dir.clone(),
-            emails: profiles
-                .names_sorted()
-                .into_iter()
-                .filter_map(|n| v.email_for(n).map(|e| (n.to_owned(), e.to_owned())))
-                .collect(),
-        }
-    }
-
-    /// The row suffix for `name`: ` [orca slot]`, ` ⇄ <email>`, or nothing.
-    fn marker(&self, name: &str) -> String {
-        if name == self.slot {
-            " [orca slot]".to_owned()
-        } else if let Some(e) = self.emails.get(name) {
-            format!(" \u{21c4} {e}")
-        } else {
-            String::new()
-        }
-    }
-}
-
-/// [`print_status`] with the Orca extras injected (`None` = Orca mode OFF,
-/// which renders exactly the pre-Orca output).
-pub(super) fn print_status_with(
-    w: &mut impl Write,
     _shell: Shell,
     profiles: &ProfileMap,
-    orca: Option<&OrcaStatus>,
 ) -> anyhow::Result<()> {
     // The live shell's CLAUDE_CONFIG_DIR is read from the environment.
     // The binary does not have a "previous profile" concept (that lives in the
@@ -321,9 +265,6 @@ pub(super) fn print_status_with(
     } else {
         writeln!(w, "global default: {default} ({default_dir})")?;
     }
-    if let Some(o) = orca {
-        writeln!(w, "floor:          {} (orca slot)", o.floor_dir)?;
-    }
     writeln!(w, "available:")?;
 
     if profiles.is_empty() {
@@ -339,8 +280,7 @@ pub(super) fn print_status_with(
                 (false, true) => " d",
                 (false, false) => "  ",
             };
-            let suffix = orca.map(|o| o.marker(name)).unwrap_or_default();
-            writeln!(w, "  {mark} {name:<12} {dir}{suffix}")?;
+            writeln!(w, "  {mark} {name:<12} {dir}")?;
         }
         writeln!(w, "(legend: * = current shell, d = global default)")?;
     }
@@ -797,99 +737,5 @@ mod tests {
                 });
             },
         );
-    }
-
-    /// Orca mode: a floor line after the default, ` [orca slot]` on the
-    /// slot row, ` ⇄ <email>` on bound rows.
-    #[test]
-    fn golden_status_orca_extras() {
-        crate::testenv::with_env_var("CLAUDE_CONFIG_DIR", None, || {
-            with_isolated_home(|_home| {
-                let mut profiles = test_profiles();
-                profiles.insert("orca".into(), "/Users/example/.claude.orca".into());
-                let orca = OrcaStatus {
-                    slot: "orca".into(),
-                    floor_dir: "/Users/example/.claude.orca".into(),
-                    emails: [("work".to_owned(), "alice@example.com".to_owned())]
-                        .into_iter()
-                        .collect(),
-                };
-                let mut buf = Vec::new();
-                print_status_with(&mut buf, Shell::Zsh, &profiles, Some(&orca)).unwrap();
-                let out = String::from_utf8(buf).unwrap();
-                assert!(
-                    out.contains(
-                        "\nfloor:          /Users/example/.claude.orca (orca slot)\navailable:\n"
-                    ),
-                    "{out}"
-                );
-                assert!(
-                    out.contains("orca         /Users/example/.claude.orca [orca slot]\n"),
-                    "{out}"
-                );
-                assert!(
-                    out.contains(
-                        "work         /Users/example/.claude.work \u{21c4} alice@example.com\n"
-                    ),
-                    "{out}"
-                );
-                assert!(
-                    out.contains("home         /Users/example/.claude.home\n"),
-                    "{out}"
-                );
-            });
-        });
-    }
-
-    /// Orca mode OFF renders byte-for-byte what it did before.
-    #[test]
-    fn status_without_orca_is_unchanged() {
-        crate::testenv::with_env_var("CLAUDE_CONFIG_DIR", None, || {
-            with_isolated_home(|_home| {
-                let profiles = test_profiles();
-                let mut a = Vec::new();
-                print_status(&mut a, Shell::Zsh, &profiles).unwrap();
-                let mut b = Vec::new();
-                print_status_with(&mut b, Shell::Zsh, &profiles, None).unwrap();
-                assert_eq!(a, b);
-                assert!(!String::from_utf8(a).unwrap().contains("floor:"));
-            });
-        });
-    }
-
-    /// Orca mode: `cas -g` still prints exactly the export line on stdout;
-    /// the Orca side (here: queue, Orca not running) goes to stderr/state.
-    #[test]
-    fn golden_global_in_orca_mode_prints_only_the_export_line() {
-        crate::testenv::with_env_var("CLAUDE_CONFIG_DIR", None, || {
-            with_isolated_home(|home| {
-                use crate::orca::integrate::test_support;
-                let profiles = test_support::orca_home(home, &["home", "work"]);
-                test_support::write_orca_data(home, &[("a1", "alice@example.com")], None);
-                test_support::login(home, "work", "alice@example.com");
-                let (out, r) = emit(
-                    Shell::Zsh,
-                    &Op::Global {
-                        profile: "work".to_owned(),
-                    },
-                    &profiles,
-                );
-                r.unwrap();
-                let dir = home.join(".claude.work");
-                assert_eq!(
-                    out,
-                    format!("{}\n", Shell::Zsh.export_line(&dir.to_string_lossy()))
-                );
-                assert_eq!(profiles.default_name(), "work");
-                let queued = crate::orca::pending::read().unwrap();
-                if cfg!(unix) {
-                    assert_eq!(queued.expect("a queued select").account_id, "a1");
-                } else {
-                    // No select transport off unix: nothing is ever queued
-                    // (see `orca::integrate::queue`).
-                    assert!(queued.is_none());
-                }
-            });
-        });
     }
 }

@@ -19,7 +19,7 @@ pub mod scoring;
 pub use profiles::ProfileMap;
 
 use crate::usage::{self, UsageData};
-use scoring::{PickPolicy, ScoringError, ScoringResult};
+use scoring::{ScoringError, ScoringResult};
 
 /// Choose the best profile to switch to.
 ///
@@ -58,50 +58,8 @@ pub fn pick_account_gated(
     include_current: bool,
     apply_stale_gate: bool,
 ) -> ScoringResult {
-    pick_account_with(
-        current_profile,
-        &PickPolicy {
-            include_current,
-            apply_stale_gate,
-            ..Default::default()
-        },
-    )
-}
-
-/// Full-policy account pick over freshly fetched usage (see
-/// [`scoring::pick_best_with`]). The Orca slot, when Orca mode is ON, is
-/// always added to `policy.exclude`: it is not an account of its own. With
-/// Orca mode OFF the exclusion list is exactly the caller's, so this is the
-/// pre-Orca [`pick_account_gated`].
-pub fn pick_account_with(current_profile: &str, policy: &PickPolicy<'_>) -> ScoringResult {
     let data: UsageData = usage::fetch().map_err(ScoringError::FetchFailed)?;
-    score_excluding_slot(&data, current_profile, policy)
-}
-
-/// [`pick_account_with`] over the positive usage cache only: no network, no
-/// collector. For `claude -p` / `--print` launches, which must not pay for a
-/// usage fetch. A missing or unreadable cache reads as
-/// [`ScoringError::NoUsableData`].
-pub fn pick_account_cached(current_profile: &str, policy: &PickPolicy<'_>) -> ScoringResult {
-    let data = crate::cmd::usage::read_usage_cache().ok_or(ScoringError::NoUsableData)?;
-    score_excluding_slot(&data, current_profile, policy)
-}
-
-fn score_excluding_slot(
-    data: &UsageData,
-    current_profile: &str,
-    policy: &PickPolicy<'_>,
-) -> ScoringResult {
-    let slot = crate::orca::slot::current();
-    let mut exclude: Vec<&str> = policy.exclude.to_vec();
-    if let Some(s) = &slot {
-        exclude.push(s.name.as_str());
-    }
-    let merged = PickPolicy {
-        exclude: &exclude,
-        ..*policy
-    };
-    scoring::pick_best_with(data, current_profile, &merged, chrono::Utc::now())
+    scoring::pick_best_gated(&data, current_profile, include_current, apply_stale_gate)
 }
 
 /// Return `(session_pct, week_all_pct)` for `profile`, or `None` when the

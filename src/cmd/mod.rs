@@ -10,7 +10,6 @@ pub mod claude;
 pub mod completions;
 pub mod config;
 pub mod hook;
-pub mod orca;
 pub mod pick_account;
 pub mod profiles;
 pub mod run;

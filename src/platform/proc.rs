@@ -55,43 +55,6 @@ pub(crate) fn probe(pid: u32) -> Option<ProcInfo> {
     })
 }
 
-/// Liveness only: a targeted refresh of `pid` that loads no optional field.
-/// Cheaper than [`probe`] for callers that need nothing but "is it running"
-/// (Orca's `orca-runtime.json` pid check).
-pub(crate) fn is_running(pid: u32) -> bool {
-    use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
-
-    let sys_pid = Pid::from_u32(pid);
-    let mut sys = System::new();
-    sys.refresh_processes_specifics(
-        ProcessesToUpdate::Some(&[sys_pid]),
-        true,
-        ProcessRefreshKind::nothing(),
-    );
-    sys.process(sys_pid).is_some()
-}
-
-/// The environment block of one process (`KERN_PROCARGS2` on macOS,
-/// `/proc/<pid>/environ` on Linux), via a targeted single-pid refresh that
-/// loads the environment and nothing else.
-///
-/// `None` when the process is gone or its environment could not be read — an
-/// empty block is reported as `None` too, since every real process carries
-/// at least `PATH`/`HOME` and sysinfo returns an empty list on a permission
-/// failure. Off the hot path: only `csm orca …` and the pre-select safety
-/// check call this.
-#[cfg_attr(not(unix), allow(dead_code))]
-pub(crate) fn environ(pid: u32) -> Option<Vec<OsString>> {
-    use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
-
-    let sys_pid = Pid::from_u32(pid);
-    let mut sys = System::new();
-    let kind = ProcessRefreshKind::nothing().with_environ(UpdateKind::Always);
-    sys.refresh_processes_specifics(ProcessesToUpdate::Some(&[sys_pid]), true, kind);
-    let env = sys.process(sys_pid)?.environ().to_vec();
-    if env.is_empty() { None } else { Some(env) }
-}
-
 /// Full process-table sweep: `System::new_all()`. Off the hot path — never
 /// called from the latency-sensitive Stop path [`probe`] guards.
 pub(crate) fn snapshot() -> Vec<ProcInfo> {
@@ -107,47 +70,6 @@ pub(crate) fn snapshot() -> Vec<ProcInfo> {
             exe: proc_.exe().map(|p| p.to_path_buf()),
             cmd: proc_.cmd().to_vec(),
             start_time: proc_.start_time(),
-        })
-        .collect()
-}
-
-/// One process's identifiers plus its `CLAUDE_CONFIG_DIR`, from a full-table
-/// environment sweep.
-#[derive(Debug, Clone)]
-#[cfg_attr(windows, allow(dead_code))] // only the unix relaunch supervisor sweeps
-pub(crate) struct ProcEnv {
-    pub pid: u32,
-    pub name: String,
-    pub exe: Option<PathBuf>,
-    pub argv0: Option<OsString>,
-    /// The raw `CLAUDE_CONFIG_DIR` value, `None` when unset or unreadable.
-    pub config_dir: Option<String>,
-}
-
-/// Full-table sweep that loads every process's identifiers and environment.
-/// Expensive: the followSwitch path in the relaunch supervisor is its only
-/// caller, never the hook, the statusline, or the launch path.
-#[cfg_attr(windows, allow(dead_code))] // only the unix relaunch supervisor sweeps
-pub(crate) fn sweep_config_dirs() -> Vec<ProcEnv> {
-    use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
-
-    let mut sys = System::new();
-    let kind = ProcessRefreshKind::nothing()
-        .with_exe(UpdateKind::OnlyIfNotSet)
-        .with_cmd(UpdateKind::OnlyIfNotSet)
-        .with_environ(UpdateKind::Always);
-    sys.refresh_processes_specifics(ProcessesToUpdate::All, true, kind);
-    sys.processes()
-        .iter()
-        .map(|(pid, p)| ProcEnv {
-            pid: pid.as_u32(),
-            name: p.name().to_string_lossy().into_owned(),
-            exe: p.exe().map(|e| e.to_path_buf()),
-            argv0: p.cmd().first().cloned(),
-            config_dir: p.environ().iter().find_map(|kv| {
-                let (k, v) = kv.to_str()?.split_once('=')?;
-                (k == "CLAUDE_CONFIG_DIR").then(|| v.to_owned())
-            }),
         })
         .collect()
 }
