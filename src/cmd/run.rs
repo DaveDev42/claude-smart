@@ -67,8 +67,9 @@ impl SessionResolution {
 ///   - `pick_account` returned `Err(FetchFailed)` (usage collection failed) OR
 ///     `Err(NoUsableData)` (fetch ok but no profile had scorable usage —
 ///     "couldn't tell" must not silently keep current).
-///     NOT when hook / `--profile` / `--no-pick` / non-interactive, and NOT for
-///     `AllSaturated` (real limits read → warn + keep current).
+///     NOT when hook / `--profile` / `--no-pick` / non-interactive / an
+///     embedded launch (`support::is_embedded_launch`: an Orca pane), and NOT
+///     for `AllSaturated` (real limits read → warn + keep current).
 pub(crate) fn run(args: &[OsString]) -> anyhow::Result<()> {
     use crate::cli::parser::{ResumeArg, parse};
     use platform::relaunch::LaunchSpec;
@@ -488,7 +489,9 @@ fn stale_usage_pick(
     current_dir: &Path,
 ) -> anyhow::Result<Option<PathBuf>> {
     // TTY gate: isatty(0) && isatty(1) — matches zsh `[[ -t 0 && -t 1 ]]`.
-    if !is_interactive() {
+    // An embedded launch (an Orca pane resuming a session) is a TTY too, but
+    // nobody there expects a prompt: fail safe to current like a script would.
+    if !is_interactive() || crate::cmd::support::is_embedded_launch() {
         return Ok(Some(current_dir.to_path_buf()));
     }
     run_account_picker(profiles, current_dir, "stale-usage picker")

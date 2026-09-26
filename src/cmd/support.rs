@@ -117,6 +117,24 @@ pub(crate) fn is_interactive() -> bool {
     }
 }
 
+/// `true` when a terminal-managing app launched csm, so there is nobody
+/// watching the prompt who expects a picker (today: an Orca pane, which exports
+/// `ORCA_PANE_KEY` into every pane shell). `CSM_EMBEDDED=1` forces it on for
+/// other such tools; `CSM_EMBEDDED=0` forces it off.
+pub(crate) fn is_embedded_launch() -> bool {
+    embedded_from_env(|k| std::env::var(k).ok())
+}
+
+/// Pure core of [`is_embedded_launch`].
+pub(crate) fn embedded_from_env(get: impl Fn(&str) -> Option<String>) -> bool {
+    match get("CSM_EMBEDDED").as_deref().map(str::trim) {
+        Some("1") => return true,
+        Some("0") => return false,
+        _ => {}
+    }
+    get("ORCA_PANE_KEY").is_some_and(|v| !v.trim().is_empty())
+}
+
 /// Hard cap on how much of `csm usage capture`'s stdin (a statusLine JSON
 /// payload) we will ever read. StatusLine payloads are small (a few KB at
 /// most); this is purely a defensive ceiling against a misconfigured or
@@ -166,6 +184,34 @@ mod tests {
     #[test]
     fn is_interactive_does_not_panic() {
         let _ = is_interactive();
+    }
+
+    #[test]
+    fn embedded_launch_detection() {
+        let env = |pairs: &'static [(&'static str, &'static str)]| {
+            move |k: &str| {
+                pairs
+                    .iter()
+                    .find(|(n, _)| *n == k)
+                    .map(|(_, v)| (*v).to_owned())
+            }
+        };
+        assert!(!embedded_from_env(env(&[])));
+        assert!(embedded_from_env(env(&[("ORCA_PANE_KEY", "tab:pane")])));
+        assert!(!embedded_from_env(env(&[("ORCA_PANE_KEY", "  ")])));
+        // Only the pane key counts: Orca's app-wide vars leak into every
+        // descendant (tmux servers, editors), not just its panes.
+        assert!(!embedded_from_env(env(&[("ORCA_APP_VERSION", "1.4.209")])));
+        assert!(embedded_from_env(env(&[("CSM_EMBEDDED", "1")])));
+        assert!(!embedded_from_env(env(&[
+            ("CSM_EMBEDDED", "0"),
+            ("ORCA_PANE_KEY", "tab:pane"),
+        ])));
+        // Any other override value falls through to detection.
+        assert!(embedded_from_env(env(&[
+            ("CSM_EMBEDDED", "yes"),
+            ("ORCA_PANE_KEY", "tab:pane"),
+        ])));
     }
 
     // ── profile_name_for_dir ────────────────────────────────────────────────────

@@ -473,7 +473,11 @@ or none has a `week_all` section, or the profile map is empty). Both surface
 the picker in an interactive terminal so you can choose deliberately against
 the last-known (stale) usage; in a non-interactive context (the Stop hook,
 scripts) both fail safe to the current profile instead of blocking on a
-picker. This is distinct from **all-saturated**: when real percentages exist
+picker. A launch from a terminal-managing app counts as non-interactive here
+even though it has a TTY: in an Orca pane (`ORCA_PANE_KEY` set), a
+`csm --resume <id>` from Orca's session list resumes at once on the current
+profile instead of waiting on the picker. `CSM_EMBEDDED=1` gives other such
+tools the same behaviour and `CSM_EMBEDDED=0` turns detection off. This is distinct from **all-saturated**: when real percentages exist
 but *every* account is over the limit, there is nothing better to pick, so
 `csm` keeps the current profile with a warning and does **not** open the
 picker. Passing **`-i` / `--interactive`** forces the picker in all of these
@@ -680,6 +684,7 @@ Defaults shown are what applies when the variable is unset or unparseable.
 | `CLAUDE_CONFIG_DIR` | The active profile's Claude Code config home. Set by the shell `cas` shim (or the platform floor) before `csm` runs; `csm` reads it to resolve the current profile name and directory. See *Profiles*. |
 | `CLAUDE_SMART_CLAUDE_BIN` | A single binary path/name that overrides what `csm run` spawns instead of `claude`. Highest precedence (above `csm config set launch-command`); mainly for tests and one-off overrides. See *Configuration*. |
 | `CSM_HOST_REPLACE` | A literal, case-insensitive, first-match `find/replace` pair (e.g. `Acme-/`) applied to the short hostname `csm statusline` shows as `<profile>@<host>`. Unset = the raw short hostname, no rewrite; `csm` carries no built-in naming convention. |
+| `CSM_EMBEDDED` | `1` marks the launch as coming from a terminal-managing app, so the stale-usage account picker never opens and the launch keeps the current profile. `0` turns off the automatic detection, which treats a non-empty `ORCA_PANE_KEY` (an Orca pane) the same way. Explicit `-i` still opens the picker. |
 | `CSM_NO_HOME_SHIM` | Any non-empty value turns off the launch-time create-only step for the `~/.claude` compatibility shim. `csm profiles doctor` still reports the shim and `--fix-home` still repairs it. See *Third-party integration contract*. |
 | `CLAUDE_TITLE_INDEX_TTL` | Seconds the session title index (`titles.tsv`) is served without a rebuild (default `300`). |
 
