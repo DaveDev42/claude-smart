@@ -1,5 +1,22 @@
 # Changelog
 
+## [0.3.8](https://github.com/DaveDev42/claude-smart/compare/v0.3.7...v0.3.8) (2026-09-26)
+
+
+### Features
+
+* **orca:** interoperate with Orca's Claude account switching ([de91859](https://github.com/DaveDev42/claude-smart/commit/de918594decaf8a428d24ba254981b293613408b))
+
+
+### Bug Fixes
+
+* **run:** resume at once in an Orca pane instead of opening the account picker ([5d6d90a](https://github.com/DaveDev42/claude-smart/commit/5d6d90aa7b16c85a357c88ba669dada2b7cf1ab2))
+
+
+### Reverts
+
+* **orca:** drop the slot-profile Orca interop ([464f651](https://github.com/DaveDev42/claude-smart/commit/464f651d1796f7632b36d2b92af49db1669d6cf5))
+
 ## [0.3.7](https://github.com/DaveDev42/claude-smart/compare/v0.3.6...v0.3.7) (2026-09-21)
 
 
