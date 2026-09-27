@@ -28,10 +28,15 @@ summary.
   `/usr/bin/perl e2e/fakes/security.pl` instead of `/usr/bin/security`, the
   Orca process-table scan only counts processes under the sandbox, the Orca
   version comes from the sandbox's bundle or `CSM_E2E_ORCA_VERSION`, the
-  login session's `CLAUDE_CONFIG_DIR` (which `csm migrate` checks) comes
-  from `CSM_E2E_SESSION_FLOOR` instead of launchd or the registry, and
-  the store writer can run a hook at its two commit points. A default
-  build has none of this.
+  login session's `CLAUDE_CONFIG_DIR` (the migration's floor) is the
+  content of the file `CSM_E2E_SESSION_FLOOR_FILE` names, and clearing
+  the floor empties that file instead of calling `launchctl` or the
+  registry, the boot id comes from `CSM_E2E_BOOT_ID` (default `boot-1`)
+  so a scenario can stage a reboot, and `point(name)` runs
+  `e2e/fakes/point-hook.sh` at the store writer's two commit points and at
+  the migration's `migrate-b1-moved`, `migrate-b1-unlinked`,
+  `migrate-b2-write`, `migrate-cutover-cleared` and
+  `migrate-retire-quarantined`. A default build has none of this.
 - Every `csm` call runs under `env -i` with a whitelisted environment:
   `HOME` in the sandbox, `CLAUDE_CONFIG_DIR` and `ORCA_USER_DATA_PATH`
   unset, `CSM_USAGE_API_BASE` and `CSM_OAUTH_TOKEN_URL` on the loopback
@@ -49,13 +54,13 @@ summary.
 
 | File | Plays |
 |---|---|
-| `fake-claude/claude.c` | `claude`: logs its argv and `CLAUDE_CONFIG_DIR`, then either prints and exits (print mode, `mcp`, or stdin not a terminal) or blocks until SIGTERM. With `FAKE_ORCA_HOLDER` it is Orca's main process holding `SingletonLock`. |
-| `fakes/World.pm`, `fakes/world.pl` | Builds and reads the sandbox state in Orca 1.4.214's layout: the profile index, `orca-data.json`, stashes under `claude-accounts/<id>/auth`, and `D` (`~/.claude`) logged in as the active account. Also writes legacy `~/.claude.<name>` profiles for the migration scenario. |
-| `fakes/orca.pl`, `fakes/start-orca.sh` | Orca's runtime: `orca-runtime.json`, a unix socket speaking Orca's NDJSON protocol, and the four methods csm calls (`accounts.list`, `accounts.selectClaude`, `accounts.addClaudeFromConfigDir`, `accounts.removeClaude`). They edit the store and `D` the way Orca's source does. `orca.pl call` stands in for the Orca GUI. |
+| `fake-claude/claude.c` | `claude`: logs its argv and `CLAUDE_CONFIG_DIR`, then either prints and exits (print mode, `mcp`, or stdin not a terminal) or blocks until SIGTERM. With `FAKE_EXPECT=<path>` the record says whether that path existed when claude started, and with `FAKE_COUNT=<path>` how many lines that file had, so a scenario can prove what happened before the spawn. With `FAKE_ORCA_HOLDER` it is Orca's main process holding `SingletonLock`. |
+| `fakes/World.pm`, `fakes/world.pl` | Builds and reads the sandbox state in Orca 1.4.214's layout: the profile index, `orca-data.json`, stashes under `claude-accounts/<id>/auth`, and `D` (`~/.claude`) logged in as the active account. For the migration scenarios it also builds the legacy layout: `legacy-reset` (a store with no accounts and no active id, no `D`), `legacy` (a registered `~/.claude.<name>` profile with a login), `shared <sid>` (`~/.claude.shared` with a transcript, history and todos, linked from every profile), `set-active`, `id-of`, `rotate-dir` (a fresher grant in a profile dir), `sqlite` (a `profile-state.db` beside the store) and `marker phase|boot|cutover` (reads csm's `migration.json`). |
+| `fakes/orca.pl`, `fakes/start-orca.sh` | Orca's runtime: `orca-runtime.json`, a unix socket speaking Orca's NDJSON protocol, and the four methods csm calls (`accounts.list`, `accounts.selectClaude`, `accounts.addClaudeFromConfigDir`, `accounts.removeClaude`). They edit the store and `D` the way Orca's source does. `orca.pl call` stands in for the Orca GUI. With `ORCA_D=<dir>` set, `start_orca` runs Orca's main process with that `CLAUDE_CONFIG_DIR` (Orca started under a legacy floor), and with `ORCA_MATERIALIZE=1` Orca writes its active account into `D` at start, as a real Orca does after a restart. |
 | `fakes/security.pl` | `/usr/bin/security`: items are files holding the exact bytes. It handles `find`, `add` (`-w` and `-X`), `delete` and `-i`, and logs the verb only. |
 | `fakes/http.pl` | `/api/oauth/profile`, `/api/oauth/usage` and `/v1/oauth/token` on 127.0.0.1, answering from rule files a scenario writes. A request with no rule gets status 599. |
 | `fakes/usage-cmd.sh` | `CSM_USAGE_CMD`: prints the scenario's usage fixture and counts its calls. |
-| `fakes/point-hook.sh` | Starts the fake Orca at one named point of csm's offline store write. |
+| `fakes/point-hook.sh` | At one named point: starts the fake Orca (`E2E_POINT_AT`), or kills the csm process once (`E2E_POINT_KILL`) so a scenario can check the next run recovers. |
 
 The accounts are alice (`aaaaaaaa-…-00000000000a`, active) and bob
 (`bbbbbbbb-…-00000000000b`). Tokens are fixture strings such as `rt-bob-1`.
@@ -132,11 +137,42 @@ Launch contexts:
   socket, the Keychain or the usage command, and one with no turn finishes
   in under 0.5 s.
 
-Migration:
+Migration off the legacy profile layout. Except for `auto_fresh`, each
+starts from two registered profiles, work (carol, the floor) and home
+(erin), a `~/.claude.shared` linked from both, the floor naming
+`~/.claude.work`, an Orca store with no account and no `~/.claude`:
 
-- `migrate`: `migrate plan`, `import` and `retire` over two legacy
-  `~/.claude.<name>` profiles. `retire` refuses a profile whose stash the
-  profile endpoint cannot confirm, then retires both once it can.
+- `migrate`: `csm migrate --dry-run` exits 75 and writes nothing, the
+  former `plan`/`import`/`retire` exit 1 with a pointer, and with Orca
+  running in the floor dir the first run imports, carries, cuts over and
+  retires home (exit 0). After Orca restarts in `~/.claude`, a run in the
+  same boot still waits for a reboot; after one the floor dir retires and
+  the marker reaches `done`. A later run finds nothing to migrate.
+- `auto_fresh`: no legacy layout; the first launch writes a `done`
+  marker and prints nothing, and later runs change nothing.
+- `auto_adopt_live`: with Orca running, an interactive launch imports
+  both logins over RPC and selects the floor's account before claude
+  starts, then finishes after the spawn, logging only.
+- `auto_pane_quiet`: in an Orca pane nothing runs before the spawn and
+  nothing is printed; the migration runs afterwards and logs.
+- `auto_untouched`: the hook, the status line, `usage capture`, `-p`,
+  piped stdin, `csm claude`, `cas`, `completions` and `--help` leave no
+  marker and change nothing.
+- `auto_live_defers`: a claude running in the home profile keeps it from
+  retiring until it ends; the cutover does not wait for it.
+- `auto_crash`: csm is killed at `migrate-b1-moved`,
+  `migrate-cutover-cleared` and `migrate-retire-quarantined` in turn; the
+  following runs reach the same end state.
+- `auto_sqlite`: Orca stopped with a SQLite-backed profile and no active
+  account gives 75; with Orca running, 0.
+- `auto_floor_early`: Orca already runs in `~/.claude`; a pane's resume
+  finds its transcript because the shared dirs and `~/.claude.json` move
+  before the spawn, without RPC and without a line.
+- `auto_floor_reset`: a floor set again after the cutover is cleared
+  again, and the floor dir retires only after the boot id changes.
+- `auto_fresher`: a profile dir's grant fresher than its stash is
+  quarantined while Orca runs and filed into the stash once Orca is
+  stopped.
 
 Plus `guard`, which checks that the e2e build refuses a `HOME` outside the
 sandbox.

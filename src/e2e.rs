@@ -13,10 +13,18 @@
 //! - the Orca version can be injected (`CSM_E2E_ORCA_VERSION`), since Linux
 //!   has no version source and offline writes need a tested one
 //!   ([`orca_version`]);
-//! - named points in the store-write protocol run a harness script
-//!   (`CSM_E2E_POINT_HOOK`), which is how a scenario starts the fake Orca
-//!   exactly at L1 or L2 ([`point`]);
-//! - `csm migrate retire` never runs `launchctl`.
+//! - named points run a harness script (`CSM_E2E_POINT_HOOK`, [`point`]):
+//!   the store-write protocol's `store-L1` and `store-L2`, where a scenario
+//!   starts the fake Orca, and the migration's `migrate-b1-moved`,
+//!   `migrate-cutover-cleared` and `migrate-retire-quarantined` (plus
+//!   `migrate-b1-unlinked` and `migrate-b2-write`), where a scenario kills
+//!   csm to prove a rerun finishes the job;
+//! - the login session's `CLAUDE_CONFIG_DIR` (the legacy floor) is the file
+//!   `CSM_E2E_SESSION_FLOOR_FILE` names: `migrate::cutover::session_floor`
+//!   reads it and `unset_floor_env` empties it, so no `launchctl` or
+//!   registry call is ever made;
+//! - the boot id is `CSM_E2E_BOOT_ID` (`orca::fsx::boot_id`), so a
+//!   scenario reboots by changing it.
 //!
 //! Without the feature (or under `cfg(test)`) every function here is an
 //! inert stub the optimizer removes.
@@ -217,5 +225,6 @@ mod tests {
         assert_eq!(orca_version(), None);
         guard();
         point("store-L1");
+        point("migrate-b1-moved");
     }
 }

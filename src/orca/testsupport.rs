@@ -352,6 +352,7 @@ pub(crate) struct FakeProcs {
     hidden: HashMap<u32, ProcInfo>,
     alive_only: Vec<u32>,
     unreadable: bool,
+    environs: HashMap<u32, Vec<std::ffi::OsString>>,
 }
 
 impl FakeProcs {
@@ -377,6 +378,14 @@ impl FakeProcs {
         self.unreadable = true;
         self
     }
+
+    /// Give `pid` a readable environment of `KEY=value` entries. A listed
+    /// process without one reads as unreadable.
+    pub(crate) fn with_env(mut self, pid: u32, vars: &[&str]) -> Self {
+        self.environs
+            .insert(pid, vars.iter().map(std::ffi::OsString::from).collect());
+        self
+    }
 }
 
 impl super::live::ProcFacts for FakeProcs {
@@ -394,6 +403,10 @@ impl super::live::ProcFacts for FakeProcs {
 
     fn table(&self) -> Option<Vec<ProcInfo>> {
         (!self.unreadable).then(|| self.listed.clone())
+    }
+
+    fn environ(&self, pid: u32) -> Option<Vec<std::ffi::OsString>> {
+        self.environs.get(&pid).cloned()
     }
 }
 

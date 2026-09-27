@@ -220,6 +220,10 @@ pub enum Method {
     },
     /// `accounts.removeClaude {"accountId":"<id>"}`.
     RemoveClaude { account_id: String },
+    /// `settings.get` (no params; Orca's schema is `null`). The answer holds
+    /// every client setting, `agentDefaultEnv` included, which may carry
+    /// secrets: callers read the one key they need and print nothing else.
+    SettingsGet,
 }
 
 fn non_blank(s: &str) -> Option<String> {
@@ -269,6 +273,7 @@ impl Method {
             Method::SelectClaude { .. } => "accounts.selectClaude",
             Method::AddClaudeFromConfigDir { .. } => "accounts.addClaudeFromConfigDir",
             Method::RemoveClaude { .. } => "accounts.removeClaude",
+            Method::SettingsGet => "settings.get",
         }
     }
 
@@ -289,6 +294,7 @@ impl Method {
                 }
                 Value::Object(m)
             }
+            Method::SettingsGet => Value::Null,
         }
     }
 }

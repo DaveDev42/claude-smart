@@ -19,6 +19,13 @@
  *   (pid, ppid, CLAUDE_CONFIG_DIR, argv) to FAKE_LOG, then block until
  *   SIGTERM and log that too.
  *
+ * With FAKE_EXPECT=<path> every record also says whether that path existed
+ * when claude started (`expect=present|absent`): how a scenario proves a
+ * file was in place before the spawn (a resumed transcript, say), and
+ * with FAKE_COUNT=<path> how many lines that file had then (`count=N`):
+ * how a scenario proves which requests reached the fake Orca before the
+ * spawn.
+ *
  * Records never carry credentials; the harness's fixtures hold only fake
  * tokens anyway.
  *
@@ -60,6 +67,23 @@ static void wait_for_term(void) {
     }
 }
 
+/* Lines in a file; 0 when it cannot be read. */
+static long count_lines(const char *path) {
+    FILE *f = fopen(path, "r");
+    if (!f) {
+        return 0;
+    }
+    long n = 0;
+    int c;
+    while ((c = fgetc(f)) != EOF) {
+        if (c == '\n') {
+            n++;
+        }
+    }
+    fclose(f);
+    return n;
+}
+
 static void log_record(const char *kind, int argc, char **argv) {
     const char *log_path = getenv("FAKE_LOG");
     if (!log_path || !*log_path) {
@@ -70,8 +94,18 @@ static void log_record(const char *kind, int argc, char **argv) {
         return;
     }
     const char *cfgdir = getenv("CLAUDE_CONFIG_DIR");
-    fprintf(f, "=== %s pid=%d ppid=%d time=%ld config_dir=%s ===\n", kind, (int)getpid(),
-            (int)getppid(), (long)time(NULL), cfgdir ? cfgdir : "(unset)");
+    const char *expect = getenv("FAKE_EXPECT");
+    const char *seen = "";
+    if (expect && *expect) {
+        seen = access(expect, F_OK) == 0 ? " expect=present" : " expect=absent";
+    }
+    char counted[48] = "";
+    const char *count_path = getenv("FAKE_COUNT");
+    if (count_path && *count_path) {
+        snprintf(counted, sizeof(counted), " count=%ld", count_lines(count_path));
+    }
+    fprintf(f, "=== %s pid=%d ppid=%d time=%ld config_dir=%s%s%s ===\n", kind, (int)getpid(),
+            (int)getppid(), (long)time(NULL), cfgdir ? cfgdir : "(unset)", seen, counted);
     for (int i = 0; i < argc; i++) {
         fprintf(f, "argv[%d]=%s\n", i, argv[i]);
     }

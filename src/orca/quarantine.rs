@@ -145,6 +145,10 @@ pub enum Reason {
     /// side state (MCP servers' OAuth logins) the account's stash lacks.
     /// `accounts doctor --fix` keeps it until the stash holds that too.
     ExtraLogins,
+    /// An orphan `~/.claude/.credentials.json` the migration's cutover moved
+    /// out of `~/.claude` before Orca's `D` moves there: it is not the
+    /// active account's stashed grant, so no account is claimed for it.
+    Cutover,
 }
 
 /// The secret-free index entry.
@@ -195,6 +199,25 @@ fn side_choice(fresher: bool, new_extra: bool, old_extra: bool) -> Option<bool> 
         (true, false) => Some(true),
         (false, true) => Some(false),
         (false, false) => Some(fresher),
+    }
+}
+
+/// Does a filing as `reason` under `account` lift an existing index entry
+/// `old` of the same grant? Only a retired copy of an account
+/// ([`Reason::Retired`], [`Reason::ExtraLogins`]) lifts, and only an entry
+/// with no account, or a 401 filed under that same account: an entry
+/// already attributed to another account, or filed for another reason
+/// under this one, keeps what it says. Pure.
+pub fn upgrades(old: &Meta, reason: Reason, account: Option<&str>) -> bool {
+    let Some(account) = account else {
+        return false;
+    };
+    if !matches!(reason, Reason::Retired | Reason::ExtraLogins) {
+        return false;
+    }
+    match old.matched_account.as_deref() {
+        None => true,
+        Some(a) => a == account && old.reason == Reason::Unauthorized,
     }
 }
 
@@ -292,8 +315,29 @@ impl Quarantine {
             None => (Filed::New(fp.clone()), None),
         };
         let described = match kept {
-            Some(_) if self.meta_of(&fp).is_some() => return Ok(outcome),
-            Some(old) => old.expose(),
+            Some(old_secret) => match self.meta_of(&fp) {
+                // A later filing that attributes an entry filed with no
+                // account, or one filed as a 401 under the same account,
+                // as a retired copy of its account lifts it: settle then
+                // considers it (a grant A3 filed as unauthorized, or one
+                // step 1 of the cutover could not attribute, is retired
+                // later under its account).
+                Some(old) if upgrades(&old, reason, matched_account) => {
+                    let meta = Meta {
+                        reason,
+                        matched_account: matched_account.map(str::to_owned),
+                        profile_account_uuid: profile
+                            .and_then(|(_, u)| u.map(str::to_owned))
+                            .or(old.profile_account_uuid),
+                        profile_status: profile.map(|(s, _)| s).or(old.profile_status),
+                        ..old
+                    };
+                    self.write_meta(&meta)?;
+                    return Ok(outcome);
+                }
+                Some(_) => return Ok(outcome),
+                None => old_secret.expose(),
+            },
             None => {
                 self.put_secret(&fp, creds)?;
                 creds
@@ -309,12 +353,16 @@ impl Quarantine {
             profile_status: profile.map(|(s, _)| s),
             captured_at: now_ms,
         };
-        let text = serde_json::to_vec_pretty(&meta)
-            .map_err(|e| OrcaError::Invalid(format!("quarantine index: {e}")))?;
-        let mp = self.meta_path(&fp);
-        fsx::write_atomic(&mp, &text, WriteOpts::PRIVATE_DURABLE)
-            .map_err(|e| OrcaError::io("cannot write", &mp, e))?;
+        self.write_meta(&meta)?;
         Ok(outcome)
+    }
+
+    fn write_meta(&self, meta: &Meta) -> Result<(), OrcaError> {
+        let text = serde_json::to_vec_pretty(meta)
+            .map_err(|e| OrcaError::Invalid(format!("quarantine index: {e}")))?;
+        let mp = self.meta_path(&meta.fingerprint);
+        fsx::write_atomic(&mp, &text, WriteOpts::PRIVATE_DURABLE)
+            .map_err(|e| OrcaError::io("cannot write", &mp, e))
     }
 
     /// The index entry for `fp`, when it exists and parses as that entry.
@@ -353,11 +401,30 @@ impl Quarantine {
             return Ok(false);
         };
         meta.reason = reason;
-        let text = serde_json::to_vec_pretty(&meta)
-            .map_err(|e| OrcaError::Invalid(format!("quarantine index: {e}")))?;
-        let mp = self.meta_path(fp);
-        fsx::write_atomic(&mp, &text, WriteOpts::PRIVATE_DURABLE)
-            .map_err(|e| OrcaError::io("cannot write", &mp, e))?;
+        self.write_meta(&meta)?;
+        Ok(true)
+    }
+
+    /// Rewrite entry `fp` as not provably any account's: `reason`, no
+    /// matched account, and the profile endpoint's answer when there was
+    /// one. For a grant filed under an account that then profiled as
+    /// another. `Ok(false)` when there is no such entry.
+    pub fn unattribute(
+        &self,
+        fp: &str,
+        reason: Reason,
+        profile: Option<(u16, Option<&str>)>,
+    ) -> Result<bool, OrcaError> {
+        let Some(mut meta) = self.meta_of(fp) else {
+            return Ok(false);
+        };
+        meta.reason = reason;
+        meta.matched_account = None;
+        if let Some((status, uuid)) = profile {
+            meta.profile_status = Some(status);
+            meta.profile_account_uuid = uuid.map(str::to_owned);
+        }
+        self.write_meta(&meta)?;
         Ok(true)
     }
 
@@ -571,6 +638,80 @@ mod tests {
                 .is_err()
         );
         assert_eq!(q.get(&fp).unwrap().unwrap().expose(), logins);
+    }
+
+    /// A grant first filed as no one's (or as a 401 under its account) is
+    /// lifted to `Retired` under the account when retire files it again,
+    /// so settle can still store it; an entry attributed elsewhere, or a
+    /// filing that names no account, changes nothing.
+    #[test]
+    fn a_retired_filing_attributes_an_unattributed_entry() {
+        let meta = |reason, account: Option<&str>| Meta {
+            fingerprint: "fp".into(),
+            expires_at: None,
+            reason,
+            source: "file".into(),
+            matched_account: account.map(str::to_owned),
+            profile_account_uuid: None,
+            profile_status: None,
+            captured_at: 0,
+        };
+        assert!(upgrades(
+            &meta(Reason::NoMatch, None),
+            Reason::Retired,
+            Some("a")
+        ));
+        assert!(upgrades(
+            &meta(Reason::Unauthorized, Some("a")),
+            Reason::Retired,
+            Some("a")
+        ));
+        assert!(!upgrades(
+            &meta(Reason::Unauthorized, Some("b")),
+            Reason::Retired,
+            Some("a")
+        ));
+        assert!(!upgrades(
+            &meta(Reason::ProfileMismatch, Some("a")),
+            Reason::Retired,
+            Some("a")
+        ));
+        assert!(!upgrades(
+            &meta(Reason::NoMatch, None),
+            Reason::Retired,
+            None
+        ));
+        assert!(!upgrades(
+            &meta(Reason::NoMatch, None),
+            Reason::Cutover,
+            Some("a")
+        ));
+
+        let tmp = tempfile::tempdir().unwrap();
+        let q = Quarantine::new(HostOs::Linux, tmp.path());
+        let g = creds_json("at-1", "rt-1", 1000);
+        let fp = q
+            .file(&g, Reason::Unauthorized, "file", None, Some((401, None)), 1)
+            .unwrap()
+            .fingerprint()
+            .to_owned();
+        assert_eq!(
+            q.file(&g, Reason::Retired, "file", Some("a"), Some((401, None)), 2)
+                .unwrap(),
+            Filed::Kept(fp.clone())
+        );
+        let m = q.meta_of(&fp).unwrap();
+        assert_eq!(m.reason, Reason::Retired);
+        assert_eq!(m.matched_account.as_deref(), Some("a"));
+        assert_eq!(m.profile_status, Some(401));
+        // Attributed now: another account's filing does not take it over.
+        q.file(&g, Reason::Retired, "file", Some("b"), None, 3)
+            .unwrap();
+        assert_eq!(
+            q.meta_of(&fp).unwrap().matched_account.as_deref(),
+            Some("a")
+        );
+        assert_eq!(q.get(&fp).unwrap().unwrap().expose(), g);
     }
 
     #[cfg(unix)]

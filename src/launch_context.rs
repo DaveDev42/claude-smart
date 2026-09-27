@@ -243,30 +243,161 @@ pub fn orca_config_dir_pin(inherited: Option<&str>, orca_explicit: Option<&Path>
 pub struct LaunchDir {
     pub d: PathBuf,
     pub pin: ConfigDirPin,
+    /// The inherited `CLAUDE_CONFIG_DIR` was a stale pin (R1/I5) and was
+    /// replaced: worth the daily hint.
+    pub stale: bool,
 }
 
-/// I/O shell. Inside Orca (`orca == true`), `D` is Orca main's own
-/// `CLAUDE_CONFIG_DIR` read from its process environment when readable, so
-/// a login dotfile that overrode the pane's value cannot move claude out of
-/// Orca's dir, and the pin follows Orca's rule ([`orca_config_dir_pin`]);
-/// otherwise, and outside Orca, it is this process's own `D`
-/// ([`config_dir_pin`]). Reads files and the process table only: no
-/// Keychain, no network.
+/// What csm knows of Orca main's `D`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OrcaMain {
+    /// Orca is not running.
+    Stopped,
+    /// Orca runs but its environment could not be read.
+    Unreadable,
+    /// Orca runs in this `D`.
+    Dir(crate::orca::procenv::OrcaDir),
+}
+
+/// Trim a dir value the way the pins compare it.
+fn trim_dir(v: &str) -> PathBuf {
+    PathBuf::from(v.trim().trim_end_matches(['/', '\\']))
+}
+
+/// Is the inherited `CLAUDE_CONFIG_DIR` a stale pin (design I5): it names
+/// one of `stale` (the recorded legacy dirs and `~/.claude`) and is not
+/// Orca's live `D` (`orca_d`)? Blank is no pin at all. Pure.
+pub fn stale_pin(inherited: Option<&str>, stale: &[PathBuf], orca_d: Option<&Path>) -> bool {
+    let Some(v) = inherited.filter(|s| !s.trim().is_empty()) else {
+        return false;
+    };
+    let v = trim_dir(v);
+    let same = |p: &Path| trim_dir(&p.to_string_lossy()) == v;
+    !orca_d.is_some_and(same) && stale.iter().any(|s| same(s))
+}
+
+/// What the migration marker tells a launch ([`crate::migrate::stale_dirs`]).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Recorded<'a> {
+    /// The recorded legacy dirs plus `~/.claude`.
+    pub stale: &'a [PathBuf],
+    /// The migration recorded its cutover.
+    pub cutover: bool,
+    /// Linux or Windows, Orca stopped, `~/.claude` without a login and the
+    /// recorded floor profile's dir still holding one: this dir. Those
+    /// hosts have no Keychain mirror, so `~/.claude` gets Orca's active
+    /// account only at Orca's next start there (a cutover made while Orca
+    /// ran in the floor dir writes nothing into it); until then csm
+    /// launches stay on the floor dir (design section 3).
+    pub floor_fallback: Option<&'a Path>,
+}
+
+/// Pure core of [`launch_dir`]. `orca_launch`: a pane or structured
+/// session; `own_d`: `D` over this process's own environment; `rec`: what
+/// the migration recorded.
+///
+/// - Orca runs and its `D` is known: a pane follows Orca's rule
+///   ([`orca_config_dir_pin`]); so does every other launch (R1) unless it
+///   inherited a deliberate pin, a value that is neither blank nor stale,
+///   which keeps today's rule ([`config_dir_pin`]).
+/// - Orca stopped after the cutover: a blank or stale pin goes to the
+///   floor dir while [`Recorded::floor_fallback`] names it; otherwise a
+///   stale pin is removed (I5) and claude runs in the implicit `~/.claude`.
+/// - Otherwise (Orca's environment unreadable included): today's rule.
+pub fn resolve_launch_dir(
+    orca_launch: bool,
+    inherited: Option<&str>,
+    home: &Path,
+    own_d: &Path,
+    main: &OrcaMain,
+    rec: &Recorded<'_>,
+) -> LaunchDir {
+    let blank = inherited.is_none_or(|s| s.trim().is_empty());
+    let stale = rec.stale;
+    let cutover = rec.cutover;
+    let fallback = match main {
+        OrcaMain::Stopped
+            if cutover && !orca_launch && (blank || stale_pin(inherited, stale, None)) =>
+        {
+            rec.floor_fallback
+        }
+        _ => None,
+    };
+    if let Some(f) = fallback {
+        return LaunchDir {
+            d: f.to_path_buf(),
+            pin: config_dir_pin(inherited, home, f).into(),
+            stale: !blank && stale_pin(inherited, stale, Some(f)),
+        };
+    }
+    match main {
+        OrcaMain::Dir(o) if orca_launch || blank || stale_pin(inherited, stale, None) => {
+            let explicit = o.explicit.then_some(o.dir.as_path());
+            LaunchDir {
+                d: o.dir.clone(),
+                pin: orca_config_dir_pin(inherited, explicit),
+                stale: !orca_launch && stale_pin(inherited, stale, explicit),
+            }
+        }
+        OrcaMain::Stopped if cutover && stale_pin(inherited, stale, None) => LaunchDir {
+            d: home.join(".claude"),
+            pin: ConfigDirPin::Unset,
+            stale: true,
+        },
+        _ => LaunchDir {
+            d: own_d.to_path_buf(),
+            pin: config_dir_pin(inherited, home, own_d).into(),
+            stale: false,
+        },
+    }
+}
+
+/// I/O shell over [`resolve_launch_dir`]. Orca main's `D` is read from its
+/// process environment, so a login dotfile that overrode this shell's
+/// value cannot move claude out of Orca's dir. Reads files and the process
+/// table only: no Keychain, no network, no RPC.
 pub fn launch_dir(orca: bool) -> Option<LaunchDir> {
     let env = crate::orca::HostEnv::current().ok()?;
     let inherited = env.claude_config_dir.as_deref();
-    if orca && let Some(o) = orca_main_dir(&env) {
-        let pin = orca_config_dir_pin(inherited, o.explicit.then_some(o.dir.as_path()));
-        return Some(LaunchDir { d: o.dir, pin });
-    }
-    let d = crate::orca::runtime::runtime_paths(inherited, &env.home, |p| p.exists()).config_dir;
-    let pin = config_dir_pin(inherited, &env.home, &d).into();
-    Some(LaunchDir { d, pin })
+    let own_d =
+        crate::orca::runtime::runtime_paths(inherited, &env.home, |p| p.exists()).config_dir;
+    let main = orca_main_dir(&env);
+    // The stale set (the migration marker, at most the registry) is read
+    // only for a launch that inherited a value and may use it: a pane
+    // follows Orca's rule whenever Orca's D is known.
+    let needs_stale =
+        inherited.is_some_and(|s| !s.trim().is_empty()) && (!orca || main == OrcaMain::Stopped);
+    // Linux and Windows keep no Keychain mirror: with Orca stopped,
+    // `~/.claude` holds a login only once Orca has started there.
+    let home_empty = !orca
+        && main == OrcaMain::Stopped
+        && env.os != crate::orca::HostOs::MacOs
+        && !crate::orca::runtime::runtime_paths(None, &env.home, |p| p.exists())
+            .credentials_path
+            .is_file();
+    let (stale, cutover, floor) = if needs_stale || home_empty {
+        crate::migrate::stale_dirs(&env)
+    } else {
+        (Vec::new(), false, None)
+    };
+    let floor = floor.filter(|f| home_empty && f.join(".credentials.json").is_file());
+    Some(resolve_launch_dir(
+        orca,
+        inherited,
+        &env.home,
+        &own_d,
+        &main,
+        &Recorded {
+            stale: &stale,
+            cutover,
+            floor_fallback: floor.as_deref(),
+        },
+    ))
 }
 
 /// Orca main's `CLAUDE_CONFIG_DIR` (else its `~/.claude`), from its
 /// runtime metadata's pid and that process's environment.
-fn orca_main_dir(env: &crate::orca::HostEnv) -> Option<crate::orca::procenv::OrcaDir> {
+pub(crate) fn orca_main_dir(env: &crate::orca::HostEnv) -> OrcaMain {
     use crate::orca::{procenv, rpc, userdata};
     let alive = |pid: u32| pid != 0 && crate::platform::proc::is_running(pid);
     let ud = userdata::resolve(env, |dir| {
@@ -275,11 +406,13 @@ fn orca_main_dir(env: &crate::orca::HostEnv) -> Option<crate::orca::procenv::Orc
             .flatten()
             .is_some_and(|m| alive(m.pid))
     });
-    let meta = rpc::read_runtime_metadata(&ud.dir).ok().flatten()?;
+    let Some(meta) = rpc::read_runtime_metadata(&ud.dir).ok().flatten() else {
+        return OrcaMain::Stopped;
+    };
     if !alive(meta.pid) {
-        return None;
+        return OrcaMain::Stopped;
     }
-    procenv::orca_dir(meta.pid, Some(&env.home))
+    procenv::orca_dir(meta.pid, Some(&env.home)).map_or(OrcaMain::Unreadable, OrcaMain::Dir)
 }
 
 // ─── managed-account auth env ─────────────────────────────────────────────────
@@ -592,5 +725,222 @@ mod tests {
             true,
         );
         assert_eq!(out, vec!["anthropic_api_key", "Anthropic_Custom_Headers"]);
+    }
+
+    // ─── R1 / I5 ──────────────────────────────────────────────────────────
+
+    use crate::orca::procenv::OrcaDir;
+
+    const HOME: &str = "/Users/example";
+
+    fn stale_set() -> Vec<PathBuf> {
+        vec![
+            PathBuf::from("/Users/example/.claude.work"),
+            PathBuf::from("/Users/example/.claude.home"),
+            PathBuf::from("/Users/example/.claude"),
+        ]
+    }
+
+    #[test]
+    fn stale_pin_names_a_recorded_dir_that_is_not_orcas() {
+        let s = stale_set();
+        assert!(stale_pin(Some("/Users/example/.claude.work"), &s, None));
+        assert!(stale_pin(Some("/Users/example/.claude.home/"), &s, None));
+        assert!(stale_pin(Some("/Users/example/.claude"), &s, None));
+        // Orca's live D is that dir: not stale.
+        let work = Path::new("/Users/example/.claude.work");
+        assert!(!stale_pin(
+            Some("/Users/example/.claude.work"),
+            &s,
+            Some(work)
+        ));
+        // A deliberate pin, blank, or unset: not stale.
+        assert!(!stale_pin(Some("/Volumes/x/claude"), &s, None));
+        assert!(!stale_pin(Some("  "), &s, None));
+        assert!(!stale_pin(None, &s, None));
+    }
+
+    fn orca(dir: &str, explicit: bool) -> OrcaMain {
+        OrcaMain::Dir(OrcaDir {
+            dir: PathBuf::from(dir),
+            explicit,
+        })
+    }
+
+    fn resolve(inherited: Option<&str>, main: &OrcaMain, cutover: bool) -> LaunchDir {
+        resolve_with(inherited, main, cutover, None)
+    }
+
+    fn resolve_with(
+        inherited: Option<&str>,
+        main: &OrcaMain,
+        cutover: bool,
+        floor_fallback: Option<&Path>,
+    ) -> LaunchDir {
+        let home = Path::new(HOME);
+        let own = crate::orca::runtime::runtime_paths(inherited, home, |_| false).config_dir;
+        let stale = stale_set();
+        resolve_launch_dir(
+            false,
+            inherited,
+            home,
+            &own,
+            main,
+            &Recorded {
+                stale: &stale,
+                cutover,
+                floor_fallback,
+            },
+        )
+    }
+
+    /// R1: while Orca runs, a terminal launch follows Orca's live D.
+    #[test]
+    fn interactive_follows_orcas_live_d() {
+        let floor = orca("/Users/example/.claude.work", true);
+        let r = resolve(None, &floor, false);
+        assert_eq!(r.d, PathBuf::from("/Users/example/.claude.work"));
+        assert_eq!(
+            r.pin,
+            ConfigDirPin::Set(PathBuf::from("/Users/example/.claude.work"))
+        );
+        assert!(!r.stale);
+        // The floor itself, inherited: left alone.
+        let r = resolve(Some("/Users/example/.claude.work"), &floor, false);
+        assert_eq!(r.pin, ConfigDirPin::Leave);
+        assert!(!r.stale);
+        // Another legacy dir: stale, replaced.
+        let r = resolve(Some("/Users/example/.claude.home"), &floor, false);
+        assert_eq!(r.d, PathBuf::from("/Users/example/.claude.work"));
+        assert_eq!(
+            r.pin,
+            ConfigDirPin::Set(PathBuf::from("/Users/example/.claude.work"))
+        );
+        assert!(r.stale);
+        // Orca on the implicit ~/.claude: an explicit ~/.claude is removed.
+        let implicit = orca("/Users/example/.claude", false);
+        let r = resolve(Some("/Users/example/.claude"), &implicit, false);
+        assert_eq!(r.pin, ConfigDirPin::Unset);
+        assert!(r.stale);
+        // A deliberate pin keeps today's rule.
+        let r = resolve(Some("/Volumes/x/claude"), &floor, false);
+        assert_eq!(r.d, PathBuf::from("/Volumes/x/claude"));
+        assert_eq!(r.pin, ConfigDirPin::Leave);
+        assert!(!r.stale);
+    }
+
+    /// I5: after the cutover, with Orca stopped, a stale pin is removed.
+    #[test]
+    fn stale_pin_is_unset_after_the_cutover() {
+        let r = resolve(
+            Some("/Users/example/.claude.home"),
+            &OrcaMain::Stopped,
+            true,
+        );
+        assert_eq!(r.d, PathBuf::from("/Users/example/.claude"));
+        assert_eq!(r.pin, ConfigDirPin::Unset);
+        assert!(r.stale);
+        // Before the cutover the legacy dir still holds the login.
+        let r = resolve(
+            Some("/Users/example/.claude.home"),
+            &OrcaMain::Stopped,
+            false,
+        );
+        assert_eq!(r.d, PathBuf::from("/Users/example/.claude.home"));
+        assert_eq!(r.pin, ConfigDirPin::Leave);
+        // Orca's environment unreadable: today's rule, even after the cutover.
+        let r = resolve(
+            Some("/Users/example/.claude.home"),
+            &OrcaMain::Unreadable,
+            true,
+        );
+        assert_eq!(r.d, PathBuf::from("/Users/example/.claude.home"));
+        assert!(!r.stale);
+    }
+
+    /// Linux or Windows after a cutover made while Orca ran in the floor
+    /// dir: with Orca stopped and `~/.claude` still without a login, a
+    /// blank or stale launch stays on the floor dir, never on an empty
+    /// `~/.claude`; a deliberate pin keeps today's rule; once `~/.claude`
+    /// holds a login (no fallback), I5 applies again.
+    #[test]
+    fn a_launch_stays_on_the_floor_until_home_holds_a_login() {
+        let floor = Path::new("/Users/example/.claude.work");
+        let r = resolve_with(None, &OrcaMain::Stopped, true, Some(floor));
+        assert_eq!(r.d, floor);
+        assert_eq!(r.pin, ConfigDirPin::Set(floor.to_path_buf()));
+        assert!(!r.stale);
+        // The floor itself, inherited: left alone.
+        let r = resolve_with(
+            Some("/Users/example/.claude.work"),
+            &OrcaMain::Stopped,
+            true,
+            Some(floor),
+        );
+        assert_eq!(r.d, floor);
+        assert_eq!(r.pin, ConfigDirPin::Leave);
+        assert!(!r.stale);
+        // Another legacy dir: stale, moved to the floor.
+        let r = resolve_with(
+            Some("/Users/example/.claude.home"),
+            &OrcaMain::Stopped,
+            true,
+            Some(floor),
+        );
+        assert_eq!(r.d, floor);
+        assert_eq!(r.pin, ConfigDirPin::Set(floor.to_path_buf()));
+        assert!(r.stale);
+        // A deliberate pin: today's rule.
+        let r = resolve_with(
+            Some("/Volumes/x/claude"),
+            &OrcaMain::Stopped,
+            true,
+            Some(floor),
+        );
+        assert_eq!(r.d, PathBuf::from("/Volumes/x/claude"));
+        assert_eq!(r.pin, ConfigDirPin::Leave);
+        // Before the cutover, or with Orca running: no fallback.
+        let r = resolve_with(None, &OrcaMain::Stopped, false, Some(floor));
+        assert_eq!(r.d, PathBuf::from("/Users/example/.claude"));
+        let r = resolve_with(
+            None,
+            &orca("/Users/example/.claude", false),
+            true,
+            Some(floor),
+        );
+        assert_eq!(r.d, PathBuf::from("/Users/example/.claude"));
+        // `~/.claude` holds a login: I5 as before.
+        let r = resolve_with(
+            Some("/Users/example/.claude.home"),
+            &OrcaMain::Stopped,
+            true,
+            None,
+        );
+        assert_eq!(r.d, PathBuf::from("/Users/example/.claude"));
+        assert_eq!(r.pin, ConfigDirPin::Unset);
+    }
+
+    /// A pane keeps Orca's rule and never reports a stale pin.
+    #[test]
+    fn a_pane_follows_orcas_rule() {
+        let home = Path::new(HOME);
+        let own = PathBuf::from("/Users/example/.claude.home");
+        let r = resolve_launch_dir(
+            true,
+            Some("/Users/example/.claude.home"),
+            home,
+            &own,
+            &orca("/Users/example/.claude.work", true),
+            &Recorded {
+                stale: &stale_set(),
+                cutover: false,
+                floor_fallback: None,
+            },
+        );
+        assert_eq!(
+            r.pin,
+            ConfigDirPin::Set(PathBuf::from("/Users/example/.claude.work"))
+        );
+        assert!(!r.stale);
     }
 }

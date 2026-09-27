@@ -558,11 +558,37 @@ pub fn switch_held(
     switch_locked(env, target)
 }
 
+/// [`switch_held`] only while Orca has no active account: the migration's
+/// A2 ("an account Orca already has active wins"). The caller's check can
+/// be overtaken by a GUI select before the switch reads Orca's state, so
+/// the switch checks again on the state it acts on. `Ok(None)`: an account
+/// is active now and nothing was selected.
+pub fn select_if_none_active(
+    env: &SwitchEnv<'_>,
+    _held: &fsx::SwitchLock,
+    target: &str,
+) -> Result<Option<SwitchReport>, OrcaError> {
+    switch_locked_if(env, target, true)
+}
+
 fn switch_locked(env: &SwitchEnv<'_>, target: &str) -> Result<SwitchReport, OrcaError> {
+    switch_locked_if(env, target, false).map(|r| r.expect("an unconditional switch reports"))
+}
+
+/// A2's condition over the active account the switch read. Pure.
+pub(crate) fn someone_else_active(if_none_active: bool, active: Option<&str>) -> bool {
+    if_none_active && active.is_some()
+}
+
+fn switch_locked_if(
+    env: &SwitchEnv<'_>,
+    target: &str,
+    if_none_active: bool,
+) -> Result<Option<SwitchReport>, OrcaError> {
     let journal = read_journal(env.state);
     let l0 = env.live.mark();
     if l0.running {
-        return switch_running(env, target, journal);
+        return switch_running(env, target, journal, if_none_active);
     }
     let view = load_view(env.data_file)?;
     let offline_allowed = if !env.version_ok {
@@ -579,6 +605,9 @@ fn switch_locked(env: &SwitchEnv<'_>, target: &str) -> Result<SwitchReport, Orca
     };
     let rec = view.as_ref().and_then(|v| v.account(target)).cloned();
     let active = view.as_ref().and_then(named_active);
+    if someone_else_active(if_none_active, active.as_deref()) {
+        return Ok(None);
+    }
     // A pending journal with no active account in the store: settle it
     // first (a switch from the system default puts the snapshot back), so
     // this switch's snapshot captures the system default, not the half
@@ -603,7 +632,7 @@ fn switch_locked(env: &SwitchEnv<'_>, target: &str) -> Result<SwitchReport, Orca
         journal_pending: journal.as_ref().is_some_and(Journal::pending),
         live_claude,
     };
-    match plan_switch(&state) {
+    let r = match plan_switch(&state) {
         Plan::Refuse(why) => Err(OrcaError::Refused(why)),
         Plan::Rpc => unreachable!("Orca is stopped"),
         Plan::Noop => Ok(SwitchReport {
@@ -622,14 +651,16 @@ fn switch_locked(env: &SwitchEnv<'_>, target: &str) -> Result<SwitchReport, Orca
             let rec = rec.expect("target state Ok implies a record");
             run_offline(env, &l0, &view, &rec, active, journal, steps)
         }
-    }
+    };
+    r.map(Some)
 }
 
 fn switch_running(
     env: &SwitchEnv<'_>,
     target: &str,
     journal: Option<Journal>,
-) -> Result<SwitchReport, OrcaError> {
+    if_none_active: bool,
+) -> Result<Option<SwitchReport>, OrcaError> {
     let null_crash = journal
         .as_ref()
         .filter(|j| j.pending() && j.from.is_none() && null_switch_touched_d(j.step));
@@ -666,6 +697,9 @@ fn switch_running(
         .find(|a| a.id == target)
         .cloned();
     let from = snap.claude.active_by_runtime.host.clone();
+    if someone_else_active(if_none_active, from.as_deref()) {
+        return Ok(None);
+    }
     let loaded = rec.as_ref().and_then(|r| load_account(env, r).ok());
     let state = SwitchState {
         target_id: target.to_owned(),
@@ -718,7 +752,7 @@ fn switch_running(
                     owner: env.owner.clone(),
                 },
             )?;
-            Ok(SwitchReport {
+            Ok(Some(SwitchReport {
                 route: Route::Rpc,
                 outcome: Outcome::Switched,
                 to: target.to_owned(),
@@ -728,7 +762,7 @@ fn switch_running(
                 snapshot: None,
                 refresh: None,
                 redo: None,
-            })
+            }))
         }
     }
 }
@@ -1192,41 +1226,24 @@ fn handed_outcome(redo: &RedoOutcome, unrestored: Option<&str>) -> Result<Outcom
     })
 }
 
-// ─── offline attribution ──────────────────────────────────────────────────────
+// ─── the SQLite export's active account ───────────────────────────────────────
 
-/// What [`attribute_offline`] did.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Attribution {
-    /// The store names no active account: Orca's start does not read `D`
-    /// back, so nothing was done.
-    NoActiveAccount,
-    /// The read-back ran. `identity_cleared`: `D`'s `oauthAccount` was
-    /// removed afterwards.
-    Done {
-        readback: ReadBackReport,
-        identity_cleared: bool,
-    },
-}
-
-/// Attribute `D`'s runtime grants with Orca stopped, without switching:
-/// step 3 of the offline switch (the read-back with the profile veto) on
-/// its own, then `D` made neutral.
+/// Materialize the store's active account into `D` with Orca stopped when
+/// the store is a SQLite export (the migration design's section 4): the
+/// a=i repair of [`plan_switch`] without its store write. The export is
+/// read-only for csm (`store::sqlite_gate`), and a lagging one is harmless:
+/// Orca materializes its real active account again at start.
 ///
-/// For the migration's step 7 when the switch cannot run offline (a
-/// SQLite-backed store, or the floor profile has no account). Orca's first
-/// start reads `D` back while nothing is written yet
-/// (runtime-auth-readback.ts, `lastWrittenCredentialsJson === null`): a
-/// candidate matched by the email in `D`'s `oauthAccount` and fresher than
-/// that account's stash is written into it with no profile check. So csm
-/// first files each grant with its owner (or in the quarantine), then
-/// removes `D`'s `oauthAccount`: without it Orca's matcher accepts a grant
-/// only by an equal refresh token (runtime-auth-credential-matching.ts),
-/// which is the owner csm just stored it with. The identity goes only when
-/// the store names an active account, whose materialize on Orca's start
-/// writes it again; with none, `D` is the system default Orca captures and
-/// is left alone. Writes stashes, csm's quarantine and `D`'s
-/// `.claude.json` only, never the store.
-pub fn attribute_offline(env: &SwitchEnv<'_>) -> Result<Attribution, OrcaError> {
+/// Refuses unless `target` is the export's active host account, and while
+/// an earlier switch is unfinished (its recovery owns `D`). Steps: the
+/// read-back of `D` with the active stash excluded, the stash refresh when
+/// no claude is live in `D`, the materialize, the verify. Writes stashes,
+/// csm's quarantine and `D` only; no journal, since nothing in Orca's
+/// state changes and a failed materialize puts `D` back itself.
+pub fn materialize_export_active(
+    env: &SwitchEnv<'_>,
+    target: &str,
+) -> Result<SwitchReport, OrcaError> {
     let _lock = SwitchLock::acquire(env.state, env.timing.lock_wait)
         .map_err(|e| OrcaError::io("cannot take", &env.state.join(fsx::SWITCH_LOCK), e))?;
     if env.live.mark().running {
@@ -1244,14 +1261,47 @@ pub fn attribute_offline(env: &SwitchEnv<'_>) -> Result<Attribution, OrcaError> 
             "this userData is not csm's to write".into(),
         ));
     }
-    let Some(view) = load_view(env.data_file)? else {
-        return Ok(Attribution::NoActiveAccount);
+    let journal = read_journal(env.state);
+    if journal.as_ref().is_some_and(Journal::pending) {
+        return Err(OrcaError::Refused(
+            "an earlier switch did not finish; `csm accounts doctor --fix` repairs D first".into(),
+        ));
+    }
+    let view =
+        load_view(env.data_file)?.ok_or_else(|| OrcaError::Refused("no Orca store".into()))?;
+    if named_active(&view).as_deref() != Some(target) {
+        return Err(OrcaError::Refused(format!(
+            "{target} is not the active account Orca's store names"
+        )));
+    }
+    let rec = view
+        .account(target)
+        .cloned()
+        .ok_or_else(|| OrcaError::Refused(format!("no Claude account {target}")))?;
+    let unusable =
+        |why: String| OrcaError::Refused(format!("the target account's stash is unusable: {why}"));
+    let mut report = SwitchReport {
+        route: Route::Offline,
+        outcome: Outcome::Switched,
+        to: target.to_owned(),
+        generation: journal.map(|j| j.generation).unwrap_or(0),
+        steps: Vec::new(),
+        readback: None,
+        snapshot: None,
+        refresh: None,
+        redo: None,
     };
-    let Some(active) = named_active(&view).and_then(|id| view.account(&id).cloned()) else {
-        return Ok(Attribution::NoActiveAccount);
-    };
-    let exclude = raw_stash_credentials(env, &active);
-    let readback = readback::read_back(&ReadBack {
+    let t = load_account(env, &rec).map_err(unusable)?;
+    if d_holds(env, &t) {
+        report.route = Route::Noop;
+        report.outcome = Outcome::AlreadyActive;
+        return Ok(report);
+    }
+    // Every runtime grant is attributed (or quarantined) before the
+    // materialize overwrites it.
+    let exclude = raw_stash_credentials(env, &rec);
+    report.steps.push(Step::ReadBack);
+    report.readback = Some(readback::read_back(&ReadBack {
         os: env.os,
         user_data: env.user_data,
         paths: env.paths,
@@ -1263,25 +1313,60 @@ pub fn attribute_offline(env: &SwitchEnv<'_>) -> Result<Attribution, OrcaError> 
         quarantine: &env.quarantine(),
         now_ms: super::now_ms(),
         migration: false,
-    })?;
-    // Orca came up during the read-back: never write `D` behind it.
+    })?);
     if env.live.mark().running {
-        return Ok(Attribution::Done {
-            readback,
-            identity_cleared: false,
+        return Err(OrcaError::Refused(
+            "Orca started during the read-back; it materializes its account itself".into(),
+        ));
+    }
+    // The read-back may have stored a fresher grant in the target's stash.
+    report.steps.push(Step::LoadTarget);
+    let mut t = load_account(env, &rec).map_err(unusable)?;
+    let live_claude = (env.live_claude)();
+    if !live_claude {
+        report.steps.push(Step::Refresh);
+        let r = refresh::refresh_stash_if_needed(
+            env.user_data,
+            env.os,
+            &t.stash,
+            t.creds.expose(),
+            env.http,
+            &env.quarantine(),
+            super::now_ms(),
+        )?;
+        report.refresh = Some(match r {
+            StashRefresh::NotDue => "not due".to_owned(),
+            StashRefresh::Failed(f) => format!("failed: {f:?}"),
+            StashRefresh::Quarantined(fp) => {
+                format!("refreshed but not stored; quarantined as {fp}")
+            }
+            StashRefresh::Refreshed(fresh) => {
+                t.creds = fresh;
+                "refreshed".to_owned()
+            }
         });
     }
-    let identity_cleared = matches!(
-        read_runtime_identity(env.paths),
-        RuntimeIdentity::Present(_)
-    );
-    if identity_cleared {
-        runtime::clear_identity(env.paths)?;
+    let order = if live_claude {
+        Order::OrcaOrder
+    } else {
+        Order::NeutralWindow
+    };
+    report.steps.push(Step::Materialize(order));
+    if let Err(f) =
+        runtime::materialize_checked(&env.target_dir(), t.creds.expose(), t.oauth.as_ref(), order)
+    {
+        return Err(if f.d_restored {
+            f.error
+        } else {
+            OrcaError::Refused(format!(
+                "{}; D could not be restored, run `csm accounts doctor --fix`",
+                f.error
+            ))
+        });
     }
-    Ok(Attribution::Done {
-        readback,
-        identity_cleared,
-    })
+    report.steps.push(Step::Verify);
+    verify(env, &t).map_err(OrcaError::Refused)?;
+    Ok(report)
 }
 
 // ─── recovery ─────────────────────────────────────────────────────────────────
@@ -1710,6 +1795,13 @@ mod tests {
     }
 
     #[test]
+    fn a_conditional_select_yields_to_any_active_account() {
+        assert!(someone_else_active(true, Some("id-a")));
+        assert!(!someone_else_active(true, None));
+        assert!(!someone_else_active(false, Some("id-a")));
+    }
+
+    #[test]
     fn rpc_outcome_needs_the_state_not_the_answer() {
         use RpcVerdict::*;
         assert_eq!(
@@ -2082,159 +2174,6 @@ mod tests {
         assert_eq!(std::fs::read(&w.choice.path).unwrap(), store_before);
         assert_eq!(w.d_creds(), a_creds());
         assert!(read_journal(&w.state).is_none());
-    }
-
-    /// Migration step 7 with a SQLite-backed store: no offline switch, but
-    /// `D`'s grants are attributed with the profile veto and `D`'s identity
-    /// is cleared, so Orca's first start (nothing written yet) cannot file
-    /// a's grant into b's stash by the email in `D`'s `oauthAccount`.
-    #[test]
-    fn offline_attribution_files_d_grants_and_neutralizes_d_without_the_store() {
-        let w = World::new(None);
-        std::fs::write(
-            w.choice
-                .path
-                .with_file_name(crate::orca::userdata::STATE_DB),
-            b"",
-        )
-        .unwrap();
-        let store_before = std::fs::read(&w.choice.path).unwrap();
-        // a's rotated grant beside b's identity: what Orca's cold read-back
-        // would match to b by email.
-        let fresher = creds_json("at-a2", "rt-a2", 4_100_000_000_000);
-        std::fs::write(&w.paths.credentials_path, &fresher).unwrap();
-        std::fs::write(
-            &w.paths.config_path,
-            json!({"numStartups": 1, "oauthAccount": oauth_json("u-b", "bob@example.com", None)})
-                .to_string(),
-        )
-        .unwrap();
-        let live = ScriptedLiveness::stopped();
-        let http = FakeHttp::default().profile_uuid("at-a2", "u-a");
-        let Attribution::Done {
-            readback,
-            identity_cleared,
-        } = attribute_offline(&w.env(&live, &http)).unwrap()
-        else {
-            panic!("the store names an active account");
-        };
-        assert!(identity_cleared);
-        assert_eq!(readback.candidates, 1);
-        // b's stash is untouched; the grant sits with a or in the quarantine.
-        let b = Stash::open(&w.ud, "id-b", None).unwrap();
-        assert_eq!(b.credentials(OS).unwrap().unwrap().expose(), b_creds());
-        let a = Stash::open(&w.ud, "id-a", None).unwrap();
-        let in_a = a.credentials(OS).unwrap().unwrap().expose() == fresher;
-        let q = Quarantine::new(OS, &w.state);
-        let in_q = q
-            .list()
-            .iter()
-            .any(|m| q.get(&m.fingerprint).unwrap().unwrap().expose() == fresher);
-        assert!(in_a || in_q, "{readback:?}");
-        // D: grant kept, identity gone, other keys intact; store untouched.
-        assert_eq!(w.d_creds(), fresher);
-        assert!(matches!(
-            read_runtime_identity(&w.paths),
-            RuntimeIdentity::None
-        ));
-        let cfg: Value =
-            serde_json::from_slice(&std::fs::read(&w.paths.config_path).unwrap()).unwrap();
-        assert_eq!(cfg["numStartups"], json!(1));
-        assert_eq!(std::fs::read(&w.choice.path).unwrap(), store_before);
-        assert!(read_journal(&w.state).is_none());
-    }
-
-    #[test]
-    fn offline_attribution_refuses_a_running_orca_and_skips_no_active_account() {
-        let w = World::new(None);
-        let cfg_before = std::fs::read(&w.paths.config_path).unwrap();
-        let running = ScriptedLiveness::new(vec![crate::orca::testsupport::running_mark()]);
-        let http = FakeHttp::default();
-        assert!(matches!(
-            attribute_offline(&w.env(&running, &http)),
-            Err(OrcaError::Refused(_))
-        ));
-        assert_eq!(std::fs::read(&w.paths.config_path).unwrap(), cfg_before);
-        // No network for the veto: an error, and D keeps its identity.
-        std::fs::write(
-            &w.paths.credentials_path,
-            creds_json("at-a2", "rt-a2", 4_100_000_000_000),
-        )
-        .unwrap();
-        let stopped = ScriptedLiveness::stopped();
-        assert!(matches!(
-            attribute_offline(&w.env(&stopped, &http)),
-            Err(OrcaError::Network(_))
-        ));
-        assert_eq!(std::fs::read(&w.paths.config_path).unwrap(), cfg_before);
-        // No active account: D is the system default, left alone.
-        let recs: Vec<Value> = ["id-a", "id-b"]
-            .iter()
-            .zip(["alice@example.com", "bob@example.com"])
-            .map(|(id, e)| record_json(&w.ud, id, e, None))
-            .collect();
-        write_store(&w.ud, &recs, None);
-        assert_eq!(
-            attribute_offline(&w.env(&stopped, &http)).unwrap(),
-            Attribution::NoActiveAccount
-        );
-        assert_eq!(std::fs::read(&w.paths.config_path).unwrap(), cfg_before);
-    }
-
-    /// Round 8: attribute_offline's safety branches. Orca coming up during
-    /// the read-back leaves `D`'s identity in place (never written behind a
-    /// running Orca), and an untested Orca version or a userData that is
-    /// not csm's to write refuses with `D` and the stashes unchanged.
-    #[test]
-    fn offline_attribution_never_writes_d_behind_an_orca_that_came_up() {
-        let w = World::new(None);
-        let fresher = creds_json("at-a2", "rt-a2", 4_100_000_000_000);
-        std::fs::write(&w.paths.credentials_path, &fresher).unwrap();
-        std::fs::write(
-            &w.paths.config_path,
-            json!({"oauthAccount": oauth_json("u-b", "bob@example.com", None)}).to_string(),
-        )
-        .unwrap();
-        let cfg_before = std::fs::read(&w.paths.config_path).unwrap();
-        let stash_bytes = |id: &str| {
-            Stash::open(&w.ud, id, None)
-                .unwrap()
-                .credentials(OS)
-                .unwrap()
-                .map(|s| s.expose().to_owned())
-        };
-        let (a_before, b_before) = (stash_bytes("id-a"), stash_bytes("id-b"));
-        let http = FakeHttp::default().profile_uuid("at-a2", "u-a");
-        for (version_ok, store_access_allowed) in [(false, true), (true, false)] {
-            let live = ScriptedLiveness::stopped();
-            let mut env = w.env(&live, &http);
-            env.version_ok = version_ok;
-            env.store_access_allowed = store_access_allowed;
-            assert!(matches!(
-                attribute_offline(&env),
-                Err(OrcaError::Refused(_))
-            ));
-            assert_eq!(std::fs::read(&w.paths.config_path).unwrap(), cfg_before);
-            assert_eq!(w.d_creds(), fresher);
-            assert_eq!(stash_bytes("id-a"), a_before);
-            assert_eq!(stash_bytes("id-b"), b_before);
-            assert!(Quarantine::new(OS, &w.state).list().is_empty());
-        }
-        // Stopped at the first check, running after the read-back.
-        let live = ScriptedLiveness::appears_at(1);
-        let Attribution::Done {
-            identity_cleared, ..
-        } = attribute_offline(&w.env(&live, &http)).unwrap()
-        else {
-            panic!("the store names an active account");
-        };
-        assert!(!identity_cleared);
-        assert_eq!(live.checks(), 2);
-        assert_eq!(std::fs::read(&w.paths.config_path).unwrap(), cfg_before);
-        assert!(matches!(
-            read_runtime_identity(&w.paths),
-            RuntimeIdentity::Present(_)
-        ));
     }
 
     #[test]
@@ -3232,6 +3171,33 @@ mod tests {
             // csm wrote nothing of Orca's: the store and D's grant as before.
             assert_eq!(w.store_active().as_deref(), Some("id-a"));
             assert_eq!(w.d_creds(), a_creds());
+        }
+
+        /// A2's select checks Orca's active account again on the state the
+        /// switch acts on: an account a GUI select made active since the
+        /// caller looked wins, and nothing is selected.
+        #[test]
+        fn a_select_if_none_active_leaves_an_active_account() {
+            let (fake, w, model) = running_world(true);
+            let live = ScriptedLiveness::new(vec![running_mark()]);
+            let lock = fsx::SwitchLock::acquire(&w.state, Duration::ZERO).unwrap();
+            let r =
+                select_if_none_active(&w.env(&live, &FakeHttp::default()), &lock, "id-b").unwrap();
+            assert!(r.is_none());
+            assert_eq!(model.lock().unwrap().active.as_deref(), Some("id-a"));
+            assert!(
+                fake.requests()
+                    .iter()
+                    .all(|r| r["method"] != "accounts.selectClaude")
+            );
+            assert!(read_journal(&w.state).is_none());
+            // With none active it selects.
+            model.lock().unwrap().active = None;
+            let live = ScriptedLiveness::new(vec![running_mark()]);
+            let r =
+                select_if_none_active(&w.env(&live, &FakeHttp::default()), &lock, "id-b").unwrap();
+            assert!(r.is_some_and(|r| r.outcome == Outcome::Switched));
+            assert_eq!(model.lock().unwrap().active.as_deref(), Some("id-b"));
         }
 
         #[test]

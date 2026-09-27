@@ -189,8 +189,22 @@ sub stash_remove {
 
 # ─── D (~/.claude) ─────────────────────────────────────────────────────────────
 
-sub d_dir { return home() . '/.claude'; }
-sub config_path { my $in = d_dir() . '/.claude.json'; return -e $in ? $in : home() . '/.claude.json'; }
+# D: $E2E_ORCA_D when the fake Orca runs with CLAUDE_CONFIG_DIR set (the
+# legacy floor, see start-orca.sh), else ~/.claude. With the variable set
+# Orca and Claude Code read <D>/.claude.json; without it ~/.claude.json,
+# unless ~/.claude/.claude.json exists (Orca's resolveConfigPath).
+sub d_explicit {
+    my $d = $ENV{E2E_ORCA_D};
+    return undef unless defined $d && length $d;
+    die "World.pm: E2E_ORCA_D must be inside E2E_HOME\n" unless index($d, home() . '/') == 0;
+    return $d;
+}
+sub d_dir { return d_explicit() // home() . '/.claude'; }
+sub config_path {
+    return d_explicit() . '/.claude.json' if defined d_explicit();
+    my $in = d_dir() . '/.claude.json';
+    return -e $in ? $in : home() . '/.claude.json';
+}
 
 sub set_oauth_account {
     my ($oauth) = @_;

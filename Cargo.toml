@@ -128,6 +128,7 @@ windows-sys = { version = "0.61", features = [
     "Win32_UI_WindowsAndMessaging",  # SendMessageTimeout, WM_SETTINGCHANGE, HWND_BROADCAST
     "Win32_System_Registry",         # RegOpenKeyExW, RegSetValueExW (HKCU\Environment)
     "Win32_System_SystemInformation", # GetComputerNameExW (statusline host)
+    "Win32_Storage_FileSystem",      # GetFileInformationByHandle (migrate: hard-link compat check)
 ] }
 
 # ─── cargo-binstall metadata (consumed by WSL `cargo binstall claude-smart`) ──

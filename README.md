@@ -94,9 +94,7 @@ csm accounts doctor [--fix] [--offline]  check the store, stashes, quarantine an
 csm orca [status]                        what csm sees of Orca (never prints secrets)
 csm orca setup                           create the `claude` alias for Orca panes
 
-csm migrate [plan]                       read-only: what import/retire would do
-csm migrate import [--dry-run]           move profile logins into Orca
-csm migrate retire [--dry-run] [name...] retire verified profile dirs
+csm migrate [--dry-run]                  finish the move off the old profile layout now
 
 csm usage [--json] [--no-fetch] [--refresh]   usage per account
 csm usage capture                        read a statusLine payload on stdin, record it
@@ -169,8 +167,10 @@ an editor started inside a pane inherits them without being an Orca launch.
 ### Inside an Orca pane
 
 csm makes no account decision. Claude runs on whatever account Orca has
-active. Before claude starts, csm reads only files and the process table: no
-Keychain, no network, no picker, no prompt. `csm --resume <id>`, which is
+active. Before claude starts, csm touches only files and the process table: no
+Keychain, no network, no RPC, no picker, no prompt. The only files it
+writes there are the migration's (see [Migrating from the profile setup](#migrating-from-the-profile-setup): it may move
+the shared entries and merge `~/.claude.json` first). `csm --resume <id>`, which is
 what Orca's session list sends, starts claude at once. Warnings go to csm's
 log instead of the pane; only fatal errors and the one-line notice after a
 limit switch are printed.
@@ -396,142 +396,160 @@ stash holds the same grant and every MCP server login the entry carries
 ## Migrating from the profile setup
 
 Earlier csm versions kept named profiles (`~/.claude.<name>` directories
-listed in `~/.config/claude-as/profiles.json`) and pinned
-`CLAUDE_CONFIG_DIR` machine-wide to one of them. Orca then inherited that
-pin. The move to Orca's accounts is one pass per machine:
+listed in `~/.config/claude-as/profiles.json`), shared transcripts through
+`~/.claude.shared/`, and pinned `CLAUDE_CONFIG_DIR` machine-wide to one
+profile, called the floor profile here. Orca then inherited that pin.
 
-1. `csm migrate plan`. Read-only. For each profile it shows whether the
-   account is already in Orca, still to import, or has no login. It only
-   checks that a grant is there (Keychain items are probed without reading
-   the secret) and reads no secrets; `import` compares the profile dir's
-   grant with Orca's stash by fingerprint and expiry. It also shows Orca's
-   current `D`, the target `D` (`~/.claude`), and what steps 5 and 6 will
-   do.
-2. End every claude session, including panes Orca's terminal daemon keeps
-   alive after Orca quits, and every `csm run` that supervises one. Then
-   quit Orca. `import` and `retire` refuse while Orca runs, while a claude
-   session is live in a profile dir or `~/.claude`, while a claude an
-   earlier csm started still runs (its `~/.claude.shared/smart/*.pid`,
-   which `csm reap` no longer reads), and while any other csm process
-   runs, since a supervisor restarts claude between hops.
-3. Remove the machine-wide `CLAUDE_CONFIG_DIR` (the shell export, including
-   a `cas` shim that exports whatever `csm cas --print-default-dir` prints,
-   the launchd variable on macOS, the `HKCU\Environment` value on Windows)
-   and open a new shell. Also remove any login item or LaunchAgent that
-   sets it again at every login, not only the current value: on macOS
-   `import` and `retire` refuse while a `~/Library/LaunchAgents` plist, or
-   a script it runs, sets `CLAUDE_CONFIG_DIR` with `launchctl setenv`.
-   `import` and `retire` refuse while either the
-   shell or the login session still sets it. Another dir would become the
-   `D` of an Orca started from the Dock; even `~/.claude` itself makes
-   claude and Orca read `~/.claude/.claude.json` instead of the
-   `~/.claude.json` step 5 merges into.
-4. `csm migrate import`. It imports each profile Orca does not have yet.
-   For a profile Orca already has, it reads back the newest grant from the
-   profile dir into Orca's stash, after the profile endpoint confirms the
-   owner. When Orca keeps its state in SQLite (1.4.214 and later), csm
-   adds accounts only through a running Orca, so this step prints a
-   `csm accounts import <dir>` line for each new profile instead; run
-   those once Orca is started, before `csm migrate retire`. Step 7 then
-   prints the `csm accounts use` line to run the same way.
-5. If `~/.claude.json` does not exist yet, the same command creates it from
-   the old default profile's `.claude.json` without `oauthAccount`, so
-   claude keeps its onboarding state and settings. Either way it merges
-   that profile's trust settings (`projects[<path>]`), user MCP servers and
-   onboarding state (`hasCompletedOnboarding`, `lastOnboardingVersion`,
-   `theme`) into `~/.claude.json`, keeping values already there, so Orca panes do
-   not ask to trust every folder again. A value claude wrote only as its
-   default (`false`, an empty list) is not kept: the old profile's accepted
-   trust and tool allowances replace it. Differences in other profiles are
-   listed for you to merge by hand.
-6. It moves what the profiles shared out of `~/.claude.shared/` into
-   `~/.claude`: `projects`, `sessions`, `plugins`, `todos`, `session-env`
-   and `shell-snapshots` become real directories there (a real directory
-   already in place takes the shared entries it does not hold yet; an
-   entry both hold with different content stays in `~/.claude.shared/`,
-   and `import` lists those paths for you to merge by hand), and the
-   shared `history.jsonl` goes in front of `~/.claude/history.jsonl`. Each
-   old profile dir's links into `~/.claude.shared/` are then pointed at the
-   new entries in `~/.claude`, so a claude still started with an old
-   `CLAUDE_CONFIG_DIR` keeps its transcripts and shows up as a live
-   session. The plugin registries (`installed_plugins.json`,
-   `known_marketplaces.json`) record absolute install paths under the old
-   plugins dirs; csm rewrites each one to the same path under
-   `~/.claude/plugins` when that path exists, lists the ones that do not,
-   and keeps a copy of each registry it changes, as it was, under
-   `<state>/migrate/`.
-   It moves csm's session sidecars, title index and scan indexes from
-   `~/.claude.shared/smart` to the new state dir. Caches and per-profile
-   records stay in `~/.claude.shared/` unread; delete the dir once you have
-   looked at it. What each profile kept for itself is not moved:
-   `settings.json`, `settings.local.json`, `CLAUDE.md`, `hooks`,
-   `statusline-command.sh`, `keybindings.json`, `output-styles`, `agents`,
-   `commands`, `skills`, `plans` and `file-history` stay in the profile
-   dir, and so in `<dir>.retired` after step 8, for you to move by hand.
-   The plan lists the ones each profile has. `settings.json` matters most:
-   csm never writes `~/.claude/settings.json`, so the statusLine and the
-   `csm hook` entries a profile had are gone after the move until you add
-   them there (see [Limit auto-switch](#limit-auto-switch)). Without the
-   statusLine, the weekly and model-scoped caps no longer switch accounts.
-7. It makes the old default profile's account active. When it cannot do
-   that offline (Orca keeps its state in SQLite, or that profile has no
-   Orca account yet), it still files the grants in `~/.claude` with their
-   own accounts (checked with the profile endpoint) and removes
-   `~/.claude.json`'s `oauthAccount`, so Orca's first start cannot file a
-   grant under the wrong account. Without an old default profile it does
-   the same. When Orca's store names no active account, nothing is filed
-   or removed: `~/.claude` is then the system default Orca captures. If
-   the profile endpoint does not answer, `import` fails; run it again
-   before you start Orca. When an earlier step failed, `import` still
-   files the grants but does not switch, and stops: do not start Orca
-   until a later `import` completes.
-8. `csm migrate retire`. It refuses until `import` has done steps 5 and 6
-   (nothing left to carry out of `~/.claude.shared`, the old default
-   profile's settings merged, no plugin path left to rewrite; entries
-   that collided in step 6 do not count, and retire names them), because it
-   renames the dirs and removes the profile list those steps read. It also
-   refuses until the last `import` completed step 7. For
-   each profile whose stash the profile endpoint confirms, it moves the
-   dir's grants into the quarantine and renames the dir to
-   `<dir>.retired`. A grant with another refresh token than the stash's is
-   checked with the profile endpoint first: the account's own grants are
-   filed as retired, any other grant is filed unattributed for
-   `csm accounts doctor`, and while the endpoint does not answer the dir is
-   skipped with nothing moved. A copy of the account's grant that also
-   holds MCP server logins the stash lacks is filed as `extra-logins`,
-   which `accounts doctor --fix` keeps, and retire names those servers.
-   For each dir it renames, retire also names what the profile's
-   `.claude.json` holds that step 5 did not carry into `~/.claude.json`,
-   pointing at `<dir>.retired/.claude.json`. A dir with no login left whose account Orca
-   already has is just renamed. Once no profile dir holds a login any
-   more, retire removes `~/.config/claude-as/{profiles.json,default,floor-dir}`. The machine-wide variable must already be gone
-   (step 3): retire refuses while it is set, so its own clearing of the
-   variable is only a safety net. A profile is skipped, and says why,
-   when its stash cannot be verified, when its dir holds a grant newer than
-   the stash (run `import` first), when a Keychain item of the dir
-   cannot be read, or while `~/.claude/settings.json`,
-   `~/.claude/settings.local.json` or an MCP server in `~/.claude.json`
-   still names the dir by path (a statusLine script, a hook, a server
-   command copied from the profile): move what they need into `~/.claude`
-   and point them there first, or they break at the rename.
-9. Start Orca (its `D` is now `~/.claude`), run `csm orca setup` and set
-   `agentCmdOverrides.claude` as it says.
+There is no manual procedure any more. The first `csm` launch after the
+upgrade moves the machine onto Orca's accounts, and later launches finish
+the job. Nothing needs to be stopped first.
 
-`import` and `retire` refuse to run while Orca runs, while a claude session
-is live in a dir they would touch, while another csm process runs, or
-while `CLAUDE_CONFIG_DIR` is set at all. `import` checks this again before
-steps 5 and 6, and a profile whose Keychain could not be read, or an old
-default profile `.claude.json` that cannot be read, fails its step and
-keeps step 7 from running. `retire` also refuses until `import` has done
-steps 5 and 6.
-`--dry-run` shows what they would do, and says when the real run would
-refuse.
+### What happens
 
-The old shell function `cas` no longer switches anything:
-`csm cas --eval …` prints nothing and exits 0, so a leftover shim does not
-break a shell, and `csm cas --print-default-dir` prints `D`. A shim that
-exports that value still sets `CLAUDE_CONFIG_DIR`, so remove it before
-step 4.
+The work runs in phases. Each one can stop at any point and picks up where
+it left off on the next run; progress is kept in `<state>/migration.json`,
+and a lock (`<state>/migrate.lock`) keeps two csm processes from migrating
+at once.
+
+1. Adopt. Every profile login becomes an Orca account, and if Orca has no
+   active account, the floor profile's account becomes active. This runs
+   before the first interactive launch starts claude (it waits at most 3
+   seconds, then starts claude and finishes afterwards), so that session
+   already switches through Orca. While Orca runs, csm starts claude in
+   Orca's current config dir, which is still the floor profile's dir at
+   this point.
+2. Carry. `projects`, `sessions`, `todos` and the other shared entries move
+   from `~/.claude.shared/` into `~/.claude`, and a link is left at each old
+   path, so profile dirs and sessions that are still open keep working.
+   `~/.claude.json` is created from the floor profile's copy (without its
+   `oauthAccount`), or gets that profile's trust settings, MCP servers and
+   any top-level keys it lacks; other profiles add their trust settings and
+   MCP servers. The floor profile's `settings.json`, `CLAUDE.md`, hooks,
+   agents, commands, skills, output styles, key bindings and statusline
+   script are copied into `~/.claude` where `~/.claude` has none. csm's old
+   sidecars and indexes move to the new state dir, and plugin registries
+   are rewritten to the new install paths (again on each run, since a
+   session still running in a profile dir records paths through it).
+3. Cutover. csm prepares `~/.claude` for the active account and clears the
+   machine-wide `CLAUDE_CONFIG_DIR` (`launchctl unsetenv` on macOS, the
+   `HKCU\Environment` value on Windows; Linux has none to clear). If Orca
+   is running, it keeps its current dir until you restart it; its next
+   start uses `~/.claude`. csm never restarts Orca. On Linux and Windows,
+   where no Keychain item mirrors the active account, a csm launch with
+   Orca quit keeps running in the floor profile's dir until Orca has
+   started in `~/.claude` once and put its active account there.
+4. Retire. Each profile dir whose login Orca has (or that holds no login
+   at all), and that no running claude uses, gets its credentials moved
+   into csm's quarantine and is renamed `<dir>.retired`. The floor
+   profile's dir waits for a reboot after the cutover, so no program
+   started with the old value is still using it. It also waits while a
+   shell startup file (`~/.zshenv`, `~/.bashrc`, a PowerShell profile and
+   the like) still runs `csm cas --print-default-dir`: that old guard's
+   fallback would export the renamed dir in every new shell. Remove the
+   guard and the retire goes ahead. A dir also waits while a plugin
+   registry records an install path that exists only inside it (reinstall
+   that plugin with `/plugin`). On Windows, a dir whose login is fresher
+   than Orca's copy waits until you log in to that account again in Orca.
+   On Linux and Windows it also waits
+   until `~/.claude` holds a login (start Orca once). Once every dir is retired, the
+   registry files under `~/.config/claude-as/` are removed and
+   `~/.claude.shared` becomes `~/.claude.shared.retired` when nothing
+   links into it.
+
+csm never deletes a credential or a directory. Credentials go to the
+quarantine (see `csm accounts doctor`), dirs are renamed, and a
+`~/.claude.<name>` dir that was not in the registry is left alone and only
+listed. If a profile dir holds a newer login than Orca's stash while Orca
+runs, csm files it in the quarantine and copies it into the stash the next
+time it runs with Orca stopped.
+
+### What you see
+
+An interactive `csm` prints one line on stderr when a run changed
+something (`csm: migration: ...`), and at most one line a day for each
+thing that is still waiting (`csm: migration to Orca's accounts is not
+finished: ...`). A run that finished after claude started leaves its line
+for the next launch. Inside an Orca pane nothing is printed; the lines go
+to csm's log.
+
+The commands that change accounts run every phase that can run, the
+cutover and the retire included, before they do their own work, and
+print the same lines: `csm accounts use`, `add`, `import` and `rm`,
+`csm accounts doctor --fix` and `csm orca setup`. `csm accounts list`,
+`csm accounts doctor`, `csm usage` and `csm orca status` only mention,
+once a day, that the machine still has the old layout, and
+`csm orca status` shows a `migration` row. The hook, the status line,
+`-p` and piped runs, `csm claude` and `csm cas` never start a migration.
+
+When claude exits before a run it started is done, csm waits at most a
+second for it (longer only while it copies across filesystems or holds
+Claude Code's config lock) and exits; the next launch carries on from
+where it stopped.
+
+In an Orca pane, csm does nothing before claude starts, with one
+exception: if Orca already runs in `~/.claude` while the shared entries
+or `~/.claude.json` have not moved yet, csm moves them first so a resumed
+session finds its transcript.
+
+### `csm migrate`
+
+`csm migrate` runs every phase that can run now and prints a report: one
+block per profile dir with a line per phase, then what changed, what is
+pending and why, errors, and dirs that are not registered. Logins appear
+only as fingerprints. `csm migrate --dry-run` prints the same report
+without writing anything.
+
+| Exit | Meaning |
+|---|---|
+| `0` | Nothing legacy is left, or the cutover is recorded. The machine-wide `CLAUDE_CONFIG_DIR` setters (a LaunchAgent, a registry task, shell exports) can be removed now, even while the floor profile's dir waits for a reboot. |
+| `75` | Something is pending (the report says what). Change nothing and run it again later. |
+| `1` | An error before the cutover. After the cutover an error is still reported, but the exit is `0`. |
+
+A fleet tool can run `csm migrate` after installing csm and remove its
+old setters only on exit 0. The former `plan`, `import` and `retire`
+verbs print a pointer to `csm migrate` and exit 1.
+
+### What is not automatic
+
+- Orca's `agentCmdOverrides.claude` setting. Orca has no way for another
+  program to change it. A plain `csm` there keeps working; to use the
+  alias instead, run `csm orca setup` and set the value it prints in
+  Orca's settings.
+- Accounts on a machine without Orca's store (Linux or WSL next to a
+  Windows Orca, a headless box). csm moves the files there, and the floor
+  profile's login into `~/.claude` when `~/.claude` has none, but other
+  profile dirs stay until the accounts exist. Add them in Orca on the
+  machine that runs it.
+- Shell startup files. csm does not edit them. A shell that still exports
+  `CLAUDE_CONFIG_DIR`, or an old guard that sets it, keeps plain `claude`
+  in the old dir; remove those lines. csm itself replaces an inherited
+  value that names an old profile dir or `~/.claude` with Orca's current
+  dir while Orca runs (and with none after the cutover), and says so once
+  a day. Any other value is left as it is.
+- A login newer than Orca's stash while Orca never stops. Copying it into
+  the stash needs Orca stopped: quit Orca, run `csm migrate`, start Orca.
+  `csm accounts doctor` lists such entries.
+- The time between the cutover and Orca's restart. A plain `claude` in a
+  new shell then runs in `~/.claude` on the same login Orca holds in the
+  floor profile's dir. If one side refreshes it, the other may ask you to
+  log in again. Restart Orca soon after the cutover.
+
+Settings a profile other than the floor kept for itself (`settings.json`,
+`CLAUDE.md`, hooks and the like) are not copied; they stay in
+`<dir>.retired` for you to move by hand. csm's statusLine and hook entries
+must be in `~/.claude/settings.json` for the limit switch to work (see
+[Limit auto-switch](#limit-auto-switch)).
+
+### The `cas` compat
+
+The old shell function `cas` no longer switches anything. `csm cas --eval
+…` prints nothing and exits 0, so a leftover shim does not break a shell.
+`csm cas --print-default-dir` prints Orca's current dir while that is
+still an old profile dir, and before the cutover csm's own; after that it
+prints nothing and a note on stderr, since exporting `~/.claude` would
+make claude read the wrong `.claude.json`. `csm hook --owner <dir>`, which
+old per-profile settings pass, is accepted and ignored. These go away in
+the next major version.
 
 ## What csm never does
 
@@ -626,6 +644,7 @@ and Linux, and `%LOCALAPPDATA%\csm` on Windows.
 | `--profile`, `-A/--pick-account`, `--no-pick` | Gone with the profiles. |
 | `csm profiles`, `csm pick-account`, `csm current-usage` | Gone. Use `csm accounts` and `csm usage --json`. |
 | `csm cas` | Kept only as the quiet compat described under *Migrating*. |
+| `csm migrate plan`, `import`, `retire` | Print a pointer to `csm migrate` and exit 1. The migration runs on its own. |
 
 ## Platforms
 

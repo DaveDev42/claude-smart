@@ -29,7 +29,7 @@ use crate::orca::runtime::{OauthIdentity, UuidMatch};
 use crate::orca::stash::Stash;
 use crate::orca::switch::{self, Outcome};
 use crate::orca::userdata::claude_accounts_root;
-use crate::orca::{OrcaView, SnapshotOptions};
+use crate::orca::{OrcaView, SecretString, SnapshotOptions};
 
 // ─── argument parsing (pure) ──────────────────────────────────────────────────
 
@@ -454,6 +454,11 @@ pub(crate) struct QEntry {
     /// status and the account uuid it named.
     pub profile_status: Option<u16>,
     pub profile_account_uuid: Option<String>,
+    /// A grant the migration's settle files into its account's stash (a
+    /// retired dir's, one settle's refresh or the cutover returned) that is
+    /// fresher than that stash ([`crate::migrate::settle_wanted`]): settle
+    /// still waits for it, which it does while Orca runs.
+    pub settle_waiting: bool,
 }
 
 /// The parenthesised details of a quarantine line: reason, source, expiry,
@@ -587,6 +592,21 @@ pub(crate) fn findings(f: &DoctorFacts) -> Vec<Finding> {
             })
             .unwrap_or_default()
         );
+        // Settle files it only with Orca stopped: while Orca never quits
+        // the entry just sits here, so say what finishes it.
+        let settle = match (&q.matched, held.is_none() && q.settle_waiting) {
+            (Some(id), true) => format!(
+                ": it is fresher than stash {id}, and the migration files it there only with \
+                 Orca stopped{}",
+                if f.running {
+                    "; quit Orca and run `csm migrate` to settle it"
+                } else {
+                    "; run `csm migrate` to settle it"
+                }
+            ),
+            _ => String::new(),
+        };
+        let text = format!("{text}{settle}");
         let fix = held.map(|id| Fix::PurgeQuarantine {
             fingerprint: q.fingerprint.clone(),
             holder: (*id).to_owned(),
@@ -771,8 +791,19 @@ pub(crate) fn gather(
     if let crate::cmd::orca::AliasState::Dangling(t) = crate::cmd::orca::alias_state(&alias) {
         f.alias_dangling = Some(t);
     }
-    f.quarantine = Quarantine::new(os, &ctx.state)
-        .list()
+    let quarantine = Quarantine::new(os, &ctx.state);
+    let qmetas = quarantine.list();
+    // Entries settle would file, by account: their grants are compared
+    // with that account's stash below.
+    let settle_ids: Vec<Option<String>> = qmetas
+        .iter()
+        .map(|m| {
+            m.matched_account
+                .clone()
+                .filter(|_| crate::migrate::settle_reason(m.reason))
+        })
+        .collect();
+    f.quarantine = qmetas
         .into_iter()
         .map(|m| QEntry {
             fingerprint: m.fingerprint,
@@ -782,6 +813,7 @@ pub(crate) fn gather(
             expires_at_ms: m.expires_at.filter(|v| v.is_finite()).map(|v| v as i64),
             profile_status: m.profile_status,
             profile_account_uuid: m.profile_account_uuid,
+            settle_waiting: false,
         })
         .collect();
     f.accounts = view.accounts.iter().map(|a| a.id.clone()).collect();
@@ -802,6 +834,9 @@ pub(crate) fn gather(
             .and_then(|s| s.account(id))
             .and_then(|r| r.managed_auth_path.clone())
     };
+    // (account id, its stash's grant) for the settle comparison; `None`: the
+    // stash holds no grant. An unreadable stash is left out.
+    let mut stash_grants: Vec<(String, Option<SecretString>)> = Vec::new();
     for rec in view.accounts.iter().filter(|a| a.is_host()) {
         let stash = match Stash::open(ud, &rec.id, path_of(&rec.id).as_deref()) {
             Ok(s) => s,
@@ -812,7 +847,10 @@ pub(crate) fn gather(
         };
         let creds = match stash.credentials(os) {
             Ok(Some(c)) => c,
-            Ok(None) => continue,
+            Ok(None) => {
+                stash_grants.push((rec.id.clone(), None));
+                continue;
+            }
             Err(e) => {
                 f.unreadable.push((rec.id.clone(), e.to_string()));
                 continue;
@@ -820,6 +858,7 @@ pub(crate) fn gather(
         };
         f.stash_fingerprints
             .push((rec.id.clone(), quarantine::fingerprint(creds.expose())));
+        stash_grants.push((rec.id.clone(), Some(creds.clone())));
         if offline {
             continue;
         }
@@ -840,6 +879,19 @@ pub(crate) fn gather(
             }
             Ok(ProfileAnswer::Unauthorized) => f.profile_dead.push(rec.id.clone()),
             _ => {}
+        }
+    }
+
+    // A quarantined grant settle would file and that is fresher than its
+    // account's stash: settle still waits for it.
+    for (q, id) in f.quarantine.iter_mut().zip(&settle_ids) {
+        let Some(id) = id else { continue };
+        let Some((_, stash)) = stash_grants.iter().find(|(s, _)| s == id) else {
+            continue;
+        };
+        if let Ok(Some(entry)) = quarantine.get(&q.fingerprint) {
+            q.settle_waiting =
+                crate::migrate::settle_wanted(entry.expose(), stash.as_ref().map(|s| s.expose()));
         }
     }
 
@@ -1193,6 +1245,7 @@ mod tests {
                     expires_at_ms: Some(1_767_225_600_000),
                     profile_status: Some(200),
                     profile_account_uuid: Some("u-x".into()),
+                    settle_waiting: false,
                 },
             ],
             accounts: vec!["a".into(), "b".into(), "c".into()],
@@ -1386,5 +1439,102 @@ mod tests {
             .join("\n");
         assert!(!text.contains("rt-shared"), "no secret in output: {text}");
         assert!(!text.contains("at-x"), "no secret in output: {text}");
+    }
+
+    /// Settle files a retired dir's fresher grant only with Orca stopped.
+    /// While Orca never quits, the doctor says so and how to finish it.
+    #[test]
+    fn a_grant_settle_waits_for_says_how_to_finish_it() {
+        let entry = |running| DoctorFacts {
+            running,
+            quarantine: vec![QEntry {
+                fingerprint: "fp-r".into(),
+                reason: "retired".into(),
+                source: "/Users/example/.claude.work".into(),
+                matched: Some("a".into()),
+                settle_waiting: true,
+                ..Default::default()
+            }],
+            accounts: vec!["a".into()],
+            stash_fingerprints: vec![("a".into(), "fp-old".into())],
+            d_account: Some("a".into()),
+            active: Some("a".into()),
+            dir_agrees: Some(true),
+            ..Default::default()
+        };
+        let got = findings(&entry(true));
+        assert_eq!(got.len(), 1);
+        assert!(got[0].fix.is_none(), "settle is not the doctor's to run");
+        assert!(
+            got[0].text.contains("fresher than stash a")
+                && got[0].text.contains("quit Orca and run `csm migrate`"),
+            "{}",
+            got[0].text
+        );
+        let got = findings(&entry(false));
+        assert!(
+            got[0].text.contains("run `csm migrate` to settle it")
+                && !got[0].text.contains("quit Orca"),
+            "{}",
+            got[0].text
+        );
+        let mut f = entry(true);
+        f.quarantine[0].settle_waiting = false;
+        assert!(!findings(&f)[0].text.contains("settle"));
+    }
+
+    /// `gather` marks a retired grant fresher than its account's stash as
+    /// waiting for settle, and a staler one, or one filed for another
+    /// reason, as not.
+    #[test]
+    fn gather_marks_the_grants_settle_waits_for() {
+        use crate::orca::http::FakeHttp;
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        let env = HostEnv::for_test(home, HostOs::Linux);
+        let ctx = Context::from_env(env.clone(), &FakeProcs::default());
+        let ud = ctx.user_data.dir.clone();
+        let stash = creds_json("at-s", "rt-s", 2_000_000_000_000);
+        let alice = serde_json::to_vec(&oauth_json("u-a", "alice@example.com", None)).unwrap();
+        make_stash(&ud, "acct-a", Some(&alice), Some(stash.as_bytes()));
+        crate::orca::testsupport::write_store(
+            &ud,
+            &[record_json(&ud, "acct-a", "alice@example.com", None)],
+            Some("acct-a"),
+        );
+        let q = Quarantine::new(HostOs::Linux, &ctx.state);
+        let fresh = creds_json("at-f", "rt-f", 2_100_000_000_000);
+        let stale = creds_json("at-o", "rt-o", 1_000_000_000_000);
+        let other = creds_json("at-n", "rt-n", 2_200_000_000_000);
+        let fp = |c: &str| quarantine::fingerprint(c);
+        q.file(&fresh, Reason::Retired, "dir", Some("acct-a"), None, 1)
+            .unwrap();
+        q.file(&stale, Reason::Retired, "dir", Some("acct-a"), None, 1)
+            .unwrap();
+        q.file(&other, Reason::NoMatch, "file", Some("acct-a"), None, 1)
+            .unwrap();
+
+        let v =
+            crate::orca::snapshot_with(&env, &SnapshotOptions::default(), &FakeProcs::default());
+        let f = gather(&ctx, &v, &FakeHttp::default(), true);
+        let waiting = |c: &str| {
+            f.quarantine
+                .iter()
+                .find(|q| q.fingerprint == fp(c))
+                .map(|q| q.settle_waiting)
+        };
+        assert_eq!(waiting(&fresh), Some(true));
+        assert_eq!(waiting(&stale), Some(false));
+        assert_eq!(waiting(&other), Some(false));
+        let text = findings(&f)
+            .into_iter()
+            .map(|x| x.text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("fresher than stash acct-a"), "{text}");
+        assert!(
+            !text.contains("rt-f") && !text.contains("at-f"),
+            "no secret: {text}"
+        );
     }
 }

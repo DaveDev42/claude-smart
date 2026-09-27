@@ -15,6 +15,10 @@
 #                                    from the stash, persist
 #   accounts.removeClaude            drop the record and its stash
 #   accounts.addClaudeFromConfigDir  capture a dir's login into a stash
+# D is ~/.claude, or $E2E_ORCA_D when start-orca.sh started the main
+# process with CLAUDE_CONFIG_DIR set (see World.pm). With
+# E2E_ORCA_MATERIALIZE=1 it materializes the active account into D at
+# start, as Orca's runtime auth service does.
 # Each request is logged as "<caller> <method> <params>" (caller "gui" for
 # `call`, else "csm"); the auth token is never logged. SIGTERM removes the
 # runtime file and the socket.
@@ -60,6 +64,14 @@ my $done = 0;
 $SIG{TERM} = $SIG{INT} = $SIG{HUP} = sub { $done = 1; };
 
 my $store = World::load_store();
+# Orca's runtime auth service materializes the active account into D at
+# start. Opt-in (E2E_ORCA_MATERIALIZE=1): most scenarios arrange D
+# themselves and must find it as they left it.
+if ($ENV{E2E_ORCA_MATERIALIZE}) {
+    my $id = World::host_active($store);
+    my $creds = defined $id ? World::stash_creds($id) : undef;
+    World::materialize($creds, World::stash_oauth($id)) if defined $creds;
+}
 World::spew($runtime_file, World::encode({
     runtimeId => $rid, pid => 0 + $main_pid,
     transports => [{ kind => 'unix', endpoint => $sock_path }],

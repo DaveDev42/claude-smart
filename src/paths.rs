@@ -6,9 +6,9 @@
 //! The state dir ([`smart_dir`]) is `orca::fsx::state_dir`: `$XDG_STATE_HOME/csm`
 //! (absolute values only), else `~/.local/state/csm`, on every unix including
 //! macOS; `%LOCALAPPDATA%\csm` on Windows. The retired profile setup kept it
-//! at `~/.claude.shared/smart`; `csm migrate import` moves the session
-//! sidecars, `titles.tsv` and the scan indexes from there and leaves the
-//! caches and per-profile records behind unread.
+//! at `~/.claude.shared/smart`; the migration's carry phase (B4) moves the
+//! session sidecars, `titles.tsv` and the scan indexes from there and
+//! leaves the caches and per-profile records behind unread.
 //!
 //! Sessions live under csm's runtime dir `D` ([`runtime_dir`]): transcripts in
 //! `<D>/projects`, the live-session registry in `<D>/sessions`.

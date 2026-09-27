@@ -77,7 +77,9 @@ E2E_PATH_BASE="/usr/bin:/bin:/usr/sbin:/sbin"
 
 # The whole environment of one csm call, in ENVV. EXTRA (an array the caller
 # may set) is appended last; PATH_PREFIX (a string) goes in front of the
-# sandbox bin dir.
+# sandbox bin dir. The login session's CLAUDE_CONFIG_DIR (the legacy floor)
+# is the file $LOGS/session-floor (floor_set, floor_value), and the boot id
+# is $BOOT_ID (default boot-1; a scenario reboots by changing it).
 build_env() {
   sbx_check
   ENVV=(
@@ -98,6 +100,8 @@ build_env() {
     "E2E_ORCA_EXE=$ORCA_EXE" "E2E_ORCA_LOG=$LOGS/orca-requests.log"
     "E2E_ORCA_PIDS=$LOGS/orca.pids" "E2E_PIDS=$LOGS/pids"
     "E2E_POINT_MARK=$LOGS/point.fired"
+    "CSM_E2E_SESSION_FLOOR_FILE=$LOGS/session-floor"
+    "CSM_E2E_BOOT_ID=${BOOT_ID:-boot-1}"
     "FAKE_LOG=${FAKE_LOG:-$LOGS/claude.log}"
   )
   if [ "$HOST_OS" = linux ]; then
@@ -217,8 +221,14 @@ http_rule() {
 
 # ─── the fake Orca ─────────────────────────────────────────────────────────────
 
+# start_orca: the fake Orca. ORCA_D=<dir> starts its main process with
+# CLAUDE_CONFIG_DIR=<dir> (an Orca the legacy floor reached), so its D is
+# that dir; ORCA_MATERIALIZE=1 makes it put the active account into D at
+# start, as Orca does.
 start_orca() {
   build_env
+  [ -n "${ORCA_D:-}" ] && ENVV+=("E2E_ORCA_CONFIG_DIR=$ORCA_D")
+  [ -n "${ORCA_MATERIALIZE:-}" ] && ENVV+=("E2E_ORCA_MATERIALIZE=1")
   env -i "${ENVV[@]}" /bin/sh "$FAKES/start-orca.sh" || {
     say "FAIL  the fake Orca did not start"
     FAILED=$((FAILED + 1))
@@ -392,6 +402,34 @@ statusline_json() {
 
 # tick <json>: one statusLine tick (`csm usage capture`).
 tick() { csm_stdin "$1" usage capture; }
+
+# ─── the legacy layout ─────────────────────────────────────────────────────────
+
+LEGACY_SID=0f0f0f0f-1111-4222-8333-444444444444
+
+# legacy_world: a machine on the legacy per-profile layout. Orca's store
+# holds no account and no active id; ~/.config/claude-as/profiles.json
+# registers work (carol, the floor profile) and home (erin); both dirs link
+# projects, history.jsonl and todos to ~/.claude.shared, which holds the
+# transcript $LEGACY_SID; the login session's CLAUDE_CONFIG_DIR names
+# ~/.claude.work; ~/.claude does not exist. The profile endpoint confirms
+# both logins, so retire can verify their stashes.
+legacy_world() {
+  fresh_world
+  world legacy-reset
+  world legacy work carol@example.com uuid-carol at-carol-1 rt-carol-1 floor
+  world legacy home erin@example.com uuid-erin at-erin-1 rt-erin-1
+  world shared "$LEGACY_SID"
+  floor_set "$HOME_DIR/.claude.work"
+  http_rule profile at-carol-1 200 '{"account":{"uuid":"uuid-carol","email":"carol@example.com"},"organization":{"uuid":"org-acme"}}'
+  http_rule profile at-erin-1 200 '{"account":{"uuid":"uuid-erin","email":"erin@example.com"},"organization":{"uuid":"org-acme"}}'
+}
+
+floor_set() { printf '%s\n' "$1" >"$LOGS/session-floor"; }
+floor_value() { if [ -f "$LOGS/session-floor" ]; then tr -d '\n' <"$LOGS/session-floor"; fi; }
+marker() { world marker "$1"; }
+retired() { [ -d "$1.retired" ] && [ ! -e "$1" ]; }
+transcript_at() { [ -f "$1/projects/-tmp-e2e-cwd/$LEGACY_SID.jsonl" ]; }
 
 # ─── state readers ─────────────────────────────────────────────────────────────
 

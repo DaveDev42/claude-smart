@@ -922,7 +922,7 @@ fn runtime_refresh_tokens(h: &crate::account::accounts::HostCtx) -> Result<Vec<S
 /// by email. A listed dir whose identity cannot be read counts as holding
 /// it (fail safe: no offline refresh).
 fn legacy_dir_holds(home: &Path, uuid: Option<&str>, email: Option<&str>) -> bool {
-    let Ok(legacy) = crate::cmd::migrate::load_legacy(home) else {
+    let Ok(legacy) = crate::migrate::load_legacy(home) else {
         return true;
     };
     legacy.profiles.iter().any(|p| {

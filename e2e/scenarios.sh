@@ -40,6 +40,16 @@ SCENARIOS=(
   alias_dispatch
   sessionend_budget
   migrate
+  auto_fresh
+  auto_adopt_live
+  auto_pane_quiet
+  auto_untouched
+  auto_live_defers
+  auto_crash
+  auto_sqlite
+  auto_floor_early
+  auto_floor_reset
+  auto_fresher
 )
 
 now_ms() { /usr/bin/perl -MTime::HiRes=time -e 'printf "%d\n", time * 1000'; }
@@ -421,7 +431,7 @@ rotated_d() {
 
 # no_secret_in <file...>: no refresh or access token of the fixtures.
 no_secret_in() {
-  ! cat "$@" 2>/dev/null | grep -qE '(rt|at)-(alice|bob)-[0-9]'
+  ! cat "$@" 2>/dev/null | grep -qE '(rt|at)-(alice|bob|carol|erin)-[0-9]'
 }
 
 # The profile check confirms the grant is alice's: it goes to her stash.
@@ -627,72 +637,363 @@ sc_sessionend_budget() {
   stop_orca
 }
 
-# ─── migration ─────────────────────────────────────────────────────────────────
+# ─── the automatic migration ───────────────────────────────────────────────────
+# The world these start from is legacy_world (lib.sh): two registered
+# profiles, work (carol, the floor) and home (erin), ~/.claude.shared linked
+# from both, the login session's floor naming ~/.claude.work, an Orca store
+# with no account, and no ~/.claude.
 
-# Two legacy ~/.claude.<name> profiles, work being the floor.
+WORK=""
+HOMEP=""
+set_dirs() { WORK="$HOME_DIR/.claude.work"; HOMEP="$HOME_DIR/.claude.home"; }
+n_ids() { world ids | wc -l | tr -d ' '; }
+carol() { world id-of carol@example.com; }
+erin() { world id-of erin@example.com; }
+phase_is() { [ "$(marker phase)" = "$1" ]; }
+# no_line <file> <text>: the file does not mention <text>.
+no_line() { ! grep -qF -- "$2" "$1" 2>/dev/null; }
+
+# The single verb: --dry-run writes nothing and exits 75, the former verbs
+# point at it, and two runs (one after a reboot) take the machine from the
+# legacy layout to Orca's accounts with ~/.claude as D.
 sc_migrate() {
-  fresh_world
-  world legacy work carol@example.com uuid-carol at-carol-1 rt-carol-1 floor
-  world legacy home erin@example.com uuid-erin at-erin-1 rt-erin-1
-  csm migrate plan
-  check "plan exits 0" eq "$RC" 0
-  check "plan names both profiles" eq "$(grep -c -e work -e home "$LOGS/out" | awk '$1 >= 2 { print "yes" }')" yes
-  check "plan names the target D" has_fixed "$LOGS/out" "target D: $D"
-  check "plan changes nothing" eq "$(world ids | wc -l | tr -d ' ')" 2
-  csm migrate import --dry-run
-  check "the dry run exits 0" eq "$RC" 0
-  check "the dry run lists the imports" has_fixed "$LOGS/out" "import work from $HOME_DIR/.claude.work"
-  check "the dry run changes nothing" eq "$(world ids | wc -l | tr -d ' ')" 2
+  legacy_world
+  set_dirs
+  csm migrate --dry-run
+  check "the dry run exits 75 (pending)" eq "$RC" 75
+  check "it names the floor profile's dir" has_fixed "$LOGS/out" "$WORK"
+  check "it names the other profile's dir" has_fixed "$LOGS/out" "$HOMEP"
+  check "it writes no marker" eq "$(marker phase)" none
+  check "it imports nothing" eq "$(n_ids)" 0
+  check "the registry stays" test -f "$HOME_DIR/.config/claude-as/profiles.json"
+  check "the shared transcripts stay" test -d "$HOME_DIR/.claude.shared/projects" -a ! -L "$HOME_DIR/.claude.shared/projects"
+  check "the floor stays" eq "$(floor_value)" "$WORK"
 
-  start_orca || return
-  csm migrate import
-  check_not "import refuses while Orca runs" eq "$RC" 0
-  check "and imports nothing" eq "$(world ids | wc -l | tr -d ' ')" 2
+  for verb in plan import retire; do
+    csm migrate "$verb"
+    check "\`migrate $verb\` exits 1" eq "$RC" 1
+    check "and points at the single verb" has_fixed "$LOGS/out" "csm migrate --dry-run"
+  done
+
+  # Orca, started while the floor was set, runs in ~/.claude.work.
+  ORCA_D="$WORK" start_orca || return
+  csm migrate
+  check "exits 0 once the cutover is recorded" eq "$RC" 0
+  check "both logins are Orca accounts now" eq "$(n_ids)" 2
+  check "carol, the floor profile's account, is active" eq "$(active)" "$(carol)"
+  check "the transcripts moved into ~/.claude" transcript_at "$D"
+  check "~/.claude.shared/projects is a compat link now" test -L "$HOME_DIR/.claude.shared/projects"
+  check "the floor profile still reads them through it" transcript_at "$WORK"
+  check "the history moved too" has_fixed "$D/history.jsonl" "hello from the shared history"
+  check "~/.claude.json carries the floor's MCP servers" has_fixed "$HOME_DIR/.claude.json" '"docs-work"'
+  check "and the other profile's" has_fixed "$HOME_DIR/.claude.json" '"docs-home"'
+  check "but no identity" no_line "$HOME_DIR/.claude.json" oauthAccount
+  check "the floor is cleared" eq "$(floor_value)" ""
+  check "the cutover is recorded in this boot" eq "$(marker boot)" boot-1
+  check "home is retired" retired "$HOMEP"
+  check "work stays while Orca runs in it" test -d "$WORK"
+  check "the report says so" has_fixed "$LOGS/out" "moves to ~/.claude at Orca's next start"
+  check "and asks for an Orca restart" has_fixed "$LOGS/out" "restart Orca"
+  check "the phase is retire" eq "$(marker phase)" retire
+
+  # Orca restarts (in ~/.claude now: the floor is gone), then a reboot.
   stop_orca
+  ORCA_MATERIALIZE=1 start_orca || return
+  check "Orca put carol into ~/.claude" eq "$(d_refresh)" rt-carol-1
+  csm migrate
+  check "without a reboot work still waits" test -d "$WORK"
+  check "and the report says for what" has_fixed "$LOGS/out" "waits for a reboot"
+  BOOT_ID=boot-2 csm migrate
+  check "after the reboot: exit 0" eq "$RC" 0
+  check "work is retired" retired "$WORK"
+  check "the registry is gone" test ! -e "$HOME_DIR/.config/claude-as/profiles.json"
+  check "~/.claude.shared is retired" retired "$HOME_DIR/.claude.shared"
+  check "the transcript stays in ~/.claude" transcript_at "$D"
+  check "the phase is done" eq "$(marker phase)" done
+  BOOT_ID=boot-2 csm migrate
+  check "a third run finds nothing" has_fixed "$LOGS/out" "nothing to migrate"
+  check "and exits 0" eq "$RC" 0
+  check "csm printed no token" no_secret_in "$LOGS/transcript"
+  stop_orca
+}
 
-  # The login session still names the floor dir although this shell does
-  # not: an Orca started from the Dock would take it as D.
-  EXTRA=("CSM_E2E_SESSION_FLOOR=$HOME_DIR/.claude.work")
-  csm migrate import
+# No legacy layout: the first launch writes a done marker and says
+# nothing; later runs change nothing.
+sc_auto_fresh() {
+  fresh_world
+  usage_healthy
+  check "no marker at first" eq "$(marker phase)" none
+  start_sup s run -n || return
+  stop_sup "$SUP_PID" "$FLOG"
+  check "the first launch wrote a done marker" eq "$(marker phase)" done
+  check "and printed nothing about a migration" no_line "$LOGS/s.sup.log" migrat
+  cp "$STATE/migration.json" "$LOGS/marker.1"
+  csm migrate
+  check "csm migrate exits 0" eq "$RC" 0
+  check "and finds nothing" has_fixed "$LOGS/out" "nothing to migrate"
+  csm accounts list
+  check "accounts list says nothing about a migration" no_line "$LOGS/out" migrat
+  check "the marker did not change" cmp -s "$STATE/migration.json" "$LOGS/marker.1"
+  check "D is untouched" eq "$(d_refresh)" rt-alice-1
+  check "alice stays active" eq "$(active)" "$A_ID"
+}
+
+# Orca runs (in the floor dir, as the legacy floor started it). An
+# interactive launch imports both logins over RPC and selects the floor's
+# account before claude starts, then carries, cuts over and retires what
+# it can after the spawn, logging only.
+sc_auto_adopt_live() {
+  legacy_world
+  set_dirs
+  ORCA_D="$WORK" start_orca || return
+  EXTRA=("FAKE_COUNT=$LOGS/orca-requests.log")
+  start_sup s run -n || { EXTRA=(); stop_orca; return; }
   EXTRA=()
-  check_not "import refuses while the session floor remains" eq "$RC" 0
-  check "and names it" has_fixed "$LOGS/out" "login session's CLAUDE_CONFIG_DIR"
-  check "and imports nothing" eq "$(world ids | wc -l | tr -d ' ')" 2
+  check "both logins were imported over RPC" eq "$(grep -c '^csm accounts.addClaudeFromConfigDir' "$LOGS/orca-requests.log")" 2
+  check "the floor profile's account was selected" has "$LOGS/orca-requests.log" "^csm accounts.selectClaude"
+  check "all of it before claude started" lt 2 "$(inv_field "$FLOG" 1 count)"
+  check "carol is active" eq "$(active)" "$(carol)"
+  check "claude runs in Orca's D" eq "$(inv_field "$FLOG" 1 config_dir)" "$WORK"
+  check "the terminal got the one migration line" poll 5 has_fixed "$LOGS/s.sup.log" "csm: migration:"
+  check "the rest ran after the spawn" poll 20 phase_is retire
+  check "home was retired" retired "$HOMEP"
+  check "work waits (claude runs in it)" test -d "$WORK"
+  check "the transcripts are in ~/.claude" transcript_at "$D"
+  check "the post-spawn run logged its lines" poll 5 has_fixed "$STATE/limit-switch.log" "migration"
+  stop_sup "$SUP_PID" "$FLOG"
+  stop_orca
+}
 
-  # A leftover `cas` shim exports CLAUDE_CONFIG_DIR=~/.claude: the switch
-  # would then write ~/.claude/.claude.json while step 5 merges into
-  # ~/.claude.json, so import refuses that too.
-  EXTRA=("CLAUDE_CONFIG_DIR=$HOME_DIR/.claude")
-  csm migrate import
+# In an Orca pane nothing runs before the spawn and nothing is printed;
+# the migration runs afterwards and logs.
+sc_auto_pane_quiet() {
+  legacy_world
+  set_dirs
+  ORCA_D="$WORK" start_orca || return
+  local t0 t1
+  EXTRA=("ORCA_PANE_KEY=pane-e2e" "ORCA_TERMINAL_HANDLE=term-e2e" "FAKE_COUNT=$LOGS/orca-requests.log")
+  t0=$(now_ms)
+  start_sup pane --resume "$LEGACY_SID" || { EXTRA=(); stop_orca; return; }
+  t1=$(now_ms)
   EXTRA=()
-  check_not "import refuses CLAUDE_CONFIG_DIR=~/.claude" eq "$RC" 0
-  check "and says why" has_fixed "$LOGS/out" "~/.claude/.claude.json"
-  check "and imports nothing" eq "$(world ids | wc -l | tr -d ' ')" 2
+  check "claude started within 3 s" lt $((t1 - t0)) 3000
+  check "it resumes the session" inv_pair "$FLOG" 1 --resume "$LEGACY_SID"
+  check "no RPC before the spawn" eq "$(inv_field "$FLOG" 1 count)" 0
+  check "the migration ran after the spawn" poll 20 phase_is retire
+  check "carol is active" eq "$(active)" "$(carol)"
+  check "its lines went to the log" poll 5 has_fixed "$STATE/limit-switch.log" "migration"
+  check "the pane printed nothing of csm's" no_line "$LOGS/pane.sup.log" "csm"
+  stop_sup "$SUP_PID" "$FLOG"
+  stop_orca
+}
 
-  csm migrate import
-  check "import exits 0" eq "$RC" 0
-  check "work imported" has "$LOGS/out" "^work: imported carol@example.com"
-  check "home imported" has "$LOGS/out" "^home: imported erin@example.com"
-  check "D switched to the floor's account" has "$LOGS/out" "^switched ~/.claude to work's account"
-  check "four accounts now" eq "$(world ids | wc -l | tr -d ' ')" 4
-  check "D holds carol's grant" eq "$(d_refresh)" rt-carol-1
-  check "D's identity is carol" eq "$(d_uuid)" uuid-carol
-  check "the floor's MCP servers merged into ~/.claude.json" has_fixed "$HOME_DIR/.claude.json" '"docs-work"'
-  check "the next step is named" has_fixed "$LOGS/out" "next: \`csm migrate retire\`"
+# NONE-class invocations never probe or migrate: no marker, no change.
+sc_auto_untouched() {
+  legacy_world
+  set_dirs
+  usage_healthy
+  : >"$LOGS/all-out"
+  hook "$(stop_json "$LEGACY_SID")"
+  cat "$LOGS/stdout" "$LOGS/stderr" >>"$LOGS/all-out"
+  hook "$(hook_json SessionEnd "$LEGACY_SID" '"reason":"other"')"
+  cat "$LOGS/stdout" "$LOGS/stderr" >>"$LOGS/all-out"
+  csm_stdin "$(statusline_json "$LEGACY_SID" 10 20)" statusline
+  cat "$LOGS/stdout" "$LOGS/stderr" >>"$LOGS/all-out"
+  tick "$(statusline_json "$LEGACY_SID" 10 20)"
+  cat "$LOGS/stdout" "$LOGS/stderr" >>"$LOGS/all-out"
+  local args
+  for args in "-p hi" "run -p hi" "claude --version" "cas --eval" "cas --print-default-dir" \
+    "config show" "newuuid" "completions zsh" "--version" "--help" "migrate --help" "usage capture"; do
+    # shellcheck disable=SC2086
+    csm $args
+    cat "$LOGS/out" >>"$LOGS/all-out"
+  done
+  check "no marker" eq "$(marker phase)" none
+  check "no migrate lock either" test ! -e "$STATE/migrate.lock"
+  check "the registry stays" test -f "$HOME_DIR/.config/claude-as/profiles.json"
+  check "the shared dir stays" test -d "$HOME_DIR/.claude.shared/projects" -a ! -L "$HOME_DIR/.claude.shared/projects"
+  check "no ~/.claude was made" test ! -e "$D"
+  check "no ~/.claude.json was made" test ! -e "$HOME_DIR/.claude.json"
+  check "Orca's store has no account" eq "$(n_ids)" 0
+  check "the floor stays" eq "$(floor_value)" "$WORK"
+  check "no Keychain access" eq "$(lines "$KC_ROOT/calls")" 0
+  check "no migration line" no_line "$LOGS/all-out" "csm: migration"
+  check "no legacy-layout note" no_line "$LOGS/all-out" "legacy profile layout"
+}
 
-  # Retire checks each stash with the profile endpoint first; with no answer
-  # nothing is retired.
-  csm migrate retire
-  check "an unverified stash is not retired" has_fixed "$LOGS/out" "work: skipped: stash"
-  check "and its dir stays" test -d "$HOME_DIR/.claude.work"
-  http_rule profile at-carol-1 200 '{"account":{"uuid":"uuid-carol","email":"carol@example.com"},"organization":{"uuid":"org-acme"}}'
-  http_rule profile at-erin-1 200 '{"account":{"uuid":"uuid-erin","email":"erin@example.com"},"organization":{"uuid":"org-acme"}}'
-  csm migrate retire
-  check "retire exits 0" eq "$RC" 0
-  check "work's dir is retired" test -d "$HOME_DIR/.claude.work.retired"
-  check "home's dir is retired" test -d "$HOME_DIR/.claude.home.retired"
-  check "the legacy registry is removed" test ! -e "$HOME_DIR/.config/claude-as/profiles.json"
-  check "the floor is cleared" has_fixed "$LOGS/out" "cleared the CLAUDE_CONFIG_DIR floor"
-  check "D still holds carol's grant" eq "$(d_refresh)" rt-carol-1
+# A claude someone started in the home profile keeps it from retiring
+# until it ends; the cutover does not wait for it.
+sc_auto_live_defers() {
+  legacy_world
+  set_dirs
+  ORCA_D="$WORK" start_orca || return
+  EXTRA=("CLAUDE_CONFIG_DIR=$HOMEP")
+  PROG="$BIN/claude" start_sup other || { EXTRA=(); stop_orca; return; }
+  EXTRA=()
+  local other_sup=$SUP_PID other_log=$FLOG
+  csm migrate
+  check "exits 0: the cutover is recorded" eq "$RC" 0
+  check "home stays while its claude runs" test -d "$HOMEP"
+  check "the report names the process" has_fixed "$LOGS/out" "CLAUDE_CONFIG_DIR=$HOMEP"
+  csm migrate
+  check "a rerun still leaves it" test -d "$HOMEP"
+  stop_sup "$other_sup" "$other_log"
+  csm migrate
+  check "home retires once its claude ended" retired "$HOMEP"
+  check "and its login is still carol's and erin's accounts" eq "$(n_ids)" 2
+  stop_orca
+}
+
+# csm dies at each migration point; the next runs reach the same end.
+sc_auto_crash() {
+  local p
+  set_dirs
+  for p in migrate-b1-unlinked migrate-b1-moved migrate-b2-write migrate-cutover-cleared \
+    migrate-retire-quarantined; do
+    say "-- crash at $p"
+    legacy_world
+    rm -f "$LOGS/point.fired"
+    if [ "$p" = migrate-b1-unlinked ]; then
+      # ~/.claude links into the shared dir too (a machine whose default
+      # profile was ~/.claude): B1 removes that link before the move.
+      mkdir -p "$D" && ln -s "$HOME_DIR/.claude.shared/projects" "$D/projects"
+    fi
+    ORCA_D="$WORK" start_orca || return
+    EXTRA=("E2E_POINT_KILL=$p")
+    csm migrate
+    EXTRA=()
+    check "[$p] csm was killed there" test -e "$LOGS/point.fired"
+    check "[$p] with SIGKILL" eq "$RC" 137
+    if [ "$p" = migrate-b1-unlinked ]; then
+      check "[$p] the kill left ~/.claude without the link" test ! -e "$D/projects"
+      check "[$p] the transcripts are still in the shared dir" \
+        test -f "$HOME_DIR/.claude.shared/projects/-tmp-e2e-cwd/$LEGACY_SID.jsonl"
+    fi
+    if [ "$p" = migrate-b2-write ]; then
+      # Killed while holding Claude Code's config lock: the dir stays
+      # behind. Age it past the 10 s stale time instead of sleeping.
+      check "[$p] the kill left the config lock" test -d "$HOME_DIR/.claude.json.lock"
+      /usr/bin/perl -e 'my $t = time - 60; utime $t, $t, @ARGV' "$HOME_DIR"/.claude*.lock
+    fi
+    csm migrate
+    check "[$p] the rerun exits 0" eq "$RC" 0
+    stop_orca
+    if [ "$HOST_OS" = linux ]; then
+      # No Keychain mirror: the floor dir holds the only login csm
+      # launches reach until Orca has started in ~/.claude once.
+      ORCA_MATERIALIZE=1 start_orca || return
+      stop_orca
+    fi
+    BOOT_ID=boot-2 csm migrate
+    check "[$p] after a reboot: exit 0" eq "$RC" 0
+    check "[$p] the phase is done" eq "$(marker phase)" done
+    check "[$p] work is retired" retired "$WORK"
+    check "[$p] home is retired" retired "$HOMEP"
+    check "[$p] ~/.claude.shared is retired" retired "$HOME_DIR/.claude.shared"
+    check "[$p] the transcript is in ~/.claude" transcript_at "$D"
+    check "[$p] the history is in ~/.claude once" eq "$(grep -c 'hello from the shared history' "$D/history.jsonl" 2>/dev/null)" 1
+    check "[$p] both accounts, carol active" eq "$(n_ids) $(active)" "2 $(carol)"
+    check "[$p] no leftover lock dir" test ! -e "$HOME_DIR/.claude.json.lock"
+  done
+}
+
+# Orca stopped with a SQLite-backed profile and no active account: csm
+# cannot import or select offline, so it exits 75; with Orca up, 0.
+sc_auto_sqlite() {
+  legacy_world
+  set_dirs
+  world sqlite
+  csm migrate
+  check "exits 75 while Orca is stopped" eq "$RC" 75
+  if [ "$HOST_OS" = mac ]; then
+    check "the report names SQLite" has_fixed "$LOGS/out" "SQLite"
+  fi
+  check "nothing was imported" eq "$(n_ids)" 0
+  check "the floor stays" eq "$(floor_value)" "$WORK"
+  check "no cutover" eq "$(marker cutover)" no
+  ORCA_D="$WORK" start_orca || return
+  csm migrate
+  check "with Orca up: exit 0" eq "$RC" 0
+  check "carol is active" eq "$(active)" "$(carol)"
+  check "the floor is cleared" eq "$(floor_value)" ""
+  stop_orca
+}
+
+# Orca already runs in ~/.claude (the floor was dropped before csm got
+# here). A pane's resume must find its transcript: B1 and B2 run before
+# the spawn, without RPC and without a line.
+sc_auto_floor_early() {
+  legacy_world
+  set_dirs
+  floor_set ""
+  start_orca || return
+  EXTRA=("ORCA_PANE_KEY=pane-e2e" "ORCA_TERMINAL_HANDLE=term-e2e"
+    "FAKE_EXPECT=$D/projects/-tmp-e2e-cwd/$LEGACY_SID.jsonl" "FAKE_COUNT=$LOGS/orca-requests.log")
+  start_sup pane --resume "$LEGACY_SID" || { EXTRA=(); stop_orca; return; }
+  EXTRA=()
+  check "the transcript was in ~/.claude when claude started" eq "$(inv_field "$FLOG" 1 expect)" present
+  check "no RPC before the spawn" eq "$(inv_field "$FLOG" 1 count)" 0
+  check "claude runs in ~/.claude" eq "$(inv_field "$FLOG" 1 config_dir)" "(unset)"
+  check "~/.claude.json has the floor's config" has_fixed "$HOME_DIR/.claude.json" '"docs-work"'
+  check "the pane printed nothing of csm's" no_line "$LOGS/pane.sup.log" "csm"
+  check "the rest ran after the spawn" poll 20 phase_is retire
+  stop_sup "$SUP_PID" "$FLOG"
+  stop_orca
+}
+
+# A floor set again after the cutover (a LaunchAgent not yet removed) is
+# cleared again, and the floor dir retires only after a later boot.
+sc_auto_floor_reset() {
+  legacy_world
+  set_dirs
+  ORCA_D="$WORK" start_orca || return
+  csm migrate
+  check "the cutover is recorded" eq "$RC $(marker boot)" "0 boot-1"
+  stop_orca
+  floor_set "$WORK"
+  BOOT_ID=boot-2 csm migrate
+  check "the re-set floor is cleared again" eq "$(floor_value)" ""
+  check "the report says so" has_fixed "$LOGS/out" "set again"
+  check "the cutover's boot moved to this one" eq "$(marker boot)" boot-2
+  check "work waits: the floor was seen in this boot" test -d "$WORK"
+  BOOT_ID=boot-2 csm migrate
+  check "still waits without a reboot" test -d "$WORK"
+  BOOT_ID=boot-3 csm migrate
+  if [ "$HOST_OS" = linux ]; then
+    # Orca never started in ~/.claude, which holds no login (no Keychain
+    # mirror on Linux): csm launches still run in work, so it stays.
+    check "work waits while ~/.claude holds no login" test -d "$WORK"
+    check "the report says why" has_fixed "$LOGS/out" "no login yet"
+    ORCA_MATERIALIZE=1 start_orca || return
+    stop_orca
+    BOOT_ID=boot-3 csm migrate
+  fi
+  check "work retires after the next reboot" retired "$WORK"
+  check "the phase is done" eq "$(marker phase)" done
+}
+
+# A retired dir's grant fresher than its stash (claude refreshed it after
+# the import) is quarantined while Orca runs, then settled into the stash
+# once Orca is stopped.
+sc_auto_fresher() {
+  legacy_world
+  set_dirs
+  http_rule profile at-erin-2 200 '{"account":{"uuid":"uuid-erin","email":"erin@example.com"},"organization":{"uuid":"org-acme"}}'
+  ORCA_D="$WORK" start_orca || return
+  EXTRA=("CLAUDE_CONFIG_DIR=$HOMEP")
+  PROG="$BIN/claude" start_sup other || { EXTRA=(); stop_orca; return; }
+  EXTRA=()
+  csm migrate
+  check "erin is imported" test -n "$(erin)"
+  check "home waits for its claude" test -d "$HOMEP"
+  # That claude refreshed its grant, then ended.
+  world rotate-dir "$HOMEP" at-erin-2 rt-erin-2
+  stop_sup "$SUP_PID" "$FLOG"
+  csm migrate
+  check "home is retired" retired "$HOMEP"
+  check "its fresher grant is not in the stash yet (Orca runs)" eq "$(stash_refresh "$(erin)")" rt-erin-1
+  stop_orca
+  csm migrate
+  check "with Orca stopped the fresher grant is settled into the stash" eq "$(stash_refresh "$(erin)")" rt-erin-2
   check "csm printed no token" no_secret_in "$LOGS/transcript"
 }

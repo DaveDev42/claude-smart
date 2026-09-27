@@ -137,7 +137,20 @@ mod tests {
         assert_ne!(tid, me);
         assert!(table.iter().any(|p| p.pid == me), "this process is listed");
         assert!(!table.iter().any(|p| p.pid == tid), "thread {tid} listed");
-        assert_eq!(crate::cmd::migrate::other_csm(&table, me), None);
+        // Only this process and its thread's pid, each given csm's exe name:
+        // a thread row would read as "another csm". The rest of the host's
+        // table is left out, so a csm running elsewhere on the machine (an
+        // e2e run, the operator's own sessions) cannot fail this test.
+        let ours: Vec<super::ProcInfo> = table
+            .iter()
+            .filter(|p| p.pid == me || p.pid == tid)
+            .cloned()
+            .map(|mut p| {
+                p.exe = Some(std::path::PathBuf::from("/usr/local/bin/csm"));
+                p
+            })
+            .collect();
+        assert_eq!(crate::migrate::other_csm(&ours, me, None), None);
     }
 
     #[cfg(unix)]

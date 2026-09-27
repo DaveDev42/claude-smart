@@ -669,17 +669,36 @@ fn journal_pending() -> bool {
 }
 
 /// Start the repair of an unfinished switch on a thread, when the journal
-/// says one is pending. Called right after the child spawns.
+/// says one is pending, and after it hand the automatic migration's
+/// post-spawn run, when the launch armed one, to a thread of its own
+/// ([`crate::migrate::start_post_spawn`], once per process). The handle
+/// returned covers the repair only: when claude exits the supervisor joins
+/// the repair, never the migration run, which stops after its current
+/// stage and gets a short grace at the process exit
+/// ([`crate::migrate::finish_on_exit`]). Called right after the child
+/// spawns.
 fn start_recovery(
     pin: &crate::launch_context::ConfigDirPin,
 ) -> Option<std::thread::JoinHandle<Repair>> {
-    if !journal_pending() {
+    let recover = journal_pending();
+    let migrate = crate::migrate::post_spawn_armed();
+    if !recover && !migrate {
         return None;
     }
     let pin = pin.clone();
     std::thread::Builder::new()
         .name("csm-recover".into())
-        .spawn(move || recover_now(&pin, true))
+        .spawn(move || {
+            let r = if recover {
+                recover_now(&pin, true)
+            } else {
+                Repair::Done
+            };
+            if migrate {
+                crate::migrate::start_post_spawn();
+            }
+            r
+        })
         .ok()
 }
 
@@ -714,6 +733,9 @@ fn finish_recovery(
     sid: &str,
     recovery: Option<std::thread::JoinHandle<Repair>>,
 ) -> Repair {
+    // claude has exited: a migration run bound to this launch starts no
+    // further stage, so a hop does not queue behind it.
+    crate::migrate::child_exited();
     let r = recovery.and_then(|h| h.join().ok()).unwrap_or(Repair::Done);
     report_repair(spec, sid, r)
 }
@@ -851,6 +873,9 @@ fn build_next_cli(
 /// Map a child `ExitStatus` to the loop's `Result`, preserving the exit code by
 /// setting our own process exit code to match (so `csm run` is transparent).
 fn exit_with(status: std::process::ExitStatus) -> anyhow::Result<()> {
+    // The launch ends here, maybe through `process::exit`, which skips the
+    // guard in `cmd::run`: give a migration run its short grace first.
+    crate::migrate::finish_on_exit();
     if let Some(code) = status.code() {
         if code != 0 {
             std::process::exit(code);

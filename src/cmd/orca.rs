@@ -167,7 +167,93 @@ fn status() -> anyhow::Result<()> {
         let alias = alias_path(&fsx::state_dir(&env), env.os);
         println!("{:<13} {}", "alias", alias_line(&alias_state(&alias)));
     }
+    println!("{:<13} {}", "migration", crate::migrate::status_line());
+    if let Some(w) = override_warning_now(&v) {
+        println!("{:<13} {w}", "warning");
+    }
     Ok(())
+}
+
+// ─── the pane override ────────────────────────────────────────────────────────
+
+/// `agentCmdOverrides.claude` out of Orca's settings, and nothing else: the
+/// same object holds `agentDefaultEnv`, which may carry secrets. Takes the
+/// `settings.get` answer (`{settings: {…}}`) or the store's document (whose
+/// top-level `settings` holds the same key). Pure.
+pub(crate) fn claude_override(v: &serde_json::Value) -> Option<String> {
+    v.get("settings")?
+        .get("agentCmdOverrides")?
+        .get("claude")?
+        .as_str()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
+}
+
+/// The program an override command line runs: its first token, with the
+/// quotes Orca's pane launcher strips. Pure.
+pub(crate) fn override_program(cmd: &str) -> Option<String> {
+    let cmd = cmd.trim_start();
+    let prog = match cmd.chars().next()? {
+        q @ ('"' | '\'') => cmd[1..].split(q).next().unwrap_or(""),
+        _ => cmd.split_whitespace().next().unwrap_or(""),
+    };
+    (!prog.is_empty()).then(|| prog.to_owned())
+}
+
+/// The warning for an override whose executable is missing. `found` says
+/// whether a program (a path, or a bare name looked up on `PATH`) exists.
+/// No override: no warning (Orca then runs plain `claude`). Pure over
+/// `found`.
+pub(crate) fn override_warning(cmd: Option<&str>, found: impl Fn(&str) -> bool) -> Option<String> {
+    let prog = override_program(cmd?)?;
+    (!found(&prog)).then(|| {
+        format!(
+            "Orca's agentCmdOverrides.claude runs {prog}, which does not exist: Orca's claude \
+             panes fail to start. Point it at an existing csm (`csm orca setup` prints the value)"
+        )
+    })
+}
+
+/// Does `prog` exist: a path as given (`~/` under the home dir), or a bare
+/// name on `PATH` (with the Windows executable suffixes)?
+fn program_found(prog: &str, home: Option<&Path>) -> bool {
+    let p = match (prog.strip_prefix("~/"), home) {
+        (Some(rest), Some(h)) => h.join(rest),
+        _ => PathBuf::from(prog),
+    };
+    if prog.contains(['/', '\\']) {
+        return p.is_file();
+    }
+    let exts: &[&str] = if cfg!(windows) {
+        &["", ".exe", ".cmd", ".bat"]
+    } else {
+        &[""]
+    };
+    std::env::var_os("PATH").is_some_and(|path| {
+        std::env::split_paths(&path)
+            .any(|d| exts.iter().any(|e| d.join(format!("{prog}{e}")).is_file()))
+    })
+}
+
+/// The override warning for this machine: `settings.get` while Orca runs,
+/// the store's `settings` otherwise. Reads only the one key.
+fn override_warning_now(v: &OrcaView) -> Option<String> {
+    let value = if v.running {
+        crate::orca::rpc::call(
+            &v.user_data.dir,
+            &crate::orca::rpc::Method::SettingsGet,
+            crate::orca::rpc::LIST_TIMEOUT,
+        )
+        .ok()?
+    } else {
+        let choice = crate::orca::userdata::data_file(&v.user_data.dir);
+        let f = crate::orca::store::load_choice(&choice).ok()??;
+        serde_json::from_slice(&f.bytes).ok()?
+    };
+    let cmd = claude_override(&value);
+    let home = HostEnv::current().ok().map(|e| e.home);
+    override_warning(cmd.as_deref(), |p| program_found(p, home.as_deref()))
 }
 
 // ─── setup ────────────────────────────────────────────────────────────────────
@@ -506,5 +592,39 @@ mod tests {
         assert!(out.contains("(store)"), "{out}");
         assert!(out.contains("- (Orca stopped)"), "{out}");
         assert!(out.contains(&tmp.path().join(".claude").display().to_string()));
+    }
+
+    #[test]
+    fn override_warning_reads_only_the_claude_key() {
+        let answer = serde_json::json!({
+            "settings": {
+                "agentCmdOverrides": { "claude": "/opt/csm/bin/claude --flag", "codex": "x" },
+                "agentDefaultEnv": { "SECRET_TOKEN": "sk-do-not-print" }
+            }
+        });
+        assert_eq!(
+            claude_override(&answer).as_deref(),
+            Some("/opt/csm/bin/claude --flag")
+        );
+        assert_eq!(claude_override(&serde_json::json!({"settings": {}})), None);
+        assert_eq!(claude_override(&serde_json::json!({})), None);
+        assert_eq!(
+            override_program("\"/Users/example/My Tools/claude\" --x").as_deref(),
+            Some("/Users/example/My Tools/claude")
+        );
+        assert_eq!(override_program("csm run").as_deref(), Some("csm"));
+        assert_eq!(override_program("   "), None);
+        // Missing: one warning that names the program and nothing else.
+        let w = override_warning(claude_override(&answer).as_deref(), |_| false).unwrap();
+        assert!(w.contains("/opt/csm/bin/claude"), "{w}");
+        assert!(
+            !w.contains("sk-do-not-print") && !w.contains("--flag"),
+            "{w}"
+        );
+        assert_eq!(
+            override_warning(claude_override(&answer).as_deref(), |_| true),
+            None
+        );
+        assert_eq!(override_warning(None, |_| false), None);
     }
 }

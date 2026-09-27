@@ -34,6 +34,7 @@
 //! empty (readable) table, so no test can see an Orca running on the
 //! developer's machine.
 
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 use super::rpc::{RuntimeMetadata, read_runtime_metadata};
@@ -56,6 +57,12 @@ pub trait ProcFacts {
     /// A process's start time in epoch seconds.
     fn start_time(&self, pid: u32) -> Option<u64> {
         self.probe(pid).map(|p| p.start_time)
+    }
+    /// A process's environment block, `None` when it cannot be read (the
+    /// default: a source that cannot read environments reads none).
+    fn environ(&self, pid: u32) -> Option<Vec<OsString>> {
+        let _ = pid;
+        None
     }
 }
 
@@ -100,6 +107,20 @@ impl ProcFacts for SystemProcs {
     fn table(&self) -> Option<Vec<ProcInfo>> {
         crate::usage::reach::note("proc-sweep");
         Some(Vec::new())
+    }
+
+    #[cfg(not(test))]
+    fn environ(&self, pid: u32) -> Option<Vec<OsString>> {
+        if pid == 0 {
+            return None;
+        }
+        crate::platform::proc::environ(pid)
+    }
+
+    /// Test build: never the real machine's environments.
+    #[cfg(test)]
+    fn environ(&self, _pid: u32) -> Option<Vec<OsString>> {
+        None
     }
 }
 
@@ -487,6 +508,265 @@ impl Liveness for SystemLiveness<'_> {
     }
 }
 
+// ─── who uses a config dir ────────────────────────────────────────────────────
+
+/// Who uses a config dir: the migration's retire gate asks before it
+/// renames a legacy dir. Anything short of a certain [`DirUsers::Free`]
+/// counts as live.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DirUsers {
+    /// No live claude registered in the dir and no claude or csm process
+    /// whose environment names it.
+    Free,
+    /// A live user, and which.
+    Live(String),
+    /// Could not tell (an unreadable table or environment): counts as live.
+    Unknown(String),
+}
+
+/// A process whose environment may pin a config dir for a claude: claude
+/// itself (the native build, or node/bun running Claude Code's script) or
+/// a csm (a `csm run` supervisor between two hops, the `claude` alias).
+/// Pure.
+pub fn claude_like(p: &ProcInfo) -> bool {
+    let stem = p
+        .exe
+        .as_deref()
+        .and_then(Path::file_name)
+        .and_then(|s| s.to_str())
+        .map(|s| crate::platform::proc_check::bare_basename(s).to_owned())
+        .unwrap_or_else(|| crate::platform::proc_check::bare_basename(&p.name).to_owned());
+    let name = crate::platform::proc_check::bare_basename(&p.name);
+    let is = |w: &str| stem.eq_ignore_ascii_case(w) || name.eq_ignore_ascii_case(w);
+    if is("claude") || is("csm") {
+        return true;
+    }
+    (is("node") || is("bun"))
+        && p.cmd
+            .iter()
+            .skip(1)
+            .any(|a| a.to_string_lossy().contains("claude"))
+}
+
+/// This process and its ancestors in `table`. Pure.
+fn self_and_ancestors(table: &[ProcInfo], this: u32) -> Vec<u32> {
+    let parent = |pid: u32| table.iter().find(|p| p.pid == pid).and_then(|p| p.ppid);
+    let mut mine = vec![this];
+    let mut at = this;
+    while let Some(pp) = parent(at) {
+        if pp == 0 || mine.contains(&pp) || mine.len() > 64 {
+            break;
+        }
+        mine.push(pp);
+        at = pp;
+    }
+    mine
+}
+
+/// The same dir: equal once trimmed of blanks and trailing separators, or
+/// once both resolve.
+fn same_path(a: &Path, b: &Path) -> bool {
+    let trim = |p: &Path| {
+        PathBuf::from(
+            p.to_string_lossy()
+                .trim()
+                .trim_end_matches(['/', '\\'])
+                .to_owned(),
+        )
+    };
+    trim(a) == trim(b)
+        || std::fs::canonicalize(a)
+            .ok()
+            .is_some_and(|x| std::fs::canonicalize(b).ok() == Some(x))
+}
+
+/// The non-blank `CLAUDE_CONFIG_DIR` an environment block sets.
+fn environ_config_dir(env: &[OsString]) -> Option<PathBuf> {
+    env.iter().find_map(|kv| {
+        let kv = kv.to_string_lossy();
+        let (k, v) = kv.split_once('=')?;
+        (k.eq_ignore_ascii_case("CLAUDE_CONFIG_DIR") && !v.trim().is_empty())
+            .then(|| PathBuf::from(v.trim()))
+    })
+}
+
+/// Does a claude with this environment run in `dir`: its non-blank
+/// `CLAUDE_CONFIG_DIR` names `dir`, or it sets none and `dir` is the
+/// implicit `~/.claude`?
+fn environ_uses(env: &[OsString], dir: &Path, home: &Path) -> bool {
+    match environ_config_dir(env) {
+        Some(_) => environ_names(env, dir),
+        None => same_path(&home.join(".claude"), dir),
+    }
+}
+
+/// [`registry_users`]'s core. `scan` is `dir/sessions` scanned (`None`:
+/// it could not be listed), `environ` one process's environment, `alive`
+/// whether a pid still runs. Pure over its facts.
+///
+/// In the legacy layout every profile dir's `sessions` links to one
+/// machine-wide registry (and after B1 `~/.claude/sessions` is that
+/// registry), so a live record there says only that some claude runs
+/// somewhere. Each live record's pid is therefore attributed by its
+/// environment. A record that cannot be attributed (an unreadable
+/// environment of a pid still running, another pid domain, a file that
+/// does not parse, a registry that cannot be listed) counts as the dir's:
+/// fail closed.
+pub fn registry_users_in(
+    dir: &Path,
+    home: &Path,
+    scan: Option<&super::runtime::SessionScan>,
+    environ: &dyn Fn(u32) -> Option<Vec<OsString>>,
+    alive: &dyn Fn(u32) -> bool,
+) -> Option<String> {
+    let reg = dir.join("sessions");
+    let Some(scan) = scan else {
+        return Some(format!("{} cannot be listed", reg.display()));
+    };
+    if scan.unreadable > 0 {
+        return Some(format!(
+            "a session record in {} cannot be read",
+            reg.display()
+        ));
+    }
+    if let Some(r) = scan.unverifiable.first() {
+        return Some(format!(
+            "session pid {} in {} cannot be verified",
+            r.pid,
+            reg.display()
+        ));
+    }
+    for r in &scan.live {
+        match environ(r.pid) {
+            Some(env) if environ_uses(&env, dir, home) => {
+                return Some(format!(
+                    "a claude session (pid {}) runs in {}",
+                    r.pid,
+                    dir.display()
+                ));
+            }
+            Some(_) => {}
+            None if !alive(r.pid) => {}
+            None => {
+                return Some(format!(
+                    "the environment of session pid {} cannot be read, so it may run in {}",
+                    r.pid,
+                    dir.display()
+                ));
+            }
+        }
+    }
+    None
+}
+
+/// Is a claude registered in `dir/sessions` running in `dir` (see
+/// [`registry_users_in`])? `Some(why)` when it is, or may be.
+pub fn registry_users(
+    os: HostOs,
+    dir: &Path,
+    home: &Path,
+    procs: &dyn ProcFacts,
+) -> Option<String> {
+    let domain = super::runtime::this_pid_domain(os);
+    let scan = super::runtime::scan_sessions(&dir.join("sessions"), &domain, procs).ok();
+    registry_users_in(dir, home, scan.as_ref(), &|p| procs.environ(p), &|p| {
+        procs.alive(p)
+    })
+}
+
+/// Does an environment block set `CLAUDE_CONFIG_DIR` to `dir` (trimmed,
+/// without a trailing separator, or the same dir once both resolve)?
+fn environ_names(env: &[OsString], dir: &Path) -> bool {
+    let trim = |s: &str| PathBuf::from(s.trim().trim_end_matches(['/', '\\']));
+    let want = trim(&dir.to_string_lossy());
+    let real = std::fs::canonicalize(dir).ok();
+    env.iter().any(|kv| {
+        let kv = kv.to_string_lossy();
+        let Some((k, v)) = kv.split_once('=') else {
+            return false;
+        };
+        if !k.eq_ignore_ascii_case("CLAUDE_CONFIG_DIR") || v.trim().is_empty() {
+            return false;
+        }
+        let v = trim(v);
+        v == want || (real.is_some() && std::fs::canonicalize(&v).ok() == real)
+    })
+}
+
+/// [`dir_users`]'s core over its facts: `registered` is
+/// [`super::context::live_claude_in`]'s answer (a scan error already counts
+/// as live), `table` the process table, `this` csm's own pid (it and its
+/// ancestors never count), `environ` one process's environment.
+pub fn dir_users_in(
+    dir: &Path,
+    registered: bool,
+    table: Option<&[ProcInfo]>,
+    this: u32,
+    environ: &dyn Fn(u32) -> Option<Vec<OsString>>,
+) -> DirUsers {
+    if registered {
+        return DirUsers::Live(format!(
+            "a claude session is registered in {}",
+            dir.join("sessions").display()
+        ));
+    }
+    let Some(table) = table else {
+        return DirUsers::Unknown("the process table cannot be read".into());
+    };
+    let mine = self_and_ancestors(table, this);
+    let mut unknown = None;
+    for p in table
+        .iter()
+        .filter(|p| !mine.contains(&p.pid) && claude_like(p))
+    {
+        match environ(p.pid) {
+            Some(env) if environ_names(&env, dir) => {
+                return DirUsers::Live(format!(
+                    "pid {} ({}) runs with CLAUDE_CONFIG_DIR={}",
+                    p.pid,
+                    p.name,
+                    dir.display()
+                ));
+            }
+            Some(_) => {}
+            None => {
+                // Gone since the sweep, or unreadable: only a process still
+                // there counts.
+                unknown.get_or_insert(p.pid);
+            }
+        }
+    }
+    match unknown {
+        Some(pid) => DirUsers::Unknown(format!(
+            "the environment of pid {pid} cannot be read, so it may use {}",
+            dir.display()
+        )),
+        None => DirUsers::Free,
+    }
+}
+
+/// Who uses `dir` right now (design section 2, C): a live claude
+/// registered in `dir/sessions` that runs in `dir` ([`registry_users`]: the
+/// legacy registry is shared, so a record elsewhere's claude does not
+/// count), or a claude or csm process whose environment sets
+/// `CLAUDE_CONFIG_DIR` to it. Unreadable counts as live.
+pub fn dir_users(os: HostOs, dir: &Path, home: &Path, procs: &dyn ProcFacts) -> DirUsers {
+    let registered = registry_users(os, dir, home, procs).is_some();
+    let table = procs.table();
+    dir_users_in(
+        dir,
+        registered,
+        table.as_deref(),
+        std::process::id(),
+        &|pid| match procs.environ(pid) {
+            Some(env) => Some(env),
+            // Exited since the sweep: it uses nothing.
+            None if !procs.alive(pid) => Some(Vec::new()),
+            None => None,
+        },
+    )
+}
+
 // ─── tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -773,5 +1053,159 @@ mod tests {
         assert_eq!(l1.runtime, Some(("rt-1".into(), 999999, Some(5))));
         assert!(!format!("{l1:?}").contains("tok"));
         assert!(live.mark().still_clear_of(&l1));
+    }
+
+    #[test]
+    fn dir_users_scans_claude_environments() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join(".claude.work");
+        std::fs::create_dir(&dir).unwrap();
+        let other = tmp.path().join(".claude.home");
+        let set = format!("CLAUDE_CONFIG_DIR={}/", dir.display());
+        let set_other = format!("CLAUDE_CONFIG_DIR={}", other.display());
+        let claude = proc_info(40, "claude", Some("/opt/bin/claude"), &[]);
+        let node = proc_info(
+            41,
+            "node",
+            Some("/usr/bin/node"),
+            &["/lib/claude-code/cli.js"],
+        );
+        let shell = proc_info(42, "zsh", Some("/bin/zsh"), &[]);
+        let users = |f: &FakeProcs| {
+            let t = f.table();
+            dir_users_in(&dir, false, t.as_deref(), 7, &|p| f.environ(p))
+        };
+        // A claude pinned to the dir (trailing separator and all) is live.
+        let f = FakeProcs::default()
+            .with(claude.clone())
+            .with_env(40, &["PATH=/bin", &set]);
+        assert!(matches!(users(&f), DirUsers::Live(w) if w.contains("pid 40")));
+        // Node running Claude Code counts; a shell never does.
+        let f = FakeProcs::default()
+            .with(node.clone())
+            .with_env(41, &[&set])
+            .with(shell.clone())
+            .with_env(42, &[&set]);
+        assert!(matches!(users(&f), DirUsers::Live(w) if w.contains("pid 41")));
+        let f = FakeProcs::default().with(shell).with_env(42, &[&set]);
+        assert_eq!(users(&f), DirUsers::Free);
+        // Another dir, or no variable at all: free.
+        let f = FakeProcs::default()
+            .with(claude.clone())
+            .with_env(40, &[&set_other])
+            .with(node)
+            .with_env(41, &["PATH=/bin"]);
+        assert_eq!(users(&f), DirUsers::Free);
+        // An unreadable environment or table counts as live.
+        let f = FakeProcs::default().with(claude.clone());
+        assert!(matches!(users(&f), DirUsers::Unknown(_)));
+        assert!(!matches!(users(&f), DirUsers::Free));
+        let f = FakeProcs::default().unreadable_table();
+        assert!(matches!(users(&f), DirUsers::Unknown(_)));
+        // csm itself and its ancestors never count.
+        let me = ProcInfo {
+            ppid: Some(40),
+            ..proc_info(7, "csm", Some("/opt/bin/csm"), &[])
+        };
+        let f = FakeProcs::default()
+            .with(me)
+            .with(claude)
+            .with_env(40, &[&set]);
+        assert_eq!(users(&f), DirUsers::Free);
+        // A registered session wins whatever the table says.
+        let t: Vec<ProcInfo> = Vec::new();
+        assert!(matches!(
+            dir_users_in(&dir, true, Some(&t), 7, &|_| None),
+            DirUsers::Live(_)
+        ));
+    }
+
+    /// The legacy registry is one machine-wide dir every profile's
+    /// `sessions` links to: a live record there counts for a dir only when
+    /// its pid runs in that dir (its `CLAUDE_CONFIG_DIR`, or the implicit
+    /// `~/.claude` without one). What cannot be attributed counts as live.
+    #[test]
+    fn a_shared_registry_counts_a_record_only_for_its_own_dir() {
+        use crate::orca::runtime::{SessionRecord, SessionScan};
+        let home = Path::new("/Users/example");
+        let work = home.join(".claude.work");
+        let other = home.join(".claude.home");
+        let implicit = home.join(".claude");
+        let rec = |pid| SessionRecord {
+            pid,
+            session_id: None,
+            proc_start: None,
+            proc_start_ft: None,
+            pid_domain: None,
+            kind: None,
+            status: None,
+        };
+        let scan = SessionScan {
+            live: vec![rec(40), rec(41)],
+            ..SessionScan::default()
+        };
+        let set_work = format!("CLAUDE_CONFIG_DIR={}", work.display());
+        let env = |pid: u32| -> Option<Vec<OsString>> {
+            match pid {
+                40 => Some(vec![OsString::from(&set_work)]),
+                41 => Some(vec![OsString::from("PATH=/bin")]),
+                _ => None,
+            }
+        };
+        let alive = |_: u32| true;
+        let users = |d: &Path| registry_users_in(d, home, Some(&scan), &env, &alive);
+        assert!(users(&work).is_some_and(|w| w.contains("pid 40")));
+        assert!(users(&implicit).is_some_and(|w| w.contains("pid 41")));
+        assert_eq!(users(&other), None);
+        // An unreadable environment: live while the pid runs, nothing once
+        // it exited.
+        let one = SessionScan {
+            live: vec![rec(42)],
+            ..SessionScan::default()
+        };
+        assert!(registry_users_in(&other, home, Some(&one), &env, &|_| true).is_some());
+        assert_eq!(
+            registry_users_in(&other, home, Some(&one), &env, &|_| false),
+            None
+        );
+        // Another pid domain, an unreadable record, an unlisted registry.
+        let unv = SessionScan {
+            unverifiable: vec![rec(43)],
+            ..SessionScan::default()
+        };
+        assert!(registry_users_in(&other, home, Some(&unv), &env, &alive).is_some());
+        let bad = SessionScan {
+            unreadable: 1,
+            ..SessionScan::default()
+        };
+        assert!(registry_users_in(&other, home, Some(&bad), &env, &alive).is_some());
+        assert!(registry_users_in(&other, home, None, &env, &alive).is_some());
+    }
+
+    /// Two profile dirs linked to one registry: a claude running in one of
+    /// them keeps only that one in use.
+    #[cfg(unix)]
+    #[test]
+    fn dir_users_over_a_shared_registry_attributes_each_record() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        let shared = home.join(".claude.shared").join("sessions");
+        std::fs::create_dir_all(&shared).unwrap();
+        std::fs::write(shared.join("40.json"), r#"{"sessionId":"s-40"}"#).unwrap();
+        let work = home.join(".claude.work");
+        let other = home.join(".claude.home");
+        for d in [&work, &other] {
+            std::fs::create_dir_all(d).unwrap();
+            std::os::unix::fs::symlink(&shared, d.join("sessions")).unwrap();
+        }
+        let set = format!("CLAUDE_CONFIG_DIR={}", work.display());
+        let f = FakeProcs::default()
+            .with(proc_info(40, "claude", Some("/opt/bin/claude"), &[]))
+            .with_env(40, &[&set]);
+        assert!(matches!(
+            dir_users(HostOs::Linux, &work, home, &f),
+            DirUsers::Live(_)
+        ));
+        assert_eq!(dir_users(HostOs::Linux, &other, home, &f), DirUsers::Free);
     }
 }

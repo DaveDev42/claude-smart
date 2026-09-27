@@ -30,18 +30,25 @@ multi-machine fleet), but the crate itself ships **zero** private identifiers
   unless `HOME` (and any `XDG_*_HOME`) lies inside `CSM_E2E_SANDBOX`; the
   Keychain runner calls `/usr/bin/perl $CSM_E2E_SECURITY` instead of
   `/usr/bin/security`; the Orca process scan counts only executables under
-  the sandbox; `CSM_E2E_ORCA_VERSION` supplies the Orca version;
-  `CSM_E2E_SESSION_FLOOR` stands in for the login session's
-  `CLAUDE_CONFIG_DIR` that `csm migrate`'s write gate reads; and
-  `point(name)` runs `/bin/sh $CSM_E2E_POINT_HOOK <name>` at the store
-  writer's `store-L1`/`store-L2` points so a scenario can start the fake
-  Orca mid-write. Never enable the feature in a release build.
+  the sandbox; `CSM_E2E_ORCA_VERSION` supplies the Orca version; the file
+  named by `CSM_E2E_SESSION_FLOOR_FILE` stands in for the login session's
+  `CLAUDE_CONFIG_DIR` (the migration's floor: read by `session_floor`,
+  emptied by `unset_floor_env`, so no `launchctl` or registry call);
+  `CSM_E2E_BOOT_ID` stands in for the boot id the retire gate compares;
+  and `point(name)` runs `/bin/sh $CSM_E2E_POINT_HOOK <name>` at named
+  points (the store writer's `store-L1`/`store-L2`, and the migration's
+  `migrate-b1-moved`, `migrate-b1-unlinked`, `migrate-b2-write`,
+  `migrate-cutover-cleared` and `migrate-retire-quarantined`) so a
+  scenario can start the fake Orca mid-write or kill csm there. Never
+  enable the feature in a release build.
 - `src/cmd/`: one module per subcommand, namely `run.rs`, `hook.rs`, `cas.rs` (a
-  compat stub: `--print-default-dir` prints `D`, `--eval` is a quiet no-op),
+  compat stub: `--print-default-dir` prints Orca's live `D` while that is a
+  legacy profile dir and nothing otherwise, `--eval` is a quiet no-op),
   `config.rs`, `usage.rs`, `accounts.rs` (`csm accounts`: pure arg parser,
   list render and doctor `findings` core over `orca::`), `orca.rs` (`csm orca
-  status|setup`), `migrate.rs` (`csm migrate plan|import|retire`: the move off
-  the legacy per-profile layout, with pure classify/merge/gate cores), `scan.rs`,
+  status|setup`), `migrate.rs` (`csm migrate [--dry-run]`: the parser, the
+  retired `plan`/`import`/`retire` pointer and the pure `exit_code`
+  0/75/1 over `migrate::Report`), `scan.rs`,
   `sidecar.rs`, `completions.rs`, `claude.rs` (the `csm claude <args…>`
   passthrough: pure `plan` + a thin unix-`exec` / windows-spawn shell; it runs
   in `D` and sets `CLAUDE_CONFIG_DIR` only when `launch_context::runtime_dir_pin`
@@ -52,8 +59,30 @@ multi-machine fleet), but the crate itself ships **zero** private identifiers
   `src/main.rs`).
 - `src/launch_context.rs`: how this launch was started (`Print`, `OrcaPane`,
   `OrcaStructured`, `Interactive`, with the `CSM_ORCA` override), the argv[0]
-  `claude` alias check, the `CLAUDE_CONFIG_DIR` pin rule, and the managed-account
-  auth-env strip list.
+  `claude` alias check, the `CLAUDE_CONFIG_DIR` pin rule, `launch_dir` /
+  pure `resolve_launch_dir` (R1: while Orca runs every launch uses Orca's
+  live `D`; pure `stale_pin` drops an inherited value naming a recorded
+  legacy dir or `~/.claude`), and the managed-account auth-env strip list.
+- `src/migrate/`: the automatic migration off the legacy per-profile
+  layout (`~/.config/claude-as/profiles.json`, `~/.claude.<name>`,
+  `~/.claude.shared`, the machine-wide `CLAUDE_CONFIG_DIR` floor). `mod.rs`
+  (`Trigger`, `run_with`, `at_dispatch`, `prespawn` with the 3 s
+  `PRESPAWN_BUDGET`, the post-spawn run, `pane_prespawn`, the report and
+  its `render`, the terminal/log lines), `probe.rs` (pure `probe` and
+  `trigger_class`: FULL, NOTE, PANE, NONE; NONE words never probe),
+  `state.rs` (`<state>/migration.json`: phase
+  `adopt|carry|cutover|retire|done`, the legacy snapshot, `cutover
+  {at, boot_id}`, notes with `note_due`; `migrate.lock`, a flock try-lock),
+  `legacy.rs` (the registry reader), `adopt.rs` (A1 import, A2 active, A3
+  read-back; pure `import_action`), `carry.rs` (B1 shared dirs with compat
+  links, pure `shared_step` over the crash states, B2 `~/.claude.json`
+  under Claude Code's config lock, B3 file copies, B4 old state, B5 plugin
+  paths), `cutover.rs` (pure `cutover_gate` and `floor_gate`, the steps,
+  `session_floor`/`unset_floor_env`), `retire.rs` (pure
+  `retire_gate` and `retire_verdict`, settle, `retire_dir`), `plan.rs`
+  (the dry-run view), `tests.rs`. Credentials are never deleted (the
+  quarantine files them), legacy dirs are renamed `<dir>.retired`,
+  unregistered `~/.claude.*` dirs are only listed.
 - `src/cli/`: `parser.rs` (hand-rolled `csm run` flag loop, NOT clap, so
   claude flags forward verbatim; it stops at the first positional, using
   `carry::arity` so a claude flag's value is not taken for one; `-h`/`--help`
@@ -106,12 +135,14 @@ multi-machine fleet), but the crate itself ships **zero** private identifiers
   `quarantine.rs`, `http.rs` (the profile and token calls), `refresh.rs`
   (the stash refresh), `sysdefault.rs` (the system-default snapshot),
   `rpc.rs` (NDJSON client over the socket or pipe named in
-  `orca-runtime.json`), `live.rs` (is Orca running, fail closed),
+  `orca-runtime.json`), `live.rs` (is Orca running, fail closed; `dir_users`: which live
+  claude processes use a dir, over their environment),
   `procenv.rs` (Orca main's own `CLAUDE_CONFIG_DIR`), `version.rs` (installed
   version and `TESTED`), `snapshot.rs` (one read-only view), `switch.rs`
   (pure `plan_switch` plus the executor and its journal), `add.rs`
   (add/import/remove), `forward.rs` (the statusLine forward to Orca), `fsx.rs`
-  (guarded file primitives, the state dir, `switch.lock`), and
+  (guarded file primitives, the state dir, `switch.lock`, Claude Code's
+  `<config>.lock` as `ClaudeConfigLock`, `link_compat`, `boot_id`), and
   `testsupport.rs` (fixtures: a fake `security`, a fake store and socket).
 - `src/usage/`: `model.rs` (`UsageData` serde), `transport.rs` (`fetch()`:
   positive TTL cache → `CSM_USAGE_CMD` → negative cooldown → `local::collect`),
@@ -159,7 +190,7 @@ multi-machine fleet), but the crate itself ships **zero** private identifiers
   commits → release PR → tag → build matrix + Homebrew bump; see Releases).
 - `e2e/`: the end-to-end harness. `run.sh` builds `csm --features e2e`
   and the fake `claude` (`fake-claude/claude.c`, which also plays Orca's main
-  process) once, lays out a sandbox under `/tmp`, and runs the 30 scenarios
+  process) once, lays out a sandbox under `/tmp`, and runs the 40 scenarios
   in `scenarios.sh` (helpers in `lib.sh`), each in a subshell with a time
   limit and a sweep for leftover processes. `fakes/` holds the fake Orca
   (`orca.pl` + `World.pm`: store, stashes, NDJSON socket), the fake Keychain
@@ -241,10 +272,13 @@ dependency/MSRV checks).
    names. One runtime dir `D` per machine and one active account per
    machine.
 4. **Pure core + thin I/O shell** for testable features (`report.rs`,
-   `cmd/accounts.rs`, `cmd/migrate.rs`): the join/decision logic is a pure fn unit-tested against
+   `cmd/accounts.rs`, `cmd/migrate.rs`, `migrate/`): the join/decision logic is a pure fn unit-tested against
    fixtures; network/stdin/stdout/clock live in `main`/the I/O shell only.
 5. **Deprecated `cas` compat stays quiet.** `csm cas --print-default-dir`
-   prints `D`; `csm cas --eval …` prints nothing on stdout, one note on
+   prints Orca's live `D` while that is a legacy profile dir (before the
+   cutover, csm's own `D` when that is one), else nothing plus one stderr
+   note, since exporting `~/.claude` would make Orca read
+   `~/.claude/.claude.json`; `csm cas --eval …` prints nothing on stdout, one note on
    stderr, and exits 0, so a leftover shell shim does not break a shell.
    Every other `cas` verb is retired and fails with a pointer to
    `csm accounts`. Do not grow it back.
@@ -295,7 +329,7 @@ dependency/MSRV checks).
 ## CLI surface (collision-safe)
 
 `run, hook, accounts {list|use|add|import|rm|doctor [--fix] [--offline]},
-orca {status|setup}, migrate {plan|import|retire} [--dry-run],
+orca {status|setup}, migrate [--dry-run],
 config {show|get|set|unset launch-command|min-claude-version},
 usage [--json] [--no-fetch] [--refresh] | usage capture,
 scan, sidecar, statusline, completions, reap, newuuid, claude <args…>` + the
@@ -358,6 +392,20 @@ is needed.
   exists without an `onboarding` block makes Orca skip its first-run wizard
   (`normalizeLoadedOnboardingState`).
 
+- **The automatic migration is tested on fakes only.** The e2e harness
+  drives every phase against the fake Orca, with the floor in a file
+  (`CSM_E2E_SESSION_FLOOR_FILE`) and the boot id from `CSM_E2E_BOOT_ID`.
+  Not yet run on a real machine: `launchctl unsetenv` clearing the floor
+  for an Orca started from the Dock, the `HKCU\Environment` delete plus
+  `WM_SETTINGCHANGE` on Windows, Windows junctions and hard links as
+  compat links, real Orca taking `~/.claude` at its next start after a
+  cutover done while it ran, and Claude Code honouring csm's hold of its
+  `<config>.lock`. On Windows, A1, A2 and A3 act only through a running
+  Orca's RPC (A3 not at all) and defer while Orca is stopped, and a dir
+  whose grant is newer than its stash stays until the account is logged
+  in again in Orca (settle never writes a stash there). The window between a cutover under a
+  running Orca and Orca's restart (a plain `claude` in a new shell holds
+  the same refresh token as Orca's `<floor>`) is accepted, not closed.
 - **Windows console-stop is unverified.** Two empirical checks gate the Windows
   relaunch loop and neither runs headlessly: (1) interactive Ctrl-C cancels
   claude's prompt rather than killing the supervisor; (2) after a limit-triggered

@@ -125,28 +125,56 @@ pub(crate) fn run(args: &[OsString]) -> anyhow::Result<()> {
     }
     let quiet = launch.context.is_orca();
 
+    // ── 1b. The automatic migration ────────────────────────────────────────────
+    // A terminal launch runs the probe and stage A before the spawn, within
+    // a 3 s budget, so this launch already has managed accounts; a pane
+    // does nothing before the spawn unless Orca already runs in ~/.claude
+    // (then B1 and B2 run first, so a resumed pane finds its transcripts).
+    // Either way the rest runs after the spawn, on a thread the recovery
+    // thread starts (`migrate::start_post_spawn`).
+    // Every return below, a cancelled picker or a failed step included,
+    // ends the launch through this guard: a migration run still going gets
+    // a short grace and a pre-spawn run's report reaches the terminal.
+    let _migration = crate::migrate::LaunchGuard::new();
+    match crate::migrate::probe::trigger_class("run", args, Some(launch.context)) {
+        crate::migrate::probe::TriggerClass::Full => crate::migrate::prespawn(),
+        crate::migrate::probe::TriggerClass::Pane => {
+            crate::migrate::pane_prespawn();
+            crate::migrate::arm_pane();
+        }
+        _ => {}
+    }
+
     // ── 2. Resolve the working directory, D and the child env ─────────────────
     let cwd = std::env::current_dir().context("csm: cannot determine current directory")?;
     let dir = launch_context::launch_dir(quiet);
+    let pin = dir
+        .as_ref()
+        .map_or(launch_context::ConfigDirPin::Leave, |d| d.pin.clone());
+    // A pre-spawn migration run that outlived its budget may hold
+    // switch.lock: the repair and the switch below would wait up to 30 s
+    // for it, so they are left to the recovery after the spawn.
+    let migrating = crate::migrate::prespawn_still_running();
     if !quiet {
+        if dir.as_ref().is_some_and(|d| d.stale) {
+            crate::migrate::stale_pin_hint();
+        }
         // Interactive: an unfinished switch is repaired before the account
         // decision; inside Orca it waits until after the spawn (relaunch loop).
-        prelaunch_recovery();
+        if !migrating {
+            prelaunch_recovery(&pin);
+        }
     }
     // Reads files only (store, stashes' oauth-account.json, D's .claude.json).
     let mut accounts = launch_accounts(dir.as_ref());
     if launch.context == LaunchContext::Interactive
-        && let Some(line) = prelaunch_switch(&accounts)
+        && !migrating
+        && let Some(line) = prelaunch_switch(&accounts, &pin)
     {
         eprintln!("{line}");
         accounts = launch_accounts(dir.as_ref());
     }
-    let env = child_env(
-        dir.as_ref()
-            .map_or(launch_context::ConfigDirPin::Leave, |d| d.pin.clone()),
-        accounts.active.is_some(),
-        std::env::vars_os(),
-    );
+    let env = child_env(pin, accounts.active.is_some(), std::env::vars_os());
 
     // Every account's dead-credential warning, from the CACHED UsageData
     // only (no network). Inside Orca the lines go to csm's log.
@@ -235,6 +263,12 @@ pub(crate) fn run(args: &[OsString]) -> anyhow::Result<()> {
 
     // PlatformLauncher is a type alias to PosixLauncher (unix) or WindowsLauncher
     // (Windows). Construct via Default so platform-specific changes are isolated.
+    // The migration's run after the spawn counts this child as a live
+    // claude in its D: it starts before it registers in D/sessions.
+    crate::migrate::note_child(
+        dir.as_ref().map(|d| d.d.clone()),
+        Some(spec.session_id.clone()),
+    );
     let launcher = <platform::PlatformLauncher as std::default::Default>::default();
     platform::relaunch::run_relaunch_loop(&launcher, &spec)
 }
@@ -512,7 +546,10 @@ fn prelaunch_decision(
 }
 
 /// I/O shell for [`prelaunch_decision`]. Returns the one line to print.
-fn prelaunch_switch(accounts: &account::AccountSet) -> Option<String> {
+fn prelaunch_switch(
+    accounts: &account::AccountSet,
+    pin: &launch_context::ConfigDirPin,
+) -> Option<String> {
     use crate::orca::context::Context;
     use crate::orca::http::SystemHttp;
     use crate::orca::live::SystemProcs;
@@ -533,7 +570,8 @@ fn prelaunch_switch(accounts: &account::AccountSet) -> Option<String> {
             (id, label)
         });
     let procs = SystemProcs;
-    let ctx = Context::current(&procs).ok()?;
+    // The D the child runs in (R1 may have moved it off this process's).
+    let ctx = Context::current_pinned(&procs, pin).ok()?;
     let other_live = candidate.is_some() && ctx.live_claude(&procs);
     let current_label = accounts.label(current);
     match prelaunch_decision(&current_label, active_viable, candidate, other_live) {
@@ -560,7 +598,7 @@ fn prelaunch_switch(accounts: &account::AccountSet) -> Option<String> {
 
 /// Interactive only: repair an unfinished switch before the account
 /// decision. A failure prints one line and the launch goes on.
-fn prelaunch_recovery() {
+fn prelaunch_recovery(pin: &launch_context::ConfigDirPin) {
     use crate::orca::context::Context;
     use crate::orca::http::SystemHttp;
     use crate::orca::live::SystemProcs;
@@ -571,7 +609,7 @@ fn prelaunch_recovery() {
         return;
     }
     let procs = SystemProcs;
-    let Ok(ctx) = Context::current(&procs) else {
+    let Ok(ctx) = Context::current_pinned(&procs, pin) else {
         return;
     };
     let http = SystemHttp::from_env();
@@ -626,6 +664,7 @@ mod tests {
         let dir = launch_context::LaunchDir {
             d: d.clone(),
             pin: launch_context::ConfigDirPin::Set(d.clone()),
+            stale: false,
         };
         crate::testenv::with_test_home(home.path(), || {
             std::fs::create_dir_all(crate::paths::smart_dir_no_create()).unwrap();
