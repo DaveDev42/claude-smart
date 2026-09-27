@@ -55,6 +55,43 @@ pub(crate) fn probe(pid: u32) -> Option<ProcInfo> {
     })
 }
 
+/// Liveness only: a targeted refresh of `pid` that loads no optional field.
+/// Cheaper than [`probe`] for callers that need nothing but "is it running".
+pub(crate) fn is_running(pid: u32) -> bool {
+    use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
+
+    if pid == 0 {
+        return false;
+    }
+    let sys_pid = Pid::from_u32(pid);
+    let mut sys = System::new();
+    sys.refresh_processes_specifics(
+        ProcessesToUpdate::Some(&[sys_pid]),
+        true,
+        ProcessRefreshKind::nothing(),
+    );
+    sys.process(sys_pid).is_some()
+}
+
+/// The environment block of one process (`KERN_PROCARGS2` on macOS,
+/// `/proc/<pid>/environ` on Linux, the PEB on Windows), via a targeted
+/// single-pid refresh that loads the environment and nothing else.
+///
+/// `None` when the process is gone or its environment could not be read. An
+/// empty block counts as unreadable: every real process carries at least
+/// `PATH`, and sysinfo returns an empty list on a permission failure.
+/// Off the hot path: only the Orca runtime-dir check calls this.
+pub(crate) fn environ(pid: u32) -> Option<Vec<OsString>> {
+    use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
+
+    let sys_pid = Pid::from_u32(pid);
+    let mut sys = System::new();
+    let kind = ProcessRefreshKind::nothing().with_environ(UpdateKind::Always);
+    sys.refresh_processes_specifics(ProcessesToUpdate::Some(&[sys_pid]), true, kind);
+    let env = sys.process(sys_pid)?.environ().to_vec();
+    if env.is_empty() { None } else { Some(env) }
+}
+
 /// Full process-table sweep: `System::new_all()`. Off the hot path — never
 /// called from the latency-sensitive Stop path [`probe`] guards.
 pub(crate) fn snapshot() -> Vec<ProcInfo> {
@@ -90,15 +127,16 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let link = dir.path().join("claude");
         std::os::unix::fs::symlink("/bin/sleep", &link).unwrap();
-        let mut child = std::process::Command::new(&link).arg("30").spawn().unwrap();
+        let mut child =
+            crate::platform::child::ChildGuard::spawn(std::process::Command::new(&link).arg("30"))
+                .unwrap();
         let pid = child.id();
         let live = wait_until_live_claude_or_node(pid, std::time::Duration::from_secs(5));
 
         let probed = probe(pid);
         let snapshotted = snapshot().into_iter().find(|p| p.pid == pid);
 
-        let _ = child.kill();
-        let _ = child.wait();
+        child.stop();
 
         assert!(live, "the spawned child must be recognized as live first");
         let base_of = |info: &super::ProcInfo| {

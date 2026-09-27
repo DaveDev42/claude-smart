@@ -1,35 +1,31 @@
-//! Credential lookup for the local usage collector — the macOS Keychain
-//! (mirroring Claude Code's own storage scheme exactly, since we read the
-//! same entry it writes) on macOS, or `<config_dir>/.credentials.json`
-//! everywhere else (and as the macOS fallback when the keychain entry is
-//! missing).
+//! Credential lookup for the local usage collector.
 //!
-//! **This read path never performs a `refresh_token` grant.** Refreshing
-//! rotates the token, and racing that rotation against Claude Code's own
-//! refresh can log the user out from under them. An expired token surfaces
-//! as [`CredError::Expired`]; the caller (`local::mod::collect`) falls back
-//! to the last stored reading rather than trying to mint a new one — that is
-//! still the default for every caller.
+//! Two sources, both Orca's:
+//! - the account `D` holds: [`lookup_runtime`] reads the runtime grant in
+//!   Orca's order (M:239969-239999): on macOS the scoped Keychain item for
+//!   `D`, then the unscoped (legacy) one; then `D/.credentials.json`. Every
+//!   Keychain read goes through [`crate::orca::keychain`], whose runner
+//!   refuses the real `/usr/bin/security` under `cfg(test)`.
+//! - every other account: its Orca stash, read by the collector through
+//!   [`crate::orca::stash`] and parsed here with [`parse_blob`].
 //!
-//! The one exception lives in [`super::refresh`], not here: an explicitly
-//! opted-in headless collector (`csm usage --refresh-oauth` /
-//! `CSM_OAUTH_REFRESH=1`) may mint a new access token for a profile whose
-//! access token has expired while its refresh token is still alive — and
-//! only when no live Claude Code session exists for that profile, an
-//! exclusive lock is held, and the platform stores credentials in the file
-//! rather than the macOS Keychain. See that module's gate list. Nothing in
-//! this module writes.
+//! **This module never writes and never refreshes.** The active grant is
+//! claude's and Orca's to rotate; an inactive stash is refreshed only by the
+//! collector's gated offline path (`super::collect`, design section 8).
 //!
 //! The access token is never logged, printed, or embedded in an error string
 //! anywhere in this module. [`OauthToken`] hand-writes its `Debug` impl to
-//! redact it — never derive `Debug` on that struct.
+//! redact it — never derive `Debug` on that struct. Parse errors name the
+//! category only, never the text that failed to parse.
 
 use std::path::Path;
 
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
-use sha2::{Digest, Sha256};
-use unicode_normalization::UnicodeNormalization;
+
+use crate::orca::HostOs;
+use crate::orca::keychain::{self, KeychainUser};
+use crate::orca::runtime::RuntimePaths;
 
 // ─── public types ───────────────────────────────────────────────────────────
 
@@ -116,53 +112,51 @@ struct ClaudeAiOauth {
     subscription_type: Option<String>,
 }
 
-// ─── public entry-point ─────────────────────────────────────────────────────
+// ─── public entry-points ────────────────────────────────────────────────────
 
-/// Look up the live OAuth token for the profile whose Claude Code config
-/// directory is `dir`.
-///
-/// macOS: tries the Keychain first (`security find-generic-password`,
-/// service derived from `dir` — see [`service_name`]), falling back to
-/// `<dir>/.credentials.json` on a keychain miss. Every other OS: reads
-/// `<dir>/.credentials.json` only.
-pub fn lookup(dir: &Path, now: DateTime<Utc>) -> Result<OauthToken, CredError> {
-    #[cfg(target_os = "macos")]
-    {
-        match lookup_keychain(dir, now) {
-            Ok(tok) => return Ok(tok),
-            Err(CredError::NotFound) => {} // fall through to the file on disk
-            Err(e) => return Err(e),
+/// Look up the runtime grant: the account `D` holds. See the module doc for
+/// the order. A Keychain error other than "not found" is reported as
+/// unreadable rather than falling through to the file, so a locked Keychain
+/// never makes csm probe with a stale file copy.
+pub fn lookup_runtime(
+    os: HostOs,
+    paths: &RuntimePaths,
+    user: &KeychainUser,
+    now: DateTime<Utc>,
+) -> Result<OauthToken, CredError> {
+    if os == HostOs::MacOs {
+        let dir = paths.config_dir.to_string_lossy().into_owned();
+        match keychain::read_runtime_aggregate(Some(&dir), user) {
+            Ok(Some(secret)) => return parse_blob(secret.expose(), now),
+            Ok(None) => {}
+            Err(e) => return Err(CredError::Unreadable(format!("Keychain: {e}"))),
         }
     }
-    lookup_file(dir, now)
+    lookup_file(&paths.credentials_path, now)
 }
 
 /// Hard cap on `.credentials.json` reads — a real credentials blob is a few
 /// KB; this matches the 256 KiB ceiling `csm usage capture`/`csm statusline`
-/// already apply to their own external-input reads (`CAPTURE_STDIN_CAP_BYTES`
-/// in `main.rs`/`statusline.rs`), so this is the one unbounded external-input
-/// path left in the module otherwise.
+/// already apply to their own external-input reads.
 const CREDENTIALS_FILE_CAP_BYTES: u64 = 256 * 1024;
 
-fn lookup_file(dir: &Path, now: DateTime<Utc>) -> Result<OauthToken, CredError> {
+/// Read and parse a `.credentials.json` at `path`.
+pub fn lookup_file(path: &Path, now: DateTime<Utc>) -> Result<OauthToken, CredError> {
     use std::io::Read;
 
-    let path = dir.join(".credentials.json");
-    let file = std::fs::File::open(&path).map_err(|e| {
+    let file = std::fs::File::open(path).map_err(|e| {
         if e.kind() == std::io::ErrorKind::NotFound {
             CredError::NotFound
         } else {
-            CredError::Unreadable(format!("{}: {e}", path.display()))
+            CredError::Unreadable(format!("{}: {}", path.display(), e.kind()))
         }
     })?;
     // Reject anything that isn't a regular file up front — a FIFO or a
     // device-node symlink here would otherwise let `read_to_end` block
-    // forever (no writer) or stream unbounded data (`/dev/zero`) on
-    // `collect()`'s critical launch path. `metadata()` follows symlinks, so
-    // this also catches a symlink pointing at a non-regular target.
+    // forever (no writer) or stream unbounded data (`/dev/zero`).
     let meta = file
         .metadata()
-        .map_err(|e| CredError::Unreadable(format!("{}: {e}", path.display())))?;
+        .map_err(|e| CredError::Unreadable(format!("{}: {}", path.display(), e.kind())))?;
     if !meta.is_file() {
         return Err(CredError::Unreadable(format!(
             "{}: not a regular file",
@@ -172,166 +166,13 @@ fn lookup_file(dir: &Path, now: DateTime<Utc>) -> Result<OauthToken, CredError> 
     let mut buf = Vec::new();
     file.take(CREDENTIALS_FILE_CAP_BYTES)
         .read_to_end(&mut buf)
-        .map_err(|e| CredError::Unreadable(format!("{}: {e}", path.display())))?;
+        .map_err(|e| CredError::Unreadable(format!("{}: {}", path.display(), e.kind())))?;
     let text = String::from_utf8(buf)
         .map_err(|_| CredError::Unreadable(format!("{}: not valid UTF-8", path.display())))?;
     parse_blob(&text, now)
 }
 
-// ─── macOS Keychain path ────────────────────────────────────────────────────
-
-#[cfg(target_os = "macos")]
-fn lookup_keychain(dir: &Path, now: DateTime<Utc>) -> Result<OauthToken, CredError> {
-    let dir_str = dir.to_string_lossy().to_string();
-    let account = account_name(&std::env::var("USER").unwrap_or_default());
-    let svc = service_name(&dir_str);
-
-    match run_security(&account, &svc) {
-        Ok(text) => return parse_blob(&text, now),
-        Err(CredError::NotFound) => {} // try the unsuffixed default-profile service below
-        Err(e) => return Err(e),
-    }
-
-    // The unsuffixed service `"Claude Code-credentials"` is what a login with
-    // CLAUDE_CONFIG_DIR unset writes to — only worth trying when `dir` IS that
-    // default profile dir (`$HOME/.claude`); trying it for every other
-    // profile would silently read the wrong account's token.
-    if is_default_claude_dir(dir) {
-        let text = run_security(&account, "Claude Code-credentials")?;
-        return parse_blob(&text, now);
-    }
-
-    Err(CredError::NotFound)
-}
-
-#[cfg(target_os = "macos")]
-fn is_default_claude_dir(dir: &Path) -> bool {
-    match crate::paths::home_dir() {
-        Some(home) => home.join(".claude") == dir,
-        None => false,
-    }
-}
-
-/// Run `security find-generic-password -a <account> -w -s <service>` with a
-/// 5s hard deadline.
-///
-/// Mirrors `transport.rs::run_usage_command`'s spawn/dedicated-reader-thread/kill
-/// pattern exactly: the reader thread owns the stdout pipe so the child never
-/// blocks on a full pipe buffer while we poll `try_wait`, and on
-/// timeout/wait-failure we detach (never join) the reader — a surviving
-/// grandchild could otherwise keep the pipe open past the deadline.
-#[cfg(target_os = "macos")]
-fn run_security(account: &str, service: &str) -> Result<String, CredError> {
-    use std::process::{Command, Stdio};
-    use std::time::{Duration, Instant};
-
-    let mut child = Command::new("/usr/bin/security")
-        .args(["find-generic-password", "-a", account, "-w", "-s", service])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .stdin(Stdio::null())
-        .spawn()
-        .map_err(|e| CredError::Unreadable(format!("spawn `security` failed: {e}")))?;
-
-    let stdout_pipe = child
-        .stdout
-        .take()
-        .ok_or_else(|| CredError::Unreadable("security: stdout pipe missing".into()))?;
-    let reader = std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        let mut pipe = stdout_pipe;
-        std::io::Read::read_to_end(&mut pipe, &mut buf).map(|_| buf)
-    });
-
-    let start = Instant::now();
-    let deadline = Duration::from_secs(5);
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) => {
-                if start.elapsed() >= deadline {
-                    let _ = child.kill();
-                    let _ = child.wait(); // reap so we don't leave a zombie
-                    drop(reader); // detach — see module note above
-                    return Err(CredError::Unreadable("security: timed out after 5s".into()));
-                }
-                std::thread::sleep(Duration::from_millis(50));
-            }
-            Err(e) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                drop(reader);
-                return Err(CredError::Unreadable(format!("security: wait failed: {e}")));
-            }
-        }
-    };
-
-    // errSecItemNotFound.
-    if status.code() == Some(44) {
-        return Err(CredError::NotFound);
-    }
-    if !status.success() {
-        return Err(CredError::Unreadable(format!(
-            "security exited with status {status}"
-        )));
-    }
-
-    let bytes = match reader.join() {
-        Ok(Ok(b)) => b,
-        Ok(Err(e)) => return Err(CredError::Unreadable(format!("security: read failed: {e}"))),
-        Err(_) => {
-            return Err(CredError::Unreadable(
-                "security: reader thread panicked".into(),
-            ));
-        }
-    };
-    String::from_utf8(bytes)
-        .map_err(|_| CredError::Unreadable("security: output is not valid UTF-8".into()))
-}
-
 // ─── pure helpers (unit-tested without touching the real keychain/disk) ────
-
-/// Derive the macOS Keychain service name Claude Code itself uses for a
-/// profile's config directory: `"Claude Code-credentials-" +
-/// sha256(NFC(dir)).hex[..8]`.
-///
-/// `dir` must be the directory string exactly as Claude Code saw it (i.e.
-/// `CLAUDE_CONFIG_DIR`'s value, or the resolved default) — NFC-normalizing
-/// here only protects against a path containing decomposed Unicode; it does
-/// not resolve symlinks or relative components, because neither does Claude
-/// Code's own hasher.
-///
-/// Only called from `lookup_keychain` (macOS-only); kept `pub` and testable
-/// on every platform so the fixed-sha256 vector below guards the derivation
-/// even when CI isn't running on macOS.
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-pub fn service_name(dir: &str) -> String {
-    let normalized: String = dir.nfc().collect();
-    let mut hasher = Sha256::new();
-    hasher.update(normalized.as_bytes());
-    let digest = hasher.finalize();
-    let hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
-    format!("Claude Code-credentials-{}", &hex[..8])
-}
-
-/// Derive the macOS Keychain account name from `$USER`: the literal username
-/// when it matches `^[a-zA-Z0-9._-]+$`, else Claude Code's own fallback for an
-/// unusual username.
-///
-/// Only called from `lookup_keychain` (macOS-only); kept `pub` and testable
-/// on every platform — see [`service_name`].
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-pub fn account_name(user: &str) -> String {
-    let valid = !user.is_empty()
-        && user
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'));
-    if valid {
-        user.to_string()
-    } else {
-        "claude-code-user".to_string()
-    }
-}
 
 /// Parse a credentials blob — either `security -w`'s stdout or
 /// `.credentials.json`'s content — into an [`OauthToken`], applying the
@@ -354,8 +195,10 @@ pub fn parse_blob(text: &str, now: DateTime<Utc>) -> Result<OauthToken, CredErro
         trimmed.to_string()
     };
 
-    let blob: CredentialsBlob = serde_json::from_str(&json_text)
-        .map_err(|e| CredError::Unreadable(format!("credentials JSON parse error: {e}")))?;
+    // The category only: a serde message can quote the value it choked on.
+    let blob: CredentialsBlob = serde_json::from_str(&json_text).map_err(|e| {
+        CredError::Unreadable(format!("credentials JSON parse error ({:?})", e.classify()))
+    })?;
     let oauth = blob.claude_ai_oauth.ok_or(CredError::NotFound)?;
     let access_token = oauth.access_token.ok_or(CredError::NotFound)?;
 
@@ -409,55 +252,6 @@ mod tests {
     fn now() -> DateTime<Utc> {
         Utc.with_ymd_and_hms(2026, 6, 1, 0, 0, 0).unwrap()
     }
-
-    // ── service_name — fixed sha256 vector ─────────────────────────────────
-    //
-    // sha256(NFC("/Users/example/.claude.work")) =
-    //   a343d19d04e5a6a6544b23b71bcc92c53fe55a2214b794f87f31bdbc0aea9565
-    // (computed independently, first 8 hex chars = "a343d19d"). A neutral
-    // example path per the crate's leak-guard invariant — never a real home.
-
-    #[test]
-    fn service_name_matches_fixed_sha256_vector() {
-        assert_eq!(
-            service_name("/Users/example/.claude.work"),
-            "Claude Code-credentials-a343d19d"
-        );
-    }
-
-    #[test]
-    fn service_name_is_stable_and_dir_sensitive() {
-        let a = service_name("/Users/example/.claude.work");
-        let b = service_name("/Users/example/.claude.home");
-        assert_ne!(a, b, "different dirs must hash to different service names");
-        assert_eq!(
-            a,
-            service_name("/Users/example/.claude.work"),
-            "deterministic"
-        );
-    }
-
-    #[test]
-    fn service_name_nfc_normalizes_before_hashing() {
-        // "é" as a precomposed codepoint (U+00E9) vs. "e" + combining acute
-        // (U+0065 U+0301) must hash identically once both are NFC-normalized.
-        let precomposed = "/Users/example/.claude.caf\u{00e9}";
-        let decomposed = "/Users/example/.claude.cafe\u{0301}";
-        assert_eq!(service_name(precomposed), service_name(decomposed));
-    }
-
-    // ── account_name ─────────────────────────────────────────────────────────
-
-    #[test]
-    fn account_name_rules() {
-        assert_eq!(account_name("example"), "example");
-        assert_eq!(account_name("example.user-1_x"), "example.user-1_x");
-        assert_eq!(account_name(""), "claude-code-user");
-        assert_eq!(account_name("has space"), "claude-code-user");
-        assert_eq!(account_name("has/slash"), "claude-code-user");
-    }
-
-    // ── parse_blob ────────────────────────────────────────────────────────────
 
     #[test]
     fn parse_blob_plain_json_ok() {
@@ -660,7 +454,7 @@ mod tests {
         );
     }
 
-    // ── lookup_file (works on every OS; the keychain path is macOS-only) ──────
+    // ── lookup_file / lookup_runtime ──────────────────────────────────────────
 
     #[test]
     fn lookup_file_reads_credentials_json() {
@@ -670,14 +464,15 @@ mod tests {
             r#"{"claudeAiOauth":{"accessToken":"tok_example","expiresAt":9999999999999}}"#,
         )
         .unwrap();
-        let tok = lookup_file(dir.path(), now()).expect("should read the file");
+        let tok = lookup_file(&dir.path().join(".credentials.json"), now())
+            .expect("should read the file");
         assert_eq!(tok.access_token, "tok_example");
     }
 
     #[test]
     fn lookup_file_missing_is_not_found() {
         let dir = tempfile::tempdir().unwrap();
-        let result = lookup_file(dir.path(), now());
+        let result = lookup_file(&dir.path().join(".credentials.json"), now());
         assert!(matches!(result, Err(CredError::NotFound)), "{result:?}");
     }
 
@@ -691,7 +486,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let huge = "x".repeat(CREDENTIALS_FILE_CAP_BYTES as usize + 1024);
         std::fs::write(dir.path().join(".credentials.json"), huge).unwrap();
-        let result = lookup_file(dir.path(), now());
+        let result = lookup_file(&dir.path().join(".credentials.json"), now());
         assert!(
             matches!(result, Err(CredError::Unreadable(_))),
             "{result:?}"
@@ -708,10 +503,72 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let link = dir.path().join(".credentials.json");
         std::os::unix::fs::symlink("/dev/null", &link).unwrap();
-        let result = lookup_file(dir.path(), now());
+        let result = lookup_file(&dir.path().join(".credentials.json"), now());
         assert!(
             matches!(result, Err(CredError::Unreadable(_))),
             "{result:?}"
         );
+    }
+
+    fn runtime_paths_in(dir: &Path) -> RuntimePaths {
+        crate::orca::runtime::runtime_paths(Some(dir.to_str().unwrap()), dir, |p| p.exists())
+    }
+
+    fn user() -> KeychainUser {
+        KeychainUser {
+            acct: "example".into(),
+            delete_accts: vec!["example".into()],
+        }
+    }
+
+    /// Off macOS the runtime grant is `D/.credentials.json` only.
+    #[test]
+    fn lookup_runtime_reads_the_file_off_macos() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(".credentials.json"),
+            r#"{"claudeAiOauth":{"accessToken":"tok_example","expiresAt":9999999999999}}"#,
+        )
+        .unwrap();
+        let paths = runtime_paths_in(dir.path());
+        let tok = lookup_runtime(HostOs::Linux, &paths, &user(), now()).unwrap();
+        assert_eq!(tok.access_token, "tok_example");
+    }
+
+    /// Guard: on macOS the runtime lookup goes through the Keychain seam,
+    /// which refuses to run anything without a fake `security` installed
+    /// (never the real binary), and reads the fake's scoped item first.
+    /// Unix only: the fake runs under `/usr/bin/perl`.
+    #[cfg(unix)]
+    #[test]
+    fn lookup_runtime_uses_only_the_fake_security() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = runtime_paths_in(dir.path());
+        let refused = lookup_runtime(HostOs::MacOs, &paths, &user(), now());
+        assert!(
+            matches!(&refused, Err(CredError::Unreadable(m)) if m.contains("cfg(test)")),
+            "{refused:?}"
+        );
+
+        let fake = crate::orca::testsupport::FakeSecurity::install();
+        let svc = keychain::runtime_service(Some(dir.path().to_str().unwrap()));
+        fake.put(
+            &svc,
+            "example",
+            br#"{"claudeAiOauth":{"accessToken":"tok_scoped","expiresAt":9999999999999}}"#,
+        );
+        let tok = lookup_runtime(HostOs::MacOs, &paths, &user(), now()).unwrap();
+        assert_eq!(tok.access_token, "tok_scoped");
+    }
+
+    #[test]
+    fn parse_errors_never_quote_the_text() {
+        let err = parse_blob(
+            r#"{"claudeAiOauth":{"accessToken":12345678,"expiresAt":"tok_leak"}}"#,
+            now(),
+        )
+        .err()
+        .unwrap();
+        assert!(!format!("{err}").contains("tok_leak"), "{err}");
     }
 }

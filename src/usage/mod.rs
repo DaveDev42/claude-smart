@@ -14,7 +14,74 @@ pub mod report;
 mod transport;
 
 pub use model::UsageData;
-pub use transport::{fetch, fetch_with};
+pub use transport::{
+    LIMIT_PICK_TIMEOUT, fetch, fetch_cached, fetch_cached_with, fetch_for_limit_pick, fetch_with,
+};
+
+// ─── warnings ─────────────────────────────────────────────────────────────────
+
+/// Where the collector's warnings go. They print on stderr, except inside
+/// [`capture_warnings`], which hands them to its caller instead: the limit
+/// switch runs the collector from the supervisor of an Orca pane, where
+/// only fatal errors and the one relaunch line may reach the pane (design
+/// §5), so it routes them to csm's log there.
+pub(crate) fn warn(line: String) {
+    let unclaimed = WARN_SINK.with(|s| match s.borrow_mut().as_mut() {
+        Some(v) => {
+            v.push(line);
+            None
+        }
+        None => Some(line),
+    });
+    if let Some(line) = unclaimed {
+        eprintln!("{line}");
+    }
+}
+
+thread_local! {
+    static WARN_SINK: std::cell::RefCell<Option<Vec<String>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Run `f` with every collector warning on this thread collected instead of
+/// printed. The collector runs on the calling thread, so nothing escapes.
+pub fn capture_warnings<R>(f: impl FnOnce() -> R) -> (R, Vec<String>) {
+    let prev = WARN_SINK.with(|s| s.borrow_mut().replace(Vec::new()));
+    let r = f();
+    let got = WARN_SINK.with(|s| std::mem::replace(&mut *s.borrow_mut(), prev));
+    (r, got.unwrap_or_default())
+}
+
+// ─── reach probe (test-only) ────────────────────────────────────────────────
+
+/// Marks the steps a usage read may never reach from `csm hook` or the
+/// statusline (design decision 8): the operator command, the usage API,
+/// Orca's socket, the Keychain, and Orca's process-table sweep. Each of
+/// those entry points calls [`reach::note`]; under `cfg(test)` the call is
+/// recorded per thread so a test can assert the hook reached none of them.
+/// In a release build `note` compiles to nothing.
+pub(crate) mod reach {
+    #[cfg(test)]
+    thread_local! {
+        static SEEN: std::cell::RefCell<Vec<&'static str>> =
+            const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    /// Record that `step` was reached on this thread.
+    #[inline]
+    pub(crate) fn note(step: &'static str) {
+        #[cfg(test)]
+        SEEN.with(|s| s.borrow_mut().push(step));
+        #[cfg(not(test))]
+        let _ = step;
+    }
+
+    /// Drain this thread's record.
+    #[cfg(test)]
+    pub(crate) fn take() -> Vec<&'static str> {
+        SEEN.with(|s| std::mem::take(&mut *s.borrow_mut()))
+    }
+}
 
 /// Errors that can occur when fetching usage data.
 ///
@@ -48,4 +115,25 @@ pub enum FetchError {
     /// at least one error) — local collection's terminal failure mode.
     #[error("usage collection produced no usable data for any profile")]
     EmptyPayload,
+}
+
+// ─── tests ────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn capture_warnings_collects_and_restores_the_outer_scope() {
+        let (inner, outer) = capture_warnings(|| {
+            warn("outer-1".into());
+            let ((), inner) = capture_warnings(|| warn("inner".into()));
+            warn("outer-2".into());
+            inner
+        });
+        assert_eq!(inner, vec!["inner".to_owned()]);
+        assert_eq!(outer, vec!["outer-1".to_owned(), "outer-2".to_owned()]);
+        // Outside any scope nothing is collected.
+        assert!(WARN_SINK.with(|s| s.borrow().is_none()));
+    }
 }

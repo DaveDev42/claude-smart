@@ -57,8 +57,10 @@ use chrono::Utc;
 
 use super::FetchError;
 use super::model::UsageData;
-use crate::account::ProfileMap;
+use crate::account::AccountSet;
+use crate::orca::HostEnv;
 use crate::paths;
+use crate::usage::local::{CollectOpts, OrcaUsage};
 
 // ─── constants (overrideable via env) ─────────────────────────────────────────
 
@@ -70,31 +72,141 @@ const DEFAULT_NEGATIVE_COOLDOWN_SECS: u64 = 120;
 
 // ─── public entry-points ───────────────────────────────────────────────────────
 
-/// Fetch usage data, obeying the positive/negative TTL caches. Equivalent to
-/// `fetch_with(false)`.
+/// Fetch usage data, obeying the positive/negative TTL caches, with
+/// [`CollectOpts::standard`]: no Orca RPC, no stash refresh.
 ///
 /// Returns `Ok(UsageData)` on success or `Err(FetchError)` on any failure
-/// (every profile's collection failed, cache-miss, parse error, etc.).
-///
-/// The caller should treat *any* `Err` as "no usage data available right now"
-/// and open the offline account picker (interactive contexts) or fall back
-/// silently (non-interactive contexts).
+/// (every account's collection failed, cache-miss, parse error, etc.).
+/// Callers treat *any* `Err` as "no usage data available right now".
 pub fn fetch() -> Result<UsageData, FetchError> {
-    fetch_with(false, false)
+    fetch_with(&CollectOpts::standard())
 }
 
-/// Like [`fetch`], but `force = true` bypasses the positive cache AND is
-/// threaded into [`super::local::collect`] so every profile's own store-record
-/// TTL is bypassed too — a live re-probe of every profile, not just a
-/// cache-refresh. Used by `csm usage --refresh`.
-///
-/// `refresh_oauth` is threaded straight through to
-/// [`super::local::collect`], where it permits a gated access-token refresh
-/// for a profile whose token has expired and under which no live Claude Code
-/// session exists (see `local::refresh`). Only `csm usage --refresh-oauth` /
-/// `CSM_OAUTH_REFRESH=1` sets it; [`fetch`] passes `false`, so every other
-/// caller keeps today's read-only behavior.
-pub fn fetch_with(force: bool, refresh_oauth: bool) -> Result<UsageData, FetchError> {
+/// The limit pick's read (design section 4, N8): Orca's
+/// `accounts.list{refreshUsage:true}` for up to 30 s when it runs (falling
+/// back to its cached values), and a refresh of a due stash grant when it is
+/// stopped. Only a switch decision calls this, and it holds `switch.lock`
+/// while it does (the borrow proves it): a stash refresh then runs under
+/// that lock instead of waiting on it. `env` is the leader's pinned
+/// environment ([`crate::launch_context::ConfigDirPin::apply_to`]): the
+/// collection reads, and the stash-refresh guard compares against, the `D`
+/// the child runs in, not the one this process inherited.
+pub fn fetch_for_limit_pick(
+    _held: &crate::orca::fsx::SwitchLock,
+    env: &HostEnv,
+) -> Result<UsageData, FetchError> {
+    fetch_with_env(&limit_pick_opts(), Some(env))
+}
+
+/// The limit pick's [`CollectOpts`]. Pure.
+pub(crate) fn limit_pick_opts() -> CollectOpts {
+    CollectOpts {
+        orca: OrcaUsage::Refresh(LIMIT_PICK_TIMEOUT),
+        refresh_stash: true,
+        switch_lock_held: true,
+        ..CollectOpts::standard()
+    }
+}
+
+/// The hook's and the statusline's read (design decision 8): csm's own
+/// files only. The positive cache at any age is the base, and every
+/// account's store record that is newer than the cache's entry for it
+/// replaces that entry. No `CSM_USAGE_CMD`, no usage API, no Orca socket,
+/// no Keychain, no process-table sweep, and no write. `Err` only when
+/// neither source holds anything (callers treat that as "no data").
+pub fn fetch_cached() -> Result<UsageData, FetchError> {
+    fetch_cached_with(None)
+}
+
+/// [`fetch_cached`] over an explicit (pinned) environment.
+pub fn fetch_cached_with(env: Option<&HostEnv>) -> Result<UsageData, FetchError> {
+    let cache = read_positive_cache_any_age(&paths::usage_cache());
+    let accounts = match env {
+        Some(e) => AccountSet::load_with(e),
+        None => AccountSet::load(),
+    };
+    let stored = super::local::collect(&accounts, Utc::now(), &CollectOpts::cache_only());
+    merge_cached(cache, stored).ok_or(FetchError::EmptyPayload)
+}
+
+/// The positive cache regardless of its age; `None` when absent, empty or
+/// unparseable.
+fn read_positive_cache_any_age(path: &Path) -> Option<UsageData> {
+    let raw = std::fs::read_to_string(path).ok()?;
+    if raw.trim().is_empty() {
+        return None;
+    }
+    serde_json::from_str(&raw).ok()
+}
+
+/// Pure: overlay `stored` onto `cache`, keeping per account whichever
+/// reading carries the later `captured_at` (a stored reading wins a tie or
+/// an unparseable cache stamp; a cached one wins when the stored one has no
+/// stamp). `None` when both are empty.
+pub(crate) fn merge_cached(cache: Option<UsageData>, stored: UsageData) -> Option<UsageData> {
+    let epoch = |s: Option<&str>| {
+        s.and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+            .map(|d| d.timestamp())
+    };
+    let mut out = cache.unwrap_or_default();
+    // A cached reading carries no probe flags forward: nothing probed now.
+    out.any_probe_attempted = false;
+    out.any_probe_succeeded = false;
+    for (id, rec) in stored.profiles {
+        let newer = match out.profiles.get(&id) {
+            None => true,
+            Some(old) => match (
+                epoch(rec.captured_at.as_deref()),
+                epoch(old.captured_at.as_deref()),
+            ) {
+                (Some(new), Some(old)) => new >= old,
+                (Some(_), None) => true,
+                (None, _) => false,
+            },
+        };
+        if newer {
+            out.profiles.insert(id, rec);
+        }
+    }
+    if out.profiles.is_empty() {
+        return None;
+    }
+    out.captured_at = out
+        .profiles
+        .values()
+        .filter_map(|p| p.captured_at.as_deref())
+        .filter_map(|s| epoch(Some(s)).map(|e| (e, s)))
+        .max_by_key(|(e, _)| *e)
+        .map(|(_, s)| s.to_string())
+        .or(out.captured_at);
+    Some(out)
+}
+
+/// How long a limit pick waits for Orca's own usage refresh.
+pub const LIMIT_PICK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Like [`fetch`], with explicit [`CollectOpts`]. `force` bypasses the
+/// positive cache AND every account's store TTL (`csm usage --refresh`); an
+/// Orca refresh or a stash refresh also skips the positive cache, since both
+/// exist to get newer numbers than the cache holds.
+pub fn fetch_with(opts: &CollectOpts) -> Result<UsageData, FetchError> {
+    fetch_with_env(opts, None)
+}
+
+/// The accounts a collection runs over: Orca's live list for `env` (the
+/// process's own environment for `None`). A pinned launch passes its
+/// pinned environment, so `D` (the runtime grant, the active account) is
+/// the child's.
+fn collection_accounts(env: Option<&HostEnv>) -> AccountSet {
+    match env {
+        Some(e) => AccountSet::load_live_with(e),
+        None => AccountSet::load_live(),
+    }
+}
+
+/// [`fetch_with`] over an explicit environment (see [`collection_accounts`]).
+pub fn fetch_with_env(opts: &CollectOpts, env: Option<&HostEnv>) -> Result<UsageData, FetchError> {
+    let force = opts.force || matches!(opts.orca, OrcaUsage::Refresh(_)) || opts.refresh_stash;
     let positive_ttl = positive_ttl_secs();
     let negative_cooldown = negative_cooldown_secs();
 
@@ -119,7 +231,7 @@ pub fn fetch_with(force: bool, refresh_oauth: bool) -> Result<UsageData, FetchEr
         match run_usage_command(&cmd) {
             Ok(data) => {
                 if let Err(e) = write_positive_cache(&data) {
-                    eprintln!("csm: warning: could not write usage cache: {e}");
+                    crate::usage::warn(format!("csm: warning: could not write usage cache: {e}"));
                 }
                 let _ = std::fs::remove_file(paths::fetch_failed());
                 return Ok(data);
@@ -128,7 +240,7 @@ pub fn fetch_with(force: bool, refresh_oauth: bool) -> Result<UsageData, FetchEr
                 // Command failed — fall through to local collection (the
                 // command is an override, not a hard gate). The negative-
                 // cooldown check and the final stamp below still apply.
-                eprintln!("csm: warning: CSM_USAGE_CMD failed: {e}");
+                crate::usage::warn(format!("csm: warning: CSM_USAGE_CMD failed: {e}"));
             }
         }
     }
@@ -145,9 +257,10 @@ pub fn fetch_with(force: bool, refresh_oauth: bool) -> Result<UsageData, FetchEr
         return Err(FetchError::NegativeCacheActive);
     }
 
-    // Step 4 — local, per-profile collection (the terminal layer).
-    let profiles = ProfileMap::load().unwrap_or_default();
-    let data = super::local::collect(&profiles, Utc::now(), force, refresh_oauth);
+    // Step 4 — local, per-profile collection (the terminal layer), over
+    // Orca's live list when it runs (the store lags it on Orca 1.4.214+).
+    let accounts = collection_accounts(env);
+    let data = super::local::collect(&accounts, Utc::now(), opts);
 
     // Total failure: every configured profile produced an error and none
     // produced usable data. An empty registry (zero profiles, zero errors)
@@ -176,7 +289,7 @@ pub fn fetch_with(force: bool, refresh_oauth: bool) -> Result<UsageData, FetchEr
     // Success (possibly partial — some profiles errored, others didn't).
     if let Err(e) = write_positive_cache(&data) {
         // Best-effort; don't fail on a caching error if the data is good.
-        eprintln!("csm: warning: could not write usage cache: {e}");
+        crate::usage::warn(format!("csm: warning: could not write usage cache: {e}"));
     }
     Ok(data)
 }
@@ -223,6 +336,7 @@ fn resolve_usage_command() -> Option<String> {
 /// claude-direct extraction is slow (~2–30 s in PoC), so the command must not
 /// block csm indefinitely on a prompt-path call.
 fn run_usage_command(cmd: &str) -> Result<UsageData, FetchError> {
+    super::reach::note("usage-cmd");
     use std::process::{Command, Stdio};
     use std::time::{Duration, Instant};
 
@@ -232,76 +346,83 @@ fn run_usage_command(cmd: &str) -> Result<UsageData, FetchError> {
         .unwrap_or(10);
 
     #[cfg(unix)]
-    let mut child = Command::new("sh")
-        .args(["-c", cmd])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .stdin(Stdio::null())
-        .spawn()
-        .map_err(|e| FetchError::Command(format!("spawn failed: {e}")))?;
+    let mut cmd_line = {
+        let mut c = Command::new("sh");
+        c.args(["-c", cmd]);
+        c
+    };
 
     #[cfg(not(unix))]
-    let mut child = Command::new("cmd")
-        .args(["/C", cmd])
+    let mut cmd_line = {
+        let mut c = Command::new("cmd");
+        c.args(["/C", cmd]);
+        c
+    };
+
+    cmd_line
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
-        .stdin(Stdio::null())
+        .stdin(Stdio::null());
+    // Its own process group, so a timeout kill reaches whatever the shell
+    // started (`cmd | cat`), not just the shell.
+    let mut child = crate::platform::child::own_group(&mut cmd_line)
         .spawn()
         .map_err(|e| FetchError::Command(format!("spawn failed: {e}")))?;
+    let pgid = child.id();
 
     // Drain stdout on a dedicated thread so the child never blocks on a full
     // pipe buffer (~64 KB) while we poll for exit. Without this, a command that
     // emits more than the buffer deadlocks: the child blocks writing, we block in
     // try_wait, and the (valid) result is lost to the timeout. The reader thread
-    // owns the pipe and reads to EOF, which it reaches when the child exits.
+    // owns the pipe and reads to EOF, which it reaches when the last write-end
+    // closes; it hands the bytes over a channel so collecting them is bounded.
     let stdout_pipe = child
         .stdout
         .take()
         .ok_or_else(|| FetchError::Command("stdout pipe missing".into()))?;
-    let reader = std::thread::spawn(move || {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
         let mut buf = Vec::new();
         let mut pipe = stdout_pipe;
-        std::io::Read::read_to_end(&mut pipe, &mut buf).map(|_| buf)
+        let _ = tx.send(std::io::Read::read_to_end(&mut pipe, &mut buf).map(|_| buf));
     });
 
     let start = Instant::now();
     let deadline = Duration::from_secs(timeout_secs);
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) => {
-                if start.elapsed() >= deadline {
-                    let _ = child.kill();
-                    let _ = child.wait(); // reap so we don't leave a zombie
-                    // Do NOT join the reader here. Killing the direct child does
-                    // not guarantee the pipe's write-end closes: a grandchild
-                    // (e.g. `cmd | cat`) can inherit it and outlive the parent,
-                    // so read_to_end never reaches EOF and a join would block past
-                    // the deadline — defeating the whole timeout. Drop the handle
-                    // instead: the detached thread ends on its own once the last
-                    // write-end finally closes, and is reaped at process exit.
-                    drop(reader);
-                    return Err(FetchError::Command(format!(
-                        "timed out after {timeout_secs}s"
-                    )));
-                }
-                std::thread::sleep(Duration::from_millis(50));
-            }
-            Err(e) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                // Same rationale as the timeout path: a surviving grandchild can
-                // keep the pipe open, so detach rather than join.
-                drop(reader);
-                return Err(FetchError::Command(format!("wait failed: {e}")));
-            }
+    // On timeout (or a failed wait) the whole group is killed and reaped
+    // within a bounded window; the reader thread is detached, never joined:
+    // it ends on its own once the last write-end closes.
+    let status = match crate::platform::child::wait_deadline(
+        &mut child,
+        deadline,
+        Duration::from_millis(50),
+        true,
+    ) {
+        Ok(Some(status)) => status,
+        Ok(None) => {
+            return Err(FetchError::Command(format!(
+                "timed out after {timeout_secs}s"
+            )));
         }
+        Err(e) => return Err(FetchError::Command(format!("wait failed: {e}"))),
     };
 
-    let stdout_bytes = match reader.join() {
+    // The shell exited, but something it left running in the background can
+    // still hold the pipe: collect the output within what is left of the
+    // deadline (at least the reap limit), never unbounded.
+    let left = deadline
+        .saturating_sub(start.elapsed())
+        .max(crate::platform::child::REAP_LIMIT);
+    let stdout_bytes = match rx.recv_timeout(left) {
         Ok(Ok(bytes)) => bytes,
         Ok(Err(e)) => return Err(FetchError::Command(format!("read failed: {e}"))),
-        Err(_) => return Err(FetchError::Command("stdout reader thread panicked".into())),
+        Err(_) => {
+            // Whatever still holds the pipe is in the shell's group.
+            crate::platform::child::kill_group(pgid);
+            return Err(FetchError::Command(format!(
+                "output still open after {timeout_secs}s"
+            )));
+        }
     };
 
     if !status.success() {
@@ -344,7 +465,7 @@ fn try_positive_cache(ttl_secs: u64) -> Result<Option<UsageData>, FetchError> {
 }
 
 /// Path-injected core of [`try_positive_cache`] — the testable seam (same
-/// pattern as `usage/local/store.rs` and `provision.rs`).
+/// pattern as `usage/local/store.rs`).
 fn try_positive_cache_at(path: &Path, ttl_secs: u64) -> Result<Option<UsageData>, FetchError> {
     if !path.exists() {
         return Ok(None);
@@ -387,7 +508,7 @@ fn negative_cache_active(cooldown_secs: u64) -> bool {
 }
 
 /// Path-injected core of [`negative_cache_active`] — the testable seam (same
-/// pattern as `usage/local/store.rs` and `provision.rs`).
+/// pattern as `usage/local/store.rs`).
 fn negative_cache_active_at(path: &Path, cooldown_secs: u64) -> bool {
     if !path.exists() {
         return false;
@@ -410,7 +531,7 @@ fn stamp_negative_cache() {
 }
 
 /// Path-injected core of [`stamp_negative_cache`] — the testable seam (same
-/// pattern as `usage/local/store.rs` and `provision.rs`).
+/// pattern as `usage/local/store.rs`).
 fn stamp_negative_cache_at(path: &Path) {
     // Ensure the parent directory exists.
     if let Some(parent) = path.parent() {
@@ -433,7 +554,7 @@ fn write_positive_cache(data: &UsageData) -> Result<(), FetchError> {
 }
 
 /// Path-injected core of [`write_positive_cache`] — the testable seam (same
-/// pattern as `usage/local/store.rs` and `provision.rs`).
+/// pattern as `usage/local/store.rs`).
 fn write_positive_cache_at(cache_path: &Path, data: &UsageData) -> Result<(), FetchError> {
     let parent = cache_path.parent().unwrap_or_else(|| Path::new("."));
     std::fs::create_dir_all(parent)?;
@@ -500,6 +621,25 @@ mod tests {
     use super::*;
     use std::fs;
     use tempfile::TempDir;
+
+    /// The limit pick collects over the pinned environment: its `D` (the
+    /// runtime grant it probes, the refresh tokens the stash-refresh guard
+    /// compares against) is the child's, not the inherited one.
+    #[test]
+    fn the_limit_pick_collects_over_the_pinned_d() {
+        let tmp = TempDir::new().unwrap();
+        let pinned = tmp.path().join("pinned-D");
+        fs::create_dir_all(&pinned).unwrap();
+        let mut env = HostEnv::for_test(tmp.path(), crate::orca::HostOs::Linux);
+        env.xdg_config_home = Some(tmp.path().join("xdg").to_string_lossy().into_owned());
+        env.claude_config_dir = Some(pinned.to_string_lossy().into_owned());
+        let accounts = collection_accounts(Some(&env));
+        assert_eq!(accounts.runtime_dir, pinned);
+        assert_eq!(
+            accounts.host.as_ref().map(|h| h.paths.config_dir.clone()),
+            Some(pinned)
+        );
+    }
 
     // ── shared fixture JSON ────────────────────────────────────────────────────
 
@@ -867,7 +1007,7 @@ mod tests {
     fn run_usage_command_respects_timeout() {
         crate::testenv::with_env_var("CSM_USAGE_CMD_TIMEOUT", Some("1"), || {
             let start = std::time::Instant::now();
-            let result = run_usage_command("sleep 10");
+            let result = run_usage_command("/bin/sleep 5");
             let elapsed = start.elapsed();
             assert!(
                 matches!(result, Err(FetchError::Command(_))),
@@ -875,7 +1015,7 @@ mod tests {
             );
             assert!(
                 elapsed < std::time::Duration::from_secs(5),
-                "timeout must fire well before the command's own 10s, took {elapsed:?}"
+                "timeout must fire well before the command's own 5s, took {elapsed:?}"
             );
         });
     }
@@ -889,9 +1029,10 @@ mod tests {
         // we block in try_wait — and only escape via the timeout, discarding the
         // (valid) result. Build a >256 KB valid UsageData JSON and assert it
         // parses well within a short deadline.
-        // 3s deadline: comfortably long for a correct drain, but far shorter than
-        // the wall time a deadlock would burn — so a deadlock fails the test fast.
-        crate::testenv::with_env_var("CSM_USAGE_CMD_TIMEOUT", Some("3"), || {
+        // 10s deadline: a correct drain takes milliseconds, a deadlock burns the
+        // whole deadline and fails with a timeout. Generous so a loaded host
+        // cannot turn a slow `awk` start into a flake.
+        crate::testenv::with_env_var("CSM_USAGE_CMD_TIMEOUT", Some("10"), || {
             // Have the CHILD generate the large payload itself, via a tiny awk
             // program, rather than inlining a >256 KB JSON string as a shell
             // ARGUMENT. Inlining it (`printf '%s' '<huge json>'`) overflows
@@ -919,7 +1060,7 @@ mod tests {
                 "all profiles parsed"
             );
             assert!(
-                elapsed < std::time::Duration::from_secs(3),
+                elapsed < std::time::Duration::from_secs(10),
                 "must not hit the deadline — a deadlock would, took {elapsed:?}"
             );
         });
@@ -929,19 +1070,13 @@ mod tests {
     #[cfg(unix)]
     fn run_usage_command_timeout_is_hard_even_when_a_grandchild_holds_the_pipe() {
         // The stdout-drain thread reads to EOF, which it only reaches when the
-        // pipe's last write-end closes. On timeout we kill the DIRECT child
-        // (`sh`), but a grandchild can inherit the same stdout pipe and outlive
-        // it — e.g. `sleep | cat`, where `cat` holds the write-end. If the
-        // timeout path were to `reader.join()` unconditionally, that join would
-        // block until the grandchild died on its own, silently defeating the
-        // hard deadline. This test pins that the timeout returns within the
-        // deadline regardless of a surviving grandchild.
+        // pipe's last write-end closes. A grandchild can inherit the same
+        // stdout pipe (`sleep | cat`, where `cat` holds the write-end). The
+        // timeout kills the shell's whole process group, and the reader is
+        // never joined, so the deadline stays hard either way.
         crate::testenv::with_env_var("CSM_USAGE_CMD_TIMEOUT", Some("1"), || {
-            // `sleep 30 | cat`: cat inherits our stdout pipe and stays alive
-            // ~30s after sh is killed, holding the write-end open so
-            // read_to_end can't reach EOF.
             let start = std::time::Instant::now();
-            let result = run_usage_command("sleep 30 | cat");
+            let result = run_usage_command("/bin/sleep 5 | /bin/cat");
             let elapsed = start.elapsed();
 
             assert!(
@@ -953,6 +1088,70 @@ mod tests {
                 "timeout must stay hard even with a grandchild holding the pipe, took {elapsed:?}"
             );
         });
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn run_usage_command_timeout_kills_the_grandchildren_too() {
+        // The shell records its background child's pid, then waits on it.
+        // After the timeout that grandchild must be gone, not orphaned.
+        let dir = tempfile::tempdir().unwrap();
+        let pid_file = dir.path().join("bg.pid");
+        let cmd = format!("/bin/sleep 5 & echo $! > '{}'; wait", pid_file.display());
+        crate::testenv::with_env_var("CSM_USAGE_CMD_TIMEOUT", Some("1"), || {
+            let result = run_usage_command(&cmd);
+            assert!(matches!(result, Err(FetchError::Command(_))), "{result:?}");
+        });
+        let pid: i32 = std::fs::read_to_string(&pid_file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        // Killed with the group; its parent (the shell) is dead too, so the
+        // system reaps it shortly.
+        assert!(
+            pid_gone_within_2s(pid),
+            "the background grandchild must be killed with the group"
+        );
+    }
+
+    /// Poll for up to 2 s until `pid` no longer exists.
+    #[cfg(unix)]
+    fn pid_gone_within_2s(pid: i32) -> bool {
+        (0..200).any(|_| {
+            let r = nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None);
+            if r == Err(nix::errno::Errno::ESRCH) {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            false
+        })
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn run_usage_command_output_held_open_after_exit_is_bounded() {
+        // The shell exits at once but leaves a background job holding stdout.
+        // Collecting the output must give up at the deadline, not hang.
+        let dir = tempfile::tempdir().unwrap();
+        let pid_file = dir.path().join("bg.pid");
+        let cmd = format!("/bin/sleep 4 & echo $! > '{}'; exit 0", pid_file.display());
+        crate::testenv::with_env_var("CSM_USAGE_CMD_TIMEOUT", Some("1"), || {
+            let start = std::time::Instant::now();
+            let result = run_usage_command(&cmd);
+            assert!(matches!(result, Err(FetchError::Command(_))), "{result:?}");
+            assert!(start.elapsed() < std::time::Duration::from_secs(4));
+        });
+        // The job that held the pipe was killed with the group.
+        let pid: i32 = std::fs::read_to_string(&pid_file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        assert!(
+            pid_gone_within_2s(pid),
+            "the background job must not outlive the call"
+        );
     }
 
     #[test]
@@ -1214,5 +1413,72 @@ mod tests {
             "a plain `csm usage` (no --refresh) must still short-circuit on \
              an active negative cooldown — only `force` bypasses it"
         );
+    }
+    // ── fetch_cached merge (pure) ────────────────────────────────────────────
+
+    fn reading(at: Option<&str>, pct: i64) -> crate::usage::model::ProfileUsage {
+        crate::usage::model::ProfileUsage {
+            captured_at: at.map(str::to_string),
+            week_all: Some(crate::usage::model::UsageSection {
+                pct,
+                resets: None,
+                resets_at: None,
+            }),
+            ..Default::default()
+        }
+    }
+
+    fn data(entries: &[(&str, crate::usage::model::ProfileUsage)]) -> UsageData {
+        UsageData {
+            profiles: entries
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.clone()))
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn merge_cached_keeps_the_newer_reading_per_account() {
+        let cache = data(&[
+            ("a", reading(Some("2026-09-01T00:00:00Z"), 10)),
+            ("b", reading(Some("2026-09-03T00:00:00Z"), 20)),
+            ("c", reading(None, 30)),
+        ]);
+        let stored = data(&[
+            ("a", reading(Some("2026-09-02T00:00:00Z"), 11)),
+            ("b", reading(Some("2026-09-02T00:00:00Z"), 21)),
+            ("c", reading(Some("2026-09-01T00:00:00Z"), 31)),
+            ("d", reading(None, 41)),
+        ]);
+        let m = merge_cached(Some(cache), stored).unwrap();
+        let pct = |k: &str| m.profiles[k].week_all.as_ref().unwrap().pct;
+        assert_eq!(pct("a"), 11, "a newer stored reading wins");
+        assert_eq!(pct("b"), 20, "a newer cached reading wins");
+        assert_eq!(pct("c"), 31, "a stamped reading beats an unstamped one");
+        assert_eq!(pct("d"), 41, "an account only the store knows is added");
+        assert_eq!(m.captured_at.as_deref(), Some("2026-09-03T00:00:00Z"));
+        assert!(!m.any_probe_attempted);
+    }
+
+    #[test]
+    fn merge_cached_is_none_when_both_are_empty() {
+        assert!(merge_cached(None, UsageData::default()).is_none());
+        assert!(merge_cached(Some(UsageData::default()), UsageData::default()).is_none());
+        assert!(merge_cached(None, data(&[("a", reading(None, 1))])).is_some());
+    }
+
+    #[test]
+    fn positive_cache_any_age_ignores_mtime_and_junk() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join(".usage-cache.json");
+        assert!(read_positive_cache_any_age(&p).is_none());
+        std::fs::write(&p, "not json").unwrap();
+        assert!(read_positive_cache_any_age(&p).is_none());
+        let d = data(&[("a", reading(None, 5))]);
+        std::fs::write(&p, serde_json::to_vec(&d).unwrap()).unwrap();
+        let old = filetime::FileTime::from_unix_time(1_000_000_000, 0);
+        filetime::set_file_mtime(&p, old).unwrap();
+        assert!(read_positive_cache_any_age(&p).is_some());
     }
 }

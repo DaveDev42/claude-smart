@@ -1,192 +1,243 @@
 #!/usr/bin/env bash
-# e2e/run.sh -- csm limit-switch end-to-end harness.
+# e2e/run.sh -- csm's end-to-end harness.
 #
-# Builds (or reuses) a `csm` binary and a fake, sleeping `claude` binary,
-# stands up an isolated sandbox (its own HOME, its own profile registry, no
-# network -- CSM_USAGE_API_BASE points at an unrouted local port), runs the
-# 15 numbered scenarios (plus 9b, 16 VERDICT blocks in total) against it,
-# prints the report, and tears down:
-# only PIDs this script itself started are ever signalled, and the sandbox is
-# removed unless --keep is given. Never runs the real `claude`.
+#   bash e2e/run.sh [--keep] [--timeout <secs>] [scenario...]
 #
-# Usage:
-#   bash e2e/run.sh [--csm <path-to-csm-binary>] [--keep]
+# Builds csm once with the `e2e` feature (the sandbox seams, see src/e2e.rs)
+# and the fake claude once, lays out a sandbox under /tmp with its own HOME,
+# and runs every scenario in e2e/scenarios.sh (or the ones named) against:
+#   - a fake Orca: its userData with a profile index, orca-data.json and
+#     stashes, a main process holding SingletonLock, and an NDJSON runtime
+#     socket (e2e/fakes/orca.pl) that edits the store the way Orca does;
+#   - a fake Keychain (e2e/fakes/security.pl, run through /usr/bin/perl);
+#   - a loopback stand-in for Anthropic's OAuth endpoints (e2e/fakes/http.pl);
+#   - a fake `claude` (e2e/fake-claude/claude.c).
+# Nothing reaches the network, the real Keychain, the real Orca or the real
+# home: csm runs under `env -i` with HOME in the sandbox, and the e2e build
+# exits 97 when HOME is anywhere else.
 #
-# CSM_BIN (env) is an alternative to --csm. With neither, this builds
-# `cargo build --bin csm` from the repo root (respects CARGO_TARGET_DIR if
-# already set in the environment).
+# Each scenario runs in its own subshell with a time limit (--timeout,
+# default 90 s). Afterwards any process whose command line names the sandbox
+# is killed, and a scenario that left one behind fails. The sandbox is
+# removed at exit unless --keep is given.
 #
-# Portable to macOS (BSD userland) and Linux (GNU userland, ubuntu-latest in
-# CI): see e2e/lib.sh's header for the specific BSD/GNU traps avoided.
-set -uo pipefail
+# Needs: cargo, cc, /usr/bin/perl (JSON::PP, Digest::SHA, Time::HiRes,
+# IO::Socket::UNIX), /usr/bin/script. Runs on macOS and Linux.
+set -u
 
-REPO_ROOT=$(cd "$(dirname "$0")/.." && pwd)
-
+REPO=$(cd "$(dirname "$0")/.." && pwd -P)
 KEEP=0
-CSM_ARG=""
-while [[ $# -gt 0 ]]; do
+TIMEOUT=90
+ONLY=()
+while [ $# -gt 0 ]; do
   case "$1" in
-    --csm)
-      CSM_ARG="$2"; shift 2 ;;
-    --csm=*)
-      CSM_ARG="${1#--csm=}"; shift ;;
-    --keep)
-      KEEP=1; shift ;;
-    -h|--help)
-      sed -n '2,20p' "$0"; exit 0 ;;
-    *)
-      echo "e2e/run.sh: unknown argument: $1" >&2; exit 2 ;;
+    --keep) KEEP=1; shift ;;
+    --timeout) TIMEOUT="$2"; shift 2 ;;
+    -h|--help) sed -n '2,26p' "$0"; exit 0 ;;
+    -*) echo "e2e/run.sh: unknown flag $1" >&2; exit 2 ;;
+    *) ONLY+=("$1"); shift ;;
   esac
 done
 
-# abspath <path> -- portable absolute-path resolution (no reliance on GNU
-# `readlink -f`, which older BSD/macOS readlink lacks).
-abspath() {
-  local p="$1"
-  if [[ -d "$p" ]]; then
-    (cd "$p" && pwd)
-  else
-    local dir base
-    dir=$(cd "$(dirname "$p")" 2>/dev/null && pwd) || return 1
-    base=$(basename "$p")
-    printf '%s/%s\n' "$dir" "$base"
-  fi
+case "$(uname -s)" in
+  Darwin) HOST_OS=mac ;;
+  Linux) HOST_OS=linux ;;
+  *) echo "e2e/run.sh: macOS or Linux only" >&2; exit 2 ;;
+esac
+for tool in cargo cc; do
+  command -v "$tool" >/dev/null || { echo "e2e/run.sh: $tool not found" >&2; exit 2; }
+done
+[ -x /usr/bin/perl ] && [ -x /usr/bin/script ] || { echo "e2e/run.sh: needs /usr/bin/perl and /usr/bin/script" >&2; exit 2; }
+
+# ─── sandbox ───────────────────────────────────────────────────────────────────
+# /tmp keeps the socket path short (unix sockets allow about 104 bytes) and
+# `pwd -P` makes every path physical (/private/tmp on macOS), so the paths
+# csm sees in the process table match the ones the harness writes.
+
+SANDBOX=$(mktemp -d /tmp/csm-e2e.XXXXXX) || exit 1
+SANDBOX=$(cd "$SANDBOX" && pwd -P)
+case "$SANDBOX" in
+  /tmp/csm-e2e.*|/private/tmp/csm-e2e.*) ;;
+  *) echo "e2e/run.sh: unexpected sandbox path $SANDBOX" >&2; exit 1 ;;
+esac
+HOME_DIR="$SANDBOX/home"
+D="$HOME_DIR/.claude"
+STATE="$HOME_DIR/.local/state/csm"
+if [ "$HOST_OS" = mac ]; then
+  UD="$HOME_DIR/Library/Application Support/orca"
+else
+  UD="$HOME_DIR/.config/orca"
+fi
+FAKES="$REPO/e2e/fakes"
+BIN="$SANDBOX/bin"
+KC_ROOT="$SANDBOX/keychain"
+HTTP_DIR="$SANDBOX/http"
+mkdir -p "$BIN" "$KC_ROOT/items" "$HTTP_DIR" "$SANDBOX/logs" "$SANDBOX/tmp" "$SANDBOX/transcripts"
+
+HTTP_PID=""
+
+# sweep: TERM, then KILL, every process whose command line names the
+# sandbox, except the HTTP stand-in (run-wide). Prints what it found.
+sweep() {
+  local pids p i
+  pids=$(ps -A -o pid=,command= | S="$SANDBOX/" K="${HTTP_PID:-none}" awk 'index($0, ENVIRON["S"]) && $1 != ENVIRON["K"] { print $1 }')
+  [ -z "$pids" ] && return 0
+  for p in $pids; do
+    ps -o pid=,command= -p "$p" 2>/dev/null | sed 's/^/    left behind: /'
+    kill -TERM "$p" 2>/dev/null
+  done
+  i=0
+  while [ "$i" -lt 40 ]; do
+    local any=0
+    for p in $pids; do kill -0 "$p" 2>/dev/null && any=1; done
+    [ "$any" = 0 ] && break
+    /bin/sleep 0.05
+    i=$((i + 1))
+  done
+  for p in $pids; do kill -KILL "$p" 2>/dev/null; done
+  return 1
 }
 
-# ── resolve csm binary (build unless given) ─────────────────────────────────
-CSM_BIN="${CSM_ARG:-${CSM_BIN:-}}"
-if [[ -n "$CSM_BIN" ]]; then
-  CSM_BIN=$(abspath "$CSM_BIN") || { echo "e2e/run.sh: --csm path not found: $CSM_ARG" >&2; exit 2; }
-else
-  echo "== building csm (cargo build --bin csm) =="
-  ( cd "$REPO_ROOT" && cargo build --bin csm ) || exit 1
-  TARGET_DIR="${CARGO_TARGET_DIR:-$REPO_ROOT/target}"
-  CSM_BIN="$TARGET_DIR/debug/csm"
-fi
-if [[ ! -x "$CSM_BIN" ]]; then
-  echo "e2e/run.sh: csm binary not found or not executable: $CSM_BIN" >&2
-  exit 1
-fi
-echo "== csm binary: $CSM_BIN =="
-
-# ── sandbox ──────────────────────────────────────────────────────────────────
-SANDBOX=$(mktemp -d "${TMPDIR:-/tmp}/csm-e2e.XXXXXX")
-HOME_DIR="$SANDBOX/home"
-A_DIR="$HOME_DIR/.claude.a"
-B_DIR="$HOME_DIR/.claude.b"
-SMART_DIR="$HOME_DIR/.claude.shared/smart"
-LOG_DIR="$SANDBOX/logs"
-TRANSCRIPTS_DIR="$SANDBOX/fake_transcripts"
-FAKE_BIN="$SANDBOX/bin/claude"
-USAGE_CMD_SCRIPT="$REPO_ROOT/e2e/bin/usage_cmd.sh"
-FIX_HEALTHY="$REPO_ROOT/e2e/fixtures/a_capped_b_healthy.json"
-FIX_BOTH="$REPO_ROOT/e2e/fixtures/both_capped.json"
-REPORT="$LOG_DIR/report.txt"
-
-mkdir -p "$HOME_DIR" "$SMART_DIR" "$LOG_DIR" "$TRANSCRIPTS_DIR" "$(dirname "$FAKE_BIN")"
-
-ALL_PIDS=()
-
-# ── teardown (always runs: normal exit, error, or signal) ──────────────────
 cleanup() {
-  local exit_code=$?
-  for pid in "${ALL_PIDS[@]:-}"; do
-    if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
-      kill -TERM "$pid" 2>/dev/null
-    fi
-  done
-  if (( KEEP )); then
-    echo "== --keep set: sandbox left at $SANDBOX =="
+  local rc=$?
+  if [ -n "$HTTP_PID" ]; then
+    kill -TERM "$HTTP_PID" 2>/dev/null
+    wait "$HTTP_PID" 2>/dev/null
+  fi
+  HTTP_PID=""
+  sweep >/dev/null
+  if [ "$KEEP" = 1 ]; then
+    echo "e2e: sandbox kept at $SANDBOX"
   else
     rm -rf "$SANDBOX"
   fi
-  exit "$exit_code"
+  exit "$rc"
 }
-trap cleanup EXIT INT TERM
+trap cleanup EXIT
+trap 'exit 130' INT TERM
 
-# ── build the fake claude ───────────────────────────────────────────────────
-echo "== building fake claude (cc -std=c11 -Wall -Wextra) =="
-CC_BIN="${CC:-cc}"
-"$CC_BIN" -std=c11 -Wall -Wextra -O2 -o "$FAKE_BIN" "$REPO_ROOT/e2e/fake-claude/claude.c" || exit 1
+# ─── build once ────────────────────────────────────────────────────────────────
 
-# ── register the two profiles the way `csm profiles add` does it (creates
-# the dir, symlinks plugins/projects to the shared SSOT, writes profiles.json
-# under $HOME_DIR/.config/claude-as/) ───────────────────────────────────────
-echo "== registering profiles a/b under isolated HOME=$HOME_DIR =="
-env -u CLAUDE_CONFIG_DIR HOME="$HOME_DIR" "$CSM_BIN" profiles add a "$A_DIR" >"$LOG_DIR/profiles-add-a.log" 2>&1 \
-  || { echo "e2e/run.sh: csm profiles add a failed:" >&2; cat "$LOG_DIR/profiles-add-a.log" >&2; exit 1; }
-env -u CLAUDE_CONFIG_DIR HOME="$HOME_DIR" "$CSM_BIN" profiles add b "$B_DIR" >"$LOG_DIR/profiles-add-b.log" 2>&1 \
-  || { echo "e2e/run.sh: csm profiles add b failed:" >&2; cat "$LOG_DIR/profiles-add-b.log" >&2; exit 1; }
+echo "== cargo build --features e2e --bin csm"
+(cd "$REPO" && cargo build -q --features e2e --bin csm) || exit 1
+TARGET_DIR="${CARGO_TARGET_DIR:-$REPO/target}"
+cp "$TARGET_DIR/debug/csm" "$BIN/csm" || exit 1
 
-# ── source helpers + scenarios, then run ────────────────────────────────────
+echo "== cc e2e/fake-claude/claude.c"
+"${CC:-cc}" -std=c11 -Wall -Wextra -Werror -O2 -o "$BIN/claude" "$REPO/e2e/fake-claude/claude.c" || exit 1
+
+# The fake Orca's main process is the same binary under Orca's name, so
+# csm's main-executable match accepts it. macOS also gets the bundle's
+# Info.plist, where csm reads Orca's version; Linux has no such file and
+# gets the version from CSM_E2E_ORCA_VERSION.
+cat >"$SANDBOX/Info.plist" <<'EOF'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>CFBundleShortVersionString</key>
+  <string>1.4.214</string>
+</dict>
+</plist>
+EOF
+if [ "$HOST_OS" = mac ]; then
+  mkdir -p "$SANDBOX/Orca.app/Contents/MacOS"
+  cp "$SANDBOX/Info.plist" "$SANDBOX/Orca.app/Contents/Info.plist"
+  ORCA_EXE="$SANDBOX/Orca.app/Contents/MacOS/Orca"
+else
+  mkdir -p "$SANDBOX/orca-app"
+  ORCA_EXE="$SANDBOX/orca-app/orca"
+fi
+ln "$BIN/claude" "$ORCA_EXE" || exit 1
+
+# ─── the HTTP stand-in (run-wide) ──────────────────────────────────────────────
+
+/usr/bin/perl "$FAKES/http.pl" "$HTTP_DIR" </dev/null >"$SANDBOX/logs/http.log" 2>&1 &
+HTTP_PID=$!
+i=0
+while [ ! -s "$HTTP_DIR/port" ] && [ "$i" -lt 100 ]; do /bin/sleep 0.05; i=$((i + 1)); done
+HTTP_PORT=$(cat "$HTTP_DIR/port" 2>/dev/null)
+[ -n "$HTTP_PORT" ] || { echo "e2e/run.sh: the HTTP stand-in did not start" >&2; exit 1; }
+
 # shellcheck source=e2e/lib.sh
-source "$REPO_ROOT/e2e/lib.sh"
+. "$REPO/e2e/lib.sh"
 # shellcheck source=e2e/scenarios.sh
-source "$REPO_ROOT/e2e/scenarios.sh"
+. "$REPO/e2e/scenarios.sh"
 
-: > "$REPORT"
-echo "=== csm limit-switch e2e report ===" > "$REPORT"
-echo "generated: $(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$REPORT"
-echo "csm --version: $("$CSM_BIN" --version 2>&1)" >> "$REPORT"
-echo "sandbox: $SANDBOX" >> "$REPORT"
-echo "" >> "$REPORT"
+if [ "${#ONLY[@]}" -gt 0 ]; then
+  for n in "${ONLY[@]}"; do
+    declare -F "sc_$n" >/dev/null || { echo "e2e/run.sh: no scenario $n" >&2; exit 2; }
+  done
+  SCENARIOS=("${ONLY[@]}")
+fi
 
-START_TS=$(date +%s)
-run_all_scenarios
-END_TS=$(date +%s)
+# ─── run ───────────────────────────────────────────────────────────────────────
 
-# ── final safety sweep: only PIDs this run recorded, plus a ps check scoped
-# to binaries under this sandbox (never a name-based pkill/killall) ────────
-rpt "----- final safety sweep -----"
-for pid in "${ALL_PIDS[@]:-}"; do
-  if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
-    rpt "  WARNING: pid $pid still alive, sending TERM (harness-owned pid)"
-    kill -TERM "$pid" 2>/dev/null
+# run_scenario <name>: run sc_<name> in a subshell under the time limit,
+# then sweep. Prints one PASS/FAIL line.
+run_scenario() {
+  local name="$1" sp i start verdict
+  LOGS="$SANDBOX/logs/$name"
+  mkdir -p "$LOGS"
+  : >"$LOGS/pids"
+  start=$(date +%s)
+  (
+    FAILED=0
+    SC=$name
+    echo "== $name"
+    "sc_$name"
+    wait 2>/dev/null
+    cp "$STATE/limit-switch.log" "$LOGS/limit-switch.log" 2>/dev/null
+    echo "$FAILED" >"$LOGS/failed"
+  ) >"$LOGS/scenario.log" 2>&1 &
+  sp=$!
+  i=0
+  while kill -0 "$sp" 2>/dev/null && [ "$i" -lt $((TIMEOUT * 10)) ]; do
+    /bin/sleep 0.1
+    i=$((i + 1))
+  done
+  verdict=PASS
+  if kill -0 "$sp" 2>/dev/null; then
+    echo "  TIMEOUT after ${TIMEOUT}s" >>"$LOGS/scenario.log"
+    kill -TERM "$sp" 2>/dev/null
+    verdict=FAIL
+  fi
+  wait "$sp" 2>/dev/null
+  if ! sweep >>"$LOGS/scenario.log" 2>&1; then
+    echo "  FAIL  the scenario left processes behind" >>"$LOGS/scenario.log"
+    verdict=FAIL
+  fi
+  [ "$(cat "$LOGS/failed" 2>/dev/null)" = 0 ] || verdict=FAIL
+  printf '%-4s %-28s %3ss\n' "$verdict" "$name" "$(($(date +%s) - start))"
+  [ "$verdict" = PASS ]
+}
+
+echo "== $(uname -s) $(uname -m), sandbox $SANDBOX"
+PASSED=0
+FAILED_NAMES=()
+T0=$(date +%s)
+for name in "${SCENARIOS[@]}"; do
+  if run_scenario "$name"; then
+    PASSED=$((PASSED + 1))
+  else
+    FAILED_NAMES+=("$name")
   fi
 done
-# The supervisors' own children are not in ALL_PIDS -- the supervisor spawned
-# them, not this script. They are still addressable by pid rather than by name,
-# because the fake claude logs its own pid on every invocation. Under load a
-# scenario can finish while one of them is between SIGTERM and exit, which is
-# how a run occasionally left a sleeping fake behind.
-for f in "$LOG_DIR"/*.fakeclaude.log; do
-  [[ -e "$f" ]] || continue
-  while read -r logged_pid; do
-    if [[ -n "$logged_pid" ]] && kill -0 "$logged_pid" 2>/dev/null; then
-      rpt "  WARNING: fake claude pid $logged_pid still alive, sending TERM (pid from $f)"
-      kill -TERM "$logged_pid" 2>/dev/null
-    fi
-  done < <(awk '/^=== INVOCATION/{for(i=1;i<=NF;i++) if($i ~ /^pid=[0-9]+$/){sub(/^pid=/,"",$i); print $i}}' "$f")
-done
-sleep 1
-rpt "  ps check (this sandbox's binaries only):"
-rpt "$(ps -ax -o pid,ppid,stat,command 2>/dev/null | grep -E "$SANDBOX/(bin/claude)" | grep -v grep || echo '  (none found)')"
-rpt ""
-rpt "=== end of report (${START_TS:+$((END_TS - START_TS))s}) ==="
 
-echo ""
-echo "############################################################"
-cat "$REPORT"
-echo "############################################################"
-
-PASS_COUNT=$(grep -c "VERDICT: PASS" "$REPORT" || true)
-FAIL_COUNT=$(grep -c "VERDICT: FAIL" "$REPORT" || true)
-echo ""
-echo "csm e2e: $PASS_COUNT passed, $FAIL_COUNT failed (of $((PASS_COUNT + FAIL_COUNT)) scenarios), $((END_TS - START_TS))s"
-
-if (( FAIL_COUNT > 0 )); then
-  # No artifact upload to rely on (the sandbox is removed on every exit path
-  # unless --keep) -- so dump every per-invocation log to stdout here, which
-  # is what CI actually has to debug from.
-  echo ""
-  echo "############################################################"
-  echo "## FAILURE: dumping every per-scenario log under $LOG_DIR"
-  echo "############################################################"
-  for f in "$LOG_DIR"/*.log; do
-    [[ -e "$f" ]] || continue
-    echo "----- $f -----"
+for name in "${FAILED_NAMES[@]:-}"; do
+  [ -n "$name" ] || continue
+  echo
+  echo "################ $name"
+  cat "$SANDBOX/logs/$name/scenario.log"
+  for f in "$SANDBOX/logs/$name"/transcript "$SANDBOX/logs/$name"/*.sup.log "$SANDBOX/logs/$name"/*.claude.log \
+    "$SANDBOX/logs/$name"/claude.log "$SANDBOX/logs/$name"/orca-requests.log "$SANDBOX/logs/$name"/orca-requests.log.stderr \
+    "$SANDBOX/logs/$name"/limit-switch.log; do
+    [ -f "$f" ] || continue
+    echo "---- $f"
     cat "$f"
   done
-  exit 1
-fi
-exit 0
+done
+
+echo
+echo "csm e2e: $PASSED passed, ${#FAILED_NAMES[@]} failed (of ${#SCENARIOS[@]}), $(($(date +%s) - T0))s"
+[ "${#FAILED_NAMES[@]}" -eq 0 ]

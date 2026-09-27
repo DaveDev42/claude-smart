@@ -1,255 +1,402 @@
 #!/usr/bin/env bash
-# e2e/lib.sh -- polling/assertion/process helpers for the csm limit-switch e2e
-# harness. Sourced by run.sh after it has set up the sandbox; expects these
-# globals to already be set: CSM_BIN, FAKE_BIN, USAGE_CMD_SCRIPT, HOME_DIR,
-# A_DIR, B_DIR, SMART_DIR, LOG_DIR, TRANSCRIPTS_DIR, REPORT, and the ALL_PIDS
-# array. Never runs the real `claude`; only ever kills PIDs this harness
-# itself started and recorded (in ALL_PIDS or a scenario's own *_PID var).
+# e2e/lib.sh -- helpers for csm's end-to-end harness. Sourced by run.sh after
+# it has built the binaries and laid out the sandbox; scenarios.sh uses them.
 #
-# Portable to both macOS (BSD userland) and Linux (GNU userland, ubuntu-latest
-# CI): no `stat -f`/`-c`, no `sed -i ''`, no `date -r` at run time, no
-# `mktemp -t`, no `pkill`/`killall` (kills go through `kill -TERM <pid>` on a
-# PID this script recorded itself), no GNU-only `timeout`.
+# Globals run.sh sets before sourcing: REPO SANDBOX HOME_DIR D STATE UD FAKES
+# BIN KC_ROOT HTTP_DIR HTTP_PORT HOST_OS (mac|linux) ORCA_EXE. Per scenario
+# (set by run_scenario): SC (its name) and LOGS (its log dir).
+#
+# Rules every helper keeps:
+# - csm, the fakes and the fixture helper run under `env -i` with an explicit
+#   environment whose HOME is the sandbox's; sbx_check refuses anything else,
+#   and csm's own e2e build exits when HOME is outside CSM_E2E_SANDBOX.
+# - No network: the OAuth and usage endpoints point at http.pl on loopback,
+#   usage comes from CSM_USAGE_CMD, and the Keychain is security.pl.
+# - Nothing is signalled by name. A scenario kills the pids it recorded, and
+#   run.sh's sweep only touches processes whose command line names the
+#   sandbox.
+# - Sleeps are /bin/sleep in bounded polls.
+#
+# Portable to macOS (BSD userland) and Linux (GNU userland): no `stat -c/-f`,
+# no `sed -i`, no `readlink -f`, no `timeout`, no `pkill`.
 
-rpt() { echo "$@" | tee -a "$REPORT"; }
+# ─── reporting ─────────────────────────────────────────────────────────────────
 
-# ── polling helpers ─────────────────────────────────────────────────────────
+say() { printf '  %s\n' "$*"; }
 
-wait_for_invocation_count() {
-  local f="$1" want="$2" timeout="${3:-10}"
-  local max_iters=$(( timeout * 5 )); local i=0
-  while (( i < max_iters )); do
-    local c
-    c=$(grep -c "^=== INVOCATION" "$f" 2>/dev/null || echo 0)
-    if (( c >= want )); then return 0; fi
-    sleep 0.2
-    i=$((i+1))
-  done
-  return 1
-}
-
-wait_for_pattern() {
-  local f="$1" pat="$2" timeout="${3:-10}"
-  local max_iters=$(( timeout * 5 )); local i=0
-  while (( i < max_iters )); do
-    if [[ -f "$f" ]] && grep -q -- "$pat" "$f" 2>/dev/null; then
-      return 0
-    fi
-    sleep 0.2
-    i=$((i+1))
-  done
-  [[ -f "$f" ]] && grep -q -- "$pat" "$f" 2>/dev/null
-}
-
-get_invocation_pid() {
-  # NOTE: must not match on "ppid=" -- "ppid=" contains "pid=" as a
-  # substring, so a naive `grep -oE 'pid=[0-9]+'` over the whole line
-  # matches both the child's own pid= field AND the ppid= field, producing
-  # a corrupted 2-line value. Split into space-delimited tokens and match
-  # only a token that is EXACTLY "pid=<digits>".
-  local f="$1" idx="$2"
-  awk -v want="$idx" '
-    /^=== INVOCATION/{n++; if(n==want){line=$0}}
-    END{
-      nf = split(line, arr, " ");
-      for (i=1; i<=nf; i++) {
-        if (arr[i] ~ /^pid=[0-9]+$/) { sub(/^pid=/, "", arr[i]); print arr[i]; exit }
-      }
-    }
-  ' "$f"
-}
-
-get_invocation_field() {
-  local f="$1" idx="$2" argvidx="$3"
-  awk -v want="$idx" -v ai="$argvidx" '
-    /^=== INVOCATION/{n++}
-    n==want && $0 ~ ("^argv\\[" ai "\\]="){
-      sub("^argv\\[" ai "\\]=", ""); print; f=1
-    }
-    n==want && /^=== END/ && f{exit}
-  ' "$f"
-}
-
-get_invocation_configdir() {
-  local f="$1" idx="$2"
-  awk -v want="$idx" '
-    /^=== INVOCATION/{n++; if(n==want){line=$0}}
-    END{print line}
-  ' "$f" | sed -E 's/.*config_dir=([^ ]+) ===/\1/'
-}
-
-# get_invocation_argv <log> <idx>  -> every argv value of that block, one per
-# line, argv[0] first. The INVOCATION header is not numbered in the log, so the
-# block has to be counted the same way get_invocation_field counts it.
-get_invocation_argv() {
-  local f="$1" idx="$2"
-  awk -v want="$idx" '
-    /^=== INVOCATION/{n++}
-    n==want && /^argv\[[0-9]+\]=/ { sub(/^argv\[[0-9]+\]=/, ""); print }
-    n==want && /^=== END/ {exit}
-  ' "$f"
-}
-
-invocation_has_arg() {
-  # invocation_has_arg <log> <idx> <value>  -> exit 0 if some argv[i]=<value> in that block
-  local f="$1" idx="$2" val="$3"
-  awk -v want="$idx" -v v="$val" '
-    /^=== INVOCATION/{n++}
-    n==want && /^argv\[[0-9]+\]=/ { sub(/^argv\[[0-9]+\]=/, ""); if ($0 == v) { found=1 } }
-    n==want && /^=== END/ { exit }
-    END { exit found ? 0 : 1 }
-  ' "$f"
-}
-
-count_invocations() {
-  grep -c "^=== INVOCATION" "$1" 2>/dev/null || echo 0
-}
-
-safe_term() {
-  local pid="$1"
-  if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
-    kill -TERM "$pid" 2>/dev/null
-    local i=0
-    while kill -0 "$pid" 2>/dev/null && (( i < 25 )); do sleep 0.2; i=$((i+1)); done
+# check <description> <command...>: run the command; record a failed check.
+check() {
+  local what="$1"
+  shift
+  if "$@"; then
+    say "ok    $what"
+  else
+    say "FAIL  $what"
+    FAILED=$((FAILED + 1))
   fi
 }
 
-is_alive() {
-  local pid="$1"
-  [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null
+# check_not <description> <command...>: the command must fail.
+check_not() {
+  local what="$1"
+  shift
+  if "$@"; then
+    say "FAIL  $what"
+    FAILED=$((FAILED + 1))
+  else
+    say "ok    $what"
+  fi
 }
 
-set_last_switch_fresh() { date +%s > "$SMART_DIR/.last-switch"; }
-clear_last_switch() { rm -f "$SMART_DIR/.last-switch"; }
+has() { grep -q -- "$2" "$1" 2>/dev/null; }
+has_fixed() { grep -qF -- "$2" "$1" 2>/dev/null; }
+eq() { [ "$1" = "$2" ] || { say "      want [$2] got [$1]"; return 1; }; }
+lines() { if [ -f "$1" ]; then wc -l <"$1" | tr -d ' '; else echo 0; fi; }
 
-# ── supervisor lifecycle ────────────────────────────────────────────────────
-# start_supervisor <label> <fixture> [extra csm-run args...]
-# Sets globals: SUP_PID, FAKE_LOG, SID, CHILD_PID
-start_supervisor() {
-  local label="$1" fixture="$2"; shift 2
-  local extra_csm_args=("$@")
-  FAKE_LOG="$LOG_DIR/${label}.fakeclaude.log"
-  local suplog="$LOG_DIR/${label}.supervisor.log"
-  rm -f "$FAKE_LOG"
+# show <file>: print a file into the scenario log, indented.
+show() {
+  [ -f "$1" ] || { say "($1 absent)"; return 0; }
+  say "--- $1"
+  sed 's/^/      /' "$1"
+}
 
-  env -u CLAUDE_CONFIG_DIR \
-    HOME="$HOME_DIR" \
-    CSM_USAGE_API_BASE="http://127.0.0.1:9" \
-    CLAUDE_SMART_CLAUDE_BIN="$FAKE_BIN" \
-    CSM_USAGE_CMD="$USAGE_CMD_SCRIPT" \
-    CSM_USAGE_FIXTURE="$fixture" \
-    CLAUDE_USAGE_TTL=0 CSM_USAGE_TTL_SECS=0 \
-    FAKE_LOG="$FAKE_LOG" \
-    "$CSM_BIN" run --profile a -n "${extra_csm_args[@]}" > "$suplog" 2>&1 &
-  SUP_PID=$!
-  ALL_PIDS+=("$SUP_PID")
+# ─── the sandbox environment ───────────────────────────────────────────────────
 
-  if ! wait_for_invocation_count "$FAKE_LOG" 1 10; then
-    rpt "  [$label] FAIL: fake claude never logged an invocation. supervisor log:"
-    rpt "$(cat "$suplog" 2>/dev/null)"
-    SID=""; CHILD_PID=""
-    return 1
+sbx_check() {
+  case "$HOME_DIR" in
+    "$SANDBOX"/home) ;;
+    *) echo "e2e: HOME_DIR is not the sandbox's; refusing" >&2; exit 97 ;;
+  esac
+  case "$UD" in
+    "$HOME_DIR"/*) ;;
+    *) echo "e2e: Orca userData is outside the sandbox home; refusing" >&2; exit 97 ;;
+  esac
+}
+
+E2E_PATH_BASE="/usr/bin:/bin:/usr/sbin:/sbin"
+
+# The whole environment of one csm call, in ENVV. EXTRA (an array the caller
+# may set) is appended last; PATH_PREFIX (a string) goes in front of the
+# sandbox bin dir.
+build_env() {
+  sbx_check
+  ENVV=(
+    "HOME=$HOME_DIR" "USER=e2e" "LOGNAME=e2e" "LANG=C" "TERM=xterm"
+    "PATH=${PATH_PREFIX:+$PATH_PREFIX:}$BIN:$E2E_PATH_BASE"
+    "TMPDIR=$SANDBOX/tmp"
+    "CSM_E2E_SANDBOX=$SANDBOX"
+    "CSM_E2E_SECURITY=$FAKES/security.pl"
+    "CSM_E2E_SECURITY_ROOT=$KC_ROOT"
+    "CSM_E2E_POINT_HOOK=$FAKES/point-hook.sh"
+    "CSM_USAGE_API_BASE=http://127.0.0.1:$HTTP_PORT"
+    "CSM_OAUTH_TOKEN_URL=http://127.0.0.1:$HTTP_PORT/v1/oauth/token"
+    "CSM_USAGE_CMD=/bin/sh $FAKES/usage-cmd.sh"
+    "CSM_USAGE_TTL_SECS=0" "CLAUDE_USAGE_TTL=0"
+    "E2E_USAGE_FIXTURE=$LOGS/usage.json"
+    "E2E_USAGE_CALLS=$LOGS/usage-calls"
+    "E2E_HOME=$HOME_DIR" "E2E_UD=$UD" "E2E_FAKES=$FAKES" "E2E_SEC_ROOT=$KC_ROOT"
+    "E2E_ORCA_EXE=$ORCA_EXE" "E2E_ORCA_LOG=$LOGS/orca-requests.log"
+    "E2E_ORCA_PIDS=$LOGS/orca.pids" "E2E_PIDS=$LOGS/pids"
+    "E2E_POINT_MARK=$LOGS/point.fired"
+    "FAKE_LOG=${FAKE_LOG:-$LOGS/claude.log}"
+  )
+  if [ "$HOST_OS" = linux ]; then
+    ENVV+=("CSM_E2E_ORCA_VERSION=1.4.214")
   fi
-  SID=$(get_invocation_field "$FAKE_LOG" 1 2)
-  CHILD_PID=$(get_invocation_pid "$FAKE_LOG" 1)
-  rpt "  [$label] supervisor pid=$SUP_PID fake-claude pid=$CHILD_PID sid=$SID"
+  if [ "${#EXTRA[@]}" -gt 0 ]; then
+    ENVV+=("${EXTRA[@]}")
+  fi
+}
+
+EXTRA=()
+
+# csm <args...>: run csm to completion; stdout+stderr go to $OUT (default
+# $LOGS/out), the exit code to RC. stdin is /dev/null. PROG replaces the
+# program (the `claude` alias).
+csm() {
+  local out="${OUT:-$LOGS/out}"
+  build_env
+  env -i "${ENVV[@]}" "${PROG:-$BIN/csm}" "$@" </dev/null >"$out" 2>&1
+  RC=$?
+  { printf '$ %s' "${PROG:-csm}"; printf ' %q' "$@"; printf '   (exit %s)\n' "$RC"; sed 's/^/    /' "$out"; } >>"$LOGS/transcript"
   return 0
 }
 
-# csm_env <fake_log>  -> the sandbox environment every direct csm call needs,
-# printed as `env` arguments. CLAUDE_CONFIG_DIR is unset so the call has to
-# resolve a profile the way a real shell would.
-csm_env() {
-  printf '%s\0' -u CLAUDE_CONFIG_DIR \
-    "HOME=$HOME_DIR" \
-    "CSM_USAGE_API_BASE=http://127.0.0.1:9" \
-    "CLAUDE_SMART_CLAUDE_BIN=$FAKE_BIN" \
-    "CSM_USAGE_CMD=$USAGE_CMD_SCRIPT" \
-    "CSM_USAGE_FIXTURE=${CUR_FIXTURE}" \
-    "CLAUDE_USAGE_TTL=0" "CSM_USAGE_TTL_SECS=0" \
-    "FAKE_LOG=$1"
+# csm_stdin <input> <args...>: csm with <input> on stdin (a pipe, so not a
+# terminal). Stdout to $LOGS/stdout, stderr to $LOGS/stderr, exit code to RC.
+csm_stdin() {
+  local input="$1"
+  shift
+  build_env
+  printf '%s' "$input" | env -i "${ENVV[@]}" "$BIN/csm" "$@" >"$LOGS/stdout" 2>"$LOGS/stderr"
+  RC=$?
+  { printf '$ csm'; printf ' %q' "$@"; printf '   (stdin, exit %s)\n' "$RC"; sed 's/^/    out: /' "$LOGS/stdout"; sed 's/^/    err: /' "$LOGS/stderr"; } >>"$LOGS/transcript"
+  return 0
 }
 
-# run_csm <fake_log> <args...> -- run csm directly (no supervisor) in the
-# sandbox. For calls that return; a call that reaches the fake claude blocks
-# until SIGTERM and must be backgrounded instead.
-# Sets globals: CSM_STDOUT, CSM_EXIT
-run_csm() {
-  local fake_log="$1"; shift
-  local outfile
-  outfile=$(mktemp "$LOG_DIR/csmout.XXXXXX")
-  local -a envargs=()
-  while IFS= read -r -d '' a; do envargs+=("$a"); done < <(csm_env "$fake_log")
-  env "${envargs[@]}" "$CSM_BIN" "$@" >"$outfile" 2>&1
-  CSM_EXIT=$?
-  CSM_STDOUT=$(cat "$outfile")
-  rm -f "$outfile"
+# world <command...>: the fixture helper (e2e/fakes/world.pl).
+world() {
+  sbx_check
+  env -i "HOME=$HOME_DIR" "USER=e2e" "PATH=$E2E_PATH_BASE" \
+    "E2E_HOME=$HOME_DIR" "E2E_UD=$UD" "E2E_SEC_ROOT=$KC_ROOT" \
+    /usr/bin/perl -I "$FAKES" "$FAKES/world.pl" "$@"
 }
 
-# run_csm_bg <fake_log> <args...> -- same, but backgrounded, for a call that
-# ends in the fake claude (which blocks until SIGTERM).
-# Sets globals: CSM_BG_PID
-run_csm_bg() {
-  local fake_log="$1"; shift
-  local -a envargs=()
-  while IFS= read -r -d '' a; do envargs+=("$a"); done < <(csm_env "$fake_log")
-  env "${envargs[@]}" "$CSM_BIN" "$@" > "$LOG_DIR/csmbg.log" 2>&1 &
-  CSM_BG_PID=$!
-  ALL_PIDS+=("$CSM_BG_PID")
+A_ID=aaaaaaaa-0000-4000-8000-00000000000a
+B_ID=bbbbbbbb-0000-4000-8000-00000000000b
+
+# fresh_world: wipe the sandbox home and lay out a new one: Orca's store with
+# alice (active) and bob, their stashes, D logged in as alice, an Orca.app
+# for version detection on macOS, and an empty csm state dir.
+fresh_world() {
+  sbx_check
+  rm -rf "$HOME_DIR"
+  mkdir -p "$HOME_DIR" "$STATE" "$SANDBOX/tmp" "$KC_ROOT/items"
+  : >"$KC_ROOT/calls"
+  if [ "$HOST_OS" = mac ]; then
+    mkdir -p "$HOME_DIR/Applications/Orca.app/Contents"
+    cp "$SANDBOX/Info.plist" "$HOME_DIR/Applications/Orca.app/Contents/Info.plist"
+  fi
+  world reset || { say "FAIL  world reset"; FAILED=$((FAILED + 1)); }
+  rm -f "$HTTP_DIR"/profile/* "$HTTP_DIR"/token/* "$HTTP_DIR"/usage/*
 }
 
-# run_hook <owner_dir> <json_payload> [extra env "K=V" ...]
-# Sets globals: HOOK_STDOUT, HOOK_STDERR, HOOK_EXIT
-run_hook() {
-  local owner="$1" json="$2"; shift 2
-  local extra_env=("$@")
-  local outfile errfile
-  outfile=$(mktemp "$LOG_DIR/hookout.XXXXXX")
-  errfile=$(mktemp "$LOG_DIR/hookerr.XXXXXX")
-  printf '%s' "$json" | env -u CLAUDE_CONFIG_DIR \
-    HOME="$HOME_DIR" \
-    CSM_USAGE_API_BASE="http://127.0.0.1:9" \
-    CLAUDE_SMART_CLAUDE_BIN="$FAKE_BIN" \
-    CSM_USAGE_CMD="$USAGE_CMD_SCRIPT" \
-    CSM_USAGE_FIXTURE="${CUR_FIXTURE}" \
-    CLAUDE_USAGE_TTL=0 CSM_USAGE_TTL_SECS=0 \
-    "${extra_env[@]}" \
-    "$CSM_BIN" hook --owner "$owner" >"$outfile" 2>"$errfile"
-  HOOK_EXIT=$?
-  HOOK_STDOUT=$(cat "$outfile")
-  HOOK_STDERR=$(cat "$errfile")
-  rm -f "$outfile" "$errfile"
+# ─── usage fixtures ────────────────────────────────────────────────────────────
+
+now_iso() { date -u +%Y-%m-%dT%H:%M:%SZ; }
+
+# section <pct> <resets_at>
+section() { printf '{"pct":%s,"resets":null,"resets_at":%s}' "$1" "$2"; }
+
+# profile_json <captured_at> <session> <week_all> <week_fable>
+profile_json() {
+  local at="$1" r=$(($(date +%s) + 3 * 86400))
+  printf '{"captured_at":"%s","session":%s,"week_all":%s,"week_fable":%s,"week_model_label":"Fable","session_stats":[],"source":"cmd"}' \
+    "$at" "$(section "$2" "$r")" "$(section "$3" "$r")" "$(section "$4" "$r")"
 }
 
-# run_capture <owner_dir> <statusline_json> [extra env "K=V" ...]
-# The statusline tick: `csm usage capture` with CLAUDE_CONFIG_DIR set to the
-# owning profile (that is how the real statusLine wrapper runs it).
-# Sets globals: CAP_STDOUT, CAP_EXIT
-run_capture() {
-  local owner="$1" json="$2"; shift 2
-  local extra_env=("$@")
-  local outfile
-  outfile=$(mktemp "$LOG_DIR/capout.XXXXXX")
-  printf '%s' "$json" | env \
-    HOME="$HOME_DIR" \
-    CLAUDE_CONFIG_DIR="$owner" \
-    CSM_USAGE_API_BASE="http://127.0.0.1:9" \
-    CLAUDE_SMART_CLAUDE_BIN="$FAKE_BIN" \
-    CSM_USAGE_CMD="$USAGE_CMD_SCRIPT" \
-    CSM_USAGE_FIXTURE="${CUR_FIXTURE}" \
-    CLAUDE_USAGE_TTL=0 CSM_USAGE_TTL_SECS=0 \
-    "${extra_env[@]}" \
-    "$CSM_BIN" usage capture >"$outfile" 2>&1
-  CAP_EXIT=$?
-  CAP_STDOUT=$(cat "$outfile")
-  rm -f "$outfile"
+# usage <a_session> <a_week> <a_fable> <b_session> <b_week> <b_fable> [captured_at]
+# Writes the CSM_USAGE_CMD fixture and csm's positive cache (what the hook
+# reads; it never runs the command) with the same reading.
+usage() {
+  local at="${7:-$(now_iso)}"
+  local body
+  body=$(printf '{"captured_at":"%s","profiles":{"%s":%s,"%s":%s}}' "$at" \
+    "$A_ID" "$(profile_json "$at" "$1" "$2" "$3")" \
+    "$B_ID" "$(profile_json "$at" "$4" "$5" "$6")")
+  printf '%s\n' "$body" >"$LOGS/usage.json"
+  mkdir -p "$STATE"
+  printf '%s\n' "$body" >"$STATE/.usage-cache.json"
 }
 
+usage_healthy() { usage 10 20 10 10 20 10 "$@"; }
+usage_a_capped() { usage 10 100 20 5 10 5 "$@"; }
+usage_b_capped() { usage 5 10 5 10 100 20 "$@"; }
+usage_both_capped() { usage 10 100 20 10 100 20 "$@"; }
+
+# store_record <id> <session> <week_all> <week_fable> [source]: csm's own
+# per-account usage record, as an API probe would leave it.
+store_record() {
+  local at
+  at=$(now_iso)
+  mkdir -p "$STATE/usage"
+  printf '{"profile":"%s","captured_at":"%s","source":"api","api_captured_at":"%s","cooldown_until":null,"usage":%s}\n' \
+    "$1" "$at" "$at" "$(profile_json "$at" "$2" "$3" "$4" | sed 's/"source":"cmd"/"source":"api"/')" \
+    >"$STATE/usage/$1.json"
+}
+
+stamp_last_switch() { date +%s >"$STATE/.last-switch"; }
+
+# ─── the fake HTTP endpoints ───────────────────────────────────────────────────
+
+# http_rule <profile|token|usage> <key> <status> <body>
+http_rule() {
+  mkdir -p "$HTTP_DIR/$1"
+  printf '%s\n%s' "$3" "$4" >"$HTTP_DIR/$1/$2"
+}
+
+# ─── the fake Orca ─────────────────────────────────────────────────────────────
+
+start_orca() {
+  build_env
+  env -i "${ENVV[@]}" /bin/sh "$FAKES/start-orca.sh" || {
+    say "FAIL  the fake Orca did not start"
+    FAILED=$((FAILED + 1))
+    return 1
+  }
+}
+
+# stop_orca: TERM both fake Orca processes and wait until they are gone and
+# the runtime file is removed.
+stop_orca() {
+  [ -f "$LOGS/orca.pids" ] || return 0
+  local p
+  for p in $(cat "$LOGS/orca.pids"); do kill -TERM "$p" 2>/dev/null; done
+  for p in $(cat "$LOGS/orca.pids"); do wait_dead "$p" 5; done
+  rm -f "$LOGS/orca.pids"
+}
+
+# orca_call <method> <params-json>: the Orca GUI doing something.
+orca_call() {
+  sbx_check
+  env -i "HOME=$HOME_DIR" "USER=e2e" "PATH=$E2E_PATH_BASE" \
+    "E2E_HOME=$HOME_DIR" "E2E_UD=$UD" "E2E_SEC_ROOT=$KC_ROOT" \
+    /usr/bin/perl -I "$FAKES" "$FAKES/orca.pl" call "$1" "$2" >>"$LOGS/gui-calls" 2>&1
+}
+
+# ─── processes ─────────────────────────────────────────────────────────────────
+
+alive() { [ -n "$1" ] && kill -0 "$1" 2>/dev/null; }
+
+# wait_dead <pid> <seconds>
+wait_dead() {
+  local i=0 n=$(($2 * 20))
+  while alive "$1" && [ "$i" -lt "$n" ]; do /bin/sleep 0.05; i=$((i + 1)); done
+  ! alive "$1"
+}
+
+# poll <seconds> <command...>: true as soon as the command succeeds.
+poll() {
+  local n=$(($1 * 10)) i=0
+  shift
+  while [ "$i" -lt "$n" ]; do
+    "$@" && return 0
+    /bin/sleep 0.1
+    i=$((i + 1))
+  done
+  "$@"
+}
+
+# ─── the fake claude's log ─────────────────────────────────────────────────────
+# INVOCATION blocks are interactive sessions; CALL blocks are one-shot runs
+# (print mode, `mcp`, a non-terminal stdin). Blocks count from 1.
+
+count_inv() { if [ -f "$1" ]; then grep -c '^=== INVOCATION' "$1"; else echo 0; fi; }
+count_calls() { if [ -f "$1" ]; then grep -c '^=== CALL' "$1"; else echo 0; fi; }
+inv_at_least() { [ "$(count_inv "$1")" -ge "$2" ]; }
+
+# inv_field <log> <n> <key>: pid | ppid | config_dir of the nth INVOCATION.
+inv_field() {
+  awk -v want="$2" -v key="$3" '
+    /^=== INVOCATION/ { n++; if (n == want) { for (i = 1; i <= NF; i++) if (index($i, key "=") == 1) { print substr($i, length(key) + 2); exit } } }
+  ' "$1"
+}
+
+# inv_argv <log> <n>: the nth INVOCATION's argv, one per line, argv[0] first.
+inv_argv() {
+  awk -v want="$2" '
+    /^=== INVOCATION/ { n++ }
+    n == want && /^argv\[[0-9]+\]=/ { sub(/^argv\[[0-9]+\]=/, ""); print }
+    n == want && /^=== END/ { exit }
+  ' "$1"
+}
+
+# inv_arg <log> <n> <i>: argv[i] of the nth INVOCATION.
+inv_arg() { inv_argv "$1" "$2" | sed -n "$(($3 + 1))p"; }
+
+# inv_has <log> <n> <value>
+inv_has() { inv_argv "$1" "$2" | grep -qxF -- "$3"; }
+
+# inv_pair <log> <n> <flag> <value>: <flag> immediately followed by <value>.
+inv_pair() {
+  inv_argv "$1" "$2" | awk -v f="$3" -v v="$4" 'prev == f && $0 == v { ok = 1 } { prev = $0 } END { exit !ok }'
+}
+
+# call_argv <log> <n>: the nth CALL's argv.
+call_argv() {
+  awk -v want="$2" '
+    /^=== CALL/ { n++ }
+    n == want && /^argv\[[0-9]+\]=/ { sub(/^argv\[[0-9]+\]=/, ""); print }
+    n == want && /^=== END/ { exit }
+  ' "$1"
+}
+
+# ─── supervisors ───────────────────────────────────────────────────────────────
+# A supervised launch needs a terminal on stdin (otherwise csm takes it for
+# print mode), so it runs under script(1), which gives it a pty.
+
+# start_sup <label> <csm args...>: launch `csm <args>` (or `$PROG <args>`) under script with its
+# own fake-claude log. Sets SUP_PID (the script process), FLOG, SID and
+# CHILD (the first fake claude's pid). Returns 1 when claude never starts.
+start_sup() {
+  local label="$1"
+  shift
+  FLOG="$LOGS/$label.claude.log"
+  local slog="$LOGS/$label.sup.log"
+  rm -f "$FLOG"
+  FAKE_LOG="$FLOG" build_env
+  if [ "$HOST_OS" = mac ]; then
+    env -i "${ENVV[@]}" /usr/bin/script -q /dev/null "${PROG:-$BIN/csm}" "$@" </dev/null >"$slog" 2>&1 &
+  else
+    local cmd
+    cmd=$(printf '%q ' "${PROG:-$BIN/csm}" "$@")
+    env -i "${ENVV[@]}" /usr/bin/script -qfc "$cmd" /dev/null </dev/null >"$slog" 2>&1 &
+  fi
+  SUP_PID=$!
+  echo "$SUP_PID" >>"$LOGS/pids"
+  SID=""
+  CHILD=""
+  if ! poll 10 inv_at_least "$FLOG" 1; then
+    say "FAIL  [$label] the fake claude never started"
+    show "$slog"
+    FAILED=$((FAILED + 1))
+    return 1
+  fi
+  CHILD=$(inv_field "$FLOG" 1 pid)
+  SID=$(inv_argv "$FLOG" 1 | awk 'prev == "--session-id" || prev == "--resume" { print; exit } { prev = $0 }')
+  say "[$label] supervisor=$SUP_PID claude=$CHILD sid=$SID"
+  return 0
+}
+
+# stop_sup <sup_pid> <flog>: end a supervised launch the way a user does:
+# TERM every fake claude it logged (the supervisor then exits with it), then
+# wait for script to exit; TERM script as a last resort.
+stop_sup() {
+  local sup="$1" flog="$2" p
+  if [ -f "$flog" ]; then
+    for p in $(awk '/^=== INVOCATION/ { for (i = 1; i <= NF; i++) if ($i ~ /^pid=[0-9]+$/) { sub(/^pid=/, "", $i); print $i } }' "$flog"); do
+      alive "$p" && kill -TERM "$p" 2>/dev/null
+    done
+  fi
+  if ! wait_dead "$sup" 5; then
+    kill -TERM "$sup" 2>/dev/null
+    wait_dead "$sup" 2 || kill -KILL "$sup" 2>/dev/null
+  fi
+  wait "$sup" 2>/dev/null
+  return 0
+}
+
+# ─── hook and statusline events ────────────────────────────────────────────────
+
+# hook_json <event> <sid> [extra json members]
+hook_json() {
+  local tp="$SANDBOX/transcripts/$2.jsonl"
+  printf '{"session_id":"%s","transcript_path":"%s","cwd":"/tmp/e2e-cwd","permission_mode":"default","hook_event_name":"%s"%s}' \
+    "$2" "$tp" "$1" "${3:+,$3}"
+}
+
+rate_limit_json() {
+  hook_json StopFailure "$1" '"error":"rate_limit","error_details":"You have reached your weekly limit."'
+}
+stop_json() { hook_json Stop "$1" '"stop_hook_active":false,"last_assistant_message":"done"'; }
+
+# hook <json>: `csm hook` with the event on stdin.
+hook() { csm_stdin "$1" hook; }
+
+# statusline_json <sid> <five_hour_pct> <seven_day_pct>
 statusline_json() {
-  # statusline_json <sid> <cwd> <five_hour_pct> <seven_day_pct>
-  local sid="$1" cwd="$2" fh="$3" sd="$4"
-  local tp="$TRANSCRIPTS_DIR/$sid.jsonl"
-  cat <<EOF
-{"hook_event_name":"Status","session_id":"$sid","transcript_path":"$tp","cwd":"$cwd","model":{"id":"claude-fable-5-1","display_name":"Fable 5.1"},"workspace":{"current_dir":"$cwd","project_dir":"$cwd"},"version":"2.1.270","rate_limits":{"five_hour":{"used_percentage":$fh,"resets_at":1789985119},"seven_day":{"used_percentage":$sd,"resets_at":1789985119}}}
-EOF
+  local r=$(($(date +%s) + 3 * 86400))
+  printf '{"hook_event_name":"Status","session_id":"%s","transcript_path":"%s","cwd":"/tmp/e2e-cwd","model":{"id":"claude-fable-5-1","display_name":"Fable 5.1"},"workspace":{"current_dir":"/tmp/e2e-cwd","project_dir":"/tmp/e2e-cwd"},"version":"2.1.283","rate_limits":{"five_hour":{"used_percentage":%s,"resets_at":%s},"seven_day":{"used_percentage":%s,"resets_at":%s}}}' \
+    "$1" "$SANDBOX/transcripts/$1.jsonl" "$2" "$r" "$3" "$r"
 }
+
+# tick <json>: one statusLine tick (`csm usage capture`).
+tick() { csm_stdin "$1" usage capture; }
+
+# ─── state readers ─────────────────────────────────────────────────────────────
+
+active() { world active; }
+d_refresh() { world d-refresh; }
+d_uuid() { world d-uuid; }
+stash_refresh() { world stash-refresh "$1"; }
+switch_log() { printf '%s\n' "$STATE/limit-switch.log"; }

@@ -31,14 +31,40 @@ pub struct ChildHandle {
 ///   4. Leave the terminal usable for the relaunch loop afterward.
 ///   5. Remove `<sid>.pid` is the relaunch loop's job, not the launcher's.
 ///
-/// The `env` map contains child-only environment overrides (e.g.
-/// `CLAUDE_CONFIG_DIR`).  Impls merge these into the inherited environment
-/// rather than replacing it wholesale.
+/// `env` holds child-only changes to the inherited environment: variables to
+/// set (e.g. `CLAUDE_CONFIG_DIR` when the inherited value is not `D`) and
+/// variables to remove (credential env that would override the managed
+/// account). Impls apply them to the inherited environment rather than
+/// replacing it wholesale.
+///
+/// `on_spawn` runs once, right after the child is spawned and its pidfile
+/// written, before the launcher blocks in wait: the relaunch loop starts its
+/// after-spawn work (switch recovery) there, never before exec.
 pub trait Launcher {
     fn run_foreground(
         &self,
         sid: &str,
         cli: &[OsString],
-        env: &HashMap<OsString, OsString>, // child-only overrides
+        env: &ChildEnv,
+        on_spawn: &mut dyn FnMut(),
     ) -> io::Result<(ExitStatus, ChildHandle)>;
+}
+
+/// Child-only environment changes (see [`Launcher`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ChildEnv {
+    pub set: HashMap<OsString, OsString>,
+    pub remove: Vec<OsString>,
+}
+
+impl ChildEnv {
+    /// Apply to a `Command` that inherits the parent's environment.
+    pub fn apply(&self, cmd: &mut std::process::Command) {
+        for k in &self.remove {
+            cmd.env_remove(k);
+        }
+        for (k, v) in &self.set {
+            cmd.env(k, v);
+        }
+    }
 }

@@ -1,72 +1,58 @@
-//! `csm statusline` — print `<profile>@<host>` for shell prompt integration.
-//!
-//! Ships **dormant**: `csm statusline` is built but the `settings.json`
-//! `statuslineCommand` entry still points at the legacy shell script until an
-//! explicit cutover is made.
+//! `csm statusline` — print `<account>@<host>` for Claude Code's statusLine
+//! (or a shell prompt).
 //!
 //! ## Output contract
 //!
-//! The `<profile>@<host>` segment is the **host field** that appears first in
-//! the rendered status line; `run()` emits this segment alone (with a trailing
-//! newline) for the dormant / testing use-case.
+//! One line: the host field, `<label>@<host>` when csm knows which Orca
+//! account the session runs on, else `<host>`. The label is the local part of
+//! the account's email (design §9), or the first 8 chars of its id when Orca
+//! has no email for it.
 //!
 //! ## Piggyback statusLine capture (local usage collection)
 //!
 //! Claude Code's own `statusLine` command runs with the full statusLine JSON
-//! (which carries `rate_limits` for the *active* profile, refreshed roughly
-//! once a second) on stdin — a shell prompt or manual invocation, by contrast,
-//! inherits a TTY stdin with nothing on it. `run()` tells the two apart with
-//! `stdin().is_terminal()`: when stdin is NOT a terminal (the statusLine case),
-//! it reads stdin (capped, see [`CAPTURE_STDIN_CAP_BYTES`]) and feeds it to
-//! [`usage::local::record_statusline_payload`] best-effort — every error is
-//! swallowed, since a malformed/partial payload must never turn the segment
-//! this command exists to print into an error. `CSM_STATUSLINE_NO_CAPTURE=1`
-//! (or `true`) disables the read entirely, e.g. for a caller that pipes
-//! something else into a piped, non-interactive `csm statusline` and does not
-//! want its stdin consumed for capture.
+//! (which carries `rate_limits` for the live account, refreshed roughly once a
+//! second) on stdin; a shell prompt or manual invocation inherits a TTY stdin
+//! with nothing on it. `run()` tells the two apart with
+//! `stdin().is_terminal()`: when stdin is NOT a terminal it reads stdin
+//! (capped, see [`CAPTURE_STDIN_CAP_BYTES`]) and feeds it to
+//! [`usage::local::record_statusline_payload_in`] best-effort. The reading is
+//! attributed to an account by the identity-change rule in
+//! `usage::local` (design §4 "Attribution"). `CSM_STATUSLINE_NO_CAPTURE=1`
+//! (or `true`) disables the read entirely.
 //!
-//! The same captured payload then drives the limit-switch trigger
-//! ([`crate::hook::run_from_statusline`]) after the segment has been printed,
-//! so a session whose account just hit a cap gets moved to another profile
-//! even when Claude Code fires no hook for it (see `hook/mod.rs`). Disabling
-//! the capture disables that trigger too.
+//! After the segment is printed, the same payload:
 //!
-//! ### Profile resolution
-//!
-//! 1. Take the **basename** of `$CLAUDE_CONFIG_DIR`.
-//! 2. If it starts with `.claude.`, strip that prefix →
-//!    `/home/you/.claude.work` → `"work"`.
-//! 3. Otherwise the host field shows **only** the hostname (no profile prefix).
-//! 4. If `CLAUDE_CONFIG_DIR` is unset, no profile prefix is prepended.
+//! 1. is forwarded to Orca's `/statusline/claude` receiver when the session
+//!    runs in an Orca pane (design §8, [`crate::orca::forward`]): the gate and
+//!    the 15 s throttle run here, the POST runs in a detached
+//!    `csm statusline --orca-forward` child;
+//! 2. drives the limit-switch trigger ([`crate::hook::run_from_statusline`]),
+//!    since Claude Code fires no hook for a subscription cap. Disabling the
+//!    capture disables both.
 //!
 //! ### Host display
 //!
 //! The short hostname (first DNS label) is read at runtime and optionally
-//! rewritten by the `CSM_HOST_REPLACE` rule (see [`apply_host_replace`]) — the
+//! rewritten by the `CSM_HOST_REPLACE` rule (see [`apply_host_replace`]); the
 //! binary hardcodes no naming convention. With `CSM_HOST_REPLACE=Acme-/` a host
 //! `Acme-Laptop` renders as `Laptop`; with no rule it renders verbatim.
-//!
-//! ### Personal-machine gate
-//!
-//! The host field gains a profile prefix only when a profile registry is
-//! present — the *presence* of `~/.config/claude-as/profiles.json`. When that
-//! file is absent the host field is rendered without a profile prefix.
 //!
 //! ## Segment format
 //!
 //! | Condition | Output |
 //! |-----------|--------|
-//! | registry present, `CLAUDE_CONFIG_DIR` = `…/.claude.home` | `home@Laptop` |
-//! | registry present, `CLAUDE_CONFIG_DIR` = `…/.claude.work` | `work@Laptop` |
-//! | registry present, `CLAUDE_CONFIG_DIR` unset or bare dir name | `Laptop` |
-//! | no registry | `Laptop` |
+//! | account known, email `alice@example.com` | `alice@Laptop` |
+//! | account known, no email | `<first 8 chars of id>@Laptop` |
+//! | no account known | `Laptop` |
 
 use std::ffi::OsString;
 use std::io::IsTerminal;
-use std::path::Path;
 
 use anyhow::Result;
 
+use crate::account::accounts::AccountSet;
+use crate::orca::forward;
 use crate::usage;
 
 // ─── Public entry point ───────────────────────────────────────────────────────
@@ -77,38 +63,37 @@ use crate::usage;
 /// entry points that happen to share the same defensive ceiling.
 const CAPTURE_STDIN_CAP_BYTES: u64 = 256 * 1024;
 
-/// Subcommand handler: print `<profile>@<host>` (or just `<host>`) to stdout.
+/// Subcommand handler: print `<label>@<host>` (or just `<host>`) to stdout.
 ///
-/// Matches the legacy shell implementation's host-display block:
+/// Also piggybacks the statusLine-stdin usage capture, the Orca forward and
+/// the limit trigger (see the module doc). None of them affects the printed
+/// segment or the exit code.
 ///
-/// ```sh
-/// host=$(hostname -s)
-/// host="${host#Acme-}"
-/// if [ "$IS_PERSONAL_MACHINE" = "1" ] && [ -n "${CLAUDE_CONFIG_DIR:-}" ]; then
-///   profile=$(basename "$CLAUDE_CONFIG_DIR")
-///   case "$profile" in
-///     .claude.*) host="${profile#.claude.}@${host}" ;;
-///   esac
-/// fi
-/// ```
-///
-/// Also piggybacks the statusLine-stdin usage capture (see the module doc)
-/// before rendering: when stdin is not a terminal and the capture gate is not
-/// disabled, stdin is read and handed to
-/// [`usage::local::record_statusline_payload`], best-effort. This never
-/// affects the printed segment or the exit code — a capture failure is
-/// invisible to whatever renders this command's output in the prompt.
-pub fn run(_args: &[OsString]) -> Result<()> {
-    let captured = if should_capture_stdin() {
-        let raw = read_stdin_capped(CAPTURE_STDIN_CAP_BYTES);
-        usage::local::record_statusline_payload(&raw)
+/// `csm statusline --orca-forward` is the forwarding child
+/// ([`forward::run_child`]); it prints nothing.
+pub fn run(args: &[OsString]) -> Result<()> {
+    if args.first().is_some_and(|a| a == forward::FORWARD_ARG) {
+        forward::run_child();
+        return Ok(());
+    }
+    let raw = should_capture_stdin().then(|| read_stdin_capped(CAPTURE_STDIN_CAP_BYTES));
+    let accounts = AccountSet::load();
+    let capture = raw.as_deref().and_then(|r| {
+        usage::local::record_statusline_payload_in(r, &accounts)
             .ok()
             .flatten()
-            .map(|capture| (raw, capture))
-    } else {
-        None
-    };
-    run_with_capture(captured)
+    });
+    let label = segment_label(&accounts, capture.as_ref().map(|c| c.account_id.as_str()));
+    run_with_capture(raw, capture, label)
+}
+
+/// The account label for the segment: the capture's account, else `D`'s
+/// current account, else none.
+fn segment_label(accounts: &AccountSet, captured: Option<&str>) -> Option<String> {
+    captured
+        .filter(|id| !id.is_empty())
+        .or(accounts.current.as_deref())
+        .map(|id| accounts.label(id))
 }
 
 /// The body of [`run`] after the piggybacked stdin capture has been resolved.
@@ -119,13 +104,21 @@ pub fn run(_args: &[OsString]) -> Result<()> {
 /// thread holds `Stdin`'s internal lock for the rest of its blocking read, so
 /// any later test that touches stdin then hangs waiting on that lock.
 pub(crate) fn run_with_capture(
-    captured: Option<(String, usage::local::StatuslineCapture)>,
+    raw: Option<String>,
+    capture: Option<usage::local::StatuslineCapture>,
+    label: Option<String>,
 ) -> Result<()> {
-    let segment = render_segment()?;
+    let segment = format_segment(short_hostname()?, label.as_deref());
     println!("{segment}");
-    // The limit-switch trigger runs after the segment is out: it may end
-    // this very session, and the prompt should still have been drawn.
-    if let Some((raw, capture)) = captured {
+    let Some(raw) = raw else {
+        return Ok(());
+    };
+    // Orca's feed first: the limit trigger below may end this session.
+    let payload = forward::normalize_payload(&raw);
+    if forward::gate_and_stamp(payload) {
+        forward::spawn_forward(payload);
+    }
+    if let Some(capture) = capture {
         crate::hook::run_from_statusline(&raw, &capture);
     }
     Ok(())
@@ -198,97 +191,12 @@ fn read_stdin_capped(max_bytes: u64) -> String {
     }
 }
 
-/// Compute the `<profile>@<host>` (or bare `<host>`) segment.
-///
-/// Separated from `run()` so tests can call it without spawning a process.
-pub fn render_segment() -> Result<String> {
-    let host = short_hostname()?;
-    let segment = format_segment(host, is_personal_machine());
-    Ok(segment)
-}
-
-/// Build the host segment from a pre-computed short hostname.
-///
-/// Factored out so tests can inject both the hostname and the personal-flag
-/// without touching process environment or the filesystem.
-///
-/// Logic (mirrors sh lines 166–171):
-/// - If `personal` is false → return `host` as-is.
-/// - Read `CLAUDE_CONFIG_DIR`; if absent → return `host`.
-/// - Take basename; if it starts with `.claude.` → `"{label}@{host}"`.
-/// - Otherwise → `host`.
-pub fn format_segment(host: String, personal: bool) -> String {
-    if !personal {
-        return host;
-    }
-    match std::env::var_os("CLAUDE_CONFIG_DIR") {
+/// Build the host segment. Pure.
+pub fn format_segment(host: String, label: Option<&str>) -> String {
+    match label.map(str::trim).filter(|l| !l.is_empty()) {
+        Some(l) => format!("{l}@{host}"),
         None => host,
-        Some(dir) => {
-            let base = Path::new(&dir)
-                .file_name()
-                .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_default();
-            // Only a `.claude.<profile>` dir gets a profile label; any other dir
-            // shows the bare host. `strip_claude_prefix` returns the input unchanged
-            // when the prefix is absent, so detect that case to preserve the
-            // label-only-for-managed-profiles behavior.
-            let label = strip_claude_prefix(&base);
-            if label != base {
-                format!("{label}@{host}")
-            } else {
-                host
-            }
-        }
     }
-}
-
-// ─── Profile resolution ───────────────────────────────────────────────────────
-
-/// Derive the profile label from `$CLAUDE_CONFIG_DIR`.
-///
-/// Rules (matches the legacy shell implementation):
-/// - Absent env var → `"unknown"`.
-/// - Take `basename($CLAUDE_CONFIG_DIR)`.
-/// - If the basename starts with `.claude.`, strip that prefix.
-/// - Otherwise return the raw basename.
-///
-/// Tested helper; `format_segment` is the live statusline path. Reserved for a
-/// future profile-name display (e.g. `csm cas` status) that wants the raw label
-/// without the `@host` suffix.
-#[allow(dead_code)]
-pub fn current_profile() -> Result<String> {
-    let dir = std::env::var_os("CLAUDE_CONFIG_DIR");
-    match dir {
-        None => Ok("unknown".to_owned()),
-        Some(path) => {
-            let p = Path::new(&path);
-            match p.file_name() {
-                Some(name) => {
-                    let base = name.to_string_lossy();
-                    let label = strip_claude_prefix(&base);
-                    Ok(label.to_owned())
-                }
-                None => {
-                    // Path ends in a root or is somehow empty; fall back to
-                    // the raw string rather than erroring (defensive).
-                    Ok(path.to_string_lossy().into_owned())
-                }
-            }
-        }
-    }
-}
-
-/// Strip the `.claude.` prefix if present, otherwise return `s` as-is.
-///
-/// Examples:
-/// ```text
-/// ".claude.home"  →  "home"
-/// ".claude.work"   →  "work"
-/// ".claude."          →  ""   (degenerate — prefix present but suffix empty)
-/// "myprofile"         →  "myprofile"
-/// ```
-pub fn strip_claude_prefix(s: &str) -> &str {
-    s.strip_prefix(".claude.").unwrap_or(s)
 }
 
 // ─── Hostname ─────────────────────────────────────────────────────────────────
@@ -371,34 +279,6 @@ fn hostname_impl() -> Result<String> {
     Ok(OsString::from_wide(&buf).to_string_lossy().into_owned())
 }
 
-// ─── Personal machine detection ───────────────────────────────────────────────
-
-/// Return `true` if this appears to be a personal machine.
-///
-/// The sh/ps1 scripts bake `IS_PERSONAL_MACHINE` at Ansible deploy time. A single
-/// cross-platform binary cannot bake a compile-time constant, so the signal is,
-/// in priority order:
-///
-/// 1. The `IS_PERSONAL_MACHINE` env var, if set to `1`/`true`/`0`/`false`
-///    (the deploy may still export it via settings.json env — honour it first,
-///    matching the sh script's source-of-truth exactly).
-/// 2. Otherwise, **delegate to the `.claude.` match itself**: on a toss/non-managed
-///    box `CLAUDE_CONFIG_DIR` is never a `.claude.<profile>` path (toss uses bare
-///    `~/.claude` or leaves it unset), so `format_segment`'s prefix match already
-///    encodes the gate. Returning `true` here is safe — the profile prefix only
-///    appears when the dir genuinely is `.claude.<profile>`.
-///
-/// The old `profiles.json`-presence heuristic was dropped: it produced a false
-/// negative whenever the binary ran before ansible had deployed that file
-/// (e.g. fresh checkout / dev box), hiding the `home@host` prefix.
-pub fn is_personal_machine() -> bool {
-    match std::env::var("IS_PERSONAL_MACHINE") {
-        Ok(v) => matches!(v.trim(), "1" | "true" | "True" | "TRUE" | "yes"),
-        // Unset → delegate to the .claude.<profile> match in format_segment.
-        Err(_) => true,
-    }
-}
-
 // ─── Tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -410,108 +290,6 @@ mod tests {
     // CLAUDE_CONFIG_DIR-mutating tests, since a module-local lock cannot
     // protect against a different module's test interleaving on the same
     // process-global variable. See `crate::testenv` for why.
-
-    /// Set `CLAUDE_CONFIG_DIR`, call `current_profile()`, then restore original.
-    fn profile_with_dir(dir: &str) -> String {
-        crate::testenv::with_env_var("CLAUDE_CONFIG_DIR", Some(dir), || {
-            current_profile().expect("current_profile() must not fail")
-        })
-    }
-
-    /// Call `current_profile()` with `CLAUDE_CONFIG_DIR` absent.
-    fn profile_with_no_var() -> String {
-        crate::testenv::with_env_var("CLAUDE_CONFIG_DIR", None, || {
-            current_profile().expect("current_profile() must not fail when var is absent")
-        })
-    }
-
-    /// Call `format_segment` with a specific `CLAUDE_CONFIG_DIR` (personal machine).
-    fn segment_personal(dir: &str) -> String {
-        crate::testenv::with_env_var("CLAUDE_CONFIG_DIR", Some(dir), || {
-            format_segment("Laptop".to_owned(), true)
-        })
-    }
-
-    /// Call `format_segment` without `CLAUDE_CONFIG_DIR` (personal machine, no dir set).
-    fn segment_personal_no_dir() -> String {
-        crate::testenv::with_env_var("CLAUDE_CONFIG_DIR", None, || {
-            format_segment("Laptop".to_owned(), true)
-        })
-    }
-
-    // ── strip_claude_prefix ───────────────────────────────────────────────────
-
-    #[test]
-    fn strip_prefix_personal() {
-        assert_eq!(strip_claude_prefix(".claude.home"), "home");
-    }
-
-    #[test]
-    fn strip_prefix_work() {
-        assert_eq!(strip_claude_prefix(".claude.work"), "work");
-    }
-
-    #[test]
-    fn strip_prefix_no_prefix() {
-        assert_eq!(strip_claude_prefix("myprofile"), "myprofile");
-    }
-
-    #[test]
-    fn strip_prefix_degenerate_empty_suffix() {
-        // ".claude." → strip gives "" (degenerate but should not panic)
-        assert_eq!(strip_claude_prefix(".claude."), "");
-    }
-
-    #[test]
-    fn strip_prefix_bare_claude_no_dot() {
-        // ".claude" (no trailing dot) → no strip
-        assert_eq!(strip_claude_prefix(".claude"), ".claude");
-    }
-
-    // ── current_profile — env var extraction ─────────────────────────────────
-
-    #[test]
-    fn leaf_personal_path() {
-        // /home/you/.claude.home  →  basename ".claude.home"  →  "home"
-        assert_eq!(profile_with_dir("/home/you/.claude.home"), "home");
-    }
-
-    #[test]
-    fn leaf_work_path() {
-        // /home/you/.claude.work  →  basename ".claude.work"  →  "work"
-        assert_eq!(profile_with_dir("/home/you/.claude.work"), "work");
-    }
-
-    #[test]
-    fn leaf_macos_style_path() {
-        // /Users/example/.claude.home  →  "home"
-        assert_eq!(profile_with_dir("/Users/example/.claude.home"), "home");
-    }
-
-    #[test]
-    fn leaf_bare_profile_no_dot_prefix() {
-        // A dir with no .claude. prefix is returned as-is.
-        assert_eq!(profile_with_dir("myprofile"), "myprofile");
-    }
-
-    #[test]
-    fn leaf_trailing_slash_stripped() {
-        // std::path::Path normalises trailing slashes; basename is still correct.
-        assert_eq!(profile_with_dir("/home/you/.claude.home/"), "home");
-    }
-
-    #[test]
-    fn absent_env_var_returns_unknown() {
-        assert_eq!(profile_with_no_var(), "unknown");
-    }
-
-    #[test]
-    fn leaf_windows_style_path_does_not_panic() {
-        // On POSIX, Path::file_name on a Windows-style path treats the whole
-        // string as the basename (no separator recognised).  Must not panic.
-        let result = profile_with_dir(r"C:\Users\example\.claude.home");
-        assert!(!result.is_empty());
-    }
 
     // ── apply_host_replace (CSM_HOST_REPLACE rewrite rule) ────────────────────
 
@@ -579,77 +357,63 @@ mod tests {
         );
     }
 
-    // ── format_segment — the full host-display logic ──────────────────────────
+    // ── format_segment / segment_label ────────────────────────────────────────
 
     #[test]
-    fn segment_personal_with_home_dir() {
-        // personal machine + CLAUDE_CONFIG_DIR = …/.claude.home  →  "home@Laptop"
-        let seg = segment_personal("/Users/example/.claude.home");
-        assert_eq!(seg, "home@Laptop");
-    }
-
-    #[test]
-    fn segment_personal_with_work_dir() {
-        // personal machine + CLAUDE_CONFIG_DIR = …/.claude.work  →  "work@Laptop"
-        let seg = segment_personal("/Users/example/.claude.work");
-        assert_eq!(seg, "work@Laptop");
-    }
-
-    #[test]
-    fn segment_personal_with_bare_dir_no_prefix() {
-        // personal machine + CLAUDE_CONFIG_DIR = dir with no .claude.* prefix → no @ prefix
-        let seg = segment_personal("/Users/example/.claude");
-        // ".claude" does not start with ".claude." (note the trailing dot) → host only
-        assert_eq!(seg, "Laptop");
-    }
-
-    #[test]
-    fn segment_personal_no_claude_config_dir() {
-        // personal machine but CLAUDE_CONFIG_DIR unset → host only
-        let seg = segment_personal_no_dir();
-        assert_eq!(seg, "Laptop");
-    }
-
-    #[test]
-    fn segment_toss_machine_ignores_dir() {
-        // toss / non-personal machine: profile prefix must NOT appear
-        crate::testenv::with_env_var("CLAUDE_CONFIG_DIR", Some("/some/.claude.home"), || {
-            let seg = format_segment("Laptop".to_owned(), false /* personal=false */);
-            assert_eq!(seg, "Laptop");
-        });
-    }
-
-    #[test]
-    fn segment_workstation_personal() {
-        // Acme- prefix stripped + work profile → "work@Workstation"
-        crate::testenv::with_env_var(
-            "CLAUDE_CONFIG_DIR",
-            Some("/Users/example/.claude.work"),
-            || {
-                let host = apply_host_replace("Acme-Workstation".to_owned(), Some("Acme-/"));
-                let seg = format_segment(host, true);
-                assert_eq!(seg, "work@Workstation");
-            },
+    fn segment_with_label() {
+        assert_eq!(
+            format_segment("Laptop".to_owned(), Some("alice")),
+            "alice@Laptop"
         );
     }
 
     #[test]
-    fn segment_windows_personal() {
-        // ACME-WINDOWS (NetBIOS uppercased) + personal  →  "home@WINDOWS"
-        crate::testenv::with_env_var(
-            "CLAUDE_CONFIG_DIR",
-            Some(r"C:\Users\example\.claude.home"),
-            || {
-                let host = apply_host_replace("ACME-WINDOWS".to_owned(), Some("Acme-/"));
-                // On POSIX, Path::file_name treats the Windows-style path as
-                // one token; the basename is the whole string. We only
-                // assert the Acme- strip here.
-                let seg = format_segment(host, true);
-                // On POSIX the Windows-path basename won't match .claude.*
-                // after file_name(), so the host-only branch fires — just
-                // verify no panic.
-                assert!(!seg.is_empty());
-            },
+    fn segment_without_label_is_host() {
+        assert_eq!(format_segment("Laptop".to_owned(), None), "Laptop");
+        assert_eq!(format_segment("Laptop".to_owned(), Some("  ")), "Laptop");
+    }
+
+    #[test]
+    fn segment_after_host_replace() {
+        let host = apply_host_replace("Acme-Workstation".to_owned(), Some("Acme-/"));
+        assert_eq!(format_segment(host, Some("bob")), "bob@Workstation");
+    }
+
+    fn entry(id: &str, email: Option<&str>) -> crate::account::accounts::AccountEntry {
+        crate::account::accounts::AccountEntry {
+            id: id.to_owned(),
+            email: email.map(str::to_owned),
+            organization_name: None,
+            managed_auth_path: None,
+        }
+    }
+
+    #[test]
+    fn label_prefers_the_capture_then_current() {
+        let set = AccountSet {
+            accounts: vec![
+                entry("a1", Some("alice@example.com")),
+                entry("b2", Some("bob@example.com")),
+            ],
+            current: Some("a1".to_owned()),
+            ..AccountSet::default()
+        };
+        assert_eq!(segment_label(&set, Some("b2")).as_deref(), Some("bob"));
+        assert_eq!(segment_label(&set, None).as_deref(), Some("alice"));
+        assert_eq!(segment_label(&set, Some("")).as_deref(), Some("alice"));
+        let empty = AccountSet::default();
+        assert_eq!(segment_label(&empty, None), None);
+    }
+
+    #[test]
+    fn label_of_an_account_without_email_is_the_id_prefix() {
+        let set = AccountSet {
+            accounts: vec![entry("0123456789abcdef", None)],
+            ..AccountSet::default()
+        };
+        assert_eq!(
+            segment_label(&set, Some("0123456789abcdef")).as_deref(),
+            Some("01234567")
         );
     }
 
@@ -735,56 +499,13 @@ mod tests {
         // `run_with_capture` directly with no capture, exactly what
         // `should_capture_stdin` returning false (or a timed-out read)
         // produces.
-        crate::testenv::with_env_var(
-            "CLAUDE_CONFIG_DIR",
-            Some("/Users/example/.claude.test"),
-            || {
-                let result = run_with_capture(None);
-                assert!(
-                    result.is_ok(),
-                    "run_with_capture(None) returned Err: {:?}",
-                    result.unwrap_err()
-                );
-            },
+        let result = run_with_capture(None, None, Some("alice".to_owned()));
+        assert!(
+            result.is_ok(),
+            "run_with_capture returned Err: {:?}",
+            result.err()
         );
     }
-
-    #[test]
-    fn render_segment_returns_nonempty() {
-        let seg = render_segment().expect("render_segment must not error");
-        assert!(!seg.is_empty());
-    }
-
-    // ── is_personal_machine env gate ──────────────────────────────────────────
-
-    #[test]
-    fn personal_gate_env_explicit_false() {
-        crate::testenv::with_env_var("IS_PERSONAL_MACHINE", Some("0"), || {
-            assert!(!is_personal_machine(), "IS_PERSONAL_MACHINE=0 → false");
-        });
-        crate::testenv::with_env_var("IS_PERSONAL_MACHINE", Some("false"), || {
-            assert!(!is_personal_machine(), "IS_PERSONAL_MACHINE=false → false");
-        });
-    }
-
-    #[test]
-    fn personal_gate_env_explicit_true() {
-        crate::testenv::with_env_var("IS_PERSONAL_MACHINE", Some("1"), || {
-            assert!(is_personal_machine(), "IS_PERSONAL_MACHINE=1 → true");
-        });
-    }
-
-    #[test]
-    fn personal_gate_unset_delegates_true() {
-        // Unset → delegate to the .claude. match (returns true; the prefix match
-        // in format_segment is the real gate). This is the fix for the
-        // profiles.json-absent false-negative.
-        crate::testenv::with_env_var("IS_PERSONAL_MACHINE", None, || {
-            assert!(is_personal_machine());
-        });
-    }
-
-    // ── capture_disabled_by_env (CSM_STATUSLINE_NO_CAPTURE gate) ─────────────
 
     #[test]
     fn capture_disabled_by_env_unset_is_false() {

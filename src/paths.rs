@@ -1,17 +1,30 @@
-//! Paths SSOT — every `$SMART_DIR`-relative filename in one place.
+//! Paths SSOT — every state-dir-relative filename in one place.
 //!
 //! Rule: **no hardcoded path strings outside this module**. Every caller that
-//! needs a file under `smart_dir()` uses the constructors here.
+//! needs a file under csm's state dir uses the constructors here.
 //!
-//! `$SMART_DIR` = `$HOME/.claude.shared/smart` (POSIX) or
-//!               `%USERPROFILE%\.claude.shared\smart` (Windows).
+//! The state dir ([`smart_dir`]) is `orca::fsx::state_dir`: `$XDG_STATE_HOME/csm`
+//! (absolute values only), else `~/.local/state/csm`, on every unix including
+//! macOS; `%LOCALAPPDATA%\csm` on Windows. The retired profile setup kept it
+//! at `~/.claude.shared/smart`; `csm migrate import` moves the session
+//! sidecars, `titles.tsv` and the scan indexes from there and leaves the
+//! caches and per-profile records behind unread.
+//!
+//! Sessions live under csm's runtime dir `D` ([`runtime_dir`]): transcripts in
+//! `<D>/projects`, the live-session registry in `<D>/sessions`.
+//!
 //! [`home_dir`] resolves the current user's home directory cross-platform.
+//!
+//! Test guard: under `cfg(test)` [`home_dir`] is the thread's test home
+//! (`testenv::with_test_home`), and with none set a fixed path under the temp
+//! dir. It never falls back to the real home, so no test can resolve csm's
+//! real state dir, `~/.claude` or `~/.config/claude-smart`.
 
 use std::io;
 use std::path::{Path, PathBuf};
 
 /// The one home-dir resolver every path constructor in this module (and
-/// `usage::local::creds`) uses.
+/// `orca::HostEnv::current`) uses.
 ///
 /// Production body is exactly `dirs::home_dir()`. Under test, `dirs::home_dir()`
 /// itself is not fixture-friendly on Windows: it calls
@@ -24,49 +37,68 @@ pub(crate) fn home_dir() -> Option<PathBuf> {
     dirs::home_dir()
 }
 
+/// Test build: the thread's test home, else [`no_test_home`]. Never the real
+/// home.
 #[cfg(test)]
 pub(crate) fn home_dir() -> Option<PathBuf> {
-    crate::testenv::test_home().or_else(dirs::home_dir)
+    Some(crate::testenv::test_home().unwrap_or_else(no_test_home))
 }
 
-/// Return the smart state directory, creating it if it does not yet exist.
+/// Where a test that set no test home lands: a fixed dir under the temp dir,
+/// so a forgotten fixture writes into scratch space, never the real home.
+#[cfg(test)]
+pub(crate) fn no_test_home() -> PathBuf {
+    std::env::temp_dir().join("csm-test-no-home")
+}
+
+/// The environment the state and runtime dirs resolve from.
+#[cfg(not(test))]
+fn host_env() -> Option<crate::orca::HostEnv> {
+    crate::orca::HostEnv::current().ok()
+}
+
+/// Test build: a blank environment rooted at the test home (no real env var
+/// is ever read).
+#[cfg(test)]
+fn host_env() -> Option<crate::orca::HostEnv> {
+    let home = home_dir()?;
+    Some(crate::orca::HostEnv::for_test(
+        &home,
+        crate::orca::HostOs::current(),
+    ))
+}
+
+/// Return the state directory, creating it (0700) if it does not yet exist.
 ///
 /// The "lazy create" contract: callers that only *read* state (e.g. the TTY-gate
 /// check that peeks at `.usage-cache.json`) should call `smart_dir_no_create()`
 /// to avoid spurious dir creation in non-interactive contexts. Writers call this.
 pub fn smart_dir() -> io::Result<PathBuf> {
     let dir = smart_dir_no_create();
-    std::fs::create_dir_all(&dir)?;
+    crate::orca::fsx::create_dir_all(&dir, 0o700)?;
     Ok(dir)
 }
 
-/// Return the smart state directory path without creating it.
+/// Return csm's state directory path without creating it.
 pub fn smart_dir_no_create() -> PathBuf {
-    home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".claude.shared")
-        .join("smart")
+    match host_env() {
+        Some(env) => crate::orca::fsx::state_dir(&env),
+        None => PathBuf::from(".").join(".local").join("state").join("csm"),
+    }
 }
 
-/// `~/.claude.<name>` — the conventional profile config dir for a profile that
-/// has no explicit entry in `ProfileMap` (toss machines, first-boot before the
-/// registry is populated, or a bare token passed straight through). Shares
-/// only the path-string construction: `ProfileMap` stays the sole registry
-/// *authority* over which profiles exist and where they actually live.
-pub fn synthesize_profile_dir(name: &str) -> PathBuf {
-    home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(format!(".claude.{name}"))
-}
-
-/// `~/.config/claude-as/` — the profile-switch contract shared with the `cas`
-/// shell shims. `profiles_json()` and `cas::default_state_file()` each join
-/// their own leaf onto this.
-pub fn claude_as_dir() -> PathBuf {
-    home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".config")
-        .join("claude-as")
+/// csm's runtime dir `D`: claude's `CLAUDE_CONFIG_DIR` as csm's environment
+/// has it (trimmed), else `~/.claude` (Orca's getRuntimePaths rule).
+pub fn runtime_dir() -> PathBuf {
+    match host_env() {
+        Some(env) => {
+            crate::orca::runtime::runtime_paths(env.claude_config_dir.as_deref(), &env.home, |p| {
+                p.exists()
+            })
+            .config_dir
+        }
+        None => PathBuf::from(".").join(".claude"),
+    }
 }
 
 // ─── session-level paths ──────────────────────────────────────────────────────
@@ -76,9 +108,23 @@ pub fn sidecar(sid: &str) -> PathBuf {
     smart_dir_no_create().join(format!("{sid}.json"))
 }
 
-/// `<smart_dir>/<sid>.relaunch` — limit-switch handoff sentinel.
-pub fn relaunch(sid: &str) -> PathBuf {
-    smart_dir_no_create().join(format!("{sid}.relaunch"))
+/// `<state>/sentinel/<sid>.json` — the limit-switch handoff sentinel the
+/// hook writes and the supervisor consumes.
+pub fn sentinel(sid: &str) -> PathBuf {
+    smart_dir_no_create()
+        .join("sentinel")
+        .join(format!("{sid}.json"))
+}
+
+/// `<state>/follow/` — one follow file per csm-supervised peer session.
+pub fn follow_dir() -> PathBuf {
+    smart_dir_no_create().join("follow")
+}
+
+/// `<state>/follow/<sid>.json` — written by a leader for a peer on the capped
+/// account; the peer relaunches at its next turn boundary.
+pub fn follow(sid: &str) -> PathBuf {
+    follow_dir().join(format!("{sid}.json"))
 }
 
 /// `<smart_dir>/<sid>.pid` — PID + born epoch written by the foreground supervisor.
@@ -140,22 +186,20 @@ pub fn last_switch() -> PathBuf {
     smart_dir_no_create().join(".last-switch")
 }
 
+/// `<state>/last-identity` — the last `oauthAccount.accountUuid` csm saw in
+/// `D`. A change is a switch event (whoever made it) and re-stamps
+/// [`last_switch`].
+pub fn last_identity() -> PathBuf {
+    smart_dir_no_create().join("last-identity")
+}
+
 /// `<smart_dir>/titles.tsv` — session-name alias index (`title \t sid \t mtime`).
 pub fn titles_tsv() -> PathBuf {
     smart_dir_no_create().join("titles.tsv")
 }
 
-/// `~/.config/claude-as/profiles.json` — cross-platform profile→dir map.
-/// The registry is optional: when the file is absent, csm falls back to the
-/// current `CLAUDE_CONFIG_DIR` and disables the switch/pick features.
-pub fn profiles_json() -> PathBuf {
-    claude_as_dir().join("profiles.json")
-}
-
 /// `~/.config/claude-smart/config.json` — csm's OWN global config (drop-in
-/// launch command + future settings). Distinct from `~/.config/claude-as/`,
-/// which is the profile-switch contract shared with the `cas` shell shims;
-/// this is csm's own runtime config, not part of that contract.
+/// launch command + future settings).
 pub fn config_json() -> PathBuf {
     home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
@@ -178,8 +222,8 @@ pub fn usage_store_dir() -> PathBuf {
 
 /// `<smart_dir>/usage/<profile>.json` — one profile's local usage record.
 ///
-/// `profile` MUST already be validated via
-/// [`crate::account::profiles::ProfileMap::is_valid_name`] before it reaches
+/// `profile` (an Orca account id) MUST already be validated via
+/// [`crate::account::accounts::is_valid_key`] before it reaches
 /// here — like every other constructor in this module, this function is a
 /// pure path builder with no sanitization of its own. A profile name pulled
 /// from an external source (statusline stdin's `CLAUDE_CONFIG_DIR` reverse
@@ -203,61 +247,10 @@ pub fn scan_index_for(project_dir: &Path) -> PathBuf {
     smart_dir_no_create().join(format!("scan-meta-v2.{dir_name}.tsv"))
 }
 
-/// `$HOME/.claude.shared` — the shared config root. The smart state dir and the
-/// three cross-profile SSOTs live under here: each profile dir's `plugins`,
-/// `projects` and `sessions` are symlinked here (see
-/// [`crate::provision::ensure_profile_provisioned`]) so every profile sees one
-/// marketplace cache (avoids the `cache-miss` a per-`CLAUDE_CONFIG_DIR` plugin
-/// dir causes on switch), one session history, and one peer registry regardless
-/// of which profile is active.
-pub fn shared_base_dir() -> PathBuf {
-    home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".claude.shared")
-}
-
-/// `$HOME/.claude` — Claude Code's default config dir, i.e. where a process that
-/// ignores `CLAUDE_CONFIG_DIR` reads and writes. csm keeps it as a compatibility
-/// shim: its `projects` entry links to [`session_base_dir`] so tools that
-/// hardcode this path still see every profile's transcripts. See
-/// [`crate::homeguard`]. Unused off unix, where that link is provisioned
-/// OS-side (mirrors `provision`'s platform split).
-#[cfg_attr(not(unix), allow(dead_code))]
-pub fn home_claude_dir() -> PathBuf {
-    home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".claude")
-}
-
-/// `$HOME/.claude.shared/projects` — the single source of truth for Claude Code
-/// session transcripts shared across every profile. Each profile dir's
-/// `projects` is symlinked here so `csm`'s own session scanner/alias index
-/// (and any other reader of `<CLAUDE_CONFIG_DIR>/projects`) sees every
-/// profile's history no matter which `CLAUDE_CONFIG_DIR` is active. See
-/// [`crate::provision::ensure_profile_provisioned`].
+/// `<D>/projects` — where claude keeps session transcripts, and where csm's
+/// session scanner and alias index read.
 pub fn session_base_dir() -> PathBuf {
-    shared_base_dir().join("projects")
-}
-
-/// `$HOME/.claude.shared/plugins` — the single source of truth for Claude Code
-/// plugins/marketplaces shared across every profile. Each profile dir's
-/// `plugins` is symlinked here so the marketplace cache index stays consistent
-/// no matter which `CLAUDE_CONFIG_DIR` is active. See
-/// [`crate::provision::ensure_profile_provisioned`].
-pub fn shared_plugins_dir() -> PathBuf {
-    shared_base_dir().join("plugins")
-}
-
-/// `$HOME/.claude.shared/sessions` — the single source of truth for Claude
-/// Code's peer registry, the directory it enumerates to answer "which other
-/// sessions can I message". Each live session writes a `<pid>.json` there
-/// naming the socket it listens on; the sockets live outside the config dir
-/// and are reachable from every profile, but the index is not, so without this
-/// link a profile switch splits the messaging namespace and cross-session
-/// tools only see their own profile's sessions. See
-/// [`crate::provision::ensure_profile_provisioned`].
-pub fn shared_sessions_dir() -> PathBuf {
-    shared_base_dir().join("sessions")
+    runtime_dir().join("projects")
 }
 
 // ─── cwd encoding ─────────────────────────────────────────────────────────────
@@ -423,43 +416,35 @@ mod tests {
     }
 
     #[test]
-    fn smart_dir_no_create_is_under_home() {
-        let d = smart_dir_no_create();
-        // Must contain .claude.shared/smart somewhere in the path
-        let s = d.to_string_lossy();
-        assert!(
-            s.contains(".claude.shared"),
-            "smart_dir should be under .claude.shared, got: {s}"
-        );
-        assert!(
-            s.ends_with("smart"),
-            "smart_dir should end with 'smart', got: {s}"
-        );
+    fn state_dir_is_under_the_test_home() {
+        let tmp = tempfile::tempdir().unwrap();
+        crate::testenv::with_test_home(tmp.path(), || {
+            let d = smart_dir_no_create();
+            assert!(d.starts_with(tmp.path()), "got {}", d.display());
+            assert!(d.ends_with("csm"), "got {}", d.display());
+            assert_eq!(runtime_dir(), tmp.path().join(".claude"));
+            assert_eq!(
+                session_base_dir(),
+                tmp.path().join(".claude").join("projects")
+            );
+        });
     }
 
+    /// Guard: with no test home a test never resolves the real home, the
+    /// real state dir or `~/.claude`.
     #[test]
-    fn home_claude_dir_is_the_bare_default_home() {
-        let d = home_claude_dir();
-        assert_eq!(d.file_name().and_then(|n| n.to_str()), Some(".claude"));
-        let s = d.to_string_lossy();
-        assert!(
-            !s.contains(".claude."),
-            "the default home must not sit in the profile namespace: {s}"
-        );
-    }
-
-    #[test]
-    fn profiles_json_is_under_config() {
-        let p = profiles_json();
-        let s = p.to_string_lossy();
-        assert!(
-            s.contains(".config"),
-            "profiles_json not under .config: {s}"
-        );
-        assert!(
-            s.contains("claude-as"),
-            "profiles_json not under claude-as: {s}"
-        );
+    fn no_test_home_never_resolves_the_real_home() {
+        crate::testenv::set_test_home(None);
+        let home = home_dir().unwrap();
+        assert!(home.starts_with(std::env::temp_dir()));
+        if let Some(real) = dirs::home_dir() {
+            assert_ne!(home, real);
+            assert!(
+                !smart_dir_no_create().starts_with(&real) || real.starts_with(std::env::temp_dir())
+            );
+            assert!(!runtime_dir().starts_with(&real) || real.starts_with(std::env::temp_dir()));
+            assert!(!config_json().starts_with(&real) || real.starts_with(std::env::temp_dir()));
+        }
     }
 
     #[test]
@@ -486,7 +471,7 @@ mod tests {
         let d = usage_store_dir();
         let s = d.to_string_lossy();
         assert!(
-            s.contains("smart"),
+            usage_store_dir().starts_with(smart_dir_no_create()),
             "usage_store_dir should be under smart_dir: {s}"
         );
         assert!(
@@ -510,7 +495,8 @@ mod tests {
     fn path_constructors_use_sid() {
         let sid = "01234567-89ab-cdef-0123-456789abcdef";
         assert!(sidecar(sid).to_string_lossy().contains(sid));
-        assert!(relaunch(sid).to_string_lossy().contains(sid));
+        assert!(sentinel(sid).to_string_lossy().contains(sid));
+        assert!(follow(sid).to_string_lossy().contains(sid));
         assert!(pid_file(sid).to_string_lossy().contains(sid));
         assert!(stop_flag(sid).to_string_lossy().contains(sid));
         assert!(switched(sid).to_string_lossy().contains(sid));

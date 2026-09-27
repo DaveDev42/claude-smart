@@ -1,678 +1,679 @@
 #!/usr/bin/env bash
-# e2e/scenarios.sh -- the 15 numbered limit-switch scenarios (plus 9b, 16
-# VERDICT blocks in total), ported 1:1 from the original standalone harness
-# (same assertions, same numbering). Sourced by run.sh after lib.sh; expects
-# the same globals as lib.sh plus FIX_HEALTHY and FIX_BOTH (paths to the two
-# fixture JSON files).
+# e2e/scenarios.sh -- the scenarios. Sourced by run.sh after lib.sh; each
+# `sc_<name>` runs in its own subshell with a fresh sandbox home (see
+# run_scenario in run.sh), records failed checks in FAILED, and must stop
+# every process it started (supervisors through stop_sup, the fake Orca
+# through stop_orca). SCENARIOS lists them in run order.
 #
-# Coverage: 1/3/4 = hook-driven switch (StopFailure rate_limit / Stop
-# usage-pct, with and without the cooldown stamp); 2 = StopFailure overloaded
-# must NOT switch; 5 = both profiles capped -> notify-only, no relaunch; 6 =
-# two concurrent supervisors on profile a both switch independently; 7 =
-# CLAUDE_AUTO_SWITCH_RELAUNCH=0 detect-only; 8/10 = the statusline-tick
-# switch path (cold-launch --model/--effort carry and the CLAUDE_AUTO_SWITCH=0
-# kill-switch); 9/9b = a stored model-scoped (week_fable) cap relaxing to a
-# same-account model fallback, and a repeat tick on the same reading staying
-# suppressed rather than relaunching again; 11/12/13/14 = argv-forwarding
-# details (session-shaping flags without the prompt, closing an open
-# --add-dir before the handoff, a plain `csm --profile b claude <args>`
-# passthrough, and a global --profile in front of a csm subcommand); 15 = an
-# account switch followed by a same-account fallback on the NEW account,
-# proving the fallback survives a session that already spent its switch.
+# The world every scenario starts from (fresh_world): Orca's store holds
+# alice (active) and bob, both stashed; D (~/.claude) is logged in as alice;
+# Orca is not running; csm's state dir is empty.
 
-run_all_scenarios() {
-
-CUR_FIXTURE="$FIX_HEALTHY"
-
-# ═══════════════════════════════════════════════════════════════════════════
-rpt "----- Scenario 1: StopFailure rate_limit, a capped, b healthy, cooldown active -----"
-CUR_FIXTURE="$FIX_HEALTHY"
-set_last_switch_fresh
-rpt "  pre: .last-switch=$(cat "$SMART_DIR/.last-switch")"
-start_supervisor "s1" "$FIX_HEALTHY"
-if [[ -n "$SID" ]]; then
-  TP="$TRANSCRIPTS_DIR/$SID.jsonl"
-  JSON=$(cat <<EOF
-{"session_id":"$SID","transcript_path":"$TP","cwd":"/tmp/e2e-cwd-s1","permission_mode":"default","hook_event_name":"StopFailure","error":"rate_limit","error_details":"You have reached your weekly limit for Fable."}
-EOF
+SCENARIOS=(
+  guard
+  rate_limit_switch
+  overloaded_no_switch
+  stop_pct_cooldown
+  stop_pct_switch
+  both_capped_notify
+  relaunch_off
+  leader_follower
+  statusline_switch
+  fable_fallback
+  auto_switch_off
+  carry_flags
+  separator
+  hop_cap
+  switch_then_fallback
+  switch_via_orca
+  gui_switch_follow
+  store_orca_at_l1
+  store_orca_at_l2
+  readback_owner
+  quarantine_401
+  quarantine_refresh_owner
+  quarantine_mismatch
+  accounts_import_rm
+  passthrough
+  print_context
+  orca_pane_resume
+  alias_dispatch
+  sessionend_budget
+  migrate
 )
-  SENTINEL_PATH="$SMART_DIR/$SID.relaunch"
-  run_hook "$A_DIR" "$JSON"
-  # try to catch the sentinel before the supervisor consumes it (race, best effort)
-  SENTINEL_CONTENT=$(cat "$SENTINEL_PATH" 2>/dev/null || echo "(already consumed or never seen)")
-  rpt "  hook exit=$HOOK_EXIT stdout=$HOOK_STDOUT"
-  rpt "  sentinel (best-effort capture): $SENTINEL_CONTENT"
-  wait_for_pattern "$FAKE_LOG" "SIGTERM pid=$CHILD_PID" 10
-  rpt "  original fake-claude alive? $(is_alive "$CHILD_PID" && echo yes || echo no)"
-  wait_for_invocation_count "$FAKE_LOG" 2 10
-  N=$(count_invocations "$FAKE_LOG")
-  rpt "  invocation count now: $N"
-  if (( N >= 2 )); then
-    RELAUNCH_CFG=$(get_invocation_configdir "$FAKE_LOG" 2)
-    RELAUNCH_VERB=$(get_invocation_field "$FAKE_LOG" 2 1)
-    RELAUNCH_SID=$(get_invocation_field "$FAKE_LOG" 2 2)
-    RELAUNCH_PID=$(get_invocation_pid "$FAKE_LOG" 2)
-    rpt "  relaunch: verb=$RELAUNCH_VERB sid=$RELAUNCH_SID config_dir=$RELAUNCH_CFG pid=$RELAUNCH_PID"
-  fi
-  rpt "  limit-switch.log tail:"
-  rpt "$(tail -5 "$SMART_DIR/limit-switch.log" 2>/dev/null)"
-  rpt "  .switched marker: $(ls "$SMART_DIR/$SID.switched" 2>/dev/null && cat "$SMART_DIR/$SID.switched" || echo MISSING)"
-  # verdict
-  if (( N >= 2 )) && [[ "$RELAUNCH_VERB" == "--resume" && "$RELAUNCH_SID" == "$SID" && "$RELAUNCH_CFG" == "$B_DIR" ]]; then
-    rpt "  VERDICT: PASS"
-  else
-    rpt "  VERDICT: FAIL"
-  fi
-  # cleanup: terminate whichever fake-claude is now running for this sid
-  if (( N >= 2 )); then safe_term "$RELAUNCH_PID"; else safe_term "$CHILD_PID"; fi
-fi
-safe_term "$SUP_PID"
-rpt ""
 
-# ═══════════════════════════════════════════════════════════════════════════
-rpt "----- Scenario 2: StopFailure overloaded, a capped, b healthy -----"
-CUR_FIXTURE="$FIX_HEALTHY"
-start_supervisor "s2" "$FIX_HEALTHY"
-if [[ -n "$SID" ]]; then
-  TP="$TRANSCRIPTS_DIR/$SID.jsonl"
-  JSON=$(cat <<EOF
-{"session_id":"$SID","transcript_path":"$TP","cwd":"/tmp/e2e-cwd-s2","permission_mode":"default","hook_event_name":"StopFailure","error":"overloaded","error_details":"The API is temporarily overloaded."}
-EOF
-)
-  run_hook "$A_DIR" "$JSON"
-  rpt "  hook exit=$HOOK_EXIT stdout=$HOOK_STDOUT"
-  rpt "  fake-claude alive? $(is_alive "$CHILD_PID" && echo yes || echo no)"
-  N=$(count_invocations "$FAKE_LOG")
-  rpt "  invocation count: $N (expect 1, no relaunch)"
-  rpt "  sentinel present? $(test -f "$SMART_DIR/$SID.relaunch" && echo yes || echo no)"
-  rpt "  .switched present? $(test -f "$SMART_DIR/$SID.switched" && echo yes || echo no)"
-  rpt "  limit-switch.log tail:"
-  rpt "$(tail -3 "$SMART_DIR/limit-switch.log" 2>/dev/null)"
-  if (( N == 1 )) && is_alive "$CHILD_PID" && [[ ! -f "$SMART_DIR/$SID.relaunch" ]] && [[ -z "$HOOK_STDOUT" ]]; then
-    rpt "  VERDICT: PASS"
-  else
-    rpt "  VERDICT: FAIL"
-  fi
-  safe_term "$CHILD_PID"
-fi
-safe_term "$SUP_PID"
-rpt ""
+now_ms() { /usr/bin/perl -MTime::HiRes=time -e 'printf "%d\n", time * 1000'; }
+iso_days_ago() { /usr/bin/perl -MPOSIX=strftime -e 'print strftime("%Y-%m-%dT%H:%M:%SZ", gmtime(time - $ARGV[0] * 86400))' "$1"; }
+lt() { [ "$1" -lt "$2" ] || { say "      $1 is not below $2"; return 1; }; }
+count_is() { eq "$(lines "$1")" "$2"; }
+the_new_id() { world ids | grep -vxF -e "$A_ID" -e "$B_ID"; }
 
-# ═══════════════════════════════════════════════════════════════════════════
-rpt "----- Scenario 3: Stop payload, a capped, b healthy, cooldown active -----"
-CUR_FIXTURE="$FIX_HEALTHY"
-set_last_switch_fresh
-rpt "  pre: .last-switch=$(cat "$SMART_DIR/.last-switch")"
-start_supervisor "s3" "$FIX_HEALTHY"
-if [[ -n "$SID" ]]; then
-  TP="$TRANSCRIPTS_DIR/$SID.jsonl"
-  JSON=$(cat <<EOF
-{"session_id":"$SID","transcript_path":"$TP","cwd":"/tmp/e2e-cwd-s3","permission_mode":"default","hook_event_name":"Stop","stop_hook_active":false,"last_assistant_message":"ok, done for now"}
-EOF
-)
-  LAST_SWITCH_BEFORE=$(cat "$SMART_DIR/.last-switch" 2>/dev/null || echo MISSING)
-  run_hook "$A_DIR" "$JSON"
-  LAST_SWITCH_AFTER=$(cat "$SMART_DIR/.last-switch" 2>/dev/null || echo MISSING)
-  rpt "  hook exit=$HOOK_EXIT stdout=$HOOK_STDOUT"
-  rpt "  .last-switch before=$LAST_SWITCH_BEFORE after=$LAST_SWITCH_AFTER (unchanged means the hook never reached the step-9 cooldown claim -- see report notes)"
-  rpt "  fake-claude alive? $(is_alive "$CHILD_PID" && echo yes || echo no)"
-  N=$(count_invocations "$FAKE_LOG")
-  rpt "  invocation count: $N (expect 1, no relaunch -- cooldown blocks pct path)"
-  rpt "  sentinel present? $(test -f "$SMART_DIR/$SID.relaunch" && echo yes || echo no)"
-  rpt "  limit-switch.log tail:"
-  rpt "$(tail -3 "$SMART_DIR/limit-switch.log" 2>/dev/null)"
-  if (( N == 1 )) && is_alive "$CHILD_PID" && [[ ! -f "$SMART_DIR/$SID.relaunch" ]] && [[ -z "$HOOK_STDOUT" ]]; then
-    rpt "  VERDICT: PASS"
-  else
-    rpt "  VERDICT: FAIL"
-  fi
-  safe_term "$CHILD_PID"
-fi
-safe_term "$SUP_PID"
-rpt ""
+# switched_to_bob <label>: the checks every A->B limit switch shares, after
+# the hook fired for $SID under supervisor <label>.
+switched_to_bob() {
+  check "the capped claude got SIGTERM" poll 10 has_fixed "$FLOG" "=== SIGTERM pid=$CHILD "
+  check "the supervisor relaunched claude" poll 15 inv_at_least "$FLOG" 2
+  check "the relaunch resumes the same session" inv_pair "$FLOG" 2 --resume "$SID"
+  check "the relaunch runs in D (no CLAUDE_CONFIG_DIR pin)" eq "$(inv_field "$FLOG" 2 config_dir)" "(unset)"
+  check "the supervisor says what it did" poll 5 has_fixed "$LOGS/$1.sup.log" "csm: account alice capped; resumed on bob"
+  check "Orca's store now has bob active" eq "$(active)" "$B_ID"
+  check "D holds bob's grant" eq "$(d_refresh)" rt-bob-1
+  check "D's identity is bob" eq "$(d_uuid)" uuid-bob
+}
 
-# ═══════════════════════════════════════════════════════════════════════════
-rpt "----- Scenario 4: Stop payload, a capped, b healthy, no cooldown stamp -----"
-CUR_FIXTURE="$FIX_HEALTHY"
-clear_last_switch
-rpt "  pre: .last-switch present? $(test -f "$SMART_DIR/.last-switch" && echo yes || echo no)"
-start_supervisor "s4" "$FIX_HEALTHY"
-if [[ -n "$SID" ]]; then
-  TP="$TRANSCRIPTS_DIR/$SID.jsonl"
-  JSON=$(cat <<EOF
-{"session_id":"$SID","transcript_path":"$TP","cwd":"/tmp/e2e-cwd-s4","permission_mode":"default","hook_event_name":"Stop","stop_hook_active":false,"last_assistant_message":"ok, done for now"}
-EOF
-)
-  SENTINEL_PATH="$SMART_DIR/$SID.relaunch"
-  run_hook "$A_DIR" "$JSON"
-  SENTINEL_CONTENT=$(cat "$SENTINEL_PATH" 2>/dev/null || echo "(already consumed or never seen)")
-  rpt "  hook exit=$HOOK_EXIT stdout=$HOOK_STDOUT"
-  rpt "  sentinel (best-effort capture): $SENTINEL_CONTENT"
-  wait_for_pattern "$FAKE_LOG" "SIGTERM pid=$CHILD_PID" 10
-  wait_for_invocation_count "$FAKE_LOG" 2 10
-  N=$(count_invocations "$FAKE_LOG")
-  rpt "  invocation count now: $N"
-  if (( N >= 2 )); then
-    RELAUNCH_CFG=$(get_invocation_configdir "$FAKE_LOG" 2)
-    RELAUNCH_VERB=$(get_invocation_field "$FAKE_LOG" 2 1)
-    RELAUNCH_SID=$(get_invocation_field "$FAKE_LOG" 2 2)
-    RELAUNCH_PID=$(get_invocation_pid "$FAKE_LOG" 2)
-    rpt "  relaunch: verb=$RELAUNCH_VERB sid=$RELAUNCH_SID config_dir=$RELAUNCH_CFG pid=$RELAUNCH_PID"
-  fi
-  rpt "  limit-switch.log tail:"
-  rpt "$(tail -5 "$SMART_DIR/limit-switch.log" 2>/dev/null)"
-  if (( N >= 2 )) && [[ "$RELAUNCH_VERB" == "--resume" && "$RELAUNCH_SID" == "$SID" && "$RELAUNCH_CFG" == "$B_DIR" ]]; then
-    rpt "  VERDICT: PASS"
-  else
-    rpt "  VERDICT: FAIL"
-  fi
-  if (( N >= 2 )); then safe_term "$RELAUNCH_PID"; else safe_term "$CHILD_PID"; fi
-fi
-safe_term "$SUP_PID"
-rpt ""
+# ─── guard ─────────────────────────────────────────────────────────────────────
 
-# ═══════════════════════════════════════════════════════════════════════════
-rpt "----- Scenario 5: StopFailure rate_limit, both a and b capped -----"
-CUR_FIXTURE="$FIX_BOTH"
-start_supervisor "s5" "$FIX_BOTH"
-if [[ -n "$SID" ]]; then
-  TP="$TRANSCRIPTS_DIR/$SID.jsonl"
-  JSON=$(cat <<EOF
-{"session_id":"$SID","transcript_path":"$TP","cwd":"/tmp/e2e-cwd-s5","permission_mode":"default","hook_event_name":"StopFailure","error":"rate_limit","error_details":"You have reached your weekly limit for Fable."}
-EOF
-)
-  run_hook "$A_DIR" "$JSON"
-  rpt "  hook exit=$HOOK_EXIT stdout=$HOOK_STDOUT"
-  rpt "  fake-claude alive? $(is_alive "$CHILD_PID" && echo yes || echo no)"
-  N=$(count_invocations "$FAKE_LOG")
-  rpt "  invocation count: $N (expect 1, notify-only)"
-  rpt "  sentinel present? $(test -f "$SMART_DIR/$SID.relaunch" && echo yes || echo no)"
-  rpt "  .detected present? $(test -f "$SMART_DIR/$SID.detected" && echo yes || echo no)"
-  rpt "  limit-switch.log tail:"
-  rpt "$(tail -3 "$SMART_DIR/limit-switch.log" 2>/dev/null)"
-  if (( N == 1 )) && is_alive "$CHILD_PID" && [[ ! -f "$SMART_DIR/$SID.relaunch" ]] && [[ -n "$HOOK_STDOUT" ]]; then
-    rpt "  VERDICT: PASS"
-  else
-    rpt "  VERDICT: FAIL"
-  fi
-  safe_term "$CHILD_PID"
-fi
-safe_term "$SUP_PID"
-rpt ""
+# The e2e build refuses to run with HOME outside the sandbox (exit 97).
+sc_guard() {
+  fresh_world
+  env -i "HOME=/nonexistent-csm-e2e-home" "PATH=$E2E_PATH_BASE" "CSM_E2E_SANDBOX=$SANDBOX" \
+    "$BIN/csm" --version >"$LOGS/out" 2>&1
+  check "csm exits 97 with HOME outside the sandbox" eq "$?" 97
+  env -i "HOME=$HOME_DIR" "PATH=$E2E_PATH_BASE" "$BIN/csm" --version >"$LOGS/out" 2>&1
+  check "csm exits 97 without CSM_E2E_SANDBOX" eq "$?" 97
+  env -i "HOME=$HOME_DIR" "PATH=$E2E_PATH_BASE" "CSM_E2E_SANDBOX=$SANDBOX" \
+    "XDG_STATE_HOME=/nonexistent-csm-e2e-state" "$BIN/csm" --version >"$LOGS/out" 2>&1
+  check "csm exits 97 with an XDG dir outside the sandbox" eq "$?" 97
+  csm --version
+  check "csm runs inside the sandbox" eq "$RC" 0
+}
 
-# ═══════════════════════════════════════════════════════════════════════════
-rpt "----- Scenario 6: two supervisors on a, both capped, both StopFailure rate_limit -----"
-CUR_FIXTURE="$FIX_HEALTHY"
-clear_last_switch
-start_supervisor "s6a" "$FIX_HEALTHY"
-SUP_PID_A="$SUP_PID"; FAKE_LOG_A="$FAKE_LOG"; SID_A="$SID"; CHILD_PID_A="$CHILD_PID"
-start_supervisor "s6b" "$FIX_HEALTHY"
-SUP_PID_B="$SUP_PID"; FAKE_LOG_B="$FAKE_LOG"; SID_B="$SID"; CHILD_PID_B="$CHILD_PID"
+# ─── limit switch (ported from the profile-era harness) ───────────────────────
 
-if [[ -n "$SID_A" && -n "$SID_B" ]]; then
-  TP_A="$TRANSCRIPTS_DIR/$SID_A.jsonl"
-  TP_B="$TRANSCRIPTS_DIR/$SID_B.jsonl"
-  JSON_A=$(cat <<EOF
-{"session_id":"$SID_A","transcript_path":"$TP_A","cwd":"/tmp/e2e-cwd-s6a","permission_mode":"default","hook_event_name":"StopFailure","error":"rate_limit","error_details":"weekly limit for Fable"}
-EOF
-)
-  JSON_B=$(cat <<EOF
-{"session_id":"$SID_B","transcript_path":"$TP_B","cwd":"/tmp/e2e-cwd-s6b","permission_mode":"default","hook_event_name":"StopFailure","error":"rate_limit","error_details":"weekly limit for Fable"}
-EOF
-)
-  run_hook "$A_DIR" "$JSON_A"
-  HOOK_EXIT_A=$HOOK_EXIT; HOOK_STDOUT_A=$HOOK_STDOUT
-  run_hook "$A_DIR" "$JSON_B"
-  HOOK_EXIT_B=$HOOK_EXIT; HOOK_STDOUT_B=$HOOK_STDOUT
-  rpt "  hookA exit=$HOOK_EXIT_A stdout=$HOOK_STDOUT_A"
-  rpt "  hookB exit=$HOOK_EXIT_B stdout=$HOOK_STDOUT_B"
+# StopFailure rate_limit is definitive: it switches even inside the cooldown.
+sc_rate_limit_switch() {
+  fresh_world
+  usage_healthy
+  stamp_last_switch
+  start_sup s run -n || return
+  usage_a_capped
+  hook "$(rate_limit_json "$SID")"
+  check "the hook exits 0" eq "$RC" 0
+  switched_to_bob s
+  check "the switch is logged" has "$(switch_log)" "limit-switch sid=${SID:0:8} to=$B_ID"
+  check "the session is marked switched" test -f "$STATE/$SID.switched"
+  stop_sup "$SUP_PID" "$FLOG"
+}
 
-  wait_for_invocation_count "$FAKE_LOG_A" 2 10
-  wait_for_invocation_count "$FAKE_LOG_B" 2 10
-  NA=$(count_invocations "$FAKE_LOG_A")
-  NB=$(count_invocations "$FAKE_LOG_B")
-  rpt "  invocations: A=$NA B=$NB"
-  RELAUNCH_CFG_A=""; RELAUNCH_CFG_B=""; RELAUNCH_PID_A=""; RELAUNCH_PID_B=""
-  if (( NA >= 2 )); then
-    RELAUNCH_CFG_A=$(get_invocation_configdir "$FAKE_LOG_A" 2)
-    RELAUNCH_VERB_A=$(get_invocation_field "$FAKE_LOG_A" 2 1)
-    RELAUNCH_SID_A=$(get_invocation_field "$FAKE_LOG_A" 2 2)
-    RELAUNCH_PID_A=$(get_invocation_pid "$FAKE_LOG_A" 2)
-    rpt "  relaunch A: verb=$RELAUNCH_VERB_A sid=$RELAUNCH_SID_A config_dir=$RELAUNCH_CFG_A"
-  fi
-  if (( NB >= 2 )); then
-    RELAUNCH_CFG_B=$(get_invocation_configdir "$FAKE_LOG_B" 2)
-    RELAUNCH_VERB_B=$(get_invocation_field "$FAKE_LOG_B" 2 1)
-    RELAUNCH_SID_B=$(get_invocation_field "$FAKE_LOG_B" 2 2)
-    RELAUNCH_PID_B=$(get_invocation_pid "$FAKE_LOG_B" 2)
-    rpt "  relaunch B: verb=$RELAUNCH_VERB_B sid=$RELAUNCH_SID_B config_dir=$RELAUNCH_CFG_B"
-  fi
-  rpt "  limit-switch.log tail:"
-  rpt "$(tail -6 "$SMART_DIR/limit-switch.log" 2>/dev/null)"
-  if (( NA >= 2 && NB >= 2 )) && [[ "$RELAUNCH_CFG_A" == "$B_DIR" && "$RELAUNCH_CFG_B" == "$B_DIR" ]]; then
-    rpt "  VERDICT: PASS"
-  else
-    rpt "  VERDICT: FAIL"
-  fi
-  if (( NA >= 2 )); then safe_term "$RELAUNCH_PID_A"; else safe_term "$CHILD_PID_A"; fi
-  if (( NB >= 2 )); then safe_term "$RELAUNCH_PID_B"; else safe_term "$CHILD_PID_B"; fi
-fi
-safe_term "$SUP_PID_A"
-safe_term "$SUP_PID_B"
-rpt ""
+# A StopFailure that is not a rate limit does nothing.
+sc_overloaded_no_switch() {
+  fresh_world
+  usage_healthy
+  start_sup s run -n || return
+  usage_a_capped
+  hook "$(hook_json StopFailure "$SID" '"error":"overloaded","error_details":"The API is overloaded."')"
+  /bin/sleep 1
+  check "no relaunch" eq "$(count_inv "$FLOG")" 1
+  check "claude still runs" alive "$CHILD"
+  check "no sentinel" test ! -e "$STATE/sentinel/$SID.json"
+  check "the hook prints nothing" test ! -s "$LOGS/stdout"
+  check "alice stays active" eq "$(active)" "$A_ID"
+  stop_sup "$SUP_PID" "$FLOG"
+}
 
-# ═══════════════════════════════════════════════════════════════════════════
-rpt "----- Scenario 7: StopFailure rate_limit, CLAUDE_AUTO_SWITCH_RELAUNCH=0 -----"
-CUR_FIXTURE="$FIX_HEALTHY"
-start_supervisor "s7" "$FIX_HEALTHY"
-if [[ -n "$SID" ]]; then
-  TP="$TRANSCRIPTS_DIR/$SID.jsonl"
-  JSON=$(cat <<EOF
-{"session_id":"$SID","transcript_path":"$TP","cwd":"/tmp/e2e-cwd-s7","permission_mode":"default","hook_event_name":"StopFailure","error":"rate_limit","error_details":"weekly limit for Fable"}
-EOF
-)
-  run_hook "$A_DIR" "$JSON" "CLAUDE_AUTO_SWITCH_RELAUNCH=0"
-  rpt "  hook exit=$HOOK_EXIT stdout=$HOOK_STDOUT"
-  rpt "  fake-claude alive? $(is_alive "$CHILD_PID" && echo yes || echo no)"
-  N=$(count_invocations "$FAKE_LOG")
-  rpt "  invocation count: $N (expect 1, detect-only)"
-  rpt "  sentinel present? $(test -f "$SMART_DIR/$SID.relaunch" && echo yes || echo no)"
-  rpt "  .detected present? $(test -f "$SMART_DIR/$SID.detected" && echo yes || echo no)"
-  rpt "  .switched present? $(test -f "$SMART_DIR/$SID.switched" && echo yes || echo no)"
-  rpt "  limit-switch.log tail:"
-  rpt "$(tail -3 "$SMART_DIR/limit-switch.log" 2>/dev/null)"
-  if (( N == 1 )) && is_alive "$CHILD_PID" && [[ ! -f "$SMART_DIR/$SID.relaunch" ]] && [[ -n "$HOOK_STDOUT" ]]; then
-    rpt "  VERDICT: PASS"
-  else
-    rpt "  VERDICT: FAIL"
-  fi
-  safe_term "$CHILD_PID"
-fi
-safe_term "$SUP_PID"
-rpt ""
+# A usage-% trip at Stop is not definitive: the cooldown blocks it.
+sc_stop_pct_cooldown() {
+  fresh_world
+  usage_healthy
+  stamp_last_switch
+  start_sup s run -n || return
+  usage_a_capped
+  hook "$(stop_json "$SID")"
+  /bin/sleep 1
+  check "no relaunch" eq "$(count_inv "$FLOG")" 1
+  check "claude still runs" alive "$CHILD"
+  check "no sentinel" test ! -e "$STATE/sentinel/$SID.json"
+  check "alice stays active" eq "$(active)" "$A_ID"
+  stop_sup "$SUP_PID" "$FLOG"
+}
 
-# ═══════════════════════════════════════════════════════════════════════════
-rpt "----- Scenario 8: statusline tick, seven_day 100% on a, b healthy, cooldown active, no hook -----"
-CUR_FIXTURE="$FIX_HEALTHY"
-set_last_switch_fresh
-rm -f "$SMART_DIR/usage/a.json"
-start_supervisor "s8" "$FIX_HEALTHY" --model fake-model-x --effort high
-if [[ -n "$SID" ]]; then
-  rpt "  cold launch carries flags? model=$(invocation_has_arg "$FAKE_LOG" 1 fake-model-x && echo yes || echo no) effort=$(invocation_has_arg "$FAKE_LOG" 1 high && echo yes || echo no)"
-  # a healthy tick first: must record and do nothing else
-  run_capture "$A_DIR" "$(statusline_json "$SID" /tmp/e2e-cwd-s8 20 40)"
-  rpt "  healthy tick exit=$CAP_EXIT stdout='$CAP_STDOUT' store=$(python3 -c "import json;d=json.load(open('$SMART_DIR/usage/a.json'));u=d['usage'];print('session',u['session']['pct'],'week_all',u['week_all']['pct'],'src',d['source'])" 2>&1)"
-  rpt "  after healthy tick: sentinel? $(test -f "$SMART_DIR/$SID.relaunch" && echo yes || echo no) switched? $(test -f "$SMART_DIR/$SID.switched" && echo yes || echo no) fake-claude alive? $(is_alive "$CHILD_PID" && echo yes || echo no)"
-  # the capped tick
-  run_capture "$A_DIR" "$(statusline_json "$SID" /tmp/e2e-cwd-s8 21 100)"
-  rpt "  capped tick exit=$CAP_EXIT stdout='$CAP_STDOUT'"
-  wait_for_pattern "$FAKE_LOG" "SIGTERM pid=$CHILD_PID" 10
-  rpt "  original fake-claude alive? $(is_alive "$CHILD_PID" && echo yes || echo no)"
-  wait_for_invocation_count "$FAKE_LOG" 2 10
-  N=$(count_invocations "$FAKE_LOG")
-  rpt "  invocation count now: $N"
-  if (( N >= 2 )); then
-    RELAUNCH_CFG=$(get_invocation_configdir "$FAKE_LOG" 2)
-    RELAUNCH_VERB=$(get_invocation_field "$FAKE_LOG" 2 1)
-    RELAUNCH_SID=$(get_invocation_field "$FAKE_LOG" 2 2)
-    RELAUNCH_PID=$(get_invocation_pid "$FAKE_LOG" 2)
-    rpt "  relaunch: verb=$RELAUNCH_VERB sid=$RELAUNCH_SID config_dir=$RELAUNCH_CFG pid=$RELAUNCH_PID"
-    FLAGS_OK=no
-    if invocation_has_arg "$FAKE_LOG" 2 --model && invocation_has_arg "$FAKE_LOG" 2 fake-model-x \
-       && invocation_has_arg "$FAKE_LOG" 2 --effort && invocation_has_arg "$FAKE_LOG" 2 high; then FLAGS_OK=yes; fi
-    rpt "  relaunch carries --model/--effort? $FLAGS_OK"
-  fi
-  # a late duplicate tick (the overlapping-process case) must be a no-op
-  run_capture "$A_DIR" "$(statusline_json "$SID" /tmp/e2e-cwd-s8 21 100)"
-  N2=$(count_invocations "$FAKE_LOG")
-  rpt "  duplicate tick: exit=$CAP_EXIT invocation count still $N2 (expect $N)"
-  rpt "  limit-switch.log tail:"
-  rpt "$(tail -3 "$SMART_DIR/limit-switch.log" 2>/dev/null)"
-  rpt "  .switched marker: $(cat "$SMART_DIR/$SID.switched" 2>/dev/null || echo MISSING)"
-  if (( N >= 2 )) && (( N2 == N )) && [[ "$RELAUNCH_VERB" == "--resume" && "$RELAUNCH_SID" == "$SID" && "$RELAUNCH_CFG" == "$B_DIR" ]] \
-     && [[ "$FLAGS_OK" == yes ]] && [[ -z "$CAP_STDOUT" ]] && grep -q "via=statusline" "$SMART_DIR/limit-switch.log"; then
-    rpt "  VERDICT: PASS"
-  else
-    rpt "  VERDICT: FAIL"
-  fi
-  if (( N >= 2 )); then safe_term "$RELAUNCH_PID"; else safe_term "$CHILD_PID"; fi
-fi
-safe_term "$SUP_PID"
-rpt ""
+# The same trip with no cooldown stamp switches.
+sc_stop_pct_switch() {
+  fresh_world
+  usage_healthy
+  start_sup s run -n || return
+  usage_a_capped
+  hook "$(stop_json "$SID")"
+  switched_to_bob s
+  stop_sup "$SUP_PID" "$FLOG"
+}
 
-# ═══════════════════════════════════════════════════════════════════════════
-rpt "----- Scenario 9: statusline tick, seven_day healthy but stored week_fable 100% on a -> same-account model fallback, not a switch -----"
-CUR_FIXTURE="$FIX_HEALTHY"
-# Reset before this scenario runs so its own teardown line (shared with 9b,
-# below) never acts on a PID or count left over from Scenario 8 if
-# start_supervisor here fails to produce a SID.
-N=0
-RELAUNCH_PID=""
-clear_last_switch
-mkdir -p "$SMART_DIR/usage"
-# seed a's store with an api probe that saw the model-scoped cap; the tick
-# carries only five_hour/seven_day and must merge this in
-cat > "$SMART_DIR/usage/a.json" <<EOF
-{"profile":"a","captured_at":"2026-09-14T10:00:00Z","source":"api","api_captured_at":"2026-09-14T10:00:00Z","cooldown_until":null,"usage":{"captured_at":"2026-09-14T10:00:00Z","session":{"pct":10,"resets":null,"resets_at":1789985119},"week_all":{"pct":40,"resets":null,"resets_at":1789985119},"week_fable":{"pct":100,"resets":null,"resets_at":1789985119},"week_model_label":"Fable","session_stats":[],"source":"api","attention":null}}
-EOF
-start_supervisor "s9" "$FIX_HEALTHY"
-if [[ -n "$SID" ]]; then
-  # `week_fable` alone must relax to a same-account model fallback, never an
-  # account switch: this cap doesn't say anything about `b`'s headroom, and
-  # switching away would waste a hop the account doesn't need.
-  run_capture "$A_DIR" "$(statusline_json "$SID" /tmp/e2e-cwd-s9 12 45)"
-  rpt "  tick exit=$CAP_EXIT stdout='$CAP_STDOUT'"
-  wait_for_pattern "$FAKE_LOG" "SIGTERM pid=$CHILD_PID" 10
-  wait_for_invocation_count "$FAKE_LOG" 2 10
-  N=$(count_invocations "$FAKE_LOG")
-  rpt "  invocation count now: $N"
-  FLAGS_OK=no
-  if (( N >= 2 )); then
-    RELAUNCH_CFG=$(get_invocation_configdir "$FAKE_LOG" 2)
-    RELAUNCH_VERB=$(get_invocation_field "$FAKE_LOG" 2 1)
-    RELAUNCH_SID=$(get_invocation_field "$FAKE_LOG" 2 2)
-    RELAUNCH_PID=$(get_invocation_pid "$FAKE_LOG" 2)
-    rpt "  relaunch: verb=$RELAUNCH_VERB sid=$RELAUNCH_SID config_dir=$RELAUNCH_CFG pid=$RELAUNCH_PID"
-    # Adjacency, not just presence: `--model` must be IMMEDIATELY followed by
-    # `opus` in the argv, not merely present somewhere alongside it.
-    if get_invocation_argv "$FAKE_LOG" 2 \
-      | awk '/^--model$/{getline; if ($0=="opus") found=1} END{exit !found}'; then
-      FLAGS_OK=yes
-    fi
-    rpt "  relaunch carries --model opus adjacent? $FLAGS_OK"
-  fi
-  rpt "  limit-switch.log tail:"
-  rpt "$(tail -2 "$SMART_DIR/limit-switch.log" 2>/dev/null)"
-  rpt "  .switched marker present? $(test -f "$SMART_DIR/$SID.switched" && echo yes || echo no) (must be no -- a fallback is not an account switch)"
-  rpt "  .model-fallback marker present? $(test -f "$SMART_DIR/$SID.model-fallback" && echo yes || echo no)"
-  S9_PASS=no
-  if (( N >= 2 )) && [[ "$RELAUNCH_VERB" == "--resume" && "$RELAUNCH_SID" == "$SID" && "$RELAUNCH_CFG" == "$A_DIR" ]] \
-     && [[ "$FLAGS_OK" == yes ]] && [[ ! -f "$SMART_DIR/$SID.switched" ]] && [[ -f "$SMART_DIR/$SID.model-fallback" ]] \
-     && tail -2 "$SMART_DIR/limit-switch.log" | grep -q "model-fallback=opus account=a.*via=statusline"; then
-    rpt "  VERDICT: PASS"
-    S9_PASS=yes
-  else
-    rpt "  VERDICT: FAIL"
-  fi
-fi
-rpt ""
+# Both accounts capped: notify only, no relaunch, no switch.
+sc_both_capped_notify() {
+  fresh_world
+  usage_healthy
+  start_sup s run -n || return
+  usage_both_capped
+  hook "$(rate_limit_json "$SID")"
+  /bin/sleep 1
+  check "no relaunch" eq "$(count_inv "$FLOG")" 1
+  check "claude still runs" alive "$CHILD"
+  check "the hook emits a notification" test -s "$LOGS/stdout"
+  check "no sentinel" test ! -e "$STATE/sentinel/$SID.json"
+  check "the log says notify-only" has "$(switch_log)" "notify-only sid=${SID:0:8}"
+  check "alice stays active" eq "$(active)" "$A_ID"
+  stop_sup "$SUP_PID" "$FLOG"
+}
 
-# ═══════════════════════════════════════════════════════════════════════════
-rpt "----- Scenario 9b: a second statusline tick on the same still-capped week_fable reading is suppressed, not a duplicate relaunch -----"
-# Continues straight from Scenario 9's state, same live relaunched process
-# (never torn down above): its .model-fallback marker was just written this
-# same run, so it is fresh against the fixture's week_fable resets_at
-# regardless of when this suite happens to run, and a's stored week_fable
-# reading is still 100% -- nothing here has changed it. A second tick on that
-# same unchanged reading must NOT relaunch again.
-if [[ -n "$SID" ]] && [[ "$S9_PASS" == yes ]]; then
-  PRE_N=$(count_invocations "$FAKE_LOG")
-  PRE_LOG_LINES=$(wc -l < "$SMART_DIR/limit-switch.log" 2>/dev/null || echo 0)
-  run_capture "$A_DIR" "$(statusline_json "$SID" /tmp/e2e-cwd-s9 12 45)"
-  rpt "  second tick exit=$CAP_EXIT stdout='$CAP_STDOUT'"
-  # Bounded poll for a THIRD invocation instead of a bare sleep, so a slow
-  # duplicate relaunch cannot race past a short fixed sleep and score PASS.
-  # Success here means a bug (a duplicate relaunch did appear), so the exit
-  # code is inverted below.
-  if wait_for_invocation_count "$FAKE_LOG" $((PRE_N + 1)) 5; then
-    DUPLICATE_RELAUNCH=yes
-  else
-    DUPLICATE_RELAUNCH=no
-  fi
-  POST_N=$(count_invocations "$FAKE_LOG")
-  POST_LOG_LINES=$(wc -l < "$SMART_DIR/limit-switch.log" 2>/dev/null || echo 0)
-  rpt "  invocation count: before=$PRE_N after=$POST_N (expect unchanged -- no duplicate relaunch)"
-  rpt "  limit-switch.log line count: before=$PRE_LOG_LINES after=$POST_LOG_LINES (expect unchanged -- fully silent)"
-  rpt "  .switched marker present? $(test -f "$SMART_DIR/$SID.switched" && echo yes || echo no) (must be no -- no account switch)"
-  if [[ "$DUPLICATE_RELAUNCH" == no ]] && [[ "$POST_N" == "$PRE_N" ]] && [[ -z "$CAP_STDOUT" ]] \
-     && [[ "$POST_LOG_LINES" == "$PRE_LOG_LINES" ]] && [[ ! -f "$SMART_DIR/$SID.switched" ]]; then
-    rpt "  VERDICT: PASS"
-  else
-    rpt "  VERDICT: FAIL"
-  fi
-else
-  rpt "  SKIPPED: Scenario 9 did not leave a live relaunched process to continue from"
-  rpt "  VERDICT: FAIL"
-fi
-if (( N >= 2 )); then safe_term "$RELAUNCH_PID"; else safe_term "$CHILD_PID"; fi
-safe_term "$SUP_PID"
-rpt ""
+# CLAUDE_AUTO_SWITCH_RELAUNCH=0: detect and notify, never relaunch.
+sc_relaunch_off() {
+  fresh_world
+  usage_healthy
+  start_sup s run -n || return
+  usage_a_capped
+  EXTRA=("CLAUDE_AUTO_SWITCH_RELAUNCH=0")
+  hook "$(rate_limit_json "$SID")"
+  EXTRA=()
+  /bin/sleep 1
+  check "no relaunch" eq "$(count_inv "$FLOG")" 1
+  check "claude still runs" alive "$CHILD"
+  check "the hook emits a notification" test -s "$LOGS/stdout"
+  check "no sentinel" test ! -e "$STATE/sentinel/$SID.json"
+  check "alice stays active" eq "$(active)" "$A_ID"
+  stop_sup "$SUP_PID" "$FLOG"
+}
 
-# ═══════════════════════════════════════════════════════════════════════════
-rpt "----- Scenario 10: statusline tick, a capped, CLAUDE_AUTO_SWITCH=0 kill-switch -----"
-CUR_FIXTURE="$FIX_HEALTHY"
-rm -f "$SMART_DIR/usage/a.json"
-start_supervisor "s10" "$FIX_HEALTHY"
-if [[ -n "$SID" ]]; then
-  run_capture "$A_DIR" "$(statusline_json "$SID" /tmp/e2e-cwd-s10 21 100)" "CLAUDE_AUTO_SWITCH=0"
-  sleep 1
-  N=$(count_invocations "$FAKE_LOG")
-  rpt "  tick exit=$CAP_EXIT invocation count: $N (expect 1) fake-claude alive? $(is_alive "$CHILD_PID" && echo yes || echo no) sentinel? $(test -f "$SMART_DIR/$SID.relaunch" && echo yes || echo no) switched? $(test -f "$SMART_DIR/$SID.switched" && echo yes || echo no)"
-  rpt "  store recorded anyway: $(python3 -c "import json;d=json.load(open('$SMART_DIR/usage/a.json'));print('week_all',d['usage']['week_all']['pct'])" 2>&1)"
-  if (( N == 1 )) && is_alive "$CHILD_PID" && [[ ! -f "$SMART_DIR/$SID.relaunch" && ! -f "$SMART_DIR/$SID.switched" ]]; then
-    rpt "  VERDICT: PASS"
-  else
-    rpt "  VERDICT: FAIL"
-  fi
-  safe_term "$CHILD_PID"
-fi
-safe_term "$SUP_PID"
-rpt ""
+# Two sessions on alice. The first to hit the cap leads: it switches D and
+# leaves a follow file for the other, which relaunches at its next turn
+# boundary without a second switch.
+sc_leader_follower() {
+  fresh_world
+  usage_healthy
+  start_sup lead run -n || return
+  local l_sup=$SUP_PID l_log=$FLOG l_sid=$SID l_child=$CHILD
+  start_sup follow run -n || { stop_sup "$l_sup" "$l_log"; return; }
+  local f_sup=$SUP_PID f_log=$FLOG f_sid=$SID
+  usage_a_capped
+  hook "$(rate_limit_json "$l_sid")"
+  SID=$l_sid FLOG=$l_log CHILD=$l_child switched_to_bob lead
+  check "the leader left a follow file for its peer" poll 5 test -f "$STATE/follow/$f_sid.json"
+  check "the follower keeps running until its turn ends" eq "$(count_inv "$f_log")" 1
+  hook "$(stop_json "$f_sid")"
+  check "the follower relaunched" poll 15 inv_at_least "$f_log" 2
+  check "the follower resumes its own session" inv_pair "$f_log" 2 --resume "$f_sid"
+  check "the follower says it followed" poll 5 has "$LOGS/follow.sup.log" "resumed on bob"
+  check "the follow is logged" has "$(switch_log)" "follow sid=${f_sid:0:8} to=$B_ID"
+  check "the follow file is consumed" poll 5 test ! -e "$STATE/follow/$f_sid.json"
+  check "bob stays active" eq "$(active)" "$B_ID"
+  stop_sup "$l_sup" "$l_log"
+  stop_sup "$f_sup" "$f_log"
+}
 
-# ═══════════════════════════════════════════════════════════════════════════
-rpt "----- Scenario 11: relaunch carries the launch's session-shaping flags, not its prompt -----"
-CUR_FIXTURE="$FIX_HEALTHY"
-set_last_switch_fresh
-EXTRA_DIR="$SANDBOX/extra-dir"
-mkdir -p "$EXTRA_DIR"
-# --add-dir's values end at the next flag, so the prompt here is a plain
-# positional: carried flags yes, prompt no, and no separator needed.
-start_supervisor "s11" "$FIX_HEALTHY" \
-  --add-dir "$EXTRA_DIR" --dangerously-skip-permissions "do the thing"
-if [[ -n "$SID" ]]; then
-  TP="$TRANSCRIPTS_DIR/$SID.jsonl"
-  JSON=$(cat <<EOF
-{"session_id":"$SID","transcript_path":"$TP","cwd":"/tmp/e2e-cwd-s11","permission_mode":"default","hook_event_name":"StopFailure","error":"rate_limit","error_details":"You have reached your weekly limit for Fable."}
-EOF
-)
-  run_hook "$A_DIR" "$JSON"
-  rpt "  hook exit=$HOOK_EXIT stdout=$HOOK_STDOUT"
-  wait_for_invocation_count "$FAKE_LOG" 2 10
-  N=$(count_invocations "$FAKE_LOG")
-  rpt "  invocation count now: $N"
-  CARRIES_SKIP=no; CARRIES_ADDDIR=no; CARRIES_DIR=no; CARRIES_PROMPT=no
-  if (( N >= 2 )); then
-    RELAUNCH_PID=$(get_invocation_pid "$FAKE_LOG" 2)
-    invocation_has_arg "$FAKE_LOG" 2 "--dangerously-skip-permissions" && CARRIES_SKIP=yes
-    invocation_has_arg "$FAKE_LOG" 2 "--add-dir" && CARRIES_ADDDIR=yes
-    invocation_has_arg "$FAKE_LOG" 2 "$EXTRA_DIR" && CARRIES_DIR=yes
-    invocation_has_arg "$FAKE_LOG" 2 "do the thing" && CARRIES_PROMPT=yes
-    rpt "  relaunch argv: $(get_invocation_argv "$FAKE_LOG" 2 | tail -n +2 | tr '\n' ' ')"
-    rpt "  carries: skip-permissions=$CARRIES_SKIP add-dir=$CARRIES_ADDDIR dir=$CARRIES_DIR prompt=$CARRIES_PROMPT (prompt must be no)"
-  fi
-  rpt "  limit-switch.log dropped line: $(grep 'dropped passthru' "$SMART_DIR/limit-switch.log" 2>/dev/null | tail -1)"
-  # The log names flags and counts everything else -- it must never quote the prompt.
-  PROMPT_IN_LOG=no
-  grep -q 'do the thing' "$SMART_DIR/limit-switch.log" 2>/dev/null && PROMPT_IN_LOG=yes
-  rpt "  prompt text in limit-switch.log? $PROMPT_IN_LOG (must be no)"
-  if (( N >= 2 )) && [[ "$CARRIES_SKIP" == yes && "$CARRIES_ADDDIR" == yes && "$CARRIES_DIR" == yes \
-        && "$CARRIES_PROMPT" == no && "$PROMPT_IN_LOG" == no ]]; then
-    rpt "  VERDICT: PASS"
-  else
-    rpt "  VERDICT: FAIL"
-  fi
-  if (( N >= 2 )); then safe_term "$RELAUNCH_PID"; else safe_term "$CHILD_PID"; fi
-fi
-safe_term "$SUP_PID"
-rpt ""
+# The statusLine tick is the switch path for caps that fire no hook. It is
+# definitive (the cooldown does not block it), the relaunch keeps the
+# launch's --model/--effort, and a late duplicate tick is a no-op.
+sc_statusline_switch() {
+  fresh_world
+  usage_healthy
+  stamp_last_switch
+  start_sup s run -n --model fake-model-x --effort high || return
+  usage_a_capped
+  tick "$(statusline_json "$SID" 20 40)"
+  /bin/sleep 1
+  check "a healthy tick does nothing" eq "$(count_inv "$FLOG")" 1
+  tick "$(statusline_json "$SID" 21 100)"
+  switched_to_bob s
+  check "the relaunch keeps --model" inv_pair "$FLOG" 2 --model fake-model-x
+  check "the relaunch keeps --effort" inv_pair "$FLOG" 2 --effort high
+  check "the switch is logged via=statusline" has "$(switch_log)" "limit-switch sid=${SID:0:8} to=$B_ID.*via=statusline"
+  tick "$(statusline_json "$SID" 21 100)"
+  /bin/sleep 2
+  check "a duplicate tick does not relaunch again" eq "$(count_inv "$FLOG")" 2
+  check "the tick prints nothing" test ! -s "$LOGS/stdout"
+  stop_sup "$SUP_PID" "$FLOG"
+}
 
-# ═══════════════════════════════════════════════════════════════════════════
-rpt "----- Scenario 12: an open --add-dir run is closed with -- before the handoff -----"
-CUR_FIXTURE="$FIX_HEALTHY"
-set_last_switch_fresh
-# --add-dir last: claude would read the handoff prompt as one more directory,
-# so the hop must emit `--` between them.
-start_supervisor "s12" "$FIX_HEALTHY" --add-dir "$EXTRA_DIR"
-if [[ -n "$SID" ]]; then
-  TP="$TRANSCRIPTS_DIR/$SID.jsonl"
-  JSON=$(cat <<EOF
-{"session_id":"$SID","transcript_path":"$TP","cwd":"/tmp/e2e-cwd-s12","permission_mode":"default","hook_event_name":"StopFailure","error":"rate_limit","error_details":"You have reached your weekly limit for Fable."}
-EOF
-)
-  run_hook "$A_DIR" "$JSON"
-  rpt "  hook exit=$HOOK_EXIT stdout=$HOOK_STDOUT"
-  wait_for_invocation_count "$FAKE_LOG" 2 10
-  N=$(count_invocations "$FAKE_LOG")
-  rpt "  invocation count now: $N"
-  SEP_BEFORE_HANDOFF=no
-  if (( N >= 2 )); then
-    RELAUNCH_PID=$(get_invocation_pid "$FAKE_LOG" 2)
-    RELAUNCH_ARGV=$(get_invocation_argv "$FAKE_LOG" 2)
-    rpt "  relaunch argv: $(printf '%s\n' "$RELAUNCH_ARGV" | tail -n +2 | tr '\n' ' ')"
-    # the last two tokens must be `--` then the handoff prompt
-    if [[ "$(printf '%s\n' "$RELAUNCH_ARGV" | tail -2 | head -1)" == "--" ]]; then
-      SEP_BEFORE_HANDOFF=yes
-    fi
-    rpt "  separator immediately before the handoff? $SEP_BEFORE_HANDOFF"
-  fi
-  if (( N >= 2 )) && [[ "$SEP_BEFORE_HANDOFF" == yes ]]; then
-    rpt "  VERDICT: PASS"
-  else
-    rpt "  VERDICT: FAIL"
-  fi
-  if (( N >= 2 )); then safe_term "$RELAUNCH_PID"; else safe_term "$CHILD_PID"; fi
-fi
-safe_term "$SUP_PID"
-rpt ""
+# A stored model-scoped (week_fable) cap relaunches on the same account with
+# --model opus, and a second tick on the same reading does nothing.
+sc_fable_fallback() {
+  fresh_world
+  usage_healthy
+  store_record "$A_ID" 10 40 100
+  start_sup s run -n || return
+  tick "$(statusline_json "$SID" 12 45)"
+  check "the fallback relaunched claude" poll 15 inv_at_least "$FLOG" 2
+  check "the relaunch resumes the session" inv_pair "$FLOG" 2 --resume "$SID"
+  check "the relaunch asks for --model opus" inv_pair "$FLOG" 2 --model opus
+  check "the supervisor names the model" poll 5 has_fixed "$LOGS/s.sup.log" "csm: model-scoped cap on alice; resumed on model opus"
+  check "alice stays active" eq "$(active)" "$A_ID"
+  check "no account switch was claimed" test ! -e "$STATE/$SID.switched"
+  check "the fallback marker is set" test -f "$STATE/$SID.model-fallback"
+  check "the fallback is logged" has "$(switch_log)" "model-fallback=opus account=$A_ID.*via=statusline"
+  local before
+  before=$(lines "$(switch_log)")
+  tick "$(statusline_json "$SID" 12 45)"
+  /bin/sleep 2
+  check "a second tick on the same reading does not relaunch" eq "$(count_inv "$FLOG")" 2
+  check "nor log anything" eq "$(lines "$(switch_log)")" "$before"
+  stop_sup "$SUP_PID" "$FLOG"
+}
 
-# ═══════════════════════════════════════════════════════════════════════════
-rpt "----- Scenario 13: csm --profile b claude <args> runs claude under b, verbatim -----"
-CUR_FIXTURE="$FIX_HEALTHY"
-S13_LOG="$LOG_DIR/s13.fakeclaude.log"
-rm -f "$S13_LOG"
-run_csm_bg "$S13_LOG" --profile b claude --version --dangerously-skip-permissions
-S13_CFG=""; S13_ARGV=""
-if wait_for_invocation_count "$S13_LOG" 1 10; then
-  S13_CFG=$(get_invocation_configdir "$S13_LOG" 1)
-  S13_ARGV=$(get_invocation_argv "$S13_LOG" 1 | tail -n +2 | tr '\n' ' ')
-fi
-rpt "  config_dir=$S13_CFG (expect $B_DIR)"
-rpt "  argv after the binary: $S13_ARGV"
-# verbatim means exactly what was typed: no --session-id, no --resume, no
-# handoff prompt, nothing the launcher would have added.
-if [[ "$S13_CFG" == "$B_DIR" && "$S13_ARGV" == "--version --dangerously-skip-permissions " ]]; then
-  rpt "  VERDICT: PASS"
-else
-  rpt "  VERDICT: FAIL"
-fi
-safe_term "$CSM_BG_PID"
-rpt ""
+# CLAUDE_AUTO_SWITCH=0 turns the statusline switch off.
+sc_auto_switch_off() {
+  fresh_world
+  usage_healthy
+  start_sup s run -n || return
+  EXTRA=("CLAUDE_AUTO_SWITCH=0")
+  tick "$(statusline_json "$SID" 21 100)"
+  EXTRA=()
+  /bin/sleep 1
+  check "no relaunch" eq "$(count_inv "$FLOG")" 1
+  check "claude still runs" alive "$CHILD"
+  check "no sentinel" test ! -e "$STATE/sentinel/$SID.json"
+  check "not marked switched" test ! -e "$STATE/$SID.switched"
+  stop_sup "$SUP_PID" "$FLOG"
+}
 
-# ═══════════════════════════════════════════════════════════════════════════
-rpt "----- Scenario 14: a global --profile in front of a subcommand belongs to csm -----"
-CUR_FIXTURE="$FIX_HEALTHY"
-S14_LOG="$LOG_DIR/s14.fakeclaude.log"
-rm -f "$S14_LOG"
-# The bug: everything here used to be forwarded to claude, so the subcommand
-# never ran and a claude process started instead.
-run_csm "$S14_LOG" --profile b newuuid
-S14_UUID_OUT="$CSM_STDOUT"; S14_UUID_EXIT="$CSM_EXIT"
-S14_N=$(count_invocations "$S14_LOG")
-rpt "  newuuid exit=$S14_UUID_EXIT stdout=$S14_UUID_OUT claude invocations=$S14_N (expect 0)"
-# `csm run --help` is the other half: run's own help, not claude's.
-run_csm "$S14_LOG" run --help
-S14_HELP_OUT="$CSM_STDOUT"; S14_HELP_EXIT="$CSM_EXIT"
-S14_N2=$(count_invocations "$S14_LOG")
-rpt "  run --help exit=$S14_HELP_EXIT first line: $(printf '%s\n' "$S14_HELP_OUT" | head -1)"
-rpt "  claude invocations after both calls=$S14_N2 (expect 0)"
-if [[ "$S14_UUID_EXIT" == 0 && "$S14_N" == 0 && "$S14_N2" == 0 && "$S14_HELP_EXIT" == 0 ]] \
-   && [[ "$S14_UUID_OUT" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]] \
-   && printf '%s\n' "$S14_HELP_OUT" | grep -q 'csm run \[csm-flags\]'; then
-  rpt "  VERDICT: PASS"
-else
-  rpt "  VERDICT: FAIL"
-fi
-rpt ""
+# The relaunch replays session-shaping claude flags and drops the prompt,
+# and the log never quotes the prompt.
+sc_carry_flags() {
+  fresh_world
+  usage_healthy
+  mkdir -p "$SANDBOX/extra-dir"
+  start_sup s run -n --add-dir "$SANDBOX/extra-dir" --dangerously-skip-permissions "do the thing" || return
+  usage_a_capped
+  hook "$(rate_limit_json "$SID")"
+  check "relaunched" poll 15 inv_at_least "$FLOG" 2
+  check "keeps --dangerously-skip-permissions" inv_has "$FLOG" 2 --dangerously-skip-permissions
+  check "keeps --add-dir <dir>" inv_pair "$FLOG" 2 --add-dir "$SANDBOX/extra-dir"
+  check_not "drops the prompt" inv_has "$FLOG" 2 "do the thing"
+  check_not "the log never quotes the prompt" has_fixed "$(switch_log)" "do the thing"
+  stop_sup "$SUP_PID" "$FLOG"
+}
 
-# ═══════════════════════════════════════════════════════════════════════════
-rpt "----- Scenario 15: a rate-limit switch (a->b), then b's own stored week_fable falls back on b -----"
-CUR_FIXTURE="$FIX_HEALTHY"
-clear_last_switch
-mkdir -p "$SMART_DIR/usage"
-rm -f "$SMART_DIR/usage/a.json" "$SMART_DIR/usage/b.json"
-# b is already Fable-saturated before the switch even happens -- the user's
-# real flow: a fable-saturated account stays a pick candidate, so an
-# ordinary account switch off a can land the session on it.
-cat > "$SMART_DIR/usage/b.json" <<EOF
-{"profile":"b","captured_at":"2026-09-14T10:00:00Z","source":"api","api_captured_at":"2026-09-14T10:00:00Z","cooldown_until":null,"usage":{"captured_at":"2026-09-14T10:00:00Z","session":{"pct":10,"resets":null,"resets_at":1789985119},"week_all":{"pct":40,"resets":null,"resets_at":1789985119},"week_fable":{"pct":100,"resets":null,"resets_at":1789985119},"week_model_label":"Fable","session_stats":[],"source":"api","attention":null}}
-EOF
-start_supervisor "s15" "$FIX_HEALTHY"
-if [[ -n "$SID" ]]; then
-  TP="$TRANSCRIPTS_DIR/$SID.jsonl"
-  JSON=$(cat <<EOF
-{"session_id":"$SID","transcript_path":"$TP","cwd":"/tmp/e2e-cwd-s15","permission_mode":"default","hook_event_name":"StopFailure","error":"rate_limit","error_details":"You have reached your weekly limit."}
-EOF
-)
-  run_hook "$A_DIR" "$JSON"
-  rpt "  switch hook exit=$HOOK_EXIT stdout=$HOOK_STDOUT"
-  wait_for_pattern "$FAKE_LOG" "SIGTERM pid=$CHILD_PID" 10
-  wait_for_invocation_count "$FAKE_LOG" 2 10
-  N=$(count_invocations "$FAKE_LOG")
-  rpt "  invocation count after the switch: $N"
-  S15_SWITCH_OK=no
-  if (( N >= 2 )); then
-    RELAUNCH_CFG=$(get_invocation_configdir "$FAKE_LOG" 2)
-    RELAUNCH_VERB=$(get_invocation_field "$FAKE_LOG" 2 1)
-    RELAUNCH_SID=$(get_invocation_field "$FAKE_LOG" 2 2)
-    RELAUNCH_PID=$(get_invocation_pid "$FAKE_LOG" 2)
-    rpt "  switch relaunch: verb=$RELAUNCH_VERB sid=$RELAUNCH_SID config_dir=$RELAUNCH_CFG pid=$RELAUNCH_PID"
-    [[ "$RELAUNCH_VERB" == "--resume" && "$RELAUNCH_SID" == "$SID" && "$RELAUNCH_CFG" == "$B_DIR" ]] && S15_SWITCH_OK=yes
-  fi
-  rpt "  .switched marker present? $(test -f "$SMART_DIR/$SID.switched" && echo yes || echo no) (must be yes -- this session already spent its switch)"
+# An open --add-dir is closed with `--` before the handoff prompt.
+sc_separator() {
+  fresh_world
+  usage_healthy
+  mkdir -p "$SANDBOX/extra-dir"
+  start_sup s run -n --add-dir "$SANDBOX/extra-dir" || return
+  usage_a_capped
+  hook "$(rate_limit_json "$SID")"
+  check "relaunched" poll 15 inv_at_least "$FLOG" 2
+  check "\`--\` sits right before the handoff" eq "$(inv_argv "$FLOG" 2 | tail -2 | head -1)" "--"
+  stop_sup "$SUP_PID" "$FLOG"
+}
 
-  if [[ "$S15_SWITCH_OK" == yes ]]; then
-    # b's own tick: session/week_all healthy on this reading, but the store
-    # still carries b's week_fable at 100% from before the switch, merged in
-    # exactly like Scenario 9 -- only now on the account this session just
-    # switched TO, with .switched already on disk from the hop above. This
-    # is the fix under test: kill-switch 1c must let a WeekFable trip
-    # through despite .switched, and the marker it writes must be judged
-    # against the CURRENT account, not suppressed by a stale idea of one.
-    run_capture "$B_DIR" "$(statusline_json "$SID" /tmp/e2e-cwd-s15 12 45)"
-    rpt "  b tick exit=$CAP_EXIT stdout='$CAP_STDOUT'"
-    wait_for_pattern "$FAKE_LOG" "SIGTERM pid=$RELAUNCH_PID" 10
-    wait_for_invocation_count "$FAKE_LOG" 3 10
-    N2=$(count_invocations "$FAKE_LOG")
-    rpt "  invocation count after b's tick: $N2"
-    FLAGS_OK=no
-    if (( N2 >= 3 )); then
-      FALLBACK_CFG=$(get_invocation_configdir "$FAKE_LOG" 3)
-      FALLBACK_VERB=$(get_invocation_field "$FAKE_LOG" 3 1)
-      FALLBACK_SID=$(get_invocation_field "$FAKE_LOG" 3 2)
-      FALLBACK_PID=$(get_invocation_pid "$FAKE_LOG" 3)
-      rpt "  fallback relaunch: verb=$FALLBACK_VERB sid=$FALLBACK_SID config_dir=$FALLBACK_CFG pid=$FALLBACK_PID"
-      if get_invocation_argv "$FAKE_LOG" 3 \
-        | awk '/^--model$/{getline; if ($0=="opus") found=1} END{exit !found}'; then
-        FLAGS_OK=yes
-      fi
-      rpt "  fallback carries --model opus adjacent? $FLAGS_OK"
-    fi
-    rpt "  limit-switch.log tail:"
-    rpt "$(tail -3 "$SMART_DIR/limit-switch.log" 2>/dev/null)"
-    if (( N2 >= 3 )) && [[ "$FALLBACK_VERB" == "--resume" && "$FALLBACK_SID" == "$SID" && "$FALLBACK_CFG" == "$B_DIR" ]] \
-       && [[ "$FLAGS_OK" == yes ]]; then
-      rpt "  VERDICT: PASS"
-    else
-      rpt "  VERDICT: FAIL"
-    fi
-    if (( N2 >= 3 )); then safe_term "$FALLBACK_PID"; else safe_term "$RELAUNCH_PID"; fi
-  else
-    rpt "  SKIPPED: the a->b switch did not commit, cannot test b's own fallback"
-    rpt "  VERDICT: FAIL"
-    safe_term "$RELAUNCH_PID"
-  fi
-fi
-safe_term "$SUP_PID"
-rpt ""
+# One automatic switch per chain. The hook refuses a second hop, and when
+# the hook is told to allow more (CLAUDE_MAX_HOPS), the supervisor still
+# stops at its own cap.
+sc_hop_cap() {
+  fresh_world
+  usage_healthy
+  start_sup s run -n || return
+  usage_a_capped
+  hook "$(rate_limit_json "$SID")"
+  switched_to_bob s
+  rm -f "$STATE/$SID.switched" "$STATE/.last-switch"
+  usage_b_capped
+  hook "$(rate_limit_json "$SID")"
+  /bin/sleep 2
+  check "the hook refuses a second hop" eq "$(count_inv "$FLOG")" 2
+  check "no sentinel" test ! -e "$STATE/sentinel/$SID.json"
+  rm -f "$STATE/$SID.switched" "$STATE/.last-switch" "$STATE/$SID.detected"
+  EXTRA=("CLAUDE_MAX_HOPS=5")
+  hook "$(rate_limit_json "$SID")"
+  EXTRA=()
+  check "the supervisor stops at its cap" poll 10 has_fixed "$LOGS/s.sup.log" "csm: limit-switch hop cap (1) reached"
+  check "and exits" wait_dead "$SUP_PID" 10
+  check "without a third launch" eq "$(count_inv "$FLOG")" 2
+  check "bob stays active" eq "$(active)" "$B_ID"
+  stop_sup "$SUP_PID" "$FLOG"
+}
 
+# After a switch has spent the chain's hop, a model-scoped cap on the new
+# account still gets its same-account fallback.
+sc_switch_then_fallback() {
+  fresh_world
+  usage_healthy
+  start_sup s run -n || return
+  usage_a_capped
+  hook "$(rate_limit_json "$SID")"
+  switched_to_bob s
+  store_record "$B_ID" 10 40 100
+  /bin/sleep 1
+  tick "$(statusline_json "$SID" 12 45)"
+  check "the fallback relaunched claude" poll 15 inv_at_least "$FLOG" 3
+  check "on the same session" inv_pair "$FLOG" 3 --resume "$SID"
+  check "with --model opus" inv_pair "$FLOG" 3 --model opus
+  check "the fallback is on bob" has "$(switch_log)" "model-fallback=opus account=$B_ID"
+  check "bob stays active" eq "$(active)" "$B_ID"
+  stop_sup "$SUP_PID" "$FLOG"
+}
+
+# ─── Orca running ──────────────────────────────────────────────────────────────
+
+# With Orca running every account change goes through its RPC.
+sc_switch_via_orca() {
+  fresh_world
+  start_orca || return
+  csm accounts
+  check "\`csm accounts\` lists both accounts" eq "$(grep -c -e alice@example.com -e bob@example.com "$LOGS/out")" 2
+  csm accounts use bob@example.com
+  check "the switch exits 0" eq "$RC" 0
+  check "it went through Orca" has_fixed "$LOGS/out" "csm: switched to bob (via Orca)"
+  check "Orca got selectClaude from csm" has_fixed "$LOGS/orca-requests.log" "csm accounts.selectClaude {\"accountId\":\"$B_ID\"}"
+  check "bob is active" eq "$(active)" "$B_ID"
+  check "D holds bob's grant" eq "$(d_refresh)" rt-bob-1
+  csm accounts use bob@example.com
+  check "a second use succeeds" eq "$RC" 0
+  check "and bob stays active" eq "$(active)" "$B_ID"
+  csm accounts rm bob@example.com
+  check_not "the active account cannot be removed" eq "$RC" 0
+  stop_orca
+}
+
+# The Orca GUI switches while a session runs. When that session then hits
+# the cap, its supervisor sees the new active account and follows it
+# instead of switching again.
+sc_gui_switch_follow() {
+  fresh_world
+  usage_healthy
+  start_orca || return
+  start_sup s run -n || { stop_orca; return; }
+  orca_call accounts.selectClaude "{\"accountId\":\"$B_ID\"}"
+  check "the GUI switched Orca's store" eq "$(active)" "$B_ID"
+  usage_a_capped
+  hook "$(rate_limit_json "$SID")"
+  switched_to_bob s
+  check "csm asked Orca for the active account" has "$LOGS/orca-requests.log" "^csm accounts.list"
+  check_not "csm did not switch again" has "$LOGS/orca-requests.log" "^csm accounts.selectClaude"
+  stop_sup "$SUP_PID" "$FLOG"
+  stop_orca
+}
+
+# Orca starts in the middle of an offline store write. At L1 (the new store
+# is written to its temp file, not yet renamed) csm restores D and redoes
+# the switch over RPC; at L2 (renamed) it leaves D and confirms over RPC.
+store_orca_at() {
+  fresh_world
+  EXTRA=("E2E_POINT_AT=$1")
+  csm accounts use bob@example.com
+  EXTRA=()
+  check "the switch exits 0" eq "$RC" 0
+  check "Orca appeared at $1" test -f "$LOGS/point.fired"
+  check "the route says offline, then via Orca" has_fixed "$LOGS/out" "csm: switched to bob (offline, then via Orca)"
+  check "bob is active" eq "$(active)" "$B_ID"
+  check "D holds bob's grant" eq "$(d_refresh)" rt-bob-1
+  check "D's identity is bob" eq "$(d_uuid)" uuid-bob
+  check "csm talked to the new Orca" has "$LOGS/orca-requests.log" "^csm accounts\."
+  check "no temp store left behind" eq "$(find "$UD/profiles" -name '*.tmp*' | wc -l | tr -d ' ')" 0
+}
+
+sc_store_orca_at_l1() {
+  store_orca_at store-L1
+  check "at L1 the switch is redone with selectClaude" has "$LOGS/orca-requests.log" "^csm accounts.selectClaude"
+  stop_orca
+}
+
+sc_store_orca_at_l2() {
+  store_orca_at store-L2
+  stop_orca
+}
+
+# ─── read-back and quarantine (offline switch, step 3) ────────────────────────
+
+# D holds a newer grant for alice than her stash (Claude Code refreshed it).
+rotated_d() {
+  fresh_world
+  world rotate-d at-alice-2 rt-alice-2
+}
+
+# no_secret_in <file...>: no refresh or access token of the fixtures.
+no_secret_in() {
+  ! cat "$@" 2>/dev/null | grep -qE '(rt|at)-(alice|bob)-[0-9]'
+}
+
+# The profile check confirms the grant is alice's: it goes to her stash.
+sc_readback_owner() {
+  rotated_d
+  http_rule profile at-alice-2 200 '{"account":{"uuid":"uuid-alice","email":"alice@example.com"},"organization":{"uuid":"org-acme"}}'
+  csm accounts use bob@example.com
+  check "the switch exits 0" eq "$RC" 0
+  check "offline" has_fixed "$LOGS/out" "csm: switched to bob (offline)"
+  check "the profile endpoint was asked about D's grant" has_fixed "$HTTP_DIR/requests.log" "GET /api/oauth/profile at-alice-2"
+  check "alice's stash holds the newer grant" eq "$(stash_refresh "$A_ID")" rt-alice-2
+  check "D holds bob's grant" eq "$(d_refresh)" rt-bob-1
+  check "csm printed no token" no_secret_in "$LOGS/out"
+}
+
+# 401 and the refresh fails: quarantined, alice's stash untouched, and
+# doctor lists it.
+sc_quarantine_401() {
+  rotated_d
+  http_rule profile at-alice-2 401 '{"error":"unauthorized"}'
+  http_rule token rt-alice-2 400 '{"error":"invalid_grant"}'
+  csm accounts use bob@example.com
+  check "the switch exits 0" eq "$RC" 0
+  check "offline" has_fixed "$LOGS/out" "csm: switched to bob (offline)"
+  check "the refresh was tried" has_fixed "$HTTP_DIR/requests.log" "POST /v1/oauth/token rt-alice-2"
+  check "alice's stash is untouched" eq "$(stash_refresh "$A_ID")" rt-alice-1
+  check "D holds bob's grant" eq "$(d_refresh)" rt-bob-1
+  csm accounts doctor --offline
+  check "doctor lists the quarantined grant" has_fixed "$LOGS/out" "quarantined grant"
+  check "csm printed no token" no_secret_in "$LOGS/transcript"
+}
+
+# 401, then the refresh works and the new grant is alice's: it goes to her
+# stash and the quarantine entry is dropped.
+sc_quarantine_refresh_owner() {
+  rotated_d
+  http_rule profile at-alice-2 401 '{"error":"unauthorized"}'
+  http_rule token rt-alice-2 200 '{"access_token":"at-alice-3","refresh_token":"rt-alice-3","expires_in":28800}'
+  http_rule profile at-alice-3 200 '{"account":{"uuid":"uuid-alice","email":"alice@example.com"},"organization":{"uuid":"org-acme"}}'
+  csm accounts use bob@example.com
+  check "the switch exits 0" eq "$RC" 0
+  check "alice's stash holds the refreshed grant" eq "$(stash_refresh "$A_ID")" rt-alice-3
+  check "D holds bob's grant" eq "$(d_refresh)" rt-bob-1
+  csm accounts doctor --offline
+  check_not "nothing stays quarantined" has_fixed "$LOGS/out" "quarantined grant"
+  check "csm printed no token" no_secret_in "$LOGS/transcript"
+}
+
+# The grant belongs to someone else: quarantined, never stashed as alice.
+sc_quarantine_mismatch() {
+  rotated_d
+  http_rule profile at-alice-2 200 '{"account":{"uuid":"uuid-mallory","email":"mallory@example.com"},"organization":{"uuid":"org-acme"}}'
+  csm accounts use bob@example.com
+  check "the switch exits 0" eq "$RC" 0
+  check "alice's stash is untouched" eq "$(stash_refresh "$A_ID")" rt-alice-1
+  check "D holds bob's grant" eq "$(d_refresh)" rt-bob-1
+  csm accounts doctor --offline
+  check "doctor lists the quarantined grant" has_fixed "$LOGS/out" "quarantined grant"
+  check "csm printed no token" no_secret_in "$LOGS/transcript"
+}
+
+# ─── accounts import / rm ──────────────────────────────────────────────────────
+
+sc_accounts_import_rm() {
+  fresh_world
+  local dir="$HOME_DIR/extra-login"
+  world login-dir "$dir" carol@example.com uuid-carol at-carol-1 rt-carol-1
+  csm accounts import "$dir"
+  check "offline import exits 0" eq "$RC" 0
+  check "offline import says so" has "$LOGS/out" "csm: imported carol@example.com (.*) (offline)"
+  local c
+  c=$(the_new_id)
+  check "carol has a store record" test -n "$c"
+  check "carol's stash holds her grant" eq "$(stash_refresh "$c")" rt-carol-1
+  check "alice stays active" eq "$(active)" "$A_ID"
+  csm accounts rm carol@example.com
+  check "offline rm exits 0" eq "$RC" 0
+  check "offline rm says so" has "$LOGS/out" "csm: removed .*(offline)"
+  check "carol's record is gone" test -z "$(the_new_id)"
+  check "carol's stash is gone" test ! -e "$UD/claude-accounts/$c"
+
+  start_orca || return
+  csm accounts import "$dir"
+  check "import with Orca running exits 0" eq "$RC" 0
+  check "it went through Orca" has "$LOGS/out" "csm: imported .*(via Orca)"
+  check "Orca got addClaudeFromConfigDir" has "$LOGS/orca-requests.log" "^csm accounts.addClaudeFromConfigDir"
+  c=$(the_new_id)
+  csm accounts rm carol@example.com
+  check "rm with Orca running exits 0" eq "$RC" 0
+  check "Orca got removeClaude" has_fixed "$LOGS/orca-requests.log" "csm accounts.removeClaude {\"accountId\":\"$c\"}"
+  check "carol's record is gone" test -z "$(the_new_id)"
+  stop_orca
+}
+
+# ─── launch contexts ───────────────────────────────────────────────────────────
+
+sc_passthrough() {
+  fresh_world
+  csm claude --version
+  check "csm claude --version reaches claude" has_fixed "$LOGS/out" "2.1.283 (Claude Code)"
+  FAKE_LOG="$LOGS/claude.log" csm claude -p "hello there"
+  check "csm claude -p runs claude once" eq "$(count_calls "$LOGS/claude.log")" 1
+  check "with the arguments verbatim" eq "$(call_argv "$LOGS/claude.log" 1 | tail -n +2 | tr '\n' ' ')" "-p hello there "
+  csm newuuid
+  check "csm newuuid prints a uuid" grep -qE '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$' "$LOGS/out"
+  csm run --help
+  check "csm run --help prints run's usage" has_fixed "$LOGS/out" "csm run [csm-flags]"
+  check "nothing was launched" eq "$(count_inv "$LOGS/claude.log")" 0
+}
+
+# Print mode: -p, or a stdin that is not a terminal. claude runs verbatim;
+# no sidecar, no usage fetch, no supervisor.
+sc_print_context() {
+  fresh_world
+  usage_healthy
+  csm -p "summarize this"
+  check "csm -p exits 0" eq "$RC" 0
+  check "claude ran once, one-shot" eq "$(count_calls "$LOGS/claude.log")" 1
+  check "with the arguments verbatim" eq "$(call_argv "$LOGS/claude.log" 1 | tail -n +2 | tr '\n' ' ')" "-p summarize this "
+  csm_stdin "some piped text" "explain"
+  check "a piped stdin is print mode too" eq "$(count_calls "$LOGS/claude.log")" 2
+  check "with the arguments verbatim" eq "$(call_argv "$LOGS/claude.log" 2 | tail -n +2 | tr '\n' ' ')" "explain "
+  check "no interactive launch" eq "$(count_inv "$LOGS/claude.log")" 0
+  check "no usage fetch" eq "$(lines "$LOGS/usage-calls")" 0
+  check "no sidecar or pid file" eq "$(find "$STATE" -maxdepth 1 \( -name '*.pid' -o -name '*-*-*-*-*.json' \) | wc -l | tr -d ' ')" 0
+}
+
+# An Orca pane resuming a session execs claude at once: no picker, no usage
+# fetch, no Keychain, no account decision, even with every account capped.
+sc_orca_pane_resume() {
+  fresh_world
+  usage_both_capped
+  local r=11111111-2222-4333-8444-555555555555 t0 t1
+  EXTRA=("ORCA_PANE_KEY=pane-e2e" "ORCA_TERMINAL_HANDLE=term-e2e")
+  t0=$(now_ms)
+  start_sup pane --resume "$r" || { EXTRA=(); return; }
+  t1=$(now_ms)
+  EXTRA=()
+  check "claude started within 3 s" lt $((t1 - t0)) 3000
+  check "it resumes the session" inv_pair "$FLOG" 1 --resume "$r"
+  check "no usage fetch before claude started" eq "$(lines "$LOGS/usage-calls")" 0
+  check "no Keychain access" eq "$(lines "$KC_ROOT/calls")" 0
+  check "alice stays active" eq "$(active)" "$A_ID"
+  stop_sup "$SUP_PID" "$FLOG"
+}
+
+# Invoked as `claude` (the alias `csm orca setup` creates), csm hands
+# claude's own words and flags to the real claude further down PATH and
+# treats everything else as a launch.
+sc_alias_dispatch() {
+  fresh_world
+  usage_healthy
+  csm orca setup
+  check "setup exits 0" eq "$RC" 0
+  check "setup names the alias" has_fixed "$LOGS/out" "$STATE/bin/claude"
+  check "setup prints the agentCmdOverrides value" has_fixed "$LOGS/out" "agentCmdOverrides.claude"
+  check "the alias exists" test -x "$STATE/bin/claude"
+  PATH_PREFIX="$STATE/bin"
+  PROG="$STATE/bin/claude" csm --version
+  check "claude --version reaches the real claude" has_fixed "$LOGS/out" "2.1.283 (Claude Code)"
+  PROG="$STATE/bin/claude" csm mcp list
+  check "claude mcp reaches the real claude" eq "$(call_argv "$LOGS/claude.log" 1 | tail -n +2 | tr '\n' ' ')" "mcp list "
+  PROG="$STATE/bin/claude" csm -p hi
+  check "claude -p reaches the real claude" eq "$(call_argv "$LOGS/claude.log" 2 | tail -n +2 | tr '\n' ' ')" "-p hi "
+  PROG="$STATE/bin/claude" start_sup alias || { PATH_PREFIX=; return; }
+  PATH_PREFIX=
+  check "a bare \`claude\` is a supervised launch" inv_has "$FLOG" 1 --session-id
+  check "the real claude ran, not the alias" eq "$(inv_arg "$FLOG" 1 0)" "$BIN/claude"
+  check "csm supervises it" test -f "$STATE/$SID.pid"
+  stop_sup "$SUP_PID" "$FLOG"
+}
+
+# SessionEnd hooks together get about 1.5 s. The hook reads csm's own files
+# only: no network, no RPC, no Keychain, no usage command, even with a stale
+# cache and Orca running.
+sc_sessionend_budget() {
+  fresh_world
+  usage_healthy
+  start_orca || return
+  start_sup s run -n || { stop_orca; return; }
+  usage_both_capped "$(iso_days_ago 2)"
+  mkdir -p "$SANDBOX/transcripts"
+  printf '{"type":"user"}\n' >"$SANDBOX/transcripts/$SID.jsonl"
+  local http0 kc0 orca0 use0 t0 t1
+  http0=$(lines "$HTTP_DIR/requests.log")
+  kc0=$(lines "$KC_ROOT/calls")
+  orca0=$(lines "$LOGS/orca-requests.log")
+  use0=$(lines "$LOGS/usage-calls")
+  t0=$(now_ms)
+  hook "$(hook_json SessionEnd "$SID" '"reason":"other"')"
+  t1=$(now_ms)
+  check "the hook exits 0" eq "$RC" 0
+  check "it finished well under 1.5 s ($((t1 - t0)) ms)" lt $((t1 - t0)) 1000
+  check "no HTTP request" eq "$(lines "$HTTP_DIR/requests.log")" "$http0"
+  check "no Keychain access" eq "$(lines "$KC_ROOT/calls")" "$kc0"
+  check "no RPC" eq "$(lines "$LOGS/orca-requests.log")" "$orca0"
+  check "no usage command" eq "$(lines "$LOGS/usage-calls")" "$use0"
+  t0=$(now_ms)
+  hook '{"session_id":"'"$SID"'","hook_event_name":"SessionEnd","reason":"other"}'
+  t1=$(now_ms)
+  check "a SessionEnd with no turn returns at once ($((t1 - t0)) ms)" lt $((t1 - t0)) 500
+  stop_sup "$SUP_PID" "$FLOG"
+  stop_orca
+}
+
+# ─── migration ─────────────────────────────────────────────────────────────────
+
+# Two legacy ~/.claude.<name> profiles, work being the floor.
+sc_migrate() {
+  fresh_world
+  world legacy work carol@example.com uuid-carol at-carol-1 rt-carol-1 floor
+  world legacy home erin@example.com uuid-erin at-erin-1 rt-erin-1
+  csm migrate plan
+  check "plan exits 0" eq "$RC" 0
+  check "plan names both profiles" eq "$(grep -c -e work -e home "$LOGS/out" | awk '$1 >= 2 { print "yes" }')" yes
+  check "plan names the target D" has_fixed "$LOGS/out" "target D: $D"
+  check "plan changes nothing" eq "$(world ids | wc -l | tr -d ' ')" 2
+  csm migrate import --dry-run
+  check "the dry run exits 0" eq "$RC" 0
+  check "the dry run lists the imports" has_fixed "$LOGS/out" "import work from $HOME_DIR/.claude.work"
+  check "the dry run changes nothing" eq "$(world ids | wc -l | tr -d ' ')" 2
+
+  start_orca || return
+  csm migrate import
+  check_not "import refuses while Orca runs" eq "$RC" 0
+  check "and imports nothing" eq "$(world ids | wc -l | tr -d ' ')" 2
+  stop_orca
+
+  csm migrate import
+  check "import exits 0" eq "$RC" 0
+  check "work imported" has "$LOGS/out" "^work: imported carol@example.com"
+  check "home imported" has "$LOGS/out" "^home: imported erin@example.com"
+  check "D switched to the floor's account" has "$LOGS/out" "^switched ~/.claude to work's account"
+  check "four accounts now" eq "$(world ids | wc -l | tr -d ' ')" 4
+  check "D holds carol's grant" eq "$(d_refresh)" rt-carol-1
+  check "D's identity is carol" eq "$(d_uuid)" uuid-carol
+  check "the floor's MCP servers merged into ~/.claude.json" has_fixed "$HOME_DIR/.claude.json" '"docs-work"'
+  check "the next step is named" has_fixed "$LOGS/out" "next: \`csm migrate retire\`"
+
+  # Retire checks each stash with the profile endpoint first; with no answer
+  # nothing is retired.
+  csm migrate retire
+  check "an unverified stash is not retired" has_fixed "$LOGS/out" "work: skipped: stash"
+  check "and its dir stays" test -d "$HOME_DIR/.claude.work"
+  http_rule profile at-carol-1 200 '{"account":{"uuid":"uuid-carol","email":"carol@example.com"},"organization":{"uuid":"org-acme"}}'
+  http_rule profile at-erin-1 200 '{"account":{"uuid":"uuid-erin","email":"erin@example.com"},"organization":{"uuid":"org-acme"}}'
+  csm migrate retire
+  check "retire exits 0" eq "$RC" 0
+  check "work's dir is retired" test -d "$HOME_DIR/.claude.work.retired"
+  check "home's dir is retired" test -d "$HOME_DIR/.claude.home.retired"
+  check "the legacy registry is removed" test ! -e "$HOME_DIR/.config/claude-as/profiles.json"
+  check "the floor is cleared" has_fixed "$LOGS/out" "cleared the CLAUDE_CONFIG_DIR floor"
+  check "D still holds carol's grant" eq "$(d_refresh)" rt-carol-1
+  check "csm printed no token" no_secret_in "$LOGS/transcript"
 }

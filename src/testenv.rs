@@ -6,7 +6,7 @@
 //! only serializes tests *within* that module; it does nothing to protect
 //! against a DIFFERENT module's test mutating the same variable
 //! concurrently — `CLAUDE_CONFIG_DIR` used to be mutated by tests in three
-//! modules (`statusline`, `usage::local`, `cas::eval`) through three
+//! modules (`statusline`, `usage::local`, and the since-retired `cas::eval`) through three
 //! independent locks, which left a real interleaving possible: one module's
 //! test sets `CLAUDE_CONFIG_DIR` to some path between another module's
 //! `remove_var` and its call into config-dir-reading code, silently
@@ -19,9 +19,7 @@
 //!
 //! `set_var`/`remove_var` here are the crate's only two TEST-side call sites
 //! for `std::env::set_var`/`remove_var` — no fixture touches the raw
-//! `std::env` mutators. (Production has exactly one: `main::pin_global_profile`
-//! exporting `CLAUDE_CONFIG_DIR` for a csm-global `--profile`, which runs
-//! single-threaded before dispatch and so needs no lock.)
+//! `std::env` mutators, and production has none.
 //! Most fixtures reach them through `with_env_var`/`with_env_vars`;
 //! a few RAII fixtures (`hook`'s `EnvFixture` and `spawn_fake_managed_process`,
 //! `usage::local::refresh`'s `TokenUrlEnv`) call `set_var`/`remove_var`

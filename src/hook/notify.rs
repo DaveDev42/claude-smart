@@ -212,8 +212,8 @@ mod tests {
     /// append_log creates the log file and writes a properly formatted line.
     #[test]
     fn append_log_creates_and_writes() {
-        // append_log uses smart_dir() which writes to $HOME/.claude.shared/smart/limit-switch.log
-        // We can't easily redirect that in a test; instead test the format construction directly.
+        // append_log writes to <state>/limit-switch.log under the resolved state dir;
+        // this test checks the line format directly.
         let ts = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
         let hostname = "testhost";
         let sid = "test-sid-0001";

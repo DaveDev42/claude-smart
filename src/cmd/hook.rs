@@ -1,31 +1,19 @@
-//! `csm hook [--owner <profile_dir>]` — the Stop/StopFailure/SubagentStop/
-//! SessionEnd hook entry point.
+//! `csm hook` — the Stop/StopFailure/SubagentStop/SessionEnd hook entry
+//! point.
 
 use std::ffi::OsString;
 use std::path::PathBuf;
 
-use crate::{account, hook};
+use crate::hook;
 
-/// `csm hook [--owner <profile_dir>]`
+/// `csm hook [--owner <dir>]`
 ///
-/// Parses `--owner <dir>` and calls `hook::run`.  Defaults to `$CLAUDE_CONFIG_DIR`
-/// when `--owner` is absent (non-interactive / missing shim).
+/// The hook keys on the session's account id (its sidecar, else `D`'s
+/// identity), so `--owner` is accepted for hooks installed by older csm
+/// versions and ignored.
 pub(crate) fn cmd_hook(args: &[OsString]) -> anyhow::Result<()> {
-    let owner_dir: PathBuf = parse_owner_flag(args)
-        .or_else(|| {
-            std::env::var("CLAUDE_CONFIG_DIR")
-                .ok()
-                .filter(|d| !d.is_empty())
-                .map(PathBuf::from)
-        })
-        .unwrap_or_else(|| {
-            // Last resort (no --owner, no $CLAUDE_CONFIG_DIR): the registry default.
-            account::ProfileMap::load()
-                .unwrap_or_default()
-                .default_dir()
-        });
-
-    hook::run(&owner_dir)
+    let _ignored = parse_owner_flag(args);
+    hook::run()
 }
 
 /// Parse `--owner <value>` or `--owner=<value>` from an arg slice.

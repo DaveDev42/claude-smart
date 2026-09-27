@@ -1,7 +1,7 @@
 //! Sidecar state file — `<smart_dir>/<sid>.json`.
 //!
 //! The sidecar records per-session metadata that must survive across the relaunch
-//! loop: permission mode, effort, model, cwd, profile, the launch passthru, and
+//! loop: permission mode, effort, model, cwd, account id, born, the launch passthru, and
 //! the hop counter.
 //!
 //! **Read-compat contract:** the legacy zsh writer emits `hop` as a JSON
@@ -68,9 +68,18 @@ pub struct Sidecar {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
 
-    /// `claude-as` profile name (leaf of `CLAUDE_CONFIG_DIR`).
+    /// The Orca account id this incarnation of the session launched on: `D`'s
+    /// `oauthAccount.accountUuid` mapped to a stash at launch (never Orca's
+    /// store, which lags its memory). Usage captures and limit detection key
+    /// on it. Rewritten on every relaunch hop.
+    #[serde(rename = "accountId", skip_serializing_if = "Option::is_none")]
+    pub account_id: Option<String>,
+
+    /// Unix epoch (seconds) this incarnation launched. A statusLine capture
+    /// counts for [`Sidecar::account_id`] only when the session was born after
+    /// the last switch event (`paths::last_switch`).
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub profile: Option<String>,
+    pub born: Option<i64>,
 
     /// The launch arguments `csm run` did not consume itself and forwarded to
     /// claude verbatim, recorded so a limit-switch relaunch can replay the ones
@@ -243,8 +252,11 @@ fn overlay(dst: &mut Sidecar, src: &Sidecar) {
     if src.cwd.is_some() {
         dst.cwd = src.cwd.clone();
     }
-    if src.profile.is_some() {
-        dst.profile = src.profile.clone();
+    if src.account_id.is_some() {
+        dst.account_id = src.account_id.clone();
+    }
+    if src.born.is_some() {
+        dst.born = src.born;
     }
     if src.passthru.is_some() {
         dst.passthru = src.passthru.clone();
@@ -267,7 +279,8 @@ fn is_empty_patch(p: &Sidecar) -> bool {
         && p.effort.is_none()
         && p.model.is_none()
         && p.cwd.is_none()
-        && p.profile.is_none()
+        && p.account_id.is_none()
+        && p.born.is_none()
         && p.passthru.is_none()
         && p.hop.is_none()
         && p.extra.is_empty()
@@ -400,7 +413,7 @@ mod tests {
             effort: Some("high".to_owned()),
             model: Some("claude-opus-4-5".to_owned()),
             cwd: Some("/tmp".to_owned()),
-            profile: Some("home".to_owned()),
+            account_id: Some("home".to_owned()),
             ts: Some(1_700_000_000.0),
             hop: Some(Sidecar::hop_value(1)),
             ..Default::default()
@@ -417,7 +430,10 @@ mod tests {
         assert!(json.contains("\"effort\""), "missing effort in: {json}");
         assert!(json.contains("\"model\""), "missing model in: {json}");
         assert!(json.contains("\"cwd\""), "missing cwd in: {json}");
-        assert!(json.contains("\"profile\""), "missing profile in: {json}");
+        assert!(
+            json.contains("\"accountId\""),
+            "missing accountId in: {json}"
+        );
         assert!(json.contains("\"ts\""), "missing ts in: {json}");
         assert!(json.contains("\"hop\""), "missing hop in: {json}");
     }
@@ -514,7 +530,8 @@ mod tests {
         assert_eq!(s.effort.as_deref(), Some("high"));
         assert_eq!(s.model.as_deref(), Some("claude-opus-4-5"));
         assert_eq!(s.cwd.as_deref(), Some("/work/proj"));
-        assert_eq!(s.profile.as_deref(), Some("work"));
+        // The retired `profile` key survives in `extra` (rollback safety).
+        assert_eq!(s.extra.get("profile"), Some(&serde_json::json!("work")));
         assert_eq!(s.hop_int(), 4, "legacy string hop must read as 4");
 
         // Reserialize: known fields preserved (hop emitted in current form is
@@ -522,7 +539,7 @@ mod tests {
         let back = serde_json::to_string(&s).expect("reserialize");
         let reparsed: Sidecar = serde_json::from_str(&back).expect("reparse");
         assert_eq!(reparsed.session_id, s.session_id);
-        assert_eq!(reparsed.profile, s.profile);
+        assert_eq!(reparsed.extra.get("profile"), s.extra.get("profile"));
         assert_eq!(reparsed.hop_int(), 4, "hop survived round-trip");
     }
 
@@ -708,7 +725,7 @@ mod tests {
             permission_mode: Some("bypassPermissions".to_owned()),
             effort: Some("max".to_owned()),
             cwd: Some("/tmp/project".to_owned()),
-            profile: Some("home".to_owned()),
+            account_id: Some("home".to_owned()),
             hop: Some(Sidecar::hop_value(0)),
             ..Default::default()
         };
@@ -718,7 +735,7 @@ mod tests {
         assert_eq!(read_back.permission_mode, original.permission_mode);
         assert_eq!(read_back.effort, original.effort);
         assert_eq!(read_back.cwd, original.cwd);
-        assert_eq!(read_back.profile, original.profile);
+        assert_eq!(read_back.account_id, original.account_id);
         assert_eq!(read_back.hop_int(), 0);
     }
 

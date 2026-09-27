@@ -3,7 +3,7 @@
 //! # Commit ordering (matches the legacy shell implementation)
 //!
 //! 1. merge-sidecar `hop` (increment next_hop into `<sid>.json`)
-//! 2. write `.relaunch` sentinel (atomic tmp+rename)
+//! 2. write the sentinel `<state>/sentinel/<sid>.json` (atomic tmp+rename)
 //! 3. noclobber-create `.switched` marker
 //! 4. re-stamp `.last-switch`
 //! 5. stop signal — LAST so the supervisor always finds a complete sentinel:
@@ -30,24 +30,41 @@ use anyhow::Context as _;
 /// format the supervisor reads — a single SSOT prevents silent field/format drift.
 pub use crate::platform::relaunch::RelaunchSentinel;
 
+/// What the hook commits before it stops the session.
+#[derive(Debug, Clone, Copy)]
+pub struct Commit<'a> {
+    pub sid: &'a str,
+    /// The session's account when the hook fired (`None` when unknown).
+    pub from_account: Option<&'a str>,
+    /// The account the hook picked; for a model fallback, the session's own.
+    pub target_account: &'a str,
+    pub handoff: &'a str,
+    /// Working directory from the hook input.
+    pub cwd: &'a str,
+    /// Born epoch read from the PID file by classify(); 0 = read it here.
+    pub born: i64,
+    /// `Some(model)` for a same-account model fallback (see
+    /// `crate::hook::detect::fable_fallback_model`); `None` for a switch.
+    pub model_override: Option<&'a str>,
+    /// `limit:<dimension>` for a switch; ignored for a model fallback.
+    pub reason: &'a str,
+}
+
 /// Execute the full commit sequence and then stop the managed process.
-///
-/// `sid`            — session UUID string.
-/// `target_profile` — profile name to switch to (stored in the sentinel).
-/// `handoff`        — handoff prompt string forwarded to the resumed session.
-/// `cwd`            — working directory from the hook input (not owner_dir).
-/// `born`           — born epoch read from the PID file by classify().
-/// `model_override` — `Some(model)` for a same-account model fallback (see
-///                     `crate::hook::detect::fable_fallback_model`);
-///                     `None` for an ordinary account switch.
 ///
 /// The commit ordering (matches the legacy shell implementation) for an
 /// ordinary account switch (`model_override: None`):
 ///   1. merge-sidecar hop
-///   2. write .relaunch sentinel (atomic tmp+rename)
+///   2. write the sentinel `<state>/sentinel/<sid>.json` (atomic)
 ///   3. noclobber-create .switched marker
 ///   4. re-stamp .last-switch
 ///   5. stop signal LAST (POSIX SIGTERM / Windows .stop flag)
+///
+/// The hook never switches the account itself: the supervisor that consumes
+/// the sentinel decides whether it leads the switch or follows one that
+/// already happened (`crate::account::limit_switch`). `from_gen` is the
+/// switch journal's generation right now, which is how the supervisor tells
+/// the two apart.
 ///
 /// `model_override: Some(_)` skips steps 1, 3, and 4 — the account-switch hop
 /// bump, `.switched` marker, and machine-wide cooldown restamp all belong to
@@ -55,100 +72,128 @@ pub use crate::platform::relaunch::RelaunchSentinel;
 /// switched accounts (see `fable_fallback_model`'s loop-safety doc). In their
 /// place it (re)writes `<sid>.model-fallback` — exclusively claimed first on
 /// the statusline entry point, see `claim_model_fallback` — and writes the
-/// sentinel with `hop` equal to the *current* sidecar hop (unchanged, not
-/// bumped).
-/// Step 2 (sentinel) and step 5 (stop signal) run exactly as before either
-/// way.
-pub fn commit_and_stop(
-    sid: &str,
-    target_profile: &str,
-    handoff: &str,
-    cwd: &str,
-    born: i64,
-    model_override: Option<&str>,
-) -> anyhow::Result<()> {
+/// sentinel with `hop` equal to the *current* sidecar hop (unchanged).
+pub fn commit_and_stop(c: &Commit<'_>) -> anyhow::Result<()> {
     use crate::paths;
+    let sid = c.sid;
 
     // ── Step 1: read current hop from sidecar, compute next_hop ──────────────
-    // A model fallback never bumps the hop or touches the sidecar — the
-    // sentinel's hop stays exactly what it already was.
     let current_hop = crate::hook::read_sidecar_hop(sid);
-    let hop = if model_override.is_some() {
+    let hop = if c.model_override.is_some() {
         current_hop
     } else {
         let next_hop = current_hop + 1;
-        // Merge next_hop back into the sidecar (merge-not-clobber: preserve other fields).
-        // Shell: `"$HELPER" merge-sidecar "$session_id" hop "$next_hop"`
         merge_sidecar_hop(sid, next_hop)?;
         next_hop
     };
 
-    // ── Step 2: write .relaunch sentinel (atomic) ─────────────────────────────
-    // Shell: `"$HELPER" write-relaunch ...`
-    // born is passed from classify() (already read from the pidfile there).
-    let actual_born = if born != 0 {
-        born
+    // ── Step 2: write the sentinel (atomic) ───────────────────────────────────
+    let actual_born = if c.born != 0 {
+        c.born
     } else {
         read_pid_born(sid).unwrap_or(0)
     };
-
+    let reason = if c.model_override.is_some() {
+        crate::platform::relaunch::REASON_MODEL_FALLBACK.to_string()
+    } else {
+        c.reason.to_string()
+    };
     let sentinel = RelaunchSentinel {
+        v: crate::platform::relaunch::SENTINEL_V,
         session_id: sid.to_string(),
-        target_profile: target_profile.to_string(),
-        cwd: cwd.to_string(),
-        handoff: handoff.to_string(),
+        target_account: c.target_account.to_string(),
+        from_account: c.from_account.map(str::to_string),
+        from_gen: current_generation(),
+        reason,
+        at: now_epoch(),
+        cwd: c.cwd.to_string(),
+        handoff: c.handoff.to_string(),
         hop,
         born: actual_born,
-        model_override: model_override.map(str::to_string),
+        model_override: c.model_override.map(str::to_string),
     };
+    crate::platform::relaunch::write_relaunch(&paths::sentinel(sid), &sentinel)?;
 
-    crate::platform::relaunch::write_relaunch(&paths::relaunch(sid), &sentinel)?;
-
-    if model_override.is_some() {
+    if c.model_override.is_some() {
         // Marker: this session fell back to the fallback model on a Fable
-        // cap, current as of now, on THIS account. The statusline entry
-        // point ([`crate::hook::run_from_statusline`]) already exclusively
-        // claimed this marker via `claim_model_fallback` before ever calling
-        // here — by the time `classify_with` returned this decision it had
-        // already established no marker for the CURRENT week_fable window on
-        // the CURRENT profile survives (a stale one, or one for a different
-        // profile, is removed at that point — see
-        // `crate::hook::detect::model_fallback_marker_is_stale` and
-        // `crate::hook::detect::model_fallback_marker_is_current`), so this
-        // call is always writing into a slot that is either freshly claimed
-        // or empty. The direct hook entry point never claims first, so this
-        // write is what actually creates the marker there. Either way this
-        // just (re)writes the current epoch and profile, atomically (tmp +
-        // rename) so a reader never observes a partially written file.
-        // `target_profile` IS the profile this marker is for: `classify_with`
-        // sets it to `current_profile` by construction whenever
-        // `model_override` is `Some(_)` (5b never picks a different account).
-        // Deliberately NOT `.switched`/`.last-switch` — those belong to the
-        // account-switch hop budget and cooldown, which a same-account model
-        // change must never consume.
+        // cap, current as of now, on THIS account. Both entry points (the
+        // hook and the statusline tick) exclusively claimed it via
+        // `claim_model_fallback` first; this rewrite only refreshes the
+        // stamp. `target_account` IS the session's
+        // own account by construction for a model fallback. Deliberately NOT
+        // `.switched`/`.last-switch`: those belong to the account-switch hop
+        // budget and cooldown.
         let _ = write_atomic(
             &paths::model_fallback(sid),
-            &format!("{} {target_profile}", now_epoch()),
+            &format!("{} {}", now_epoch(), c.target_account),
         );
     } else {
         // ── Step 3: noclobber .switched marker ───────────────────────────────
         let switched_path = paths::switched(sid);
         if !switched_path.exists() {
-            let epoch = now_epoch();
-            // Write epoch string; ignore EEXIST (noclobber semantics: first write wins).
-            let _ = write_noclobber(&switched_path, &format!("{epoch}"));
+            let _ = write_noclobber(&switched_path, &format!("{}", now_epoch()));
         }
 
         // ── Step 4: re-stamp .last-switch ────────────────────────────────────
-        let epoch = now_epoch();
-        std::fs::write(paths::last_switch(), format!("{epoch}"))
-            .context("failed to write .last-switch")?;
+        stamp_last_switch().context("failed to write .last-switch")?;
     }
 
     // ── Step 5: stop the managed process (LAST) ───────────────────────────────
     stop_managed_process(sid)?;
 
     Ok(())
+}
+
+/// A peer's leader switched `D` away from this session's account: write a
+/// follow sentinel (no hop bump, no `.switched`, no cooldown stamp, empty
+/// handoff) and stop the session so its supervisor resumes it in `D`.
+/// Called only from the Stop hook, i.e. at a turn boundary.
+pub fn follow_and_stop(
+    sid: &str,
+    follow: &crate::platform::relaunch::FollowFile,
+    cwd: &str,
+    born: i64,
+) -> anyhow::Result<()> {
+    use crate::paths;
+    let sentinel = RelaunchSentinel {
+        v: crate::platform::relaunch::SENTINEL_V,
+        session_id: sid.to_string(),
+        target_account: follow.to_account.clone(),
+        from_account: None,
+        from_gen: follow.generation,
+        reason: crate::platform::relaunch::REASON_FOLLOW.to_string(),
+        at: now_epoch(),
+        cwd: cwd.to_string(),
+        handoff: String::new(),
+        hop: crate::hook::read_sidecar_hop(sid),
+        born: if born != 0 {
+            born
+        } else {
+            read_pid_born(sid).unwrap_or(0)
+        },
+        model_override: None,
+    };
+    crate::platform::relaunch::write_relaunch(&paths::sentinel(sid), &sentinel)?;
+    // Consume the follow file first so a second Stop hook in the same turn
+    // cannot stop the relaunched session again.
+    let _ = std::fs::remove_file(paths::follow(sid));
+    stop_managed_process(sid)
+}
+
+/// The switch journal's generation (0 when there is none).
+fn current_generation() -> u64 {
+    crate::orca::switch::read_journal(&crate::paths::smart_dir_no_create())
+        .map(|j| j.generation)
+        .unwrap_or(0)
+}
+
+/// Re-stamp `<state>/.last-switch` with now.
+pub(crate) fn stamp_last_switch() -> std::io::Result<()> {
+    let path = crate::paths::last_switch();
+    if let Some(parent) = path.parent() {
+        crate::orca::fsx::create_dir_all(parent, 0o700)?;
+    }
+    std::fs::write(path, format!("{}", now_epoch()))
 }
 
 // ─── sidecar hop helpers ─────────────────────────────────────────────────────
@@ -250,7 +295,11 @@ fn platform_stop(pid: u32, _sid: &str) -> anyhow::Result<()> {
     use nix::sys::signal::{Signal, kill};
     use nix::unistd::Pid;
 
-    kill(Pid::from_raw(pid as i32), Signal::SIGTERM)
+    // 0 would signal csm's own group and a pid above i32::MAX wraps to a
+    // group (or, as -1, every process the user owns).
+    let target = crate::platform::child::signal_pid(pid)
+        .ok_or_else(|| anyhow::anyhow!("refusing to signal pid {pid}"))?;
+    kill(Pid::from_raw(target), Signal::SIGTERM)
         .with_context(|| format!("failed to SIGTERM pid {pid}"))?;
     Ok(())
 }
@@ -505,8 +554,8 @@ mod tests {
     #[test]
     fn claim_model_fallback_first_caller_wins() {
         let home = TempDir::new().unwrap();
-        std::fs::create_dir_all(home.path().join(".claude.shared").join("smart")).unwrap();
         crate::testenv::with_test_home(home.path(), || {
+            std::fs::create_dir_all(crate::paths::smart_dir_no_create()).unwrap();
             let sid = "sid-claim-race-0001";
             assert!(
                 claim_model_fallback(sid, "limited"),
@@ -538,8 +587,8 @@ mod tests {
     #[test]
     fn claim_model_fallback_records_profile_before_commit_and_stop_runs() {
         let home = TempDir::new().unwrap();
-        std::fs::create_dir_all(home.path().join(".claude.shared").join("smart")).unwrap();
         crate::testenv::with_test_home(home.path(), || {
+            std::fs::create_dir_all(crate::paths::smart_dir_no_create()).unwrap();
             let sid = "sid-claim-profile-0001";
             assert!(claim_model_fallback(sid, "limited"));
             // Read the marker exactly as it sits right after the claim,
@@ -573,7 +622,12 @@ mod tests {
     fn relaunch_sentinel_hop_is_number() {
         let sentinel = RelaunchSentinel {
             session_id: "test-sid".to_string(),
-            target_profile: "work".to_string(),
+            v: crate::platform::relaunch::SENTINEL_V,
+            target_account: "work".to_string(),
+            from_account: None,
+            from_gen: 0,
+            reason: String::new(),
+            at: 0,
             cwd: "/tmp/cwd".to_string(),
             handoff: "resume".to_string(),
             hop: 1,

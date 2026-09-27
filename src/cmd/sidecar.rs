@@ -63,7 +63,7 @@ pub(crate) fn cmd_sidecar(args: &[OsString]) -> anyhow::Result<()> {
 /// Parse `key=value` args into a `Sidecar` patch for `write` / `merge`.
 ///
 /// Recognised keys: `session_id`, `permission_mode`, `effort`, `model`,
-/// `cwd`, `profile`, `hop`.
+/// `cwd`, `account_id`, `born`, `hop`.
 fn parse_sidecar_kv_args(args: &[OsString]) -> anyhow::Result<Sidecar> {
     let mut patch = Sidecar::default();
     for arg in args {
@@ -77,7 +77,13 @@ fn parse_sidecar_kv_args(args: &[OsString]) -> anyhow::Result<Sidecar> {
             "effort" => patch.effort = Some(value.to_owned()),
             "model" => patch.model = Some(value.to_owned()),
             "cwd" => patch.cwd = Some(value.to_owned()),
-            "profile" => patch.profile = Some(value.to_owned()),
+            "account_id" | "accountId" => patch.account_id = Some(value.to_owned()),
+            "born" => {
+                let n: i64 = value.parse().with_context(|| {
+                    format!("csm sidecar: born must be an integer, got {value:?}")
+                })?;
+                patch.born = Some(n);
+            }
             "hop" => {
                 let n: i64 = value.parse().with_context(|| {
                     format!("csm sidecar: hop must be an integer, got {value:?}")

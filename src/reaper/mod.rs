@@ -148,7 +148,9 @@ fn snapshot_proc_table() -> Vec<ProcRow> {
 #[cfg(unix)]
 fn pgid_of(pid: u32) -> Option<u32> {
     use nix::unistd::{Pid, getpgid};
-    getpgid(Some(Pid::from_raw(pid as i32)))
+    // `getpgid(0)` is csm's own group: never report that for a row.
+    let pid = crate::platform::child::signal_pid(pid)?;
+    getpgid(Some(Pid::from_raw(pid)))
         .ok()
         .map(|p| p.as_raw() as u32)
 }

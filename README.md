@@ -1,739 +1,607 @@
 # claude-smart (`csm`)
 
-Cross-platform smart session manager for [Claude Code](https://claude.ai/code).
+A launcher for [Claude Code](https://claude.ai/code) that works with
+[Orca](https://github.com/stablyai/orca)'s Claude accounts.
 
-`csm` is a single binary that wraps the `claude` CLI with:
+`csm` is one binary that wraps the `claude` CLI. It adds:
 
-- **smart session selection** — an interactive picker, shown on every launch,
-  to start fresh, continue the newest session, or pick an existing one (each row
-  shows its short id, time, mode, and title; type to fuzzy-filter), per
-  directory;
-- **profile management** — multiple isolated Claude Code config homes
-  (`CLAUDE_CONFIG_DIR`) with a one-command switcher;
-- **account scoring + auto-switch** — pick the viable account (session and
-  weekly caps under threshold; a model-scoped weekly cap alone falls back to
-  another model on the same account instead) whose weekly quota resets
-  soonest, and relaunch on a rate-limit hit;
-- **usage metering**: a multi-profile usage table, collected locally per
-  profile (see *Usage metering*);
-- a **limit-detection hook** and a **relaunch/handoff loop**.
+- session selection: resume, continue or start fresh, with a fuzzy session
+  picker when you ask for one;
+- account switching over Orca's Claude account list, from the terminal,
+  whether Orca is running or not;
+- a limit switch: when the account in use hits a usage cap, the running
+  session moves to another account and resumes where it stopped;
+- usage metering across every account;
+- launches from Orca panes that never stop to ask a question.
 
-It runs on macOS, Linux/WSL, and Windows-native with a single binary — no shell
-implementation to keep in sync.
+It runs on macOS, Linux (including WSL) and Windows from the same binary.
+Windows support is partial; see *Platforms*.
 
 ## Install
 
 ```sh
 # Homebrew (macOS)
 brew install davedev42/tap/claude-smart
-#   `csm` and `smart-claude` are aliases for the same formula, so
-#   `brew install csm` and `brew upgrade smart-claude` also work.
+#   the formula also answers to `csm` and `smart-claude`
 
-# from crates.io
+# crates.io
 cargo install claude-smart
 
-# or build from source
+# from source
 git clone https://github.com/DaveDev42/claude-smart
 cd claude-smart && cargo install --path .
 ```
 
-The primary binary is named **`csm`**; the Homebrew formula also installs
-**`smart-claude`** as an equivalent command name (they run the same binary — csm
-only special-cases the `csm-hook` invocation name, so any other name behaves
-identically). Use whichever reads better to you.
+The binary is `csm`. Homebrew also installs `smart-claude` as a second name
+for the same binary.
 
-An optional shell function lets `cas` switch the active profile in your *current*
-shell (a child process cannot mutate its parent's environment, so this part is a
-tiny shim — see *Profiles* below).
+## How csm relates to Orca
 
-## Usage
+Orca keeps a list of Claude accounts. For each one it stores a login (the
+OAuth grant, in the macOS Keychain or in a file) and some profile metadata,
+and it keeps one of them active. Claude Code runs in a single config
+directory, called `D` here: Orca's `CLAUDE_CONFIG_DIR` if Orca has one set,
+otherwise `~/.claude`. Switching accounts means writing another account's
+login into `D`.
 
-```
-csm [claude-args...]                 bare = smart launch (implicit `csm run`)
-csm run [csm-flags] [-- claude...]   smart launcher (session + account + relaunch)
-csm [--profile <name>] <subcommand>  run any subcommand under that profile
+csm keeps no account list of its own. It reads Orca's list and changes it
+the way Orca would:
 
-# run flags (account + session selection)
-  --profile <name>                   launch under this profile (skip all picking)
-  -i, --interactive                  manual pick: force account + session pickers
-  --no-pick                          keep current profile, no scoring
-  -A, --pick-account                 force an account pick this launch (overrides --no-pick)
-  -n, --new                          start a fresh session (skip the session picker)
-  -c, --continue                     resume newest free session
-  -r, --resume [<id>|<alias>]        resume a session (csm also reads the id)
-  --session-id <uuid>                forwarded to claude; csm tracks it for sidecar/relaunch state
-  --model <m>                        forwarded to claude; remembered across a limit-switch hop
-  --effort <e>                       forwarded to claude; remembered across a limit-switch hop
-  --permission-mode <p>              forwarded to claude; remembered across a limit-switch hop
-  # the six flags above are forwarded to claude AND read by csm; every other claude
-  #   flag passes through untouched — use `csm run -- <args>` to force passthrough
-  # default: ALWAYS opens the session picker (new / continue / pick existing) so the
-  #   choice is never made silently, and auto-picks the best account by usage; if
-  #   usage is unavailable (no usable usage data) it opens the account picker
-  #   instead of silently staying put. `-i` skips the account auto-pick entirely.
+- With Orca running, csm asks Orca over its local RPC socket
+  (`accounts.list`, `accounts.selectClaude`, `accounts.addClaudeFromConfigDir`,
+  `accounts.removeClaude`). Orca does the work with its own code.
+- With Orca stopped, csm runs a port of Orca's switch. It writes the same
+  files and Keychain items Orca would, so the next Orca start finds a state
+  Orca itself could have produced. Once Orca 1.4.214 or later has run, it
+  keeps its state in SQLite (`profile-state.db`), and every change
+  (`accounts use`, `add`, `import`, `rm`, and the limit switch) needs Orca
+  running. `csm orca status` shows which case applies.
 
-csm profiles [list]                  list configured profiles
-csm profiles add  <name> [<dir>]     register (dir defaults to ~/.claude.<name>)
-csm profiles set  <name> <dir>       register/overwrite a profile dir
-csm profiles rm   <name>             unregister (refused if it is the default)
-csm profiles use  <name>             set the machine default profile (+ floor)
-csm profiles edit                    interactive editor (TTY)
-csm profiles dir  [<name>]           print a profile's config dir
-csm profiles bootstrap [<name>|--all] provision a profile's env (dir + shared plugins/projects/sessions)
-csm profiles doctor [--fix] [--fix-home] [<name>|--all]
-                                     check profile dirs / shared links; --fix repairs
-                                     profiles, --fix-home repairs the ~/.claude shim
+One account is active per machine at a time. Every claude csm starts runs
+in `D`, so all sessions on a machine share the active account.
 
-csm config [show]                    print csm's own config JSON (~/.config/claude-smart/config.json)
-csm config get launch-command        print the resolved launch command
-csm config set launch-command <cmd>...   launch <cmd> instead of `claude` (e.g. happy)
-csm config unset launch-command      revert to launching `claude`
+You do not need Orca running to use csm, but you need Orca's account store:
+csm has nothing to switch between until Orca knows at least two accounts.
+Add them in Orca, or with `csm accounts add` / `csm accounts import`.
 
-csm usage [--json] [--no-fetch] [--refresh] [--refresh-oauth]
-                                     multi-profile usage table (see Usage metering)
-csm usage capture                    read statusLine stdin, merge into the store
-
-csm pick-account [<cur>] [--include-current]
-csm scan [<cwd>]                     session listing (TSV)
-csm reap [--dry-run] [--term] [--all|--session <sid>]   kill orphan processes left by claude
-csm sidecar {read|write|merge|flags} <sid> [k=v...]   per-session state store
-csm statusline                       `<profile>@<host>` for the shell prompt
-csm completions {zsh|bash|pwsh}      shell completions
-csm newuuid                          fresh lowercase UUID v4
-csm claude <args...>                 run claude under csm's profile, args forwarded verbatim
-```
-
-`csm run --help` prints the run flags above; `csm run -- --help` asks claude for
-claude's.
-
-> `csm` also recognizes a few **machine-interface** subcommands meant for
-> automation, not hand typing: `csm hook` (the Stop/StopFailure/SubagentStop/
-> SessionEnd limit-switch hook, wired from Claude Code `settings.json`), `csm cas` (the
-> `eval`-shim contract behind the shell `cas` function), and `csm current-usage`
-> (a raw usage probe used by the shims). They work without a profile registry.
-
-### A global profile for any subcommand
-
-`--profile <name>` may also sit in *front* of a subcommand word:
+## Quick start
 
 ```sh
-csm --profile work statusline        # that profile's status line
-csm --profile work usage --json      # collected as that profile
-csm --profile work claude mcp list   # claude's own mcp list, under that profile
+csm accounts                    # Orca's accounts, the active one marked
+csm                             # start claude in D (a fresh session)
+csm -c                          # continue the newest session in this directory
+csm -i                          # pick a session
+csm accounts use bob@example.com
 ```
 
-csm resolves the name through the registry, provisions the profile, and exports
-`CLAUDE_CONFIG_DIR` for the subcommand. Without it (`csm --profile work -p 'hi'`,
-say) nothing changes: the tokens belong to the implicit `csm run` and pin the
-launch the way they always have.
+Then install the hook and the status line (see *Limit auto-switch*) so a
+capped session can move on its own.
 
-### Running claude directly
+## Commands
 
-`csm claude <args...>` hands everything after the word to claude verbatim: no
-csm flag parsing, no session picker, no account scoring or auto-switch, no
-sidecar, no relaunch loop. csm only picks the profile (the global `--profile`,
-else the current `CLAUDE_CONFIG_DIR`, else the registry default), provisions it,
-and execs claude in place:
+```
+csm [claude-args...]                     bare = launch (implicit `csm run`)
+csm run [run-flags] [-- claude-args...]  launch with session handling and the limit switch
+csm claude <args...>                     run claude in D, arguments verbatim
+
+csm accounts [list]                      Orca's accounts (* active, D = the account D holds)
+csm accounts use <id|prefix|email>       make that account active
+csm accounts add                         log in a new account
+csm accounts import <dir>...             import the logins held by Claude config dirs
+csm accounts rm <id|prefix|email>        remove an account that is not active
+csm accounts doctor [--fix] [--offline]  check the store, stashes, quarantine and D
+
+csm orca [status]                        what csm sees of Orca (never prints secrets)
+csm orca setup                           create the `claude` alias for Orca panes
+
+csm migrate [plan]                       read-only: what import/retire would do
+csm migrate import [--dry-run]           move profile logins into Orca
+csm migrate retire [--dry-run] [name...] retire verified profile dirs
+
+csm usage [--json] [--no-fetch] [--refresh]   usage per account
+csm usage capture                        read a statusLine payload on stdin, record it
+
+csm config [show]                        csm's own config
+csm config get|set|unset launch-command  what `csm run` starts instead of `claude`
+csm config get|set|unset min-claude-version   lowest claude a limit switch accepts next to unsupervised sessions
+
+csm hook                                 the Claude Code hook (Stop, StopFailure, SubagentStop, SessionEnd)
+csm statusline                           Claude Code statusLine segment: <account>@<host>
+csm scan [<cwd>]                         session list (TSV)
+csm sidecar {read|write|merge|flags} <sid> [k=v...]   per-session state
+csm reap [--dry-run] [--term] [--all|--session <sid>] kill processes orphaned by claude
+csm completions {zsh|bash|pwsh}          shell completions
+csm newuuid                              a fresh UUID v4
+```
+
+Accounts are named by Orca's account id, a unique prefix of it, or the full
+email address.
+
+### Run flags
+
+```
+-i, --interactive          open the session picker
+-n, --new                  start a fresh session
+-c, --continue             resume the newest session not open elsewhere
+-r, --resume [<id>]        resume that session; with no id, open the picker
+--session-id <uuid>        passed to claude; csm tracks the id
+--model <m>                passed to claude; kept across a limit switch
+--effort <e>               passed to claude; kept across a limit switch
+--permission-mode <p>      passed to claude; kept across a limit switch
+```
+
+With none of these, `csm` starts a fresh session. csm stops reading flags at
+the first positional argument, so a prompt and everything after it reach
+claude untouched. Put claude flags that csm would read after `--`:
+`csm run -- -c`. `csm run --help` prints the list above and
+`csm run -- --help` shows claude's help.
+
+`-n` means "new session" to csm. claude has its own `-n/--name`, which
+`csm` and `csm run` therefore shadow; use `csm claude -n <name>` or
+`csm run -- -n <name>` to reach it.
+
+### Words csm leaves to claude
+
+csm treats a word as its own only as the first argument, and its words never
+overlap claude's subcommands. Anything else goes to claude: `csm mcp list`,
+`csm doctor` and `csm update` all run claude's commands. `csm claude <args>`
+skips csm entirely apart from running claude in `D`: no flag parsing, no
+session handling, no limit switch.
+
+## Launch contexts
+
+Before anything else, `csm run` decides where it was started from. The
+checks run in this order:
+
+1. Print. `-p`/`--print` appears before `--`, or stdin is not a terminal.
+   csm runs claude with the arguments and environment as given and does
+   nothing else: no session handling, no usage check, no supervisor. Orca's
+   source-control AI and its model discovery both launch this way.
+2. Orca pane. `ORCA_PANE_KEY` is set (Orca exports it into every pane).
+3. Orca structured session. `ORCA_AGENT_SESSION_SPAWN_TOKEN` is set.
+4. Interactive. Anything else.
+
+`CSM_ORCA=1` forces the Orca behaviour and `CSM_ORCA=0` turns detection
+off. Neither changes Print. `ORCA_USER_DATA_PATH` and `ORCA_APP_VERSION` are
+ignored on purpose: Orca sets them on its own process, so a tmux server or
+an editor started inside a pane inherits them without being an Orca launch.
+
+### Inside an Orca pane
+
+csm makes no account decision. Claude runs on whatever account Orca has
+active. Before claude starts, csm reads only files and the process table: no
+Keychain, no network, no picker, no prompt. `csm --resume <id>`, which is
+what Orca's session list sends, starts claude at once. Warnings go to csm's
+log instead of the pane; only fatal errors and the one-line notice after a
+limit switch are printed.
+
+If a login dotfile changed `CLAUDE_CONFIG_DIR` in the pane, csm puts it back
+to Orca's `D`. For a managed account it removes the variables Orca also
+removes (`ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`,
+`CLAUDE_CODE_OAUTH_TOKEN`, `AWS_BEARER_TOKEN_BEDROCK`, and an
+`ANTHROPIC_CUSTOM_HEADERS` that carries a credential), so they cannot
+override the account.
+
+The supervisor still runs, so the limit switch works in panes too.
+
+### Interactive (outside Orca)
+
+If the active account is over a limit, another account has room, and no
+other claude is running in `D`, csm switches before it starts claude.
+Otherwise it starts claude on the current account and prints one warning
+line.
+
+### The `claude` alias for Orca
+
+Orca launches its Claude panes with `claude` unless its
+`agentCmdOverrides.claude` setting names another command. Pointing it at
+csm gets every pane the limit switch. `csm orca setup` creates the alias
+(`<state>/bin/claude`, a symlink on macOS and Linux; `claude.exe`, a hard
+link or copy, on Windows) and prints the value to put in Orca's settings:
 
 ```sh
-csm claude --version
-csm claude mcp list
-csm --profile home claude auth login
+csm orca setup
+# csm: created /Users/example/.local/state/csm/bin/claude
+#
+# In Orca's settings, set the Claude agent command override to:
+#   /Users/example/.local/state/csm/bin/claude
 ```
 
-Use it for claude's own subcommands under a chosen profile, and for flags `csm
-run` would otherwise read (`-c`, `-r`, `--model`, …). `csm run -- <args>` does
-the same forwarding through the launcher.
+csm never edits Orca's settings. Set the override in Orca yourself. Orca's
+`agentDefaultArgs.claude` may keep `-n`.
 
-### No collision with `claude`
+The alias points at the `csm` on your `PATH` (with Homebrew, the
+`bin/csm` link rather than the versioned file behind it), so an upgrade
+does not break it. `csm orca status` and `csm accounts doctor` report an
+alias whose target is gone; `csm accounts doctor --fix` or another
+`csm orca setup` repoints it.
 
-`csm` only treats a known word as its own subcommand. **Any word it doesn't
-recognize is forwarded verbatim to `claude`** — so `csm mcp`, `csm doctor`,
-`csm update`, `csm /login`, etc. all reach the real `claude` untouched. The
-reserved word set is deliberately disjoint from claude's subcommands. To pass a
-flag that `csm` would otherwise interpret (`-c`, `-r`, `-n`, `--model`, …),
-put it after `--`: `csm run -- -c`.
+Started under the name `claude`, csm reserves none of its own words:
+claude's subcommands, `--version`, `-v`, `--help` and `-h` as the first
+argument go straight to the real claude further down `PATH` (so Orca's
+version probe and hook installer see claude itself), and everything else is
+a `csm run` launch. Because the alias is named `claude`, Orca treats those
+panes as Claude panes: it syncs the account before launch, holds launches
+during its own switch, and tracks the pane as a live Claude session. A plain
+`csm` override also works, but Orca then skips those steps.
 
-`claude` itself is not one of claude's subcommand words, which is why `csm
-claude …` can be reserved without narrowing what gets forwarded.
+## Limit auto-switch
 
-## Profiles
+A session that hits a usage cap stops, `D` moves to another account, and
+the same session resumes with a short note explaining the move. Since there
+is one active account per machine, the switch moves every session on the
+machine.
 
-A *profile* is a named Claude Code config home (`CLAUDE_CONFIG_DIR`). The
-registry is a flat JSON map at `~/.config/claude-as/profiles.json`:
+Three signals start it:
+
+- The statusLine tick. When a subscription cap is reached, Claude Code
+  keeps the turn open and retries on its own, and no hook fires. The
+  statusLine command still runs about once a second with the live
+  `rate_limits`, and `csm statusline` (or `csm usage capture`) checks them
+  on every tick. This is the path most caps take.
+- `StopFailure` with `error: "rate_limit"`: a 429 ended the turn.
+- `Stop`: the usage figures crossed a limit during a turn that finished.
+
+Install both pieces once, in `~/.claude/settings.json` (next to the hooks
+Orca installs there):
 
 ```json
 {
-  "personal": "/home/you/.claude.personal",
-  "work":     "/home/you/.claude.work"
+  "statusLine": { "type": "command", "command": "csm statusline" },
+  "hooks": {
+    "Stop":         [ { "hooks": [ { "type": "command", "command": "csm hook" } ] } ],
+    "SubagentStop": [ { "hooks": [ { "type": "command", "command": "csm hook" } ] } ],
+    "SessionEnd":   [ { "hooks": [ { "type": "command", "command": "csm hook" } ] } ],
+    "StopFailure":  [ { "matcher": "rate_limit",
+                        "hooks": [ { "type": "command", "command": "csm hook" } ] } ]
+  }
 }
 ```
 
-The machine default profile NAME lives in `~/.config/claude-as/default`. Manage
-the registry with `csm profiles …` (or the interactive `csm profiles edit`). No
-account names are compiled into the binary — everything comes from your
-registry.
+`csm hook` still accepts the `--owner <dir>` argument older installs passed
+and ignores it. If you keep your own statusLine script, add
+`printf '%s' "$input" | csm usage capture &` to it instead.
 
-### Switching the active profile in your shell
+### Who switches
 
-Add a tiny function so `cas <name>` switches `CLAUDE_CONFIG_DIR` in the *current*
-shell (the binary prints an `export` line; the shell evals it):
+The hook never switches accounts itself. It records which account capped
+and stops its claude. The `csm run` supervisor that started that claude
+takes a lock and looks at the active account:
 
-```zsh
-# ~/.zshrc
-cas() { eval "$(command csm cas --eval --shell zsh -- "$@")"; }
-```
+- If someone already moved `D` (another csm session, or you in Orca's GUI)
+  and the new account has room, the session follows it and resumes there.
+- Otherwise this session leads: it switches to the best other account
+  (through Orca's RPC when Orca runs, offline otherwise), resumes with
+  `claude --resume <sid>`, and prints
+  `csm: account alice capped; resumed on bob`.
 
-```powershell
-# $PROFILE
-function cas { Invoke-Expression ((Get-Command csm -CommandType Application).Source + " cas --eval --shell pwsh -- " + ($args -join ' ')) }
-```
+The leader leaves a note for every other csm session that was on the capped
+account. Each of them moves over at its next turn boundary, without a
+second switch, instead of being stopped in the middle of a tool call. A
+claude that csm did not start keeps running and moves to the new account
+with `D`, the same as after a switch in Orca's GUI. That relies on newer
+Claude Code picking up a changed login instead of writing its old one
+back, so when such a session is live the switch requires `claude
+--version` to be at least `min-claude-version` (default 2.1.283) and
+otherwise only notifies.
 
-`cas <name>` switches this shell; `cas -g <name>` / `csm profiles use <name>`
-sets the machine-wide default; `cas status` shows the current/default/available
-profiles.
+The resumed session keeps its `--model`, `--effort` and `--permission-mode`
+and the launch flags that shape it (`--dangerously-skip-permissions`,
+`--add-dir`, `--settings`, `--mcp-config`, the tool lists, the system-prompt
+flags, `--agent`, `--plugin-dir` and so on). The first prompt is not
+repeated, since `--resume` carries the conversation. Flags that would clash
+with the resume (`--continue`, `--session-id`, `--print` and the like) and
+flags csm does not know are dropped and named in `limit-switch.log`; the
+log never quotes a prompt.
 
-Setting the machine default also updates a **floor** — a platform-level default
-`CLAUDE_CONFIG_DIR` (a `launchctl setenv` on macOS, an `HKCU\Environment` value
-on Windows) so that GUI / launchd / non-shell launches of `claude` land on the
-real profile too, not just shells that sourced the `cas` function. On systems
-without such a mechanism the floor step is a no-op.
+### Limits on switching
 
-### Shared plugins, projects and sessions (provisioning)
+- One switch per session chain. A second cap after a switch only notifies.
+  The limit is fixed at 1: `CLAUDE_MAX_HOPS=0` stops the hook from
+  switching at all, but a larger value changes nothing, because the
+  session's `.switched` marker and the relaunch loop's own cap both stay
+  at one switch.
+- A switch triggered by the `Stop` usage figures waits out a machine-wide
+  cooldown (`CLAUDE_SWITCH_COOLDOWN`, default 300 s). A statusLine tick or a
+  429 is the session's own evidence and is not held back.
+- When every other account is capped too, csm notifies and changes nothing.
+- `CLAUDE_AUTO_SWITCH=0` turns the switch off. `CLAUDE_AUTO_SWITCH_RELAUNCH=0`
+  keeps detection and notifies instead of relaunching.
 
-Claude Code stores its plugins and marketplace cache *under* `CLAUDE_CONFIG_DIR`.
-If each profile kept its own copy, switching profiles would leave the active
-profile's marketplace index pointing at the wrong store — Claude Code then fails
-to load marketplaces (`cache-miss`, "Run /reload-plugins"). To avoid that, `csm`
-makes every profile's `plugins/` a symlink to one shared store at
-`~/.claude.shared/plugins` (the same `~/.claude.shared` root that already holds
-your transcripts and history), so the marketplace cache stays consistent across
-switches. The same mechanism also links each profile's `projects/` to
-`~/.claude.shared/projects`, so every profile sees the same transcript history,
-and each profile's `sessions/` to `~/.claude.shared/sessions`. That last one is
-Claude Code's list of running sessions, the one it reads to find peers for
-cross-session messaging; with a per-profile copy, a session only sees the
-others started under the same profile. One consequence to know about: the
-opt-in OAuth refresh reads that registry to decide whether Claude Code is
-already minting tokens, so its "a session is live" check now covers the whole
-machine rather than one profile (see *Headless collectors*).
+### What counts as capped
 
-This is **provisioned automatically**: every launch / profile switch / registry
-add ensures all three symlinks exist (idempotent, best-effort — a hiccup never
-blocks the launch). You can also do it explicitly:
-
-```sh
-csm profiles bootstrap --all     # provision every profile (dir + shared plugins/projects/sessions)
-csm profiles doctor              # read-only: report what's broken
-csm profiles doctor --fix        # repair anything unhealthy
-csm profiles doctor --fix-home   # repair the ~/.claude shim (see below)
-```
-
-The first time a profile with an existing real `plugins/` dir is provisioned,
-`csm` seeds the shared store from it (or backs the dir up if the shared store
-already has content) before replacing it with the symlink — no plugin data is
-lost. A real `sessions/` dir is handled differently, because its entries belong
-to sessions that may still be running: `csm` swaps the symlink in first, then
-moves the entries into the shared dir. An entry it cannot place safely (a
-same-named file it does not recognise, or a subdirectory) stays in a
-`~/.claude.shared/.sessions-staging.*` dir, which `csm profiles doctor` lists.
-A run interrupted mid-move leaves one of those too; the next launch drains it,
-as does `csm profiles doctor --fix`.
-`settings.json` stays per-profile; `doctor` is where cross-profile drift
-(e.g. divergent marketplace registrations) gets surfaced. On Windows the symlink
-step is delegated to OS-native tooling and `csm` treats it as a no-op.
-
-### Third-party integration contract
-
-`csm` honors `CLAUDE_CONFIG_DIR` on every launch, so the active profile decides
-where Claude Code reads and writes. Much of the surrounding tooling never reads
-that variable: GUI session browsers and transcript indexers resolve
-`~/.claude/projects` by hand and scan nothing else, and other tools write their
-own hooks or settings into `~/.claude/settings.json`.
-
-`csm` therefore keeps `~/.claude` as a credential-free compatibility shim. Its
-`projects` entry is a symlink to `~/.claude.shared/projects`, the same shared
-transcript store every profile links to, so a tool that hardcodes
-`~/.claude/projects` sees every profile's sessions. Everything else in
-`~/.claude` stays as you or another tool left it: `csm` never creates, renames,
-or removes an entry there other than `projects`, and it never places
-credentials in that directory.
-
-Every launch, every `csm profiles add` / `set` / `use`, and every change of the
-global default creates the shim when it is missing, and changes nothing that
-already exists, so the launch path can never move your files. A per-shell
-`cas <profile>` switch only exports `CLAUDE_CONFIG_DIR` and leaves the shim to
-the next launch. Set `CSM_NO_HOME_SHIM=1` to turn the step off; `doctor` still
-reports the shim either way.
-
-Repairs are explicit:
-
-```sh
-csm profiles doctor              # reports the shim state on its first line
-csm profiles doctor --fix-home   # repairs it
-```
-
-`--fix-home` creates a missing link, repoints one aimed somewhere else, recreates
-the shared store when the link dangles, and backs up a stray file named
-`projects`. When `~/.claude/projects` is a real directory holding transcripts,
-`--fix-home` merges those into `~/.claude.shared/projects` entry by entry and
-then links it. Nothing is copied and nothing is deleted. The merge never makes a
-backup copy, because a backup would hide that history from a plain
-`claude --resume`.
-
-The merge is all or nothing. If any name is already taken in the shared store,
-`--fix-home` moves nothing, prints the colliding paths, and leaves
-`~/.claude/projects` exactly as it found it — resolve those names by hand and run
-it again. Moving the rest would take sessions out of `~/.claude/projects` without
-leaving a link behind, so the default home would show fewer sessions than before
-the repair.
-
-`--fix` and `--fix-home` are independent; neither implies the other.
-
-### Without a registry (degraded mode)
-
-The registry is **optional**. With no `~/.config/claude-as/profiles.json` (a
-fresh machine, or a "toss" box you never set up), `csm` runs in a degraded mode:
-the plain smart launcher still works, and the registry-dependent commands fail
-*safe* rather than erroring out —
-
-| Command | Without a registry |
+| Window | Not usable at |
 |---|---|
-| `csm run` (and bare `csm`) | works — launches `claude` under the current `CLAUDE_CONFIG_DIR` |
-| `csm scan`, `statusline`, `newuuid`, `completions`, `sidecar`, `hook` | work — they don't need the registry (`hook` falls back to the current `CLAUDE_CONFIG_DIR`) |
-| `csm profiles list` | prints `(profiles.json absent — CAS/pick features disabled)` |
-| `csm usage` | prints `(no profiles configured — `csm profiles add <name>`)` |
-| `csm pick-account` | no-op (empty stdout), prints the `csm profiles add <name>` hint, exits 0 |
+| 5-hour session | `CLAUDE_LIMIT_PCT`, default 99% |
+| weekly, all models | `CLAUDE_PICK_SATURATION_PCT`, default 95% |
+| weekly, one model tier (`week_fable`) | never on its own; see below |
 
-So account scoring / auto-switch / pick-account simply don't engage until you
-`csm profiles add` at least one profile — nothing crashes.
+A cap on the model-scoped weekly window alone does not switch accounts.
+The session resumes on the same account with `--model` set to
+`CLAUDE_FABLE_FALLBACK_MODEL` (default `opus`), once per weekly window. This
+spends no switch. `CLAUDE_FABLE_FALLBACK=0` turns it off, and the cap is
+then handled like any other.
+
+## Usage metering
+
+`csm usage` prints one row per Orca account: email, organization, the three
+usage windows and when they reset. `--json` prints the same data as JSON.
+Usage comes from Anthropic's OAuth usage API (`GET /api/oauth/usage`),
+called with each account's own grant:
+
+- The active account: the statusLine captures first, else the grant in `D`.
+  csm never refreshes that grant; Claude Code and Orca do.
+- Other accounts with Orca running: Orca's own cached figures
+  (`accounts.list`). csm does not touch their stashes.
+- Other accounts with Orca stopped: the stashed grant. `csm usage --refresh`
+  and the pick before a limit switch refresh a stashed grant that expires
+  within five minutes, the way Orca does. Nothing else refreshes a grant.
+
+Results are cached: the whole snapshot for `CSM_USAGE_TTL_SECS` (60 s), each
+account's record for `CSM_USAGE_PROFILE_TTL` (300 s), with a back-off after
+a 429 or a total failure. A window whose reset time has passed is shown as
+0%. `--no-fetch` reads only the cache; `--refresh` skips the caches and asks
+a running Orca to re-probe (up to 30 s).
+
+`CSM_USAGE_CMD` replaces collection with your own command that prints the
+usage JSON. See [`examples/usage-collector.sh`](examples/usage-collector.sh)
+for the format.
+
+`csm statusline` prints `<account>@<host>`: the local part of the account's
+email and the short host name (`CSM_HOST_REPLACE=Acme-/` strips a prefix).
+Inside an Orca pane it also forwards the payload to Orca's own statusLine
+receiver, so Orca's usage display stays current even though your statusLine
+command is csm's. The forward runs in a detached child after the segment
+is printed, so it adds no render latency.
+
+The hook (`csm hook`, every event) reads only csm's own files. It makes no
+network call, no RPC call and no Keychain access, so a `SessionEnd` hook
+returns well inside Claude Code's 1.5 s budget even with stale usage.
+
+## Accounts from the terminal
+
+- `csm accounts use <account>` makes that account active. It does not stop
+  running sessions; they pick up the new account from `D`, as after a
+  switch in Orca's GUI.
+- `csm accounts add` logs in a new account. With Orca running it hands over
+  to Orca's own CLI (`account add --agent claude`): the one bundled with the
+  running Orca (`Orca.app/Contents/Resources/bin/orca` on macOS), else the
+  one on `PATH` (`orca`, or `orca-ide` on Linux, where `orca` is the screen
+  reader). With Orca stopped it runs `claude auth login` in a temporary
+  config dir and files the result the way Orca would. `add` and `import`
+  run claude through the configured launch command when one is set.
+- `csm accounts import <dir>...` takes the login a Claude config dir holds
+  and adds it as an account (or refreshes an existing one with the same
+  email and organization). The active account does not change.
+- `csm accounts rm <account>` removes an account other than the active one.
+- `csm accounts doctor` reports an unfinished switch, quarantined grants,
+  stashes without an account, two accounts sharing a refresh token, a
+  stash whose grant belongs to someone else, a `D` that disagrees with
+  the active account, and a `claude` alias whose target is gone. `--fix` repairs what it safely can. `--offline` skips
+  the network checks.
+
+### Quarantine
+
+Before csm writes another login into `D`, it works out whose grant `D`
+holds now (Claude Code may have refreshed it since Orca last saved it). It
+asks Anthropic's profile endpoint who the grant belongs to. A grant that
+belongs to the account on record goes back to that account's stash. A
+grant it cannot attribute (another account, a 401 that a refresh does not
+fix, no answer) goes to csm's quarantine under the state dir and is never
+written to another account's stash. `accounts doctor` lists quarantine
+entries by fingerprint. Nothing in the quarantine is deleted unless a live
+stash holds the same grant.
+
+## Migrating from the profile setup
+
+Earlier csm versions kept named profiles (`~/.claude.<name>` directories
+listed in `~/.config/claude-as/profiles.json`) and pinned
+`CLAUDE_CONFIG_DIR` machine-wide to one of them. Orca then inherited that
+pin. The move to Orca's accounts is one pass per machine:
+
+1. `csm migrate plan`. Read-only. For each profile it shows whether the
+   account is already in Orca, still to import, or has no login. It only
+   checks that a grant is there (Keychain items are probed without reading
+   the secret) and reads no secrets; `import` compares the profile dir's
+   grant with Orca's stash by fingerprint and expiry. It also shows Orca's
+   current `D`, the target `D` (`~/.claude`), and what steps 5 and 6 will
+   do.
+2. End every claude session, including panes Orca's terminal daemon keeps
+   alive after Orca quits. Then quit Orca. `csm reap --dry-run` should find
+   nothing.
+3. Remove the machine-wide `CLAUDE_CONFIG_DIR` (the shell export, the
+   launchd variable on macOS, the `HKCU\Environment` value on Windows) and
+   open a new shell.
+4. `csm migrate import`. It imports each profile Orca does not have yet.
+   For a profile Orca already has, it reads back the newest grant from the
+   profile dir into Orca's stash, after the profile endpoint confirms the
+   owner. When Orca keeps its state in SQLite (1.4.214 and later), csm
+   adds accounts only through a running Orca, so this step prints a
+   `csm accounts import <dir>` line for each new profile instead; run
+   those once Orca is started, before `csm migrate retire`. Step 7 then
+   prints the `csm accounts use` line to run the same way.
+5. If `~/.claude.json` does not exist yet, the same command creates it from
+   the old default profile's `.claude.json` without `oauthAccount`, so
+   claude keeps its onboarding state and settings. Either way it merges
+   that profile's trust settings (`projects[<path>]`) and user MCP servers
+   into `~/.claude.json`, keeping keys already there, so Orca panes do not
+   ask to trust every folder again. Differences in other profiles are
+   listed for you to merge by hand.
+6. It turns `~/.claude/projects`, `sessions` and `plugins` from links into
+   `~/.claude.shared/` into real directories, and moves csm's session
+   sidecars, title index and scan indexes from `~/.claude.shared/smart` to
+   the new state dir. Caches and per-profile records stay there unread;
+   delete the dir once you have looked at it.
+7. It makes the old default profile's account active.
+8. `csm migrate retire`. For each profile whose stash was verified, it moves
+   the dir's grants into the quarantine, renames the dir to `<dir>.retired`,
+   and once no profile is left clears the machine-wide variable, then
+   removes `~/.config/claude-as/`. If clearing the variable fails, the
+   registry stays so that running `retire` again retries it. A profile
+   whose stash cannot be verified is skipped and says so.
+9. Start Orca (its `D` is now `~/.claude`), run `csm orca setup` and set
+   `agentCmdOverrides.claude` as it says.
+
+`import` and `retire` refuse to run while Orca runs, while a claude session
+is live in a dir they would touch, or while `CLAUDE_CONFIG_DIR` still names
+something other than `~/.claude`. `--dry-run` shows what they would do.
+
+The old shell function `cas` no longer switches anything:
+`csm cas --eval …` prints nothing and exits 0, so a leftover shim does not
+break a shell, and `csm cas --print-default-dir` prints `D`. Remove the shim
+when convenient.
+
+## What csm never does
+
+- It never keeps its own account list, and never selects "no account" in
+  Orca.
+- It never writes Orca's store while Orca runs; it asks Orca over RPC.
+- It never writes Orca's store offline for an Orca version it was not
+  tested with, or for a store whose format it does not recognize.
+- It never edits Orca's settings, including `agentCmdOverrides`.
+- It never deletes a grant it cannot attribute. It quarantines it.
+- It never refreshes the grant `D` holds.
+- It never prints or logs a token, a credential file, Orca's RPC token or
+  Orca's hook token.
+- It never makes a network, RPC or Keychain call from `csm hook`, or before
+  claude starts in an Orca pane.
+- It never stops a running session to switch accounts by hand.
 
 ## Configuration
 
-`csm` keeps its own settings in `~/.config/claude-smart/config.json` (separate
-from the `~/.config/claude-as/` profile registry above). Today the only setting
-is the **launch command**: which binary `csm run` spawns instead of `claude`.
-This lets you point `csm` at a drop-in Claude Code wrapper — e.g.
-[`happy`](https://github.com/slopus/happy-cli) (mobile/web client) or `tp` —
-that accepts the same arguments as `claude`:
+csm's own settings live in `~/.config/claude-smart/config.json`. The main
+setting is the launch command, the program `csm run` starts instead of
+`claude`, for a drop-in wrapper such as
+[`happy`](https://github.com/slopus/happy-cli):
 
 ```sh
-csm config set launch-command happy   # csm run now launches `happy`
-csm config get launch-command         # prints the effective launch command
-csm config show                       # prints the whole config JSON
-csm config unset launch-command       # revert to launching `claude`
+csm config set launch-command happy
+csm config set launch-command npx happy   # several words, stored as an argv array
+csm config get launch-command
+csm config unset launch-command
 ```
 
-The value is stored as an **argv token array**, so multi-token commands work
-too — `csm config set launch-command npx happy` writes
-`{ "launchCommand": ["npx", "happy"] }` and spawns `npx happy …`. Tokens are
-never shell-split; pass each word separately.
+The other setting, `min-claude-version`, is the floor described under
+*Who switches*: `csm config set min-claude-version 2.1.300`.
 
-Resolution precedence (highest first): the `CLAUDE_SMART_CLAUDE_BIN` environment
-variable (a single binary, for tests / one-off overrides) → the config file's
-`launchCommand` → the default `claude`. An absent or empty config launches
-`claude` as before.
+`CLAUDE_SMART_CLAUDE_BIN` overrides the launch command for one run. csm skips any candidate
+that turns out to be csm itself (the `claude` alias, for instance) and uses
+the next `claude` on `PATH`.
 
-## Usage metering (local, per profile)
-
-`csm usage` and account scoring collect usage data directly on this machine,
-per profile: there is no separate service to run and nothing to opt into.
-For each profile in your registry, `csm` reads that profile's own Claude Code
-OAuth credentials and calls Anthropic's usage API
-(`GET /api/oauth/usage`) with them:
-
-- **macOS**: read from the login Keychain, service name
-  `Claude Code-credentials` (or `Claude Code-credentials-<hash>` for a
-  non-default `CLAUDE_CONFIG_DIR`). This is the same entry Claude Code itself
-  reads, so no separate login step and no prompt.
-- **Other platforms**: read from `<profile-dir>/.credentials.json`.
-
-By default this is **read-only**: `csm` never writes, refreshes, or rotates a
-token. It only reads the access token Claude Code already stored and asks the
-API for the current usage percentages. If a profile's token has expired, `csm`
-does not attempt a refresh itself (that would rotate the token and could race
-Claude Code's own refresh, risking a surprise logout). Instead it serves the
-last-known value and warns you, with the exact command to run, everywhere you
-would see that profile: the usage table, the account picker, and the moment
-you launch under it. See *Dead or expired credentials* below. The one way to
-change that is the explicit opt-in in *Headless collectors* below.
-
-**Fetch order**, cheapest first:
-
-1. **Positive cache** (`CLAUDE_USAGE_TTL` / `CSM_USAGE_TTL_SECS`, default 60s):
-   served as-is, no work done.
-2. **`CSM_USAGE_CMD`**, if set: your own override command (see below).
-3. **Negative cooldown**: after a total collection failure (every profile
-   failed), `csm` serves nothing new until `CLAUDE_USAGE_FAIL_COOLDOWN`
-   (default 120s) lapses, rather than re-hammering local collection.
-4. **Local collection**: for each profile, serve a fresh per-profile store
-   record, or probe the live credentials + API, or serve a stale record with
-   window decay, or record an error. This is the terminal layer; see below.
-
-Each profile's collected usage is written to its own store file at
-`<smart-dir>/usage/<profile>.json` (JSON, atomic write) so that per-profile
-writes never race each other. A profile's own record is itself served fresh
-for `CSM_USAGE_PROFILE_TTL` (default 300s) before `csm` re-probes it live.
-
-**Rate limits and staleness.** The usage API rate-limits per token. On a 429,
-`csm` stamps that profile with a cooldown (`CSM_USAGE_RATE_LIMIT_COOLDOWN`,
-default 900s) and serves its last-known store record instead of erroring.
-Any served record whose window has since rolled over (`resets_at` is in the
-past) has that window's percentage decayed to 0 rather than shown stale. The
-account is assumed to have reset, even though `csm` hasn't re-probed it yet.
-
-**Statusline capture (free, no extra API calls).** If you use a custom
-`statusLine` script, Claude Code passes it live rate-limit data on stdin for
-the active profile. Add one line to feed that into csm's store:
-
-```sh
-printf '%s' "$input" | csm usage capture &
-```
-
-`csm usage capture` reads the statusLine JSON from stdin, merges any
-`rate_limits` it finds into that profile's store record, and exits (always
-0, no stdout), so it's safe to run in the background. If you use `csm
-statusline` itself as your `statusLine` command, this capture happens
-automatically (disable it with `CSM_STATUSLINE_NO_CAPTURE=1`). The same
-capture is what moves a running session off an account that just hit its
-weekly cap (see *Reactive switch* below), so a `csm run` session without it
-only gets the hook-based paths.
-
-`csm statusline` is safe to use as your `statusLine` command directly, not
-just as a capture step. A release build measured on macOS ran p50 11.48 ms
-and p95 22.64 ms for a real statusLine payload, close to the bare
-process-spawn floor and faster than a naive shell statusline that forks its
-own `hostname` call. If you'd rather keep a non-csm statusline script, the
-manual `csm usage capture &` line above still works as a drop-in addition to
-it.
-
-See *Usage collection and caching* in [Environment variables](#environment-variables)
-for every variable named above.
-
-**Known limitation.** An idle profile you haven't run `claude` under in a
-while can have an expired access token. `csm` does not refresh a token unless
-you turn the opt-in on, so it keeps showing the last values it collected
-(with window decay applied) until either Claude Code refreshes the token on
-its next run, or you log back in by hand. See *Dead or expired credentials*
-below for exactly what to run.
-
-Use `csm usage --refresh` to bypass both the positive cache and every
-profile's own TTL and re-probe live (cooldowns are still respected).
-
-### Headless collectors (opt-in token refresh)
-
-An access token lives about 8 hours, and normally only a running Claude Code
-process mints a new one. On a headless host that collects usage for profiles
-no Claude Code ever runs under, every profile therefore goes stale 8 hours
-after login and stays that way.
-
-`csm usage --refresh-oauth` (or `CSM_OAUTH_REFRESH=1`) lets the collector mint
-a new access token itself. It applies to that command only: the statusline,
-the account picker, the sidecar and the hook never refresh, whatever the
-environment says. A refresh is attempted for a profile only when all of these
-hold:
-
-- the opt-in is on for this invocation;
-- the profile's access token has expired and its refresh token has not;
-- no live Claude Code session exists **anywhere on the machine**
-  (`<profile-dir>/sessions/*.json` is scanned, and a live `claude` or `node`
-  process there means `csm` stands down and lets Claude Code refresh). Since
-  provisioning points every profile's `sessions` at one shared registry, and
-  its records say nothing about which profile they belong to, a session under
-  any profile holds the refresh back for all of them — the safe direction,
-  and a headless collector runs no sessions at all;
-- an exclusive lock file next to the credentials is free (60s staleness
-  takeover), so two collectors can't refresh the same profile at once;
-- the platform stores credentials in `<profile-dir>/.credentials.json`.
-  **macOS is not supported**: there the Keychain holds the live copy, so
-  `csm` reports the profile as unsupported and writes nothing.
-
-On success the credential file is rewritten atomically at mode `0600`, with
-every unrelated key preserved, and the same collection tick goes on to fetch
-usage with the new token. On any refusal or failure nothing is written and
-the profile behaves exactly as it does with the opt-in off.
-
-### Dead or expired credentials
-
-When a profile's credentials go bad, `csm` tells you exactly what to run
-instead of quietly serving stale numbers. If only the access token expired
-and the refresh token is still alive, run `csm --profile <name>` once and
-Claude Code refreshes it automatically on that run. If the refresh token is
-also dead, or you were never logged in under that profile at all, nothing but
-`CLAUDE_CONFIG_DIR=<dir> claude auth login` will fix it. Both warnings show up
-in the `csm usage` table, the account picker, and right before `csm` launches
-`claude`, so you never have to guess why a profile stopped scoring.
-
-**Account picker (no usable usage data).** Account auto-selection opens the
-account picker (rather than silently keeping the current account) whenever
-it cannot score, which is two distinct cases: (1) **fetch failure**: local
-collection couldn't produce any data at all; (2) **no scorable data**: data
-came back but no profile yields a usable percentage (every profile errored,
-or none has a `week_all` section, or the profile map is empty). Both surface
-the picker in an interactive terminal so you can choose deliberately against
-the last-known (stale) usage; in a non-interactive context (the Stop hook,
-scripts) both fail safe to the current profile instead of blocking on a
-picker. A launch from a terminal-managing app counts as non-interactive here
-even though it has a TTY: in an Orca pane (`ORCA_PANE_KEY` set), a
-`csm --resume <id>` from Orca's session list resumes at once on the current
-profile instead of waiting on the picker. `CSM_EMBEDDED=1` gives other such
-tools the same behaviour and `CSM_EMBEDDED=0` turns detection off. This is distinct from **all-saturated**: when real percentages exist
-but *every* account is over the limit, there is nothing better to pick, so
-`csm` keeps the current profile with a warning and does **not** open the
-picker. Passing **`-i` / `--interactive`** forces the picker in all of these
-cases too: it skips the auto-pick entirely and always asks (and also forces
-the session picker). `--profile <name>` still wins over everything: explicit,
-no picking. **The picker is ordered by recommendation, not
-alphabetically:** rows are ranked exactly as the live scorer (`pick_best`)
-would choose: viable accounts first (no cap over its threshold, see *What
-counts as a viable account* below; soonest weekly reset, then higher
-`week_all.pct`), then saturated / session-limited / errored / no-data rows
-below. Rows that carry a model-scoped weekly reading show it as `model NN%`. The row the account auto-pick *would* have selected
-leads the list and is flagged with a **`★`** marker. Because the picker's
-cursor starts on the first row, **pressing Enter takes the recommendation**;
-you only need to move when you want a different one. (When every account is
-saturated / errored / dataless there is no recommendation, so no row gets
-the `★`.) Pressing **Escape / Ctrl-C in any picker cancels the launch
-entirely** (`csm` exits without starting `claude`). It does not silently
-fall through to a default.
-
-### What counts as a viable account
-
-Anthropic reports up to three usage windows per account. Two of them gate
-whether `csm` considers a profile viable at all; the third, model-scoped one
-no longer does — a cap there falls back to another model on the same account
-instead of excluding it (see *Reactive switch* below):
-
-| Window | Field | Not viable when |
-|---|---|---|
-| 5-hour session | `session` | `>= 99%` (`CLAUDE_LIMIT_PCT`) |
-| weekly, all models | `week_all` | `>= 95%` (`CLAUDE_PICK_SATURATION_PCT`) |
-| weekly, one model tier | `week_fable` (tier name from the API, shown as the table's tier column) | never excludes on its own — see below |
-
-A profile the API reports no model-scoped window for is simply not
-constrained by that dimension; absence is never read as "limited". A model
-tier at or over `CLAUDE_PICK_SATURATION_PCT` still shows its raw percentage
-(`model NN%`) in the usage table and account picker, but does not lower the
-profile's rank or exclude it from auto-pick — the account's session and
-all-model weekly headroom are what determine whether it can still take work.
-One predicate (`scoring::is_viable_pcts`) makes the session/week_all call for
-the launch-time auto-pick, `csm pick-account`, and the account picker's
-ordering; the Stop hook's relaunch target uses the same predicate for
-picking a different *account*, and separately checks `week_fable` on its own
-to decide whether to fall back to a model on the *current* account instead
-(see `hook::detect::fable_fallback_model`).
-
-**Reactive switch while a session is running.** Three paths feed the same
-decision; all of them end with the `csm run` supervisor restarting
-`claude --resume` under the best other viable profile, with a short handoff
-prompt so the resumed session knows why it moved.
-
-*What the switch carries.* The hop builds claude's argv fresh rather than
-repeating the one it was launched with. It resumes the same session id,
-re-applies the `--permission-mode`, `--effort` and `--model` the sidecar
-remembers, and then replays the launch flags that shape the session:
-`--dangerously-skip-permissions` and its `--allow-` form, `--add-dir`,
-`--settings` and `--setting-sources`, `--mcp-config` and `--strict-mcp-config`,
-the tool allow and deny lists, the system-prompt flags and their file and
-snapshot forms, `--agent` and `--agents`, `--plugin-dir` and `--plugin-url`,
-`--fallback-model`, `--autocompact`, `--max-budget-usd`, `--verbose` and the
-other valueless switches. A session started
-`csm --dangerously-skip-permissions --add-dir /x "do the thing"` therefore
-comes back after a switch still bypassing prompts and still able to read
-`/x`, instead of stopping on the first permission dialog with nobody watching.
-
-The initial prompt is not replayed: `--resume` already carries that
-conversation, and the handoff prompt is the hop's first turn. Nor are the
-flags that would fight the hop's own argv, among them `--resume`,
-`--continue`, `--session-id` and `--fork-session`, `--print` with its input
-and output formats, and the background, cloud, worktree and tmux launchers.
-Anything after a bare `--` stops the scan, and a flag `csm` does not
-recognise is dropped as well, since replaying it without knowing whether it
-takes a value would either swallow the following argument or strand one on
-the argv. What the hop leaves behind is written to `limit-switch.log` as
-`dropped passthru: …`, so a session that comes back without something it was
-launched with is explainable after the fact. Dropped flags are named there;
-everything else, the initial prompt included, is only counted, because that
-log holds no conversation text.
-
-One shape needs care. A flag that takes a list, such as `--add-dir`, keeps
-collecting values until something stops it, so when the replayed flags end
-inside one of those lists the hop writes `--` before the handoff prompt.
-Otherwise claude reads the handoff as one more directory and the resumed
-session has no first turn.
-
-*Statusline tick.* This is the path that fires for a subscription cap. When
-the account's session, weekly, or model-scoped weekly limit is reached,
-Claude Code (2.1.270) does not end the turn: it shows "Weekly limit reached ·
-Retrying in 6h" and keeps retrying internally, and no hook runs at all for
-the duration. What does keep running is the statusLine command, once a
-second, with the live `rate_limits` for the account. `csm usage capture`
-(or `csm statusline`) compares that reading, plus the stored model-scoped
-weekly percentage, against `CLAUDE_LIMIT_PCT` (99) on every tick, and on a
-hit runs the full switch — same kill-switches, target pick, live-supervisor
-check and hop cap as the hook. Only one tick per session commits (the
-`.switched` marker is claimed first), and the tick never writes to stdout.
-
-*`StopFailure` hook.* Register `csm hook --owner <profile-dir>` on Claude
-Code's `Stop`, `SubagentStop`, `SessionEnd`, and `StopFailure` hook events.
-When a 429 does end the turn, Claude Code fires `StopFailure` with
-`error: "rate_limit"` instead of `Stop`; `csm hook` takes that as a
-definitive limit. Other `StopFailure` errors (overloaded, server errors, auth
-failures) are ignored. A matcher keeps the hook to the one case that
-matters:
-
-```json
-"StopFailure": [
-  { "matcher": "rate_limit",
-    "hooks": [ { "type": "command",
-                 "command": "csm hook --owner '/Users/example/.claude.work'" } ] }
-]
-```
-
-*`Stop` hook.* On `Stop` the hook compares the running profile's three
-percentages against `CLAUDE_LIMIT_PCT` instead, which catches a cap crossed
-during a turn that still succeeded.
-
-*Model fallback on a Fable-only cap.* When the dimension that tripped is
-`week_fable` and nothing else, the statusline tick and the `Stop` hook's
-percentage check relaunch the same session under the same profile with
-`--model` set to `CLAUDE_FABLE_FALLBACK_MODEL` (default `opus`), instead of
-switching accounts — the account itself still has headroom, so spending a
-switch hop to move to a different account would be wasted. Only these two
-paths can make that call: they read the three percentages directly and know
-which one tripped. The `StopFailure` hook cannot — a raw 429 carries no
-dimension, only `error: "rate_limit"` — so it always falls through to the
-ordinary account-switch path, never a model fallback.
-This is one-shot per weekly window, tracked by a `<sid>.model-fallback`
-marker recorded together with the account it was written for: a further
-`week_fable` trip is suppressed silently, not escalated to a switch and not
-notified again, only while that marker is both fresh for the current window
-AND for the account the session is on right now, since the reading typically
-stays capped for days and switching on it would just undo the fallback on
-the very next tick. Once the window rolls over, or an ordinary account
-switch has since moved the session to a different account, the marker no
-longer counts and a fresh fallback can fire again for whichever account the
-session is on. A later cap on `session` or `week_all` still switches
-accounts normally regardless of the marker, and a session that already
-switched accounts once can still fall back afterward: the `.switched` marker
-that stops a repeat account switch on the same session never blocks a model
-fallback, since a fallback spends no hop and switches no account. Set
-`CLAUDE_FABLE_FALLBACK=0` to disable the fallback outright and fall through
-to the ordinary account-switch path instead (which excludes the current
-profile the same as any other cap and may itself end in a notify-only if
-nothing else has headroom).
-
-All three honour `CLAUDE_AUTO_SWITCH`, `CLAUDE_AUTO_SWITCH_RELAUNCH`, and the
-live-supervisor check. The per-session hop cap (`CLAUDE_MAX_HOPS`) also
-applies to all three — except a model fallback itself, which spends no hop
-and so is not counted or limited by it; a later account switch still counts
-against the same budget as always. The machine-wide switch cooldown
-(`CLAUDE_SWITCH_COOLDOWN`) only throttles the `Stop` percentage path; the
-statusline tick and `StopFailure` are each session's own live evidence, so
-several sessions sharing an exhausted account can all move off it. A model
-fallback neither claims nor is blocked by this cooldown either, since it
-switches no account. The model-scoped weekly
-percentage refreshes only when the per-profile usage-API probe runs
-(`CSM_USAGE_PROFILE_TTL`, default 300s), so a cap on that dimension alone can
-take up to about five minutes to register on the tick and `Stop` paths; the
-session and all-model weekly readings are live on every tick.
-
-### Custom usage command (`CSM_USAGE_CMD`)
-
-You don't have to rely on local collection. Set `CSM_USAGE_CMD` to any command
-that prints a usage JSON blob (the same shape local collection produces) on
-stdout, and `csm` will use it as a usage source instead. It runs after the
-positive cache and before local collection (the explicit "check via my own
-script" path takes precedence over the built-in collector), and its result is
-cached like any other fetch, so a slow command is not re-run within the cache
-TTL.
-
-`CSM_USAGE_CMD` runs via `sh -c` (POSIX) / `cmd /C` (Windows) — so on Windows
-the value must be `cmd.exe`-safe (single-quote quoting and Unix pipelines
-won't work; wrap complex logic in a `.cmd`/`.ps1` script and point at that).
-See *Custom usage source* in [Environment variables](#environment-variables)
-for `CSM_USAGE_CMD`, `CSM_USAGE_CMD_TIMEOUT`, and the shared cache TTL.
-
-`csm` does the scoring and the account choice itself — the command only reports
-the **facts** (each profile's usage); you do not pick a profile in it.
-
-The command is **not** compiled in — the extraction mechanism is yours to own,
-because a robust one is environment-specific. (Note: `csm`'s own built-in
-collector already calls Anthropic's OAuth usage API directly, so you only need
-`CSM_USAGE_CMD` for exotic setups: a shared cache your own tooling maintains,
-a proxy through infrastructure you already run, or a source other than the
-per-profile credentials `csm` reads by default.)
-
-See [`examples/usage-collector.sh`](examples/usage-collector.sh) for a
-reference `CSM_USAGE_CMD` that shows three practical strategies: proxy an
-existing endpoint (one `curl`), re-emit a cache file, or synthesize the JSON
-from per-profile facts. Its header comment also documents the **full usage JSON
-shape** (`profiles[<name>].session.pct` / `.week_all.pct` / `.resets`) and the
-scoring rules csm applies to it, so it doubles as the format reference.
+State lives in `$XDG_STATE_HOME/csm` (default `~/.local/state/csm`) on macOS
+and Linux, and `%LOCALAPPDATA%\csm` on Windows.
 
 ## Environment variables
 
-Every environment variable `csm` reads, grouped by what it affects. Names are
-frozen — this section documents them, it never renames or deprecates one.
-Defaults shown are what applies when the variable is unset or unparseable.
-
-### Launch and profile
+### Launch
 
 | Variable | Meaning |
 |---|---|
-| `CLAUDE_CONFIG_DIR` | The active profile's Claude Code config home. Set by the shell `cas` shim (or the platform floor) before `csm` runs; `csm` reads it to resolve the current profile name and directory. See *Profiles*. |
-| `CLAUDE_SMART_CLAUDE_BIN` | A single binary path/name that overrides what `csm run` spawns instead of `claude`. Highest precedence (above `csm config set launch-command`); mainly for tests and one-off overrides. See *Configuration*. |
-| `CSM_HOST_REPLACE` | A literal, case-insensitive, first-match `find/replace` pair (e.g. `Acme-/`) applied to the short hostname `csm statusline` shows as `<profile>@<host>`. Unset = the raw short hostname, no rewrite; `csm` carries no built-in naming convention. |
-| `CSM_EMBEDDED` | `1` marks the launch as coming from a terminal-managing app, so the stale-usage account picker never opens and the launch keeps the current profile. `0` turns off the automatic detection, which treats a non-empty `ORCA_PANE_KEY` (an Orca pane) the same way. Explicit `-i` still opens the picker. |
-| `CSM_NO_HOME_SHIM` | Any non-empty value turns off the launch-time create-only step for the `~/.claude` compatibility shim. `csm profiles doctor` still reports the shim and `--fix-home` still repairs it. See *Third-party integration contract*. |
-| `CLAUDE_TITLE_INDEX_TTL` | Seconds the session title index (`titles.tsv`) is served without a rebuild (default `300`). |
+| `CSM_ORCA` | `1` treats the launch as an Orca pane, `0` turns Orca detection off. Other values: detect. Never overrides Print. |
+| `CSM_EMBEDDED` | Older name for `CSM_ORCA`, read when `CSM_ORCA` is unset. |
+| `CLAUDE_SMART_CLAUDE_BIN` | The program to start instead of `claude` (above the config file's launch command). |
+| `CLAUDE_CONFIG_DIR` | Read to find `D`. csm sets it for claude only when the inherited value would put claude somewhere other than `D`. |
+| `CSM_HOST_REPLACE` | `find/replace` applied to the host name in `csm statusline`, for example `Acme-/`. |
+| `CLAUDE_TITLE_INDEX_TTL` | Seconds the session title index is reused (default `300`). |
 
-### Account scoring and the limit switch
-
-| Variable | Meaning |
-|---|---|
-| `CLAUDE_LIMIT_PCT` | The 5-hour session window's "not viable" threshold, percent (default `99`). Gates both scoring/pick and the hook's/statusline tick's rate-limit check. See *What counts as a viable account*. |
-| `CLAUDE_PICK_SATURATION_PCT` | The all-model weekly window's "not viable" threshold, percent (default `95`). Does not gate the model-scoped `week_fable` window — see `CLAUDE_FABLE_FALLBACK` below and *What counts as a viable account*. |
-| `CLAUDE_USAGE_MAX_AGE` / `CSM_USAGE_MAX_AGE_SECS` | Max age, in seconds, of usage data that auto-pick will still trust (default `1800`); `0` disables the gate. `CLAUDE_USAGE_MAX_AGE` wins if both are set. |
-| `CLAUDE_AUTO_SWITCH` | `0` disables the whole limit-switch decision (a kill-switch). Anything else, or unset, leaves it enabled. |
-| `CLAUDE_AUTO_SWITCH_RELAUNCH` | `1` (default) actually relaunches under the target profile on a switch. Any other value only notifies — it prints the manual switch command instead of relaunching. |
-| `CLAUDE_SWITCH_COOLDOWN` | Seconds the machine-wide switch cooldown enforces between percentage-based switches (default `300`). Throttles the `Stop` percentage path only — never the statusline tick or a `StopFailure(rate_limit)` hit, each of which is a session's own live evidence. See *Reactive switch*. |
-| `CLAUDE_MAX_HOPS` | Max switch hops one session chain may take before the hook gives up and skips (default `1`). |
-| `CLAUDE_FABLE_FALLBACK` | `1` (default) falls back to another model on the same account when a `week_fable` cap trips alone, instead of switching accounts. `0` disables the fallback and lets that cap fall through to the ordinary account-switch path. See *Model fallback on a Fable-only cap*. |
-| `CLAUDE_FABLE_FALLBACK_MODEL` | The model alias the fallback relaunches with (default `opus`). |
-| `CLAUDE_SMART_RESUME_PROMPT` | Overrides the handoff message injected into a session after a switch. Unset = `csm`'s default handoff text; set to an empty string = no handoff prompt at all; any other value is used verbatim. |
-| `CLAUDE_SWITCH_GRACE_MS` | Milliseconds the process supervisor waits for the launched child to exit gracefully after a stop signal before escalating (default `5000`). |
-
-### Usage collection and caching
+### Limit switch
 
 | Variable | Meaning |
 |---|---|
-| `CLAUDE_USAGE_TTL` / `CSM_USAGE_TTL_SECS` | Positive-cache lifetime for a fetched usage snapshot, seconds (default `60`). The legacy name wins if both are set. |
-| `CLAUDE_USAGE_FAIL_COOLDOWN` | Negative-cache cooldown in seconds after every profile fails to fetch at once (default `120`). |
-| `CSM_USAGE_PROFILE_TTL` | Seconds a profile's own store record is served without a live probe (default `300`). |
-| `CSM_USAGE_RATE_LIMIT_COOLDOWN` | Seconds to back off a profile after a 429 from the usage API (default `900`). |
-| `CSM_USAGE_API_BASE` | Override the usage API base URL (default `https://api.anthropic.com`). Mainly for tests. |
-| `CSM_OAUTH_REFRESH` | `1` enables the opt-in headless OAuth access-token refresh (same as `csm usage --refresh-oauth`). Default off. See *Headless collectors*. |
-| `CSM_OAUTH_TOKEN_URL` | Override the OAuth token endpoint used by that refresh (default `https://platform.claude.com/v1/oauth/token`). Mainly for tests; an override is announced on stderr. |
-| `CSM_STATUSLINE_NO_CAPTURE` | `1`/`true` disables the automatic statusline usage capture in `csm statusline`. |
+| `CLAUDE_AUTO_SWITCH` | `0` turns the limit switch off. |
+| `CLAUDE_AUTO_SWITCH_RELAUNCH` | `1` (default) relaunches after a switch; anything else only notifies. |
+| `CLAUDE_LIMIT_PCT` | Session-window limit, percent (default `99`). |
+| `CLAUDE_PICK_SATURATION_PCT` | All-models weekly limit, percent (default `95`). |
+| `CLAUDE_MAX_HOPS` | `0` stops the hook from switching accounts. The default and upper limit is `1` switch per session chain; larger values have no effect. |
+| `CLAUDE_SWITCH_COOLDOWN` | Seconds between switches started by the `Stop` usage check (default `300`). |
+| `CLAUDE_FABLE_FALLBACK` | `0` turns off the same-account model fallback. |
+| `CLAUDE_FABLE_FALLBACK_MODEL` | Model for that fallback (default `opus`). |
+| `CLAUDE_SMART_RESUME_PROMPT` | The note sent to a resumed session. Empty sends none. |
+| `CLAUDE_SWITCH_GRACE_MS` | Milliseconds to wait for claude to exit after the stop signal (default `5000`). |
+| `CLAUDE_USAGE_MAX_AGE` / `CSM_USAGE_MAX_AGE_SECS` | Oldest usage data a switch decision trusts, seconds (default `1800`, `0` = no limit). |
 
-### Custom usage source
+### Usage
 
 | Variable | Meaning |
 |---|---|
-| `CSM_USAGE_CMD` | Shell command whose stdout is a usage JSON blob, overriding local collection. Empty/unset = disabled. See *Custom usage command*. |
-| `CSM_USAGE_CMD_TIMEOUT` | Hard deadline in seconds for that command (default `10`). On timeout `csm` falls through to local collection. |
+| `CLAUDE_USAGE_TTL` / `CSM_USAGE_TTL_SECS` | Snapshot cache lifetime, seconds (default `60`). |
+| `CSM_USAGE_PROFILE_TTL` | Per-account record lifetime, seconds (default `300`). |
+| `CLAUDE_USAGE_FAIL_COOLDOWN` | Back-off after every account failed, seconds (default `120`). |
+| `CSM_USAGE_RATE_LIMIT_COOLDOWN` | Back-off for one account after a 429, seconds (default `900`). |
+| `CSM_USAGE_CMD` | A command that prints usage JSON, used instead of collection. |
+| `CSM_USAGE_CMD_TIMEOUT` | Its time limit, seconds (default `10`). |
+| `CSM_STATUSLINE_NO_CAPTURE` | `1` stops `csm statusline` from reading stdin, which also turns off the statusLine switch and the Orca forward. |
+| `CSM_USAGE_API_BASE` | Usage and profile API base URL (default `https://api.anthropic.com`). For tests. |
+| `CSM_OAUTH_TOKEN_URL` | Token endpoint for the stash refresh (default `https://platform.claude.com/v1/oauth/token`). For tests. |
+
+### Removed
+
+| Variable or flag | Now |
+|---|---|
+| `CSM_OAUTH_REFRESH` | Ignored. The stash refresh is part of `csm usage --refresh` and the limit pick. |
+| `csm usage --refresh-oauth` | Rejected as an unknown flag. Use `--refresh`. |
+| `CSM_NO_HOME_SHIM` | Ignored. `~/.claude` is `D` now, not a shim. |
+| `--profile`, `-A/--pick-account`, `--no-pick` | Gone with the profiles. |
+| `csm profiles`, `csm pick-account`, `csm current-usage` | Gone. Use `csm accounts` and `csm usage --json`. |
+| `csm cas` | Kept only as the quiet compat described under *Migrating*. |
+
+## Platforms
+
+- macOS: everything, with stashed grants in the login Keychain. csm calls
+  `/usr/bin/security`, as Orca and Claude Code do, so items keep the same
+  owner and no prompt appears.
+- Linux and WSL: stashed grants are files. csm has no way yet to read the
+  installed Orca version on Linux, so with Orca stopped it will not write
+  Orca's store: switch with Orca running. Under WSL, a Windows Orca's
+  userData is never written.
+- Windows: the binary builds and its unit tests pass, but Orca detection
+  (no `SingletonLock` there, the named pipe, telling `Orca.exe` from its
+  helpers) follows Orca's source and has not been checked on a real
+  machine. The relaunch loop is off until two checks pass on a real
+  console (Ctrl-C handling, and a complete transcript after a limit stop),
+  so a limit switch there switches and notifies instead of resuming.
+
+## Verified Orca versions
+
+csm's port follows Orca's source at v1.4.209 through v1.4.214. It writes
+Orca's store offline only for Orca 1.4.x (read from the app bundle on
+macOS and from `Orca.exe` on Windows), and only while the profile has no
+`profile-state.db`; otherwise it uses RPC only. The end-to-end harness
+models Orca 1.4.214.
+
+From 1.4.214 Orca keeps its state in SQLite and writes `orca-data.json`
+only as an export when it quits cleanly. csm never writes such an export,
+so with Orca stopped a switch, add, import or rm is refused with a line
+saying to start Orca. While Orca runs, csm reads the
+account list over RPC (`csm usage`, and the supervisor's limit switch);
+`csm hook` and `csm statusline` never make RPC calls, so they read the
+export, which can lag until Orca next quits. `csm accounts doctor` lists
+what it finds in an export but does not repair it; start Orca and check
+again first. csm never creates a missing store while Orca's backups
+(`.bak.N`, retained exports or database backups) are still there, since
+Orca restores from them on its next start. It also refuses every offline
+store write while `orca-profile-index.json` (or its `.bak`) exists but does
+not parse, since Orca will not start then and csm cannot tell which
+profile's store Orca will use once the index is repaired.
+
+When no store exists at all (Orca installed but never started),
+`csm accounts add` and `import` with Orca stopped create a minimal one
+(`{"schemaVersion":1,"settings":{}}`) holding the new account. Orca's
+source fills every missing field with its defaults on load, but a start of
+a real Orca on such a store has not been tested yet. One visible side
+effect is known from the source: Orca treats any existing store as an
+upgrade and skips its first-run onboarding. Start Orca once before adding
+accounts to avoid both. When Orca releases a new
+version, `bash tools/orca-drift.sh <last-verified-tag> <new-tag>` prints the
+changes to the files csm mirrors.
 
 ## Testing
 
-Unit tests (including the `no_private_names` leak guard) run with `cargo
-test`. `bash e2e/run.sh` runs the end-to-end limit-switch harness: it builds
-`csm` and a fake, sleeping `claude` binary, drives both through an isolated
-sandbox HOME with no network access, and exercises the hook-driven and
-statusline-tick-driven profile-switch paths (relaunch argv, cooldowns, the
-`CLAUDE_AUTO_SWITCH`/`CLAUDE_AUTO_SWITCH_RELAUNCH` kill-switches, and the
-flags a relaunch carries, the passthrough verb) across 15 scenarios. See [`e2e/README.md`](e2e/README.md) for what each scenario covers
-and how to run it against a prebuilt binary.
+`cargo test` runs the unit tests and the leak guard. `bash e2e/run.sh` runs
+the end-to-end harness: a real csm build against a fake Orca (store, stashes
+and RPC socket), a fake Keychain, a fake `claude` and a loopback stand-in
+for the OAuth endpoints, in a sandbox with no network access. See
+[`e2e/README.md`](e2e/README.md).
 
 ## License
 

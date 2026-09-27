@@ -17,14 +17,13 @@
 //! `proc_check::SysinfoProcCheck` (no external `ps` spawn), so this module only
 //! provides the POSIX launcher.
 
-use std::collections::HashMap;
 use std::ffi::OsString;
 use std::io;
 use std::os::unix::process::CommandExt; // pre_exec
 use std::process::{Command, ExitStatus};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use super::launcher::{ChildHandle, Launcher};
+use super::launcher::{ChildEnv, ChildHandle, Launcher};
 
 // ─── PosixLauncher ────────────────────────────────────────────────────────────
 
@@ -37,7 +36,8 @@ impl Launcher for PosixLauncher {
         &self,
         sid: &str,
         cli: &[OsString],
-        env: &HashMap<OsString, OsString>,
+        env: &ChildEnv,
+        on_spawn: &mut dyn FnMut(),
     ) -> io::Result<(ExitStatus, ChildHandle)> {
         use std::os::unix::io::AsFd;
 
@@ -61,14 +61,12 @@ impl Launcher for PosixLauncher {
         // Resolve the launch command: CLAUDE_SMART_CLAUDE_BIN env > config.json
         // `launchCommand` > "claude". out[0] is the binary; out[1..] are tokens
         // prepended to the claude-style argv (multi-token, e.g. `npx happy`).
-        let launch = crate::config::resolve_launch_command();
+        let launch = crate::config::launch_command_for_spawn()?;
         let (bin, prefix) = launch.split_first().expect("resolver returns ≥1 token");
         let mut cmd = Command::new(bin);
         cmd.args(prefix);
         cmd.args(cli);
-        for (k, v) in env {
-            cmd.env(k, v);
-        }
+        env.apply(&mut cmd);
         // stdin/stdout/stderr inherited by default (never piped) — the child must
         // own the real tty for a usable interactive session.
 
@@ -90,6 +88,7 @@ impl Launcher for PosixLauncher {
         // Write the pidfile NOW, while claude is alive — the limit-switch hook
         // fires mid-session and reads `<sid>.pid` to stamp the sentinel's born.
         let _ = crate::platform::pid::write_pid_file(&crate::paths::pid_file(sid), pid, born);
+        on_spawn();
 
         // Parent also sets the child's pgid (race-free: whoever wins, the child
         // lands in its own group). Idempotent.

@@ -1,17 +1,16 @@
-//! `csm run` — the full launch pipeline: parse flags, resolve the profile dir
-//! (auto-pick or explicit pin), resolve the session id (picker/resume/new),
-//! build the claude CLI, and hand off to the relaunch loop.
+//! `csm run` — the full launch pipeline: classify the launch
+//! ([`crate::launch_context`]), resolve the session id (picker/resume/new),
+//! build the claude CLI, and hand off to the relaunch loop in csm's runtime
+//! dir `D`.
 
 use std::ffi::OsString;
-use std::path::{Path, PathBuf};
 
 use anyhow::Context as _;
 
-use crate::cmd::support::{
-    current_profile_dir, derive_current_profile_name, is_interactive, newuuid,
-    profile_name_for_dir, resolve_profile_dir,
-};
-use crate::{account, cli, epoch, paths, picker, platform, session, sidecar, usage};
+use crate::cmd::support::newuuid;
+use crate::launch_context::LaunchContext;
+use crate::platform::launcher::ChildEnv;
+use crate::{account, cli, launch_context, paths, picker, platform, session, sidecar, usage};
 
 /// How a resolved session id should be handed to `claude`.
 ///
@@ -49,27 +48,22 @@ impl SessionResolution {
 ///
 /// Full launch path:
 ///   1. Parse args via the hand-rolled `cli::parser`.
-///   2. Resolve profile dir: `--profile` pin > proactive `pick_account` with
-///      stale-usage picker gate > current `CLAUDE_CONFIG_DIR`.
-///   3. Resolve session id: explicit `--session-id` > `--resume` > picker >
-///      auto-resume default.
-///   4. Build `LaunchSpec` (session_id + profile_dir + cwd + cli) and hand off
-///      to `run_relaunch_loop`.
+///   2. Classify the launch ([`launch_context`]). `Print` execs claude
+///      verbatim (the `csm claude` passthrough) and stops here.
+///   3. Resolve `D` and the child env ([`launch_context::launch_dir`], the
+///      credential-env strip for a managed account). Interactive only:
+///      repair an unfinished switch, then the pre-launch switch rule
+///      ([`prelaunch_decision`]).
+///   4. Resolve session id: explicit `--session-id` > `--resume` > `-n` >
+///      `-i` picker > `-c` > a fresh session. The session picker opens only
+///      for `-i` or a bare `-r`/`--resume`.
+///   5. Record the account and launch time in the sidecar, build `LaunchSpec`
+///      and hand off to `run_relaunch_loop`.
 ///
-/// Account picker gates:
-///   `-i`/`--interactive` (manual pick) — ALWAYS open the account picker (and
-///   the session picker), skipping auto-pick, as long as interactive + a
-///   non-empty ProfileMap. `--profile <p>` still wins (explicit choice).
-///
-///   Otherwise the *stale-usage / no-data* picker opens when ALL of:
-///   - interactive (isatty(0) && isatty(1))
-///   - proactive pick context (not `--profile` / not `--no-pick`)
-///   - `pick_account` returned `Err(FetchFailed)` (usage collection failed) OR
-///     `Err(NoUsableData)` (fetch ok but no profile had scorable usage —
-///     "couldn't tell" must not silently keep current).
-///     NOT when hook / `--profile` / `--no-pick` / non-interactive / an
-///     embedded launch (`support::is_embedded_launch`: an Orca pane), and NOT
-///     for `AllSaturated` (real limits read → warn + keep current).
+/// Inside Orca (a pane or a structured session) nothing prompts and nothing
+/// touches the Keychain, the network or the switch journal before claude
+/// starts; csm's own lines go to its log except fatal errors and the one
+/// relaunch line.
 pub(crate) fn run(args: &[OsString]) -> anyhow::Result<()> {
     use crate::cli::parser::{ResumeArg, parse};
     use platform::relaunch::LaunchSpec;
@@ -87,53 +81,49 @@ pub(crate) fn run(args: &[OsString]) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    // ── 1. Resolve the working directory ──────────────────────────────────────
+    // ── 1. Classify the launch ────────────────────────────────────────────────
+    let launch = launch_context::current(args);
+    if launch.context == LaunchContext::Print {
+        // `-p` or a piped stdin: claude runs verbatim, no sidecar, no usage
+        // fetch, no switch, no relaunch.
+        return crate::cmd::claude::cmd_claude(args);
+    }
+    let quiet = launch.context.is_orca();
+
+    // ── 2. Resolve the working directory, D and the child env ─────────────────
     let cwd = std::env::current_dir().context("csm: cannot determine current directory")?;
+    let dir = launch_context::launch_dir(quiet);
+    if !quiet {
+        // Interactive: an unfinished switch is repaired before the account
+        // decision; inside Orca it waits until after the spawn (relaunch loop).
+        prelaunch_recovery();
+    }
+    // Reads files only (store, stashes' oauth-account.json, D's .claude.json).
+    let mut accounts = launch_accounts(dir.as_ref());
+    if launch.context == LaunchContext::Interactive
+        && let Some(line) = prelaunch_switch(&accounts)
+    {
+        eprintln!("{line}");
+        accounts = launch_accounts(dir.as_ref());
+    }
+    let env = child_env(
+        dir.as_ref()
+            .map_or(launch_context::ConfigDirPin::Leave, |d| d.pin.clone()),
+        accounts.active.is_some(),
+        std::env::vars_os(),
+    );
 
-    // ── 2. Resolve profile dir ─────────────────────────────────────────────────
-    let profiles = account::ProfileMap::load().context("csm: failed to load profiles.json")?;
-    let current_profile_name = derive_current_profile_name(&profiles);
-
-    let profile_dir: PathBuf = if let Some(pin) = &flags.profile {
-        // `--profile <p>` pin — explicit choice, skip all picking (wins over -i).
-        let dir = resolve_profile_dir(pin, &profiles)?;
-        PathBuf::from(dir)
-    } else if flags.interactive {
-        // `-i`/`--interactive` — manual pick: disable *all* auto-pick / skip.
-        // Always open the account picker (recommendation-ordered, never the
-        // silent auto-pick), regardless of whether usage collection succeeded. Empty
-        // ProfileMap (toss/first-boot) keeps current. The session picker is
-        // also forced later by the same flag.
-        match force_account_pick(&profiles)? {
-            Some(dir) => dir,
-            None => {
-                eprintln!("csm: cancelled.");
-                return Ok(());
-            }
+    // Every account's dead-credential warning, from the CACHED UsageData
+    // only (no network). Inside Orca the lines go to csm's log.
+    for line in launch_attention_warnings(&accounts) {
+        if quiet {
+            let _ = crate::hook::notify::append_log("launch", &line);
+        } else {
+            eprintln!("{line}");
         }
-    } else if flags.no_pick {
-        // `--no-pick` — keep current profile without scoring.
-        current_profile_dir(&profiles)
-    } else {
-        // Proactive pick (include_current=true — no-op switch if already best).
-        // `None` = the stale-usage picker was cancelled with Escape → abort.
-        match proactive_pick_profile(&current_profile_name, &profiles, flags.pick_account)? {
-            Some(dir) => dir,
-            None => {
-                eprintln!("csm: cancelled.");
-                return Ok(());
-            }
-        }
-    };
+    }
 
-    // Print every profile's dead-credential warning, right after the pick is
-    // resolved and regardless of what got picked (a cancelled pick already
-    // returned above — this only runs on a launch that is actually going
-    // ahead). Reads the CACHED UsageData only — no network — so a dead
-    // token can never slow down or fail a launch.
-    print_launch_attention_warnings(&profile_dir, &profiles);
-
-    // ── 3. Resolve session id ──────────────────────────────────────────────────
+    // ── 4. Resolve session id ──────────────────────────────────────────────────
     // A picker path may yield `None` = the user pressed Escape → cancel the launch.
     // Each arm yields a `SessionResolution` that records whether the id is a
     // brand-new session (→ `--session-id`, create) or an existing one off disk
@@ -183,19 +173,13 @@ pub(crate) fn run(args: &[OsString]) -> anyhow::Result<()> {
             None => SessionResolution::Fresh(newuuid()),
         }
     } else {
-        // Default (no explicit flag): always open the session picker.
-        match resolve_session_default(&cwd)? {
-            Some(res) => res,
-            None => {
-                eprintln!("csm: cancelled.");
-                return Ok(());
-            }
-        }
+        // Default (no session flag): a fresh session, in every context.
+        SessionResolution::Fresh(newuuid())
     };
 
     let session_id: String = resolution.sid().to_owned();
 
-    // ── 4. Build the claude CLI and launch ──────────────────────────────────────
+    // ── 5. Build the claude CLI and launch ──────────────────────────────────────
     // Choose the verb by intent: `--session-id` creates a new session, `--resume`
     // continues an existing one. Using `--session-id` for an existing id is what
     // claude rejects with "Session ID … is already in use".
@@ -209,14 +193,19 @@ pub(crate) fn run(args: &[OsString]) -> anyhow::Result<()> {
     // the mode/effort/model (perfect-continue) and a limit-switch hop can replay
     // the session-shaping claude flags. Best-effort: a launch must never fail
     // because the sidecar could not be written.
-    let remembered = remembered_from_launch(flags, &parsed.passthru);
-    if !remembered.sidecar_flags().is_empty() || remembered.passthru.is_some() {
-        let _ = sidecar::merge_sidecar(&sidecar_path, &remembered);
-    }
+    // The account and launch time key usage captures and the follow check.
+    let mut remembered = remembered_from_launch(flags, &parsed.passthru);
+    remembered.account_id = accounts.current.clone();
+    remembered.born = Some(crate::epoch::now_secs() as i64);
+    let _ = sidecar::merge_sidecar(&sidecar_path, &remembered);
 
     let spec = LaunchSpec {
         session_id,
-        profile_dir,
+        pin: dir
+            .as_ref()
+            .map_or(launch_context::ConfigDirPin::Leave, |d| d.pin.clone()),
+        env,
+        quiet,
         cwd,
         cli,
     };
@@ -225,6 +214,20 @@ pub(crate) fn run(args: &[OsString]) -> anyhow::Result<()> {
     // (Windows). Construct via Default so platform-specific changes are isolated.
     let launcher = <platform::PlatformLauncher as std::default::Default>::default();
     platform::relaunch::run_relaunch_loop(&launcher, &spec)
+}
+
+/// The accounts as the child will see them. Only a pinned launch reads `D`
+/// as an explicit `CLAUDE_CONFIG_DIR` (whose identity lives in
+/// `D/.claude.json`); an unpinned one inherits this process's own
+/// environment, where an unset variable puts the identity in
+/// `~/.claude.json`. Forcing `D` for an unpinned launch made the default
+/// layout look logged out, so the sidecar lost its `account_id`. A launch
+/// that removes the variable reads the way the child will: unset.
+fn launch_accounts(dir: Option<&launch_context::LaunchDir>) -> account::AccountSet {
+    match dir {
+        Some(d) => account::AccountSet::load_pinned(&d.pin),
+        None => account::AccountSet::load(),
+    }
 }
 
 /// What this launch hands the sidecar to remember: the mode/effort/model the
@@ -339,21 +342,6 @@ fn resolve_session_via_picker(cwd: &std::path::Path) -> anyhow::Result<Option<Se
     }
 }
 
-/// Default session resolution (no explicit flags): ALWAYS open the session
-/// picker so the choice (new / continue / pick an existing session) is never
-/// made silently. The picker's `__NEW__` / `__CONTINUE__` sentinels mean a
-/// zero- or one-session directory still presents a meaningful choice.
-///
-/// Skipping only happens where a picker *cannot* run: no usable terminal
-/// (pipe / CI / hook) degrades to a fresh session inside
-/// [`resolve_session_via_picker`], so non-interactive launches never block.
-///
-/// Returns `Ok(Some(resolution))` to launch, or `Ok(None)` when the picker was
-/// cancelled (Escape / Ctrl-C).
-fn resolve_session_default(cwd: &std::path::Path) -> anyhow::Result<Option<SessionResolution>> {
-    resolve_session_via_picker(cwd)
-}
-
 /// Return the newest free (non-live) session id for `cwd`, or `None`.
 fn newest_free_sid(cwd: &std::path::Path) -> anyhow::Result<Option<String>> {
     let rows = session::scan(cwd);
@@ -363,383 +351,323 @@ fn newest_free_sid(cwd: &std::path::Path) -> anyhow::Result<Option<String>> {
         .map(|r| r.sid))
 }
 
-/// Pure core of surface 4b: every stderr line the launch-time credential
-/// warning prints, from a cached `UsageData` + which profile is about to
-/// launch. No I/O — the real clock/cache-read live only in
-/// `print_launch_attention_warnings`, so this is fully unit-testable.
-///
-/// Deliberately `(&UsageData, &str, DateTime<Utc>) -> Vec<String>` rather
-/// than the design spec's plain `&UsageData -> Vec<String>` — `now` is
-/// needed to compute a fresh relative age (never baked into the cached data;
-/// see `report::Attention`'s doc), and `current_profile` is needed to decide
-/// whether the extra "current profile needs login" line applies. Documented
-/// deviation, consistent with `report::render_table`/`attention_lines`
-/// gaining the same `now` parameter for the same reason.
+/// Pure core of the launch-time credential warning: every stderr line, from
+/// a cached `UsageData` (keyed by account id), the labels to print and the
+/// account `D` holds. No I/O — `now` is passed in for the relative age.
 fn launch_attention_lines(
     data: &usage::UsageData,
-    current_profile: &str,
+    current: &str,
+    label: &dyn Fn(&str) -> String,
     now: chrono::DateTime<chrono::Utc>,
 ) -> Vec<String> {
     let mut out = Vec::new();
-    let mut names: Vec<&String> = data.profiles.keys().collect();
-    names.sort();
-    for name in names {
-        if let Some(attention) = &data.profiles[name].attention {
-            out.extend(usage::report::attention_block_lines(name, attention, now));
+    let mut ids: Vec<&String> = data.profiles.keys().collect();
+    ids.sort();
+    for id in ids {
+        if let Some(attention) = &data.profiles[id].attention {
+            out.extend(usage::report::attention_block_lines(
+                &label(id),
+                attention,
+                now,
+            ));
         }
     }
     if let Some(attention) = data
         .profiles
-        .get(current_profile)
+        .get(current)
         .and_then(|pu| pu.attention.as_ref())
         && attention.kind == usage::model::AttentionKind::NeedsLogin
     {
         out.push(format!(
-                "csm: warning: current profile '{current_profile}' needs login — claude will show /login"
-            ));
+            "csm: warning: current account '{}' needs login — claude will show /login",
+            label(current)
+        ));
     }
     out
 }
 
-/// I/O shell for surface 4b: read the cache (best-effort, no network), derive
-/// the launching profile's name, and print every resulting line to stderr.
-/// Silently does nothing when there's no cache to read — a missing/unreadable
-/// cache is not itself something a launch should warn about.
-fn print_launch_attention_warnings(profile_dir: &Path, profiles: &account::ProfileMap) {
+/// I/O shell: read the cache (best-effort, no network). Nothing when there
+/// is no cache to read.
+fn launch_attention_warnings(accounts: &account::AccountSet) -> Vec<String> {
     let Some(data) = crate::cmd::usage::read_usage_cache() else {
+        return Vec::new();
+    };
+    launch_attention_lines(
+        &data,
+        accounts.current.as_deref().unwrap_or(""),
+        &|id| accounts.label(id),
+        chrono::Utc::now(),
+    )
+}
+
+// ─── child env ────────────────────────────────────────────────────────────────
+
+/// Pure: the child's env changes. `pin` is the `CLAUDE_CONFIG_DIR` to set
+/// (only when the inherited value differs from `D`); `managed` says Orca's
+/// active account is one of its managed accounts, in which case the explicit
+/// auth overrides are stripped exactly as Orca strips them
+/// ([`launch_context::auth_env_to_strip`]). Values are read only to classify
+/// `ANTHROPIC_CUSTOM_HEADERS`; none is kept.
+fn child_env(
+    pin: launch_context::ConfigDirPin,
+    managed: bool,
+    vars: impl IntoIterator<Item = (OsString, OsString)>,
+) -> ChildEnv {
+    use launch_context::ConfigDirPin;
+    let mut env = ChildEnv::default();
+    match pin {
+        ConfigDirPin::Set(dir) => {
+            env.set
+                .insert(OsString::from("CLAUDE_CONFIG_DIR"), dir.into_os_string());
+        }
+        ConfigDirPin::Unset => env.remove.push(OsString::from("CLAUDE_CONFIG_DIR")),
+        ConfigDirPin::Leave => {}
+    }
+    if managed {
+        let vars: Vec<(String, String)> = vars
+            .into_iter()
+            .filter_map(|(k, v)| Some((k.into_string().ok()?, v.to_string_lossy().into_owned())))
+            .collect();
+        let strip = launch_context::auth_env_to_strip(
+            vars.iter().map(|(k, v)| (k.as_str(), v.as_str())),
+            cfg!(windows),
+        );
+        env.remove.extend(strip.into_iter().map(OsString::from));
+    }
+    env
+}
+
+// ─── interactive pre-launch ───────────────────────────────────────────────────
+
+/// What an Interactive launch does about a capped account.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PreLaunch {
+    /// Nothing to do: the account is viable, or its usage is unknown.
+    Launch,
+    /// Switch to this account before launching.
+    Switch(String),
+    /// Launch anyway, with this warning line.
+    Warn(String),
+}
+
+/// Pure: design §5 "Interactive". Switch before launch only when the active
+/// account is known to be capped, a viable candidate exists, and no other
+/// claude is live in `D`; otherwise launch, with one warning when capped.
+fn prelaunch_decision(
+    current_label: &str,
+    active_viable: Option<bool>,
+    candidate: Option<(String, String)>,
+    other_claude_live: bool,
+) -> PreLaunch {
+    if active_viable != Some(false) {
+        return PreLaunch::Launch;
+    }
+    match candidate {
+        None => PreLaunch::Warn(format!(
+            "csm: warning: account {current_label} is capped and no other account has headroom"
+        )),
+        Some((_, label)) if other_claude_live => PreLaunch::Warn(format!(
+            "csm: warning: account {current_label} is capped; another claude is running in this \
+             config dir, so csm did not switch (run `csm accounts use {label}` to switch)"
+        )),
+        Some((id, _)) => PreLaunch::Switch(id),
+    }
+}
+
+/// I/O shell for [`prelaunch_decision`]. Returns the one line to print.
+fn prelaunch_switch(accounts: &account::AccountSet) -> Option<String> {
+    use crate::orca::context::Context;
+    use crate::orca::http::SystemHttp;
+    use crate::orca::live::SystemProcs;
+    use crate::orca::switch;
+
+    let current = accounts.current.as_deref()?;
+    let data = usage::fetch().ok()?;
+    let active_viable = account::limit_switch::viable_in(&data, current);
+    if active_viable != Some(false) {
+        return None;
+    }
+    let candidate = account::scoring::pick_best_gated(&data, current, false, true)
+        .ok()
+        .flatten()
+        .filter(|id| accounts.contains(id))
+        .map(|id| {
+            let label = accounts.label(&id);
+            (id, label)
+        });
+    let procs = SystemProcs;
+    let ctx = Context::current(&procs).ok()?;
+    let other_live = candidate.is_some() && ctx.live_claude(&procs);
+    let current_label = accounts.label(current);
+    match prelaunch_decision(&current_label, active_viable, candidate, other_live) {
+        PreLaunch::Launch => None,
+        PreLaunch::Warn(line) => Some(line),
+        PreLaunch::Switch(id) => {
+            let http = SystemHttp::from_env();
+            let to = accounts.label(&id);
+            match ctx.with_switch_env(&procs, &http, |env| switch::switch(env, &id)) {
+                Ok(r) if !matches!(r.outcome, switch::Outcome::Uncertain(_)) => Some(format!(
+                    "csm: account {current_label} is capped; switched to {to}"
+                )),
+                Ok(_) => Some(format!(
+                    "csm: warning: account {current_label} is capped; the switch to {to} ended \
+                     uncertain (run `csm accounts doctor --fix`)"
+                )),
+                Err(e) => Some(format!(
+                    "csm: warning: account {current_label} is capped; switching to {to} failed: {e}"
+                )),
+            }
+        }
+    }
+}
+
+/// Interactive only: repair an unfinished switch before the account
+/// decision. A failure prints one line and the launch goes on.
+fn prelaunch_recovery() {
+    use crate::orca::context::Context;
+    use crate::orca::http::SystemHttp;
+    use crate::orca::live::SystemProcs;
+    use crate::orca::switch::{self, Recovery};
+
+    let state = paths::smart_dir_no_create();
+    if !switch::read_journal(&state).is_some_and(|j| j.pending()) {
+        return;
+    }
+    let procs = SystemProcs;
+    let Ok(ctx) = Context::current(&procs) else {
         return;
     };
-    let current = profile_name_for_dir(profile_dir, profiles);
-    for line in launch_attention_lines(&data, &current, chrono::Utc::now()) {
-        eprintln!("{line}");
-    }
-}
-
-/// Proactive account pick with stale-usage picker fallback.
-///
-/// See [`crate::picker::account`] for what the stale-usage picker shows.
-///
-/// Returns `Ok(Some(dir))` with the resolved profile directory, or `Ok(None)`
-/// when the stale-usage picker was cancelled (Escape / Ctrl-C) — the caller aborts.
-///
-/// Pick guard (matches the legacy shell implementation's behavior):
-/// - `pick_account(current, include_current=true)` → scoring pick, which
-///   weighs session and week_all through `scoring::is_viable_pcts`.
-///   `week_fable` (the model-scoped weekly cap) no longer factors into
-///   viability at all — a current profile whose only exhausted window is
-///   `week_fable` is left in place here; the Stop hook handles that case with
-///   a same-account model fallback instead of a proactive account switch.
-/// - `Err(FetchFailed)` (usage collection failed) or `Err(NoUsableData)` (fetch
-///   ok but no scorable usage) + interactive → stale-usage account picker.
-/// - same errors + non-interactive → silent fail-safe to current.
-/// - `Err(AllSaturated)` → warn + keep current (no picker; real limits read).
-fn proactive_pick_profile(
-    current_profile: &str,
-    profiles: &account::ProfileMap,
-    _force_pick: bool,
-) -> anyhow::Result<Option<PathBuf>> {
-    use account::scoring::ScoringError;
-
-    let current_dir = current_profile_dir(profiles);
-
-    // No ProfileMap (toss / first-boot) — skip all picking.
-    if profiles.is_empty() {
-        return Ok(Some(current_dir));
-    }
-
-    match account::pick_account(current_profile, true) {
-        Ok(None) => {
-            // Already on the best profile — keep current.
-            Ok(Some(current_dir))
+    let http = SystemHttp::from_env();
+    let why = match ctx.with_switch_env(&procs, &http, switch::recover) {
+        Ok(Recovery::Failed(why)) => why,
+        // Another csm holds switch.lock (a switch or a login in progress):
+        // nothing was attempted, so there is no failure to report. The
+        // supervisor tries again once the child runs.
+        Ok(Recovery::Busy) => return,
+        // Orca runs and the repair has to wait for it to stop: nothing was
+        // written, and the reason is worth one line.
+        Ok(Recovery::Deferred(why)) => {
+            eprintln!("csm: an unfinished account switch was not repaired: {why}");
+            return;
         }
-        Ok(Some(winner)) => {
-            let dir = resolve_profile_dir(&winner, profiles)
-                .context("csm: proactive pick — winner profile not in map")?;
-            if winner != current_profile {
-                eprintln!("csm: auto-pick → {winner}");
-            }
-            Ok(Some(PathBuf::from(dir)))
-        }
-        Err(ScoringError::AllSaturated) => {
-            eprintln!(
-                "csm: warning: all accounts at session/week limit — keeping current profile ({current_profile})"
-            );
-            Ok(Some(current_dir))
-        }
-        // Usage collection unreachable OR fetch succeeded but carried no usable
-        // usage for any profile. Both mean "we could not determine the best
-        // account" — never silently keep current. Open the interactive picker
-        // (interactive) or fail safe to current (non-interactive), same as a
-        // stale-usage miss.
-        Err(ScoringError::FetchFailed(_)) | Err(ScoringError::NoUsableData) => {
-            stale_usage_pick(profiles, &current_dir)
-        }
-    }
-}
-
-/// Stale-usage account picker. See [`crate::picker::account`].
-///
-/// Interactive + fetch-miss → open the account picker with stale usage data.
-/// Non-interactive → silent fail-safe to current profile.
-///
-/// Returns `Ok(Some(dir))` to launch under `dir`, or `Ok(None)` when the user
-/// pressed Escape / Ctrl-C in the picker (cancel the launch entirely).
-fn stale_usage_pick(
-    profiles: &account::ProfileMap,
-    current_dir: &Path,
-) -> anyhow::Result<Option<PathBuf>> {
-    // TTY gate: isatty(0) && isatty(1) — matches zsh `[[ -t 0 && -t 1 ]]`.
-    // An embedded launch (an Orca pane resuming a session) is a TTY too, but
-    // nobody there expects a prompt: fail safe to current like a script would.
-    if !is_interactive() || crate::cmd::support::is_embedded_launch() {
-        return Ok(Some(current_dir.to_path_buf()));
-    }
-    run_account_picker(profiles, current_dir, "stale-usage picker")
-}
-
-/// Forced account picker for `-i`/`--interactive` (manual pick).
-///
-/// Unlike [`stale_usage_pick`], this is invoked even when usage collection
-/// succeeded and a
-/// confident auto-pick exists: `-i` means "let me choose", so we skip the
-/// auto-pick entirely and always present the recommendation-ordered picker
-/// (Enter still takes the recommendation). The TTY gate still applies — a piped
-/// `-i` has no usable terminal for the picker, so it keeps the current profile.
-/// An empty ProfileMap (toss / first-boot) likewise keeps current, nothing to pick.
-fn force_account_pick(profiles: &account::ProfileMap) -> anyhow::Result<Option<PathBuf>> {
-    let current_dir = current_profile_dir(profiles);
-    if profiles.is_empty() || !is_interactive() {
-        return Ok(Some(current_dir));
-    }
-    run_account_picker(profiles, &current_dir, "manual account picker")
-}
-
-/// Shared account-picker driver for [`stale_usage_pick`] and
-/// [`force_account_pick`]. Builds recommendation-ordered rows (stale usage if
-/// that is all we have) and maps the picker outcome:
-/// - Selected → that profile's dir.
-/// - Cancelled (Escape / Ctrl-C) → `None` (caller aborts the launch).
-/// - Unavailable (no usable terminal / no rows) → keep current profile.
-fn run_account_picker(
-    profiles: &account::ProfileMap,
-    current_dir: &Path,
-    ctx: &str,
-) -> anyhow::Result<Option<PathBuf>> {
-    use picker::engine::PickerOutcome;
-
-    let rows = build_account_rows(profiles);
-    let ap = picker::AccountPicker::new(rows);
-
-    match ap.pick() {
-        PickerOutcome::Selected(winner) => {
-            let dir = resolve_profile_dir(&winner, profiles)
-                .with_context(|| format!("csm: {ctx} — selected profile not in map"))?;
-            Ok(Some(PathBuf::from(dir)))
-        }
-        // Escape / Ctrl-C → cancel the launch.
-        PickerOutcome::Cancelled => Ok(None),
-        // No usable terminal / empty → keep current profile (graceful degrade).
-        // `SelectedMulti` is unreachable here (the account picker is single-select
-        // `run_picker`); fold it into the same graceful degrade to stay exhaustive.
-        PickerOutcome::Unavailable | PickerOutcome::SelectedMulti(_) => {
-            Ok(Some(current_dir.to_path_buf()))
-        }
-    }
-}
-
-/// Recommendation rank for a stale-usage picker row, mirroring `scoring::pick_best`.
-///
-/// The picker renders top-to-bottom with the cursor on the FIRST row, so
-/// pressing Enter selects it. We therefore order rows so the
-/// recommended profile (the one `pick_best` would auto-select when usage
-/// collection succeeds)
-/// leads, and the user can just press Enter.
-///
-/// Viability is delegated to `scoring::is_viable_pcts` — the SINGLE viability
-/// authority also used by `pick_best_at` — rather than a second hand-rolled
-/// check. `week_fable_pct` no longer sinks a row on its own (a
-/// model-scoped-only cap still leaves the row usable on another model); only
-/// `session_pct`/`week_all_pct` do.
-///
-/// Returns a sort key where SMALLER sorts first:
-/// - `0` bucket = viable candidate (no error, has week_all.pct, and
-///   `is_viable_pcts(session_pct, week_all_pct, week_fable_pct)` is `true` —
-///   i.e. neither session nor week_all is at or over its threshold;
-///   `week_fable_pct` is passed through but no longer read by the predicate).
-///   Within it, SOONER effective weekly reset epoch ranks first (`i64::MAX`
-///   when unknown, so a known reset beats an unknown one), then HIGHER
-///   week_all.pct (negated), matching `pick_best`'s ranking. The "effective"
-///   epoch is the LATER of `week_all`'s and `week_fable`'s reset (when both
-///   are known) — mirrors `pick_best_at`'s identical rule (see its doc): a
-///   viable row is under neither cap, but only fully fresh once BOTH weekly
-///   windows have rolled over.
-/// - `1` bucket = everything else (saturated on any of the three dimensions,
-///   session-limited, errored, or no data), ordered by name for stability.
-///
-/// `name` is the final tie-break so ordering is deterministic. `now` is the
-/// reference instant for reset-string parsing — callers pass `Utc::now()`
-/// once per picker build; tests inject a fixed instant for determinism.
-fn account_row_rank(
-    name: &str,
-    data: &picker::account::StaleProfileData,
-    now: chrono::DateTime<chrono::Utc>,
-) -> (u8, i64, i64, String) {
-    use account::scoring::{ABSENT_SESSION_PCT, effective_reset_epoch, is_viable_pcts};
-
-    let session_pct = data.session_pct.unwrap_or(ABSENT_SESSION_PCT);
-    let viable = data.error.is_none()
-        && data.week_all_pct.is_some()
-        && is_viable_pcts(session_pct, data.week_all_pct, data.week_fable_pct);
-
-    if !viable {
-        // Non-viable rows sink to the bottom, ordered by name.
-        return (1, 0, 0, name.to_owned());
-    }
-
-    let week_pct = data.week_all_pct.unwrap();
-    // Soonest EFFECTIVE weekly reset epoch first → i64::MAX when unknown so
-    // known beats unknown. Higher week_all.pct next → negate so smaller sorts
-    // first. Each dimension prefers its machine-native `resets_at` epoch
-    // (carried straight through from the local collector) over re-parsing the
-    // `resets` display string — same precedence as
-    // `UsageSection::reset_instant` / `scoring::pick_best_at`. `week_fable`
-    // carries no display-string fallback here (only `resets_at`) — a minor,
-    // deliberate asymmetry: the stale-usage picker's cache read never needed a
-    // fable resets STRING before this field existed, and the epoch is what
-    // ranking actually consumes.
-    let week_all_epoch = data.resets_at.or_else(|| {
-        data.resets
-            .as_deref()
-            .and_then(|r| account::reset::resets_to_epoch_at(r, now).ok())
-            .map(|dt| dt.timestamp())
-    });
-    let week_fable_epoch = data.week_fable_resets_at;
-    let epoch = effective_reset_epoch(week_all_epoch, week_fable_epoch);
-    (0, epoch, -week_pct, name.to_owned())
-}
-
-/// Build `AccountRow` list for the stale-usage picker, ordered by recommendation so
-/// the top row is what `pick_best` would auto-select (Enter selects it).
-fn build_account_rows(profiles: &account::ProfileMap) -> Vec<picker::account::AccountRow> {
-    use picker::account::{AccountRow, StaleProfileData};
-
-    // Read the smart-dir cache (the positive TTL cache `usage::fetch` writes
-    // from local collection).
-    let cache_path = paths::usage_cache();
-    let cache_mtime = cache_mtime(&cache_path);
-    let cache_data = crate::cmd::usage::read_usage_cache();
-
-    // Union of configured profiles + any extra profiles from cache.
-    let mut all_names: Vec<String> = profiles
-        .names_sorted()
-        .iter()
-        .map(|s| s.to_string())
-        .collect();
-    if let Some(data) = &cache_data {
-        for name in data
-            .profiles
-            .keys()
-            .chain(data.errors.as_ref().map(|e| e.keys()).into_iter().flatten())
-        {
-            if !all_names.contains(name) {
-                all_names.push(name.clone());
-            }
-        }
-    }
-
-    // Build (name, StaleProfileData) so we can order by recommendation before
-    // rendering rows. (HashMap iteration order is non-deterministic; the rank's
-    // name tie-break makes the final order stable regardless.)
-    let mut entries: Vec<(String, StaleProfileData)> = all_names
-        .into_iter()
-        .map(|profile| {
-            let error = cache_data
-                .as_ref()
-                .and_then(|d| d.errors.as_ref())
-                .and_then(|e| e.get(&profile))
-                .cloned();
-            let pu = cache_data.as_ref().and_then(|d| d.profiles.get(&profile));
-            let data = if let Some(err) = error {
-                StaleProfileData {
-                    session_pct: None,
-                    week_all_pct: None,
-                    resets: None,
-                    resets_at: None,
-                    week_fable_pct: None,
-                    week_fable_resets_at: None,
-                    error: Some(err),
-                    attention: None,
-                }
-            } else if let Some(pu) = pu {
-                StaleProfileData {
-                    session_pct: pu.session.as_ref().map(|s| s.pct),
-                    week_all_pct: pu.week_all.as_ref().map(|s| s.pct),
-                    resets: pu.week_all.as_ref().and_then(|s| s.resets.clone()),
-                    resets_at: pu.week_all.as_ref().and_then(|s| s.resets_at),
-                    week_fable_pct: pu.week_fable.as_ref().map(|s| s.pct),
-                    week_fable_resets_at: pu.week_fable.as_ref().and_then(|s| s.resets_at),
-                    error: None,
-                    attention: pu.attention.clone(),
-                }
-            } else {
-                StaleProfileData {
-                    session_pct: None,
-                    week_all_pct: None,
-                    resets: None,
-                    resets_at: None,
-                    week_fable_pct: None,
-                    week_fable_resets_at: None,
-                    error: None,
-                    attention: None,
-                }
-            };
-            (profile, data)
-        })
-        .collect();
-
-    // Recommended-first ordering: the top row is what pick_best would auto-select,
-    // so Enter (cursor starts on row 0) selects the recommendation. One shared
-    // `now` so every row's reset epoch is parsed against the same instant.
-    let now = chrono::Utc::now();
-    entries.sort_by_key(|(name, data)| account_row_rank(name, data, now));
-
-    // The recommended row is the FIRST entry *iff* it is a viable candidate
-    // (rank bucket 0). When every profile is saturated / errored / dataless,
-    // pick_best would recommend nothing, so no row gets the ★.
-    let recommended_idx = entries
-        .first()
-        .filter(|(name, data)| account_row_rank(name, data, now).0 == 0)
-        .map(|_| 0usize);
-
-    entries
-        .iter()
-        .enumerate()
-        .map(|(idx, (profile, data))| {
-            let recommended = Some(idx) == recommended_idx;
-            AccountRow::build(profile, data, cache_mtime, recommended)
-        })
-        .collect()
-}
-
-/// Modification time of a usage cache file, as a unix epoch, or `None` when
-/// the file is absent/unreadable.
-fn cache_mtime(path: &std::path::Path) -> Option<u64> {
-    std::fs::metadata(path)
-        .ok()
-        .and_then(|m| m.modified().ok())
-        .map(epoch::from_systemtime)
+        Err(e) => e.to_string(),
+        Ok(_) => return,
+    };
+    eprintln!(
+        "csm: an unfinished account switch could not be repaired ({why}); run `csm accounts doctor --fix`"
+    );
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    // ── child_env ─────────────────────────────────────────────────────────────
+
+    fn vars(pairs: &[(&str, &str)]) -> Vec<(OsString, OsString)> {
+        pairs
+            .iter()
+            .map(|(k, v)| (OsString::from(k), OsString::from(v)))
+            .collect()
+    }
+
     #[test]
-    fn cache_mtime_absent_file_is_none() {
-        assert_eq!(
-            cache_mtime(std::path::Path::new("/nonexistent/for/csm")),
-            None
+    fn child_env_pins_only_when_asked() {
+        use launch_context::ConfigDirPin;
+        let env = child_env(
+            ConfigDirPin::Leave,
+            false,
+            vars(&[("ANTHROPIC_API_KEY", "x")]),
         );
+        assert_eq!(env, ChildEnv::default());
+        let env = child_env(
+            ConfigDirPin::Set(std::path::PathBuf::from("/Users/example/.claude")),
+            false,
+            Vec::new(),
+        );
+        assert_eq!(
+            env.set.get(&OsString::from("CLAUDE_CONFIG_DIR")),
+            Some(&OsString::from("/Users/example/.claude"))
+        );
+        assert!(env.remove.is_empty());
+    }
+
+    /// Orca main without `CLAUDE_CONFIG_DIR`: the child loses the inherited
+    /// value instead of getting an explicit `~/.claude`, and the auth strip
+    /// still applies.
+    #[test]
+    fn child_env_removes_the_dir_when_orca_runs_without_it() {
+        use launch_context::ConfigDirPin;
+        let env = child_env(
+            ConfigDirPin::Unset,
+            true,
+            vars(&[("ANTHROPIC_API_KEY", "x")]),
+        );
+        assert!(env.set.is_empty());
+        assert!(env.remove.contains(&OsString::from("CLAUDE_CONFIG_DIR")));
+        assert!(env.remove.contains(&OsString::from("ANTHROPIC_API_KEY")));
+    }
+
+    #[test]
+    fn child_env_strips_auth_for_a_managed_account() {
+        let env = child_env(
+            launch_context::ConfigDirPin::Leave,
+            true,
+            vars(&[
+                ("ANTHROPIC_API_KEY", "x"),
+                ("CLAUDE_CODE_OAUTH_TOKEN", "y"),
+                ("ANTHROPIC_CUSTOM_HEADERS", "Authorization: Bearer z"),
+                ("PATH", "/usr/bin"),
+            ]),
+        );
+        let mut removed: Vec<String> = env
+            .remove
+            .iter()
+            .map(|s| s.to_string_lossy().into_owned())
+            .collect();
+        removed.sort();
+        assert_eq!(
+            removed,
+            [
+                "ANTHROPIC_API_KEY",
+                "ANTHROPIC_CUSTOM_HEADERS",
+                "CLAUDE_CODE_OAUTH_TOKEN"
+            ]
+        );
+        // No value is ever kept.
+        assert!(format!("{env:?}").find("Bearer").is_none());
+    }
+
+    // ── prelaunch_decision ────────────────────────────────────────────────────
+
+    #[test]
+    fn prelaunch_launches_when_viable_or_unknown() {
+        let cand = Some(("id-b".to_owned(), "bob".to_owned()));
+        assert_eq!(
+            prelaunch_decision("alice", Some(true), cand.clone(), false),
+            PreLaunch::Launch
+        );
+        assert_eq!(
+            prelaunch_decision("alice", None, cand, false),
+            PreLaunch::Launch
+        );
+    }
+
+    #[test]
+    fn prelaunch_switches_only_with_a_candidate_and_no_other_claude() {
+        let cand = Some(("id-b".to_owned(), "bob".to_owned()));
+        assert_eq!(
+            prelaunch_decision("alice", Some(false), cand.clone(), false),
+            PreLaunch::Switch("id-b".into())
+        );
+        match prelaunch_decision("alice", Some(false), cand, true) {
+            PreLaunch::Warn(l) => assert!(l.contains("csm accounts use bob"), "{l}"),
+            other => panic!("{other:?}"),
+        }
+        match prelaunch_decision("alice", Some(false), None, false) {
+            PreLaunch::Warn(l) => assert!(l.contains("alice"), "{l}"),
+            other => panic!("{other:?}"),
+        }
     }
 
     // ── session-verb selection (regression: "Session ID … is already in use") ──
@@ -940,330 +868,9 @@ mod tests {
         assert_eq!(res.sid(), existing);
     }
 
-    // ── account_row_rank (stale-usage picker: recommended profile leads) ─────────
-    // The picker starts the cursor on row 0, so the top row is what Enter
-    // selects. account_row_rank must order rows the same way pick_best chooses,
-    // so the recommendation leads and a bare Enter picks it.
-
-    use picker::account::StaleProfileData;
-
-    fn data(session: Option<i64>, week: Option<i64>, resets: Option<&str>) -> StaleProfileData {
-        StaleProfileData {
-            session_pct: session,
-            week_all_pct: week,
-            resets: resets.map(|s| s.to_owned()),
-            resets_at: None,
-            week_fable_pct: None,
-            week_fable_resets_at: None,
-            error: None,
-            attention: None,
-        }
-    }
-
-    /// Like [`data`] but also carrying a `week_fable_pct` reading (`None` =
-    /// no model-scoped weekly cap for this profile).
-    fn data_with_fable(
-        session: Option<i64>,
-        week: Option<i64>,
-        resets: Option<&str>,
-        fable_pct: Option<i64>,
-    ) -> StaleProfileData {
-        StaleProfileData {
-            week_fable_pct: fable_pct,
-            ..data(session, week, resets)
-        }
-    }
-
-    /// Like [`data`] but with an explicit `resets_at` epoch, for tests that
-    /// pin the epoch-preferred ranking.
-    fn data_with_epoch(
-        session: Option<i64>,
-        week: Option<i64>,
-        resets: Option<&str>,
-        resets_at: Option<i64>,
-    ) -> StaleProfileData {
-        StaleProfileData {
-            session_pct: session,
-            week_all_pct: week,
-            resets: resets.map(|s| s.to_owned()),
-            resets_at,
-            week_fable_pct: None,
-            week_fable_resets_at: None,
-            error: None,
-            attention: None,
-        }
-    }
-
-    /// Fixed reference instant for reset parsing (noon UTC Jun 17 2026 — the
-    /// `reset.rs` test convention), so date-string ordering never depends on
-    /// the wall clock at test time.
-    fn rank_now() -> chrono::DateTime<chrono::Utc> {
-        use chrono::TimeZone;
-        chrono::Utc.with_ymd_and_hms(2026, 6, 17, 12, 0, 0).unwrap()
-    }
-
-    /// Sort names by rank and return them in display order (row 0 first).
-    fn ranked_order(mut rows: Vec<(&str, StaleProfileData)>) -> Vec<String> {
-        rows.sort_by_key(|(name, data)| account_row_rank(name, data, rank_now()));
-        rows.into_iter().map(|(n, _)| n.to_owned()).collect()
-    }
-
-    #[test]
-    fn viable_sooner_reset_leads() {
-        // Both viable; the SOONER weekly reset is the recommendation (pick_best
-        // drains the account whose budget refills first), even against a much
-        // lower week_all.pct. It must be row 0.
-        let order = ranked_order(vec![
-            (
-                "later",
-                data(Some(2), Some(70), Some("Jun 20 at 9pm (Asia/Seoul)")),
-            ),
-            (
-                "sooner",
-                data(Some(5), Some(10), Some("Jun 18 at 9pm (Asia/Seoul)")),
-            ),
-        ]);
-        assert_eq!(order, vec!["sooner", "later"]);
-    }
-
-    #[test]
-    fn resets_at_epoch_preferred_over_resets_string() {
-        // "sooner" carries a `resets_at` epoch well before "later"'s parsed
-        // reset date, but a `resets` STRING that would fail to parse at all —
-        // `resets_at` must still win, mirroring
-        // `UsageSection::reset_instant`'s own precedence.
-        let sooner_epoch = rank_now().timestamp() + 1_000;
-        let order = ranked_order(vec![
-            (
-                "later",
-                data(Some(2), Some(70), Some("Jun 20 at 9pm (Asia/Seoul)")),
-            ),
-            (
-                "sooner",
-                data_with_epoch(
-                    Some(5),
-                    Some(10),
-                    Some("not a valid reset string"),
-                    Some(sooner_epoch),
-                ),
-            ),
-        ]);
-        assert_eq!(order, vec!["sooner", "later"]);
-    }
-
-    #[test]
-    fn viable_no_resets_higher_week_pct_leads() {
-        // Both viable with unknown resets → falls back to the higher
-        // week_all.pct (pick_best's secondary key). It must be row 0.
-        let order = ranked_order(vec![
-            ("low", data(Some(2), Some(10), None)),
-            ("high", data(Some(5), Some(40), None)),
-        ]);
-        assert_eq!(order, vec!["high", "low"]);
-    }
-
-    #[test]
-    fn saturated_and_errored_sink_below_viable() {
-        let errored = StaleProfileData {
-            session_pct: None,
-            week_all_pct: None,
-            resets: None,
-            resets_at: None,
-            week_fable_pct: None,
-            week_fable_resets_at: None,
-            error: Some("no credentials".to_owned()),
-            attention: None,
-        };
-        let order = ranked_order(vec![
-            ("saturated", data(Some(5), Some(96), None)), // week >= 95 → not viable
-            ("errored", errored),
-            ("viable", data(Some(5), Some(50), None)),
-            ("nodata", data(None, None, None)),
-        ]);
-        // The one viable profile must lead; the rest sink (name-ordered).
-        assert_eq!(order[0], "viable");
-        assert!(order[1..].contains(&"saturated".to_owned()));
-        assert!(order[1..].contains(&"errored".to_owned()));
-        assert!(order[1..].contains(&"nodata".to_owned()));
-    }
-
-    #[test]
-    fn session_limited_is_not_viable() {
-        // session.pct >= 99 → excluded from viable even if week is low.
-        let order = ranked_order(vec![
-            ("limited", data(Some(99), Some(5), None)),
-            ("ok", data(Some(10), Some(20), None)),
-        ]);
-        assert_eq!(order[0], "ok");
-    }
-
-    #[test]
-    fn known_reset_beats_unknown() {
-        // A known reset epoch beats an unknown (None) one regardless of pct,
-        // mirroring pick_best's primary key (unknown parses to i64::MAX).
-        let order = ranked_order(vec![
-            ("noreset", data(Some(3), Some(80), None)),
-            (
-                "hasreset",
-                data(Some(3), Some(30), Some("Jun 18 at 9pm (Asia/Seoul)")),
-            ),
-        ]);
-        assert_eq!(order, vec!["hasreset", "noreset"]);
-    }
-
-    // ── model-scoped weekly (week_fable) gate ──────────────────────────────
-    // account_row_rank no longer sinks a fable-saturated row: it
-    // routes through the same `scoring::is_viable_pcts` authority
-    // `pick_best_at` uses, and that predicate dropped the week_fable branch
-    // (a model-scoped-only cap is handled by the Stop hook's same-account
-    // model fallback instead of exclusion — see `src/hook/detect.rs`).
-
-    #[test]
-    fn fable_saturated_row_no_longer_sinks_below_viable() {
-        // The bucket assertion is the proof: a fable-saturated row must land
-        // in the viable bucket (0), not sink to bucket 1. This is checked
-        // directly on the rank tuple, not inferred from sort order, so
-        // nothing about naming or a second row can make it pass for the
-        // wrong reason.
-        let (bucket, ..) = account_row_rank(
-            "fable_capped",
-            &data_with_fable(Some(5), Some(10), None, Some(100)),
-            rank_now(),
-        );
-        assert_eq!(
-            bucket, 0,
-            "a fable-saturated row must land in the viable bucket (0), not sink to bucket 1"
-        );
-
-        // And with a second, uncapped row present: the capped row's name
-        // sorts BEFORE the uncapped one, so if a regression reintroduced
-        // sinking (bucket 1 vs bucket 0), the capped row would visibly move
-        // to the end. Seeing it stay first is real proof both rows tied on
-        // rank, not name-order luck landing on the row under test.
-        let order = ranked_order(vec![
-            (
-                "aaa_fable_capped",
-                data_with_fable(Some(5), Some(10), None, Some(100)),
-            ),
-            ("zzz_avail", data_with_fable(Some(5), Some(10), None, None)),
-        ]);
-        assert_eq!(
-            order,
-            vec!["aaa_fable_capped", "zzz_avail"],
-            "both rows are viable now; identical rank key ties to name order — a \
-             sinking regression would move the capped row to the end instead"
-        );
-    }
-
-    #[test]
-    fn fable_none_row_stays_viable() {
-        // week_fable_pct: None (no model-scoped cap for this profile) must not
-        // sink the row — it stays in the viable (bucket 0) group.
-        let order = ranked_order(vec![(
-            "only",
-            data_with_fable(Some(5), Some(10), None, None),
-        )]);
-        assert_eq!(order, vec!["only"]);
-    }
-
-    #[test]
-    fn fable_just_under_saturation_stays_viable() {
-        use account::scoring::SATURATION_PCT;
-        let order = ranked_order(vec![(
-            "almost",
-            data_with_fable(Some(5), Some(10), None, Some(SATURATION_PCT - 1)),
-        )]);
-        assert_eq!(order, vec!["almost"]);
-    }
-
-    #[test]
-    fn only_fable_difference_no_longer_affects_row_rank() {
-        // Two rows identical except for fable saturation. When a
-        // model-scoped-only cap used to exclude a profile outright, the
-        // uncapped one always led; now both are viable and tie on rank (same
-        // reset, same week_pct), so name order breaks the tie. This is a
-        // consequence of dropping the viability branch, not a ranking change.
-        //
-        // Names are picked so the alphabetically-first one ("avail") carries
-        // the WORSE (higher) fable pct: if rank tracked fable pct instead of
-        // name — the regression this test exists to catch — "fable_ok" (the
-        // lower pct) would lead instead, not silently agree.
-        let resets = Some("Jun 20 at 9pm (Asia/Seoul)");
-        let order = ranked_order(vec![
-            (
-                "avail",
-                data_with_fable(Some(5), Some(30), resets, Some(99)),
-            ),
-            (
-                "fable_ok",
-                data_with_fable(Some(5), Some(30), resets, Some(20)),
-            ),
-        ]);
-        assert_eq!(order, vec!["avail", "fable_ok"]);
-    }
-
-    #[test]
-    fn effective_epoch_uses_later_of_week_all_and_fable_reset() {
-        // Mirrors `scoring::ranking_uses_later_of_week_all_and_fable_reset`:
-        // the LATER of the two known reset epochs is the binding constraint.
-        let sooner_fable_epoch = rank_now().timestamp() + 1_000; // well before Jun 20
-        let later_all_epoch = rank_now().timestamp() + 10_000; // still before Jun 20
-
-        // "flat": both dimensions resolve to the SAME (later) epoch as
-        // "mixed"'s effective (max) epoch, but via week_all directly, so this
-        // pins the max() computation rather than tying on a single field.
-        let mixed = StaleProfileData {
-            week_fable_resets_at: Some(sooner_fable_epoch),
-            ..data_with_epoch(Some(5), Some(10), None, Some(later_all_epoch))
-        };
-        let sooner_flat = StaleProfileData {
-            week_fable_resets_at: Some(sooner_fable_epoch),
-            ..data_with_epoch(Some(5), Some(30), None, Some(sooner_fable_epoch))
-        };
-        let order = ranked_order(vec![("mixed", mixed), ("sooner_flat", sooner_flat)]);
-        assert_eq!(
-            order,
-            vec!["sooner_flat", "mixed"],
-            "the row whose LATER (binding) dimension resets sooner must lead"
-        );
-    }
-
-    #[test]
-    fn needs_refresh_attention_does_not_change_rank_bucket() {
-        // A `NeedsRefresh` profile still has usable percentages, so it must
-        // stay in the viable bucket (0) exactly like a plain healthy row —
-        // `attention` only adds display information, it is not a viability
-        // input (see `account_row_rank`'s doc).
-        let plain = data(Some(5), Some(10), None);
-        let with_attention = StaleProfileData {
-            attention: Some(usage::model::Attention {
-                kind: usage::model::AttentionKind::NeedsRefresh,
-                message: "credentials expired".to_string(),
-                action: "csm --profile home".to_string(),
-                since_epoch: Some(1_000),
-            }),
-            ..data(Some(5), Some(10), None)
-        };
-        assert_eq!(
-            account_row_rank("home", &plain, rank_now()).0,
-            0,
-            "plain viable row must be bucket 0"
-        );
-        assert_eq!(
-            account_row_rank("home", &with_attention, rank_now()).0,
-            0,
-            "a NeedsRefresh row with usable percentages must stay bucket 0"
-        );
-        assert_eq!(
-            account_row_rank("home", &plain, rank_now()),
-            account_row_rank("home", &with_attention, rank_now()),
-            "attention must not change the rank tuple at all"
-        );
-    }
-
     // ══════════════════════════════════════════════════════════════════════════
     // Launch-time credential warnings — `launch_attention_lines`/
-    // `profile_name_for_dir`.
+    // the current account id.
     // ══════════════════════════════════════════════════════════════════════════
 
     fn attention_now() -> chrono::DateTime<chrono::Utc> {
@@ -1284,7 +891,9 @@ mod tests {
                         "CLAUDE_CONFIG_DIR=/Users/example/.claude.work claude auth login"
                             .to_string()
                     }
-                    usage::model::AttentionKind::NeedsRefresh => "csm --profile home".to_string(),
+                    usage::model::AttentionKind::NeedsRefresh => {
+                        "csm accounts use home".to_string()
+                    }
                 },
                 since_epoch: Some(attention_now().timestamp() - 3600),
             }),
@@ -1295,7 +904,9 @@ mod tests {
     #[test]
     fn launch_attention_lines_empty_when_nothing_needs_attention() {
         let data = usage::UsageData::default();
-        assert!(launch_attention_lines(&data, "home", attention_now()).is_empty());
+        assert!(
+            launch_attention_lines(&data, "home", &|id| id.to_owned(), attention_now()).is_empty()
+        );
     }
 
     #[test]
@@ -1315,7 +926,7 @@ mod tests {
         };
         // Neither "other" nor a healthy profile is the current one, so no
         // extra "current profile needs login" line.
-        let lines = launch_attention_lines(&data, "other", attention_now());
+        let lines = launch_attention_lines(&data, "other", &|id| id.to_owned(), attention_now());
         assert_eq!(
             lines.len(),
             4,
@@ -1324,7 +935,7 @@ mod tests {
         assert!(lines[0].starts_with("\u{26a0} home:"), "{lines:#?}");
         assert!(lines[2].starts_with("\u{26a0} work:"), "{lines:#?}");
         assert!(
-            !lines.iter().any(|l| l.contains("current profile")),
+            !lines.iter().any(|l| l.contains("current account")),
             "current profile isn't in the map at all: {lines:#?}"
         );
     }
@@ -1340,10 +951,10 @@ mod tests {
             profiles,
             ..Default::default()
         };
-        let lines = launch_attention_lines(&data, "work", attention_now());
+        let lines = launch_attention_lines(&data, "work", &|id| id.to_owned(), attention_now());
         assert_eq!(
             lines.last().unwrap(),
-            "csm: warning: current profile 'work' needs login — claude will show /login"
+            "csm: warning: current account 'work' needs login — claude will show /login"
         );
     }
 
@@ -1360,9 +971,9 @@ mod tests {
             profiles,
             ..Default::default()
         };
-        let lines = launch_attention_lines(&data, "home", attention_now());
+        let lines = launch_attention_lines(&data, "home", &|id| id.to_owned(), attention_now());
         assert!(
-            !lines.iter().any(|l| l.contains("current profile")),
+            !lines.iter().any(|l| l.contains("current account")),
             "{lines:#?}"
         );
     }

@@ -1,15 +1,17 @@
 //! `csm usage` — multi-profile usage report.
 //!
-//! Joins the **registry** ([`ProfileMap`]) with the local per-profile
-//! [`UsageData`] store into one view, one row per profile (registry ∪ store).
-//! A registered profile with no local data shows `—`/`no data`; a profile
-//! present in the store but not in the registry is appended with an
+//! Joins the **registered accounts** (Orca's host account ids, labelled
+//! with each record's email and organization by [`label_rows`]; see
+//! [`crate::account::AccountSet`]) with the local per-account [`UsageData`]
+//! store into one view, one row per account (registered ∪ store). A
+//! registered account with no local data shows `—`/`no data`; an id present
+//! in the store but not among Orca's accounts is appended with an
 //! `(unregistered)` tag (visibility over silent drop).
 //!
 //! ## Layering (testability)
 //!
 //! The pure core — [`build_report`] (join) + [`render_table`] / [`render_json`]
-//! (format) — takes a `ProfileMap` + `Option<UsageData>` + freshness/config
+//! (format) — takes the registered ids + `Option<UsageData>` + freshness/config
 //! flags and never touches the network. `fetch()` and stdout live only in
 //! `main::cmd_usage`. Every formatting branch is unit-tested against fixtures.
 //!
@@ -25,7 +27,6 @@
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 
-use crate::account::profiles::ProfileMap;
 use crate::account::scoring::SATURATION_PCT;
 use crate::usage::model::{Attention, AttentionKind, UsageData};
 
@@ -77,7 +78,7 @@ impl Status {
 pub struct Row {
     /// Profile name (registry key, or a store-only name).
     pub name: String,
-    /// `true` iff the profile is in the registry (`profiles.json`).
+    /// `true` iff the account is in Orca's account list.
     pub registered: bool,
     /// Session quota pct, or `None` when absent.
     pub session_pct: Option<i64>,
@@ -110,6 +111,10 @@ pub struct Row {
     /// [`attention_lines`] (the footer block) and serialized verbatim into
     /// `--json`.
     pub attention: Option<Attention>,
+    /// The account's email, from Orca's record ([`label_rows`]).
+    pub email: Option<String>,
+    /// The account's organization, from Orca's record ([`label_rows`]).
+    pub organization: Option<String>,
 }
 
 /// The full report: rows + freshness/config metadata for the header/footer.
@@ -127,7 +132,7 @@ pub struct Report {
     /// real caller (`main::cmd_usage`) only ever produces `false` alongside
     /// an empty registry, in which case `rows` is also empty and the
     /// `rows.is_empty()` branch in `render_table` already explains why
-    /// ("no profiles configured — `csm profiles add <name>`"); `configured`
+    /// ("no accounts configured — `csm accounts add`"); `configured`
     /// itself drives no separate footer. `build_report`'s pure signature does
     /// accept `configured=false` with a non-empty `rows` (exercised directly
     /// by this module's own tests) — that combination renders the usage
@@ -157,7 +162,7 @@ pub struct Report {
 ///
 /// Pure: no I/O, no network, no clock. Fully unit-testable.
 pub fn build_report(
-    profiles: &ProfileMap,
+    registered: &[&str],
     usage: Option<&UsageData>,
     configured: bool,
     stale_secs: Option<u64>,
@@ -168,7 +173,11 @@ pub fn build_report(
 
     // 1. One row per registered profile (so a registered-but-unused profile is
     //    visible as `no data`, never silently dropped).
-    for name in profiles.names_sorted() {
+    let mut names: Vec<&str> = registered.to_vec();
+    names.sort_unstable();
+    names.dedup();
+    let is_registered = |n: &str| names.binary_search(&n).is_ok();
+    for name in names.iter().copied() {
         rows.push(join_one(name, true, usage, errors));
     }
 
@@ -178,12 +187,12 @@ pub fn build_report(
             .profiles
             .keys()
             .map(String::as_str)
-            .filter(|n| !profiles.contains(n))
+            .filter(|n| !is_registered(n))
             .collect();
         // Also surface error-only store profiles that never produced a row.
         if let Some(errs) = errors {
             for n in errs.keys() {
-                if !profiles.contains(n) && !u.profiles.contains_key(n) {
+                if !is_registered(n) && !u.profiles.contains_key(n) {
                     extra.push(n.as_str());
                 }
             }
@@ -275,6 +284,8 @@ fn join_one(
             status,
             error: None,
             attention: Some(attention),
+            email: None,
+            organization: None,
         };
     }
 
@@ -294,6 +305,8 @@ fn join_one(
             status: Status::Errored,
             error: Some(err.clone()),
             attention: None,
+            email: None,
+            organization: None,
         };
     }
 
@@ -343,6 +356,8 @@ fn join_one(
         status,
         error: None,
         attention: None,
+        email: None,
+        organization: None,
     }
 }
 
@@ -378,7 +393,7 @@ pub fn render_table(report: &Report, now: DateTime<Utc>) -> String {
     }
 
     if report.rows.is_empty() {
-        out.push_str("(no profiles configured — `csm profiles add <name>`)\n");
+        out.push_str("(no accounts configured — `csm accounts add`)\n");
         return out;
     }
 
@@ -467,12 +482,30 @@ pub fn render_table(report: &Report, now: DateTime<Utc>) -> String {
     out
 }
 
-/// The name as shown in the table (unregistered profiles get a tag).
+/// Attach Orca's email and organization to each row whose id names one of
+/// `accounts`. Pure.
+pub fn label_rows(report: &mut Report, accounts: &[crate::account::accounts::AccountEntry]) {
+    for row in &mut report.rows {
+        if let Some(a) = accounts.iter().find(|a| a.id == row.name) {
+            row.email = a.email.clone();
+            row.organization = a.organization_name.clone();
+        }
+    }
+}
+
+/// The name as shown in the table: the account's email (with its
+/// organization) when Orca's record has one, else the id; ids Orca no
+/// longer lists get a tag.
 fn display_name(r: &Row) -> String {
+    let base = match (&r.email, &r.organization) {
+        (Some(e), Some(o)) => format!("{e} ({o})"),
+        (Some(e), None) => e.clone(),
+        _ => r.name.clone(),
+    };
     if r.registered {
-        r.name.clone()
+        base
     } else {
-        format!("{} (unreg)", r.name)
+        format!("{base} (unreg)")
     }
 }
 
@@ -628,6 +661,10 @@ struct JsonRow<'a> {
     /// field sees exactly the JSON shape it always has.
     #[serde(skip_serializing_if = "Option::is_none")]
     attention: Option<&'a Attention>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    email: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    organization: Option<&'a str>,
 }
 
 /// Render the report as pretty JSON (stable key order via `BTreeMap`).
@@ -650,6 +687,8 @@ pub fn render_json(report: &Report) -> Result<String, serde_json::Error> {
                     status: r.status,
                     error: r.error.as_deref(),
                     attention: r.attention.as_ref(),
+                    email: r.email.as_deref(),
+                    organization: r.organization.as_deref(),
                 },
             )
         })
@@ -670,19 +709,14 @@ pub fn render_json(report: &Report) -> Result<String, serde_json::Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashMap;
 
     fn now() -> DateTime<Utc> {
         use chrono::TimeZone;
         Utc.with_ymd_and_hms(2026, 9, 2, 0, 0, 0).unwrap()
     }
 
-    fn registry(names: &[&str]) -> ProfileMap {
-        let mut m = HashMap::new();
-        for n in names {
-            m.insert((*n).to_owned(), format!("/Users/example/.claude.{n}"));
-        }
-        ProfileMap(m)
+    fn registry<'a>(names: &[&'a str]) -> Vec<&'a str> {
+        names.to_vec()
     }
 
     /// A usage blob: `home` ok, `work` near-limit (week_all=96), one
@@ -831,7 +865,7 @@ mod tests {
             "registry must still render: {table}"
         );
         assert!(!table.contains("unavailable"), "table:\n{table}");
-        assert!(!table.contains("no profiles configured"), "table:\n{table}");
+        assert!(!table.contains("no accounts configured"), "table:\n{table}");
     }
 
     #[test]
@@ -839,7 +873,7 @@ mod tests {
         let reg = registry(&[]);
         let report = build_report(&reg, None, false, None);
         let table = render_table(&report, now());
-        assert!(table.contains("no profiles configured"), "table:\n{table}");
+        assert!(table.contains("no accounts configured"), "table:\n{table}");
     }
 
     #[test]
@@ -1114,7 +1148,7 @@ mod tests {
                   "attention": {
                     "kind": "needs_refresh",
                     "message": "access token expired",
-                    "action": "csm --profile home",
+                    "action": "csm accounts use home",
                     "since_epoch": 1788300000
                   }
                 }
@@ -1179,7 +1213,7 @@ mod tests {
             vec![
                 "\u{26a0} home: access token expired 2h ago \u{2014} run once to refresh"
                     .to_string(),
-                "  csm --profile home".to_string(),
+                "  csm accounts use home".to_string(),
                 "\u{26a0} work: credentials expired 3d ago \u{2014} login required".to_string(),
                 "  CLAUDE_CONFIG_DIR=/Users/example/.claude.work claude auth login".to_string(),
             ],
@@ -1284,5 +1318,25 @@ mod tests {
                 .contains_key("attention"),
             "healthy row must omit attention, not null: {healthy_json}"
         );
+    }
+
+    #[test]
+    fn rows_show_orca_email_and_organization() {
+        let reg = registry(&["id-a", "id-b"]);
+        let mut report = build_report(&reg, None, true, None);
+        label_rows(
+            &mut report,
+            &[crate::account::accounts::AccountEntry {
+                id: "id-a".into(),
+                email: Some("alice@example.com".into()),
+                organization_name: Some("Acme".into()),
+                managed_auth_path: None,
+            }],
+        );
+        let table = render_table(&report, now());
+        assert!(table.contains("alice@example.com (Acme)"), "{table}");
+        assert!(table.contains("id-b"), "{table}");
+        let json = render_json(&report).unwrap();
+        assert!(json.contains("\"email\": \"alice@example.com\""), "{json}");
     }
 }

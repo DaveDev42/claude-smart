@@ -1,11 +1,23 @@
-//! `csm hook` — Claude Code Stop/SubagentStop/SessionEnd hook handler.
+//! `csm hook` — Claude Code Stop/SubagentStop/SessionEnd/StopFailure hook
+//! handler.
 //!
 //! Invoked by Claude Code as a hook process with the event JSON on stdin.
 //! This is the **`csm hook` subcommand** — there is no separate `csm-hook` binary.
 //!
-//! Commit ordering (matches the legacy shell implementation):
+//! # The hook never switches
+//!
+//! It classifies the event, and on a limit it writes the sentinel
+//! `<state>/sentinel/<sid>.json` (`{v, target_account, from_account,
+//! from_gen, reason, at}` plus the relaunch fields) and stops its child. The
+//! supervisor that consumes the sentinel decides, under `switch.lock`,
+//! whether it leads the switch or follows one that already happened
+//! ([`crate::account::limit_switch`]). The hook reads files only: it never
+//! opens Orca's socket, never touches the Keychain, and never probes the
+//! network (the target pick reads csm's cached usage).
+//!
+//! Commit ordering for an account switch:
 //!   1. merge-sidecar hop
-//!   2. write `.relaunch` sentinel (atomic tmp+rename)
+//!   2. write the sentinel (atomic tmp+rename)
 //!   3. noclobber-create `.switched` marker
 //!   4. re-stamp `.last-switch`
 //!   5. write `<sid>.stop` flag (Windows) / `kill(pid, SIGTERM)` (POSIX)
@@ -13,12 +25,20 @@
 //!
 //! The statusline entry point ([`run_from_statusline`]) claims `.switched`
 //! *before* committing ([`stop::claim_switched`], see below), so on that path
-//! the on-disk order is `.switched` → `.relaunch` → `.last-switch`
-//! (confirmed against a live limit switch).
+//! the on-disk order is `.switched` → sentinel → `.last-switch`.
 //!
-//! `--owner <dir>` is the CLAUDE_CONFIG_DIR of the profile that owns this hook instance.
-//! It is baked into the per-profile shim deployed outside this crate; the hook uses it
-//! to locate the correct profile context.
+//! # Which account
+//!
+//! The session's account id comes from its sidecar (`account_id`, recorded
+//! at launch from `D`'s `oauthAccount`), else from `D`'s identity now.
+//! `--owner <dir>` is still accepted for hooks installed by older csm
+//! versions and ignored.
+//!
+//! # Output
+//!
+//! Nothing on stdout but the single `{"terminalSequence":…}` object Claude
+//! Code routes to the terminal (the OSC 777 notify). Everything else goes to
+//! `<state>/limit-switch.log`.
 //!
 //! # Second entry point: the statusline tick
 //!
@@ -31,16 +51,13 @@
 //! internal auto-retry wait, indefinitely. The only csm code that still runs
 //! while the turn is parked is the statusLine command, which Claude Code keeps
 //! invoking about once a second with the live `rate_limits` for the session's
-//! account. So the tick is where the switch has to happen. Its stdout is not a
-//! terminal (the statusLine wrapper discards it), so this path never emits the
-//! OSC 777 notification — the relaunched session's handoff prompt is the
+//! account. So the tick is where the switch has to happen. It writes nothing
+//! to stdout or stderr — the relaunched session's handoff prompt is the
 //! user-visible signal.
 
 pub mod detect;
 pub mod notify;
 pub mod stop;
-
-use std::path::Path;
 
 use anyhow::Context as _;
 
@@ -48,12 +65,26 @@ use anyhow::Context as _;
 /// Number forms. Returns 0 on missing/corrupt sidecar (the legacy zsh wrote
 /// hop as a JSON string; readers accept both forms). Delegates to the single
 /// `Sidecar::hop_int` SSOT so the String/Number tolerance rule lives in
-/// exactly one place — this was previously duplicated byte-for-byte in
-/// `detect.rs` and `stop.rs`.
+/// exactly one place.
 pub(crate) fn read_sidecar_hop(sid: &str) -> i64 {
     crate::sidecar::read_sidecar(&crate::paths::sidecar(sid))
         .map(|s| s.hop_int())
         .unwrap_or(0)
+}
+
+/// The account id a session runs on: its sidecar's `account_id`, else the
+/// account `D` holds now, else empty (unknown). Reads files only.
+pub(crate) fn session_account(sid: &str) -> String {
+    if let Some(id) = crate::sidecar::read_sidecar(&crate::paths::sidecar(sid))
+        .ok()
+        .and_then(|s| s.account_id)
+        .filter(|id| !id.is_empty())
+    {
+        return id;
+    }
+    crate::account::AccountSet::load()
+        .current
+        .unwrap_or_default()
 }
 
 /// First 8 bytes of a session UUID, for compact log lines and handoff
@@ -63,11 +94,11 @@ pub(crate) fn sid_short(sid: &str) -> &str {
     sid.get(..8).unwrap_or(sid)
 }
 
-/// Build one `limit-switch.log` line. `kind` is `"notify-only"` or
-/// `"limit-switch"`; `detail` carries the kind-specific fields (`msg=…`, or
-/// `to=… cwd=… born=…`); `via` is `Some("statusline")` for the statusline
-/// entry point and `None` for the hook entry point (whose lines carry no
-/// `via=` suffix, matching the format before this helper existed).
+/// Build one `limit-switch.log` line. `kind` is `"notify-only"`,
+/// `"limit-switch"` or `"follow"`; `detail` carries the kind-specific fields
+/// (`msg=…`, or `to=… cwd=… born=…`); `via` is `Some("statusline")` for the
+/// statusline entry point and `None` for the hook entry point (whose lines
+/// carry no `via=` suffix).
 fn decision_log_line(kind: &str, sid_short: &str, detail: &str, via: Option<&str>) -> String {
     match via {
         Some(via) => format!("{kind} sid={sid_short} {detail} via={via}"),
@@ -75,92 +106,94 @@ fn decision_log_line(kind: &str, sid_short: &str, detail: &str, via: Option<&str
     }
 }
 
-/// Entry point for `csm hook [--owner <profile_dir>]`.
-///
-/// `owner_dir` is the profile directory (value of CLAUDE_CONFIG_DIR for the hook's
-/// owning profile). It is used to resolve profile context when needed. The hook
-/// reads event JSON from stdin and, depending on the detected limit state,
-/// writes the relaunch sentinel and signals the supervisor to stop.
-pub fn run(owner_dir: &Path) -> anyhow::Result<()> {
-    // Parse hook input from stdin.
+/// The sentinel's `reason` for an account switch.
+fn switch_reason(dimension: detect::LimitDimension) -> &'static str {
+    match dimension {
+        detect::LimitDimension::Session => "limit:session",
+        detect::LimitDimension::WeekAll => "limit:week_all",
+        detect::LimitDimension::WeekFable => "limit:week_fable",
+        detect::LimitDimension::Unknown => "limit:rate_limit",
+    }
+}
+
+/// Entry point for `csm hook`. Reads the event JSON from stdin and,
+/// depending on the detected limit state, writes the sentinel and signals the
+/// supervisor to stop.
+pub fn run() -> anyhow::Result<()> {
     let input = detect::parse_stdin().context("failed to parse hook stdin JSON")?;
-    run_with_input(owner_dir, input)
+    run_with_input(input)
 }
 
 /// The body of [`run`] after stdin has been parsed into a [`detect::HookInput`].
 /// Split out so tests can drive it with a synthetic input instead of the
-/// process's real stdin (`run` itself blocks on `detect::parse_stdin()` when
-/// stdin is an interactive terminal or a pipe that never closes).
-pub(crate) fn run_with_input(owner_dir: &Path, input: detect::HookInput) -> anyhow::Result<()> {
+/// process's real stdin.
+pub(crate) fn run_with_input(input: detect::HookInput) -> anyhow::Result<()> {
     // session_id is required — exit 0 silently if missing (hook contract).
     let sid = match &input.session_id {
         Some(s) if !s.is_empty() => s.clone(),
-        _ => {
-            // No session_id — exit cleanly; hook contract says exit 0.
-            return Ok(());
-        }
+        _ => return Ok(()),
     };
-
-    // Classify the hook event and determine whether a limit-switch is warranted.
-    // classify() reproduces the full legacy shell implementation's flow including
-    // kill-switches, reason gate, detection tiers, managed-session gate, cooldown,
-    // and hop guard.
-    let decision = detect::classify(&input, owner_dir)?;
+    // A SessionEnd with no turn behind it (`claude upgrade`, a session that
+    // never wrote a transcript) has nothing to act on. Claude Code gives all
+    // SessionEnd hooks together about 1.5 s, so return before any other read.
+    if detect::session_end_without_turn(&input) {
+        return Ok(());
+    }
+    let account = session_account(&sid);
+    let decision = detect::classify(&input, &account)?;
 
     match decision {
-        detect::Decision::Skip => {
-            // Nothing to do — a kill-switch, cooldown, marker, or no-limit result.
-        }
+        detect::Decision::Skip => {}
 
         detect::Decision::NotifyOnly { ref message } => {
-            // Notify-only: user-quit + limited, no-target, detect-only mode, or
-            // unmanaged session. Emit OSC 777 notify on stdout.
-            // Log goes to the smart_dir limit-switch.log.
             let log_msg = decision_log_line(
                 "notify-only",
                 sid_short(&sid),
                 &format!("msg={message}"),
                 None,
             );
-            notify::emit_osc777(message).unwrap_or(()); // best-effort stdout
-            let _ = notify::append_log(&sid, &log_msg); // best-effort log
+            notify::emit_osc777(message).unwrap_or(()); // the one stdout object
+            let _ = notify::append_log(&sid, &log_msg);
+        }
+
+        detect::Decision::Follow {
+            ref follow,
+            ref cwd,
+            born,
+        } => {
+            let detail = format!(
+                "to={} gen={} cwd={cwd} born={born}",
+                follow.to_account, follow.generation
+            );
+            let _ = notify::append_log(
+                &sid,
+                &decision_log_line("follow", sid_short(&sid), &detail, None),
+            );
+            stop::follow_and_stop(&sid, follow, cwd, born)
+                .with_context(|| format!("follow_and_stop failed for session {sid}"))?;
         }
 
         detect::Decision::LimitSwitch {
             ref message,
-            ref target_profile,
+            ref target_account,
+            ref from_account,
             ref handoff,
             ref cwd,
             born,
-            dimension: _,
+            dimension,
             ref model_override,
         } => {
-            // Full limit-switch commit sequence (matches the legacy shell
-            // implementation's ordering): notify first (stdout before any
-            // mutation), then commit_and_stop.
-            notify::emit_osc777(message).unwrap_or(());
-
-            // `target_profile == current_profile` for a fallback (5b), so the
-            // detail records the model, not a `to=` switch, or limit-switch.log
-            // would misread a same-account model change as an account switch.
-            let detail = match model_override {
-                Some(model) => {
-                    format!("model-fallback={model} account={target_profile} cwd={cwd} born={born}")
-                }
-                None => format!("to={target_profile} cwd={cwd} born={born}"),
-            };
-            let log_msg = decision_log_line("limit-switch", sid_short(&sid), &detail, None);
-            let _ = notify::append_log(&sid, &log_msg);
-
-            stop::commit_and_stop(
-                sid.as_str(),
-                target_profile,
+            let commit = stop::Commit {
+                sid: &sid,
+                from_account: Some(from_account.as_str()).filter(|a| !a.is_empty()),
+                target_account,
                 handoff,
                 cwd,
                 born,
-                model_override.as_deref(),
-            )
-            .with_context(|| format!("commit_and_stop failed for session {sid}"))?;
+                model_override: model_override.as_deref(),
+                reason: switch_reason(dimension),
+            };
+            hook_limit_switch(&commit, message)?;
         }
     }
 
@@ -175,23 +208,19 @@ pub(crate) fn run_with_input(owner_dir: &Path, input: detect::HookInput) -> anyh
 /// for every live session:
 ///
 /// 1. [`detect::statusline_limit_hit_default`] over the merged reading —
-///    pure, no I/O. Almost every tick ends here. Its typed dimension threads
-///    straight into step 3 rather than being re-parsed from the message.
+///    pure, no I/O. Almost every tick ends here.
 /// 2. Parse `raw` as a [`detect::HookInput`] (statusLine stdin carries the
 ///    same `session_id`/`cwd`/`transcript_path` keys a hook event does).
-/// 3. [`detect::classify_with`] with the hit as a definitive live limit.
-///    Kill-switches, `.switched`, target pick, relaunch switch, managed gate,
-///    cooldown exception and hop guard all apply exactly as for the hook.
+/// 3. [`detect::classify_with`] with the hit as a definitive live limit, for
+///    the account the capture was attributed to.
 /// 4. On `LimitSwitch`, claim the right one-shot marker first — `.switched`
-///    via [`stop::claim_switched`] for an ordinary account switch,
-///    `.model-fallback` via [`stop::claim_model_fallback`] for a same-account
-///    model fallback (`model_override.is_some()`) — then
-///    [`stop::commit_and_stop`]. Ticks overlap, so only one claimant may
+///    via [`stop::claim_switched`] for an account switch, `.model-fallback`
+///    via [`stop::claim_model_fallback`] for a same-account model fallback —
+///    then [`stop::commit_and_stop`]. Ticks overlap, so only one claimant may
 ///    commit; if the commit fails, the claim is released so the next tick
 ///    retries.
 ///
-/// Never returns an error and never writes to stdout/stderr: the capture
-/// this rides on is fire-and-forget and must stay that way. Outcomes are
+/// Never returns an error and never writes to stdout/stderr. Outcomes are
 /// logged to `limit-switch.log` with `via=statusline`.
 pub fn run_from_statusline(raw: &str, capture: &crate::usage::local::StatuslineCapture) {
     let Some(limit_hit) = detect::statusline_limit_hit_default(&capture.usage) else {
@@ -203,14 +232,14 @@ pub fn run_from_statusline(raw: &str, capture: &crate::usage::local::StatuslineC
     let Some(sid) = input.session_id.clone().filter(|s| !s.is_empty()) else {
         return;
     };
-    let owner_dir = Path::new(&capture.profile_dir);
-    let Ok(decision) = detect::classify_with(&input, owner_dir, Some(&limit_hit)) else {
+    let Ok(decision) = detect::classify_with(&input, &capture.account_id, Some(&limit_hit)) else {
         return;
     };
     let sid_short = sid_short(&sid);
 
     match decision {
-        detect::Decision::Skip => {}
+        // `classify_with` never follows on a live limit.
+        detect::Decision::Skip | detect::Decision::Follow { .. } => {}
 
         detect::Decision::NotifyOnly { ref message } => {
             // Deduped by `.detected` inside classify, so this lands once per
@@ -226,47 +255,40 @@ pub fn run_from_statusline(raw: &str, capture: &crate::usage::local::StatuslineC
 
         detect::Decision::LimitSwitch {
             message: _,
-            ref target_profile,
+            ref target_account,
+            ref from_account,
             ref handoff,
             ref cwd,
             born,
-            dimension: _,
+            dimension,
             ref model_override,
         } => {
-            // Claim the right one-shot marker BEFORE committing, so two
-            // overlapping ticks for the same session never both commit. A
-            // model fallback claims `.model-fallback`, never `.switched` —
-            // claiming `.switched` here would burn this session's
-            // account-switch budget for a relaunch that never touched it,
-            // blocking a real account switch this same session might still
-            // need later (see `detect::fable_fallback_model`'s doc).
-            let claimed = match model_override {
-                Some(_) => stop::claim_model_fallback(&sid, target_profile),
-                None => stop::claim_switched(&sid),
+            let commit = stop::Commit {
+                sid: &sid,
+                from_account: Some(from_account.as_str()).filter(|a| !a.is_empty()),
+                target_account,
+                handoff,
+                cwd,
+                born,
+                model_override: model_override.as_deref(),
+                reason: switch_reason(dimension),
             };
-            if !claimed {
+            // Claim the right one-shot marker BEFORE committing, so two
+            // overlapping ticks (or a tick and a hook) for the same session
+            // never both commit.
+            if !claim_for(&commit) {
                 return;
             }
-            // See run_with_input's identical comment: `target_profile ==
-            // current_profile` for a fallback (5b), so the detail records the
-            // model rather than a `to=` switch.
             let detail = match model_override {
                 Some(model) => {
-                    format!("model-fallback={model} account={target_profile} cwd={cwd} born={born}")
+                    format!("model-fallback={model} account={target_account} cwd={cwd} born={born}")
                 }
-                None => format!("to={target_profile} cwd={cwd} born={born}"),
+                None => format!("to={target_account} cwd={cwd} born={born}"),
             };
             let log_msg = decision_log_line("limit-switch", sid_short, &detail, Some("statusline"));
             let _ = notify::append_log(&sid, &log_msg);
 
-            if let Err(e) = stop::commit_and_stop(
-                sid.as_str(),
-                target_profile,
-                handoff,
-                cwd,
-                born,
-                model_override.as_deref(),
-            ) {
+            if let Err(e) = commit_or_release(&commit) {
                 let _ = notify::append_log(
                     &sid,
                     &decision_log_line(
@@ -276,14 +298,69 @@ pub fn run_from_statusline(raw: &str, capture: &crate::usage::local::StatuslineC
                         Some("statusline"),
                     ),
                 );
-                let release_path = match model_override {
-                    Some(_) => crate::paths::model_fallback(&sid),
-                    None => crate::paths::switched(&sid),
-                };
-                let _ = std::fs::remove_file(release_path);
             }
         }
     }
+}
+
+/// The hook's `LimitSwitch` arm: claim, notify, log, commit. A statusline
+/// tick may have seen the same cap and committed since classify checked
+/// `.switched`, so the claim comes first, exactly as on the tick; losing it
+/// leaves the commit to the tick.
+fn hook_limit_switch(c: &stop::Commit<'_>, message: &str) -> anyhow::Result<()> {
+    let sid = c.sid;
+    if !claim_for(c) {
+        let _ = notify::append_log(
+            sid,
+            &decision_log_line(
+                "limit-switch",
+                sid_short(sid),
+                "skipped: another caller already committed",
+                None,
+            ),
+        );
+        return Ok(());
+    }
+    notify::emit_osc777(message).unwrap_or(());
+
+    // `target_account == from_account` for a fallback (5b), so the detail
+    // records the model, not a `to=` switch.
+    let (target, cwd, born) = (c.target_account, c.cwd, c.born);
+    let detail = match c.model_override {
+        Some(model) => format!("model-fallback={model} account={target} cwd={cwd} born={born}"),
+        None => format!("to={target} cwd={cwd} born={born}"),
+    };
+    let log_msg = decision_log_line("limit-switch", sid_short(sid), &detail, None);
+    let _ = notify::append_log(sid, &log_msg);
+
+    commit_or_release(c).with_context(|| format!("commit_and_stop failed for session {sid}"))
+}
+
+// ─── the one-shot claim both entry points share ──────────────────────────────
+
+/// Claim the one-shot marker a limit commit needs: `.model-fallback` for a
+/// same-account model fallback, `.switched` for an account switch (a
+/// fallback never touches `.switched`). `false` when another caller (a
+/// statusline tick, or the hook) holds it already: that caller commits,
+/// this one must not, or the sidecar hop is bumped twice and the relaunch
+/// loop refuses the relaunch at its hop cap.
+fn claim_for(c: &stop::Commit<'_>) -> bool {
+    match c.model_override {
+        Some(_) => stop::claim_model_fallback(c.sid, c.target_account),
+        None => stop::claim_switched(c.sid),
+    }
+}
+
+/// [`stop::commit_and_stop`] after a successful [`claim_for`]; a failed
+/// commit releases the claim so the next event retries.
+fn commit_or_release(c: &stop::Commit<'_>) -> anyhow::Result<()> {
+    stop::commit_and_stop(c).inspect_err(|_| {
+        let claim = match c.model_override {
+            Some(_) => crate::paths::model_fallback(c.sid),
+            None => crate::paths::switched(c.sid),
+        };
+        let _ = std::fs::remove_file(claim);
+    })
 }
 
 // ─── tests ────────────────────────────────────────────────────────────────────
@@ -299,16 +376,17 @@ pub fn run_from_statusline(raw: &str, capture: &crate::usage::local::StatuslineC
 // up here even though each piece it calls is separately unit-tested.
 //
 // No `actions_for(decision) -> Vec<Action>` unification: `run` and
-// `run_from_statusline` have materially different, ordering-sensitive
-// sequences (`claim_switched`/release-on-failure exists only in the
-// statusline path), so each gets its own direct coverage instead.
+// `run_from_statusline` differ in what they print and log, so each gets its
+// own direct coverage; both claim through `claim_for` and release through
+// `commit_or_release`.
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::platform::child::ChildGuard;
     use crate::usage::local::StatuslineCapture;
     use crate::usage::model::{ProfileUsage, UsageData, UsageSection};
     use std::collections::HashMap;
-    use std::process::{Child, Command};
+    use std::process::Command;
 
     /// Everything one test needs torn down: restores `HOME`/`CSM_USAGE_CMD`/
     /// `CLAUDE_SMART_CLAUDE_BIN` and kills the fake managed process (if any)
@@ -316,18 +394,17 @@ mod tests {
     /// test even though the caller's lock guards are dropped right along
     /// with it.
     struct EnvFixture {
-        home: tempfile::TempDir,
+        _home: tempfile::TempDir,
         prev_usage_cmd: Option<std::ffi::OsString>,
         prev_launch_bin: Option<std::ffi::OsString>,
-        fake_proc: Option<Child>,
+        fake_proc: Option<ChildGuard>,
     }
 
     impl Drop for EnvFixture {
         fn drop(&mut self) {
-            if let Some(mut child) = self.fake_proc.take() {
-                let _ = child.kill();
-                let _ = child.wait();
-            }
+            // Killed and reaped within a bounded window, never an unbounded
+            // `wait()`.
+            drop(self.fake_proc.take());
             crate::testenv::set_test_home(None);
             match self.prev_usage_cmd.take() {
                 Some(v) => crate::testenv::set_var("CSM_USAGE_CMD", &v.to_string_lossy()),
@@ -341,9 +418,11 @@ mod tests {
     }
 
     /// Point the resolved home dir (and so `paths::smart_dir()`) at a fresh
-    /// temp dir, and wire `CSM_USAGE_CMD` to hand `usage::fetch()` the given
-    /// `UsageData` verbatim (via `cat <tmpfile>`) instead of touching any real
-    /// profile. Caller must hold `lock_for("CSM_USAGE_CMD")` and
+    /// temp dir and write the given `UsageData` as csm's usage cache, which
+    /// is all the hook may read (`usage::fetch_cached`, design decision 8).
+    /// `CSM_USAGE_CMD` is also wired to the same data (via `cat <tmpfile>`)
+    /// so a hook that wrongly ran it would still find numbers, and the
+    /// reach tests below prove it never does. Caller must hold `lock_for("CSM_USAGE_CMD")` and
     /// `lock_for("CLAUDE_SMART_CLAUDE_BIN")` for the fixture's whole
     /// lifetime — those are real process-global env vars; the home-dir
     /// override itself is thread-local and needs no lock.
@@ -359,9 +438,16 @@ mod tests {
         crate::testenv::set_test_home(Some(home.path().to_path_buf()));
         crate::testenv::set_var("CSM_USAGE_CMD", &format!("cat {}", usage_file.display()));
         crate::testenv::remove_var("CLAUDE_SMART_CLAUDE_BIN");
+        // An empty map is written nowhere, so the early-return tests can
+        // still assert the state dir was never created.
+        if !usage.profiles.is_empty() {
+            let cache = crate::paths::usage_cache();
+            std::fs::create_dir_all(cache.parent().expect("cache parent")).expect("state dir");
+            std::fs::write(&cache, &usage_json).expect("write usage cache");
+        }
 
         EnvFixture {
-            home,
+            _home: home,
             prev_usage_cmd,
             prev_launch_bin,
             fake_proc: None,
@@ -406,9 +492,9 @@ mod tests {
 
     /// A `StatuslineCapture` whose merged reading trips `statusline_limit_hit`
     /// (week_all at/above `CLAUDE_LIMIT_PCT`) for `profile_dir`.
-    fn capped_capture(profile_dir: &str) -> StatuslineCapture {
+    fn capped_capture(account: &str) -> StatuslineCapture {
         StatuslineCapture {
-            profile_dir: profile_dir.to_string(),
+            account_id: account.to_string(),
             usage: ProfileUsage {
                 week_all: Some(UsageSection {
                     pct: 100,
@@ -422,9 +508,9 @@ mod tests {
 
     /// A `StatuslineCapture` whose reading is healthy on every dimension —
     /// `statusline_limit_hit` must return `None` for it.
-    fn healthy_capture(profile_dir: &str) -> StatuslineCapture {
+    fn healthy_capture(account: &str) -> StatuslineCapture {
         StatuslineCapture {
-            profile_dir: profile_dir.to_string(),
+            account_id: account.to_string(),
             usage: ProfileUsage {
                 session: Some(UsageSection {
                     pct: 21,
@@ -456,11 +542,11 @@ mod tests {
     /// see `detect::LimitHit`'s doc). Every other test passes `None`, where
     /// the exact epoch doesn't matter.
     fn week_fable_capped_capture(
-        profile_dir: &str,
+        account: &str,
         week_fable_resets_at: Option<i64>,
     ) -> StatuslineCapture {
         StatuslineCapture {
-            profile_dir: profile_dir.to_string(),
+            account_id: account.to_string(),
             usage: ProfileUsage {
                 session: Some(UsageSection {
                     pct: 21,
@@ -489,11 +575,17 @@ mod tests {
     /// and stores the child on `fixture` so it is reaped on drop.
     fn spawn_fake_managed_process(fixture: &mut EnvFixture, sid: &str) {
         crate::testenv::set_var("CLAUDE_SMART_CLAUDE_BIN", "sleep");
-        let child = Command::new("sleep")
-            .arg("30")
-            .spawn()
+        // A second call replaces the first child: stop (kill + reap) the old
+        // one before starting the next, so none is ever orphaned.
+        if let Some(mut old) = fixture.fake_proc.take() {
+            old.stop();
+        }
+        let child = ChildGuard::spawn(Command::new("/bin/sleep").arg("30"))
             .expect("spawn fake managed process");
-        let pid = child.pid();
+        let pid = child.id();
+        // Owned by the fixture BEFORE any assertion can panic, so the child
+        // is reaped on drop either way.
+        fixture.fake_proc = Some(child);
         // Ride out the post-spawn exec window on Linux; see
         // `proc_check::wait_until_live_claude_or_node`'s doc comment.
         assert!(
@@ -503,21 +595,10 @@ mod tests {
             ),
             "fake managed process must become recognizable as live"
         );
-        fixture.fake_proc = Some(child);
 
-        let smart_dir = fixture.home.path().join(".claude.shared").join("smart");
-        std::fs::create_dir_all(&smart_dir).expect("create smart_dir");
-        std::fs::write(smart_dir.join(format!("{sid}.pid")), format!("{pid} 1000"))
-            .expect("write pid file");
-    }
-
-    trait ChildPid {
-        fn pid(&self) -> u32;
-    }
-    impl ChildPid for Child {
-        fn pid(&self) -> u32 {
-            std::process::Child::id(self)
-        }
+        let pid_file = crate::paths::pid_file(sid);
+        std::fs::create_dir_all(pid_file.parent().unwrap()).expect("create smart_dir");
+        std::fs::write(pid_file, format!("{pid} 1000")).expect("write pid file");
     }
 
     // ── run_from_statusline: early-return guards ──────────────────────────────
@@ -526,20 +607,15 @@ mod tests {
     fn run_from_statusline_skips_when_statusline_limit_is_none() {
         let _guard_cmd = crate::testenv::lock_for("CSM_USAGE_CMD");
         let _guard_bin = crate::testenv::lock_for("CLAUDE_SMART_CLAUDE_BIN");
-        let fixture = isolated_env(&usage_with_no_viable_target());
-        let capture = healthy_capture("/Users/example/.claude.home");
+        let _fixture = isolated_env(&usage_with_no_viable_target());
+        let capture = healthy_capture("home");
 
         run_from_statusline(r#"{"session_id": "sid-healthy-0001"}"#, &capture);
 
         // Nothing should have touched smart_dir at all — the function must
         // return before any I/O when the merged reading is under threshold.
         assert!(
-            !fixture
-                .home
-                .path()
-                .join(".claude.shared")
-                .join("smart")
-                .exists(),
+            !crate::paths::smart_dir_no_create().exists(),
             "smart_dir must not be created when statusline_limit_hit_default is None"
         );
     }
@@ -548,18 +624,13 @@ mod tests {
     fn run_from_statusline_skips_on_unparseable_raw() {
         let _guard_cmd = crate::testenv::lock_for("CSM_USAGE_CMD");
         let _guard_bin = crate::testenv::lock_for("CLAUDE_SMART_CLAUDE_BIN");
-        let fixture = isolated_env(&usage_with_no_viable_target());
-        let capture = capped_capture("/Users/example/.claude.home");
+        let _fixture = isolated_env(&usage_with_no_viable_target());
+        let capture = capped_capture("home");
 
         run_from_statusline("{not json", &capture);
 
         assert!(
-            !fixture
-                .home
-                .path()
-                .join(".claude.shared")
-                .join("smart")
-                .exists(),
+            !crate::paths::smart_dir_no_create().exists(),
             "smart_dir must not be created when raw stdin fails to parse"
         );
     }
@@ -568,19 +639,14 @@ mod tests {
     fn run_from_statusline_skips_on_missing_session_id() {
         let _guard_cmd = crate::testenv::lock_for("CSM_USAGE_CMD");
         let _guard_bin = crate::testenv::lock_for("CLAUDE_SMART_CLAUDE_BIN");
-        let fixture = isolated_env(&usage_with_no_viable_target());
-        let capture = capped_capture("/Users/example/.claude.home");
+        let _fixture = isolated_env(&usage_with_no_viable_target());
+        let capture = capped_capture("home");
 
         // Valid JSON, but no "session_id" key at all.
         run_from_statusline(r#"{"cwd": "/Users/example/Projects/foo"}"#, &capture);
 
         assert!(
-            !fixture
-                .home
-                .path()
-                .join(".claude.shared")
-                .join("smart")
-                .exists(),
+            !crate::paths::smart_dir_no_create().exists(),
             "smart_dir must not be created when session_id is missing"
         );
     }
@@ -591,8 +657,8 @@ mod tests {
     fn run_from_statusline_notify_only_appends_one_log_line_with_via_suffix() {
         let _guard_cmd = crate::testenv::lock_for("CSM_USAGE_CMD");
         let _guard_bin = crate::testenv::lock_for("CLAUDE_SMART_CLAUDE_BIN");
-        let fixture = isolated_env(&usage_with_no_viable_target());
-        let capture = capped_capture("/Users/example/.claude.limited");
+        let _fixture = isolated_env(&usage_with_no_viable_target());
+        let capture = capped_capture("limited");
         let sid = "sid-notify-only-0001";
 
         run_from_statusline(
@@ -600,12 +666,7 @@ mod tests {
             &capture,
         );
 
-        let log_path = fixture
-            .home
-            .path()
-            .join(".claude.shared")
-            .join("smart")
-            .join("limit-switch.log");
+        let log_path = crate::paths::smart_dir_no_create().join("limit-switch.log");
         let content = std::fs::read_to_string(&log_path).expect("limit-switch.log written");
         let lines: Vec<&str> = content.lines().collect();
         assert_eq!(lines.len(), 1, "expected exactly one log line: {content:?}");
@@ -631,26 +692,16 @@ mod tests {
         // Force `commit_and_stop`'s `write_relaunch` step to fail: pre-create
         // its target path as a directory, so the atomic tmp+rename onto it
         // errors instead of replacing a file.
-        let relaunch_dir = fixture
-            .home
-            .path()
-            .join(".claude.shared")
-            .join("smart")
-            .join(format!("{sid}.relaunch"));
-        std::fs::create_dir_all(&relaunch_dir).expect("pre-create .relaunch as a directory");
+        let relaunch_dir = crate::paths::sentinel(sid);
+        std::fs::create_dir_all(&relaunch_dir).expect("pre-create the sentinel as a directory");
 
-        let capture = capped_capture("/Users/example/.claude.limited");
+        let capture = capped_capture("limited");
         run_from_statusline(
             &format!(r#"{{"session_id": "{sid}", "cwd": "/tmp/proj"}}"#),
             &capture,
         );
 
-        let switched_path = fixture
-            .home
-            .path()
-            .join(".claude.shared")
-            .join("smart")
-            .join(format!("{sid}.switched"));
+        let switched_path = crate::paths::smart_dir_no_create().join(format!("{sid}.switched"));
         assert!(
             !switched_path.exists(),
             "a failed commit must release the .switched claim so the next tick retries"
@@ -670,10 +721,7 @@ mod tests {
         // requires to exit 0 silently, with no smart_dir I/O at all.
         let home = tempfile::tempdir().unwrap();
         let result = crate::testenv::with_test_home(home.path(), || {
-            run_with_input(
-                Path::new("/Users/example/.claude.home"),
-                detect::parse_input("").unwrap(),
-            )
+            run_with_input(detect::parse_input("").unwrap())
         });
 
         assert!(
@@ -696,20 +744,19 @@ mod tests {
         let sid = "sid-fable-fallback-0001";
         spawn_fake_managed_process(&mut fixture, sid);
 
-        let capture = week_fable_capped_capture("/Users/example/.claude.limited", None);
+        let capture = week_fable_capped_capture("limited", None);
         run_from_statusline(
             &format!(r#"{{"session_id": "{sid}", "cwd": "/tmp/proj"}}"#),
             &capture,
         );
 
-        let smart_dir = fixture.home.path().join(".claude.shared").join("smart");
+        let smart_dir = crate::paths::smart_dir_no_create();
 
-        let sentinel =
-            crate::platform::relaunch::read_relaunch(&smart_dir.join(format!("{sid}.relaunch")))
-                .expect("relaunch sentinel readable")
-                .expect("relaunch sentinel present");
+        let sentinel = crate::platform::relaunch::read_relaunch(&crate::paths::sentinel(sid))
+            .expect("relaunch sentinel readable")
+            .expect("relaunch sentinel present");
         assert_eq!(
-            sentinel.target_profile, "limited",
+            sentinel.target_account, "limited",
             "a model fallback stays on the current profile, not a switch target"
         );
         assert_eq!(sentinel.model_override.as_deref(), Some("opus"));
@@ -748,22 +795,21 @@ mod tests {
         let sid = "sid-switched-then-fable-0001";
         spawn_fake_managed_process(&mut fixture, sid);
 
-        let smart_dir = fixture.home.path().join(".claude.shared").join("smart");
+        let smart_dir = crate::paths::smart_dir_no_create();
         std::fs::create_dir_all(&smart_dir).expect("create smart_dir");
         std::fs::write(smart_dir.join(format!("{sid}.switched")), "1700000000")
             .expect("pre-write the .switched marker as if a prior hop already fired");
 
-        let capture = week_fable_capped_capture("/Users/example/.claude.limited", None);
+        let capture = week_fable_capped_capture("limited", None);
         run_from_statusline(
             &format!(r#"{{"session_id": "{sid}", "cwd": "/tmp/proj"}}"#),
             &capture,
         );
 
-        let sentinel =
-            crate::platform::relaunch::read_relaunch(&smart_dir.join(format!("{sid}.relaunch")))
-                .expect("relaunch sentinel readable")
-                .expect("a pre-existing .switched marker must not block the fallback");
-        assert_eq!(sentinel.target_profile, "limited");
+        let sentinel = crate::platform::relaunch::read_relaunch(&crate::paths::sentinel(sid))
+            .expect("relaunch sentinel readable")
+            .expect("a pre-existing .switched marker must not block the fallback");
+        assert_eq!(sentinel.target_account, "limited");
         assert_eq!(
             sentinel.model_override.as_deref(),
             Some("opus"),
@@ -783,19 +829,19 @@ mod tests {
         let sid = "sid-switched-then-week-all-0001";
         spawn_fake_managed_process(&mut fixture, sid);
 
-        let smart_dir = fixture.home.path().join(".claude.shared").join("smart");
+        let smart_dir = crate::paths::smart_dir_no_create();
         std::fs::create_dir_all(&smart_dir).expect("create smart_dir");
         std::fs::write(smart_dir.join(format!("{sid}.switched")), "1700000000")
             .expect("pre-write the .switched marker as if a prior hop already fired");
 
-        let capture = capped_capture("/Users/example/.claude.limited");
+        let capture = capped_capture("limited");
         run_from_statusline(
             &format!(r#"{{"session_id": "{sid}", "cwd": "/tmp/proj"}}"#),
             &capture,
         );
 
         assert!(
-            !smart_dir.join(format!("{sid}.relaunch")).exists(),
+            !crate::paths::sentinel(sid).exists(),
             "a week_all trip on an already-switched session must stay blocked \
              by kill-switch 1c, exactly as before this fallback existed"
         );
@@ -833,19 +879,19 @@ mod tests {
         let sid = "sid-fable-second-trip-0001";
         spawn_fake_managed_process(&mut fixture, sid);
 
-        let capture = week_fable_capped_capture("/Users/example/.claude.limited", None);
+        let capture = week_fable_capped_capture("limited", None);
 
         run_from_statusline(
             &format!(r#"{{"session_id": "{sid}", "cwd": "/tmp/proj"}}"#),
             &capture,
         );
 
-        let smart_dir = fixture.home.path().join(".claude.shared").join("smart");
-        let relaunch_path = smart_dir.join(format!("{sid}.relaunch"));
+        let smart_dir = crate::paths::smart_dir_no_create();
+        let relaunch_path = crate::paths::sentinel(sid);
         let first_sentinel = crate::platform::relaunch::read_relaunch(&relaunch_path)
             .expect("relaunch sentinel readable")
             .expect("relaunch sentinel present after the first (fallback) trip");
-        assert_eq!(first_sentinel.target_profile, "limited");
+        assert_eq!(first_sentinel.target_account, "limited");
         assert_eq!(first_sentinel.model_override.as_deref(), Some("opus"));
         assert!(smart_dir.join(format!("{sid}.model-fallback")).exists());
 
@@ -868,7 +914,7 @@ mod tests {
             .expect("relaunch sentinel readable")
             .expect("relaunch sentinel present (unchanged) after the second (suppressed) trip");
         assert_eq!(
-            second_sentinel.target_profile, "limited",
+            second_sentinel.target_account, "limited",
             "a suppressed second trip must leave the first fallback's sentinel untouched"
         );
         assert_eq!(
@@ -910,18 +956,18 @@ mod tests {
         let _guard_cmd = crate::testenv::lock_for("CSM_USAGE_CMD");
         let _guard_bin = crate::testenv::lock_for("CLAUDE_SMART_CLAUDE_BIN");
         // No `.pid` file for this sid — `managed_session` reads `NotManaged`.
-        let fixture = isolated_env(&usage_with_no_viable_target());
+        let _fixture = isolated_env(&usage_with_no_viable_target());
         let sid = "sid-fable-unmanaged-0001";
-        let capture = week_fable_capped_capture("/Users/example/.claude.limited", None);
+        let capture = week_fable_capped_capture("limited", None);
 
         run_from_statusline(
             &format!(r#"{{"session_id": "{sid}", "cwd": "/tmp/proj"}}"#),
             &capture,
         );
 
-        let smart_dir = fixture.home.path().join(".claude.shared").join("smart");
+        let smart_dir = crate::paths::smart_dir_no_create();
         assert!(
-            !smart_dir.join(format!("{sid}.relaunch")).exists(),
+            !crate::paths::sentinel(sid).exists(),
             "an unmanaged session must never commit a relaunch"
         );
 
@@ -932,10 +978,7 @@ mod tests {
             "must name the model fallback, not an account switch: {log:?}"
         );
         assert!(
-            log.contains(&format!(
-                "csm --profile limited --resume {} --model opus",
-                sid_short(sid)
-            )),
+            log.contains(&format!("csm --resume {} --model opus", sid_short(sid))),
             "must give a manual command that names --model, or resuming it \
              would land back on the capped model: {log:?}"
         );
@@ -958,7 +1001,7 @@ mod tests {
         let sid = "sid-fable-then-notify-0001";
         spawn_fake_managed_process(&mut fixture, sid);
 
-        let fable_capture = week_fable_capped_capture("/Users/example/.claude.limited", None);
+        let fable_capture = week_fable_capped_capture("limited", None);
 
         // Trip 1: the fallback fires and commits (`LimitSwitch` — never
         // touches `.detected`).
@@ -966,9 +1009,9 @@ mod tests {
             &format!(r#"{{"session_id": "{sid}", "cwd": "/tmp/proj"}}"#),
             &fable_capture,
         );
-        let smart_dir = fixture.home.path().join(".claude.shared").join("smart");
+        let smart_dir = crate::paths::smart_dir_no_create();
         assert!(
-            smart_dir.join(format!("{sid}.relaunch")).exists(),
+            crate::paths::sentinel(sid).exists(),
             "trip 1 must commit the fallback"
         );
 
@@ -986,7 +1029,7 @@ mod tests {
         // Trip 3: an unrelated, genuinely new notify-only reason (week_all
         // capped, no viable target) for the SAME session must still fire —
         // proof `.detected` was never spent by trip 2's silent suppression.
-        let week_all_capture = capped_capture("/Users/example/.claude.limited");
+        let week_all_capture = capped_capture("limited");
         run_from_statusline(
             &format!(r#"{{"session_id": "{sid}", "cwd": "/tmp/proj"}}"#),
             &week_all_capture,
@@ -1042,15 +1085,14 @@ mod tests {
         // future works. The real test is the SECOND tick below, computed
         // off the marker's own (real wall-clock, `stop.rs`'s own
         // `now_epoch`) written value.
-        let first_capture =
-            week_fable_capped_capture("/Users/example/.claude.limited", Some(4_000_000_000));
+        let first_capture = week_fable_capped_capture("limited", Some(4_000_000_000));
         run_from_statusline(
             &format!(r#"{{"session_id": "{sid}", "cwd": "/tmp/proj"}}"#),
             &first_capture,
         );
 
-        let smart_dir = fixture.home.path().join(".claude.shared").join("smart");
-        let relaunch_path = smart_dir.join(format!("{sid}.relaunch"));
+        let smart_dir = crate::paths::smart_dir_no_create();
+        let relaunch_path = crate::paths::sentinel(sid);
         assert!(relaunch_path.exists(), "first trip must commit a fallback");
         let marker_path = smart_dir.join(format!("{sid}.model-fallback"));
         assert!(
@@ -1077,10 +1119,8 @@ mod tests {
         // Second tick's reading names a window that ends well over 7 days
         // after the pinned marker epoch — i.e. the marker was written during
         // an EARLIER window.
-        let second_capture = week_fable_capped_capture(
-            "/Users/example/.claude.limited",
-            Some(OLD_MARKER_EPOCH + 8 * 86_400),
-        );
+        let second_capture =
+            week_fable_capped_capture("limited", Some(OLD_MARKER_EPOCH + 8 * 86_400));
         run_from_statusline(
             &format!(r#"{{"session_id": "{sid}", "cwd": "/tmp/proj"}}"#),
             &second_capture,
@@ -1093,7 +1133,7 @@ mod tests {
         let sentinel = crate::platform::relaunch::read_relaunch(&relaunch_path)
             .expect("relaunch sentinel readable")
             .expect("a fresh fallback must commit a new sentinel");
-        assert_eq!(sentinel.target_profile, "limited");
+        assert_eq!(sentinel.target_account, "limited");
         assert_eq!(
             sentinel.model_override.as_deref(),
             Some("opus"),
@@ -1156,7 +1196,7 @@ mod tests {
         let sid = "sid-foreign-marker-0001";
         spawn_fake_managed_process(&mut fixture, sid);
 
-        let smart_dir = fixture.home.path().join(".claude.shared").join("smart");
+        let smart_dir = crate::paths::smart_dir_no_create();
         std::fs::create_dir_all(&smart_dir).expect("create smart_dir");
         let marker_path = smart_dir.join(format!("{sid}.model-fallback"));
         // 3 days before the reset this tick reports — comfortably inside
@@ -1169,17 +1209,16 @@ mod tests {
         std::fs::write(&marker_path, format!("{} other", RESETS_AT - 3 * 86_400))
             .expect("pre-write a marker for a different profile");
 
-        let capture = week_fable_capped_capture("/Users/example/.claude.limited", Some(RESETS_AT));
+        let capture = week_fable_capped_capture("limited", Some(RESETS_AT));
         run_from_statusline(
             &format!(r#"{{"session_id": "{sid}", "cwd": "/tmp/proj"}}"#),
             &capture,
         );
 
-        let sentinel =
-            crate::platform::relaunch::read_relaunch(&smart_dir.join(format!("{sid}.relaunch")))
-                .expect("relaunch sentinel readable")
-                .expect("a foreign-profile marker must not suppress the fallback");
-        assert_eq!(sentinel.target_profile, "limited");
+        let sentinel = crate::platform::relaunch::read_relaunch(&crate::paths::sentinel(sid))
+            .expect("relaunch sentinel readable")
+            .expect("a foreign-profile marker must not suppress the fallback");
+        assert_eq!(sentinel.target_account, "limited");
         assert_eq!(
             sentinel.model_override.as_deref(),
             Some("opus"),
@@ -1215,22 +1254,21 @@ mod tests {
         let sid = "sid-fable-corrupt-marker-0001";
         spawn_fake_managed_process(&mut fixture, sid);
 
-        let smart_dir = fixture.home.path().join(".claude.shared").join("smart");
+        let smart_dir = crate::paths::smart_dir_no_create();
         std::fs::create_dir_all(&smart_dir).expect("create smart_dir");
         let marker_path = smart_dir.join(format!("{sid}.model-fallback"));
         std::fs::write(&marker_path, b"").expect("seed an empty/corrupt marker");
 
-        let capture = week_fable_capped_capture("/Users/example/.claude.limited", None);
+        let capture = week_fable_capped_capture("limited", None);
         run_from_statusline(
             &format!(r#"{{"session_id": "{sid}", "cwd": "/tmp/proj"}}"#),
             &capture,
         );
 
-        let sentinel =
-            crate::platform::relaunch::read_relaunch(&smart_dir.join(format!("{sid}.relaunch")))
-                .expect("relaunch sentinel readable")
-                .expect("a corrupt marker must not block the fallback from firing");
-        assert_eq!(sentinel.target_profile, "limited");
+        let sentinel = crate::platform::relaunch::read_relaunch(&crate::paths::sentinel(sid))
+            .expect("relaunch sentinel readable")
+            .expect("a corrupt marker must not block the fallback from firing");
+        assert_eq!(sentinel.target_account, "limited");
         assert_eq!(
             sentinel.model_override.as_deref(),
             Some("opus"),
@@ -1269,7 +1307,7 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         crate::testenv::with_test_home(home.path(), || {
             let sid = "sid-fable-overlap-0001";
-            let smart_dir = home.path().join(".claude.shared").join("smart");
+            let smart_dir = crate::paths::smart_dir_no_create();
             std::fs::create_dir_all(&smart_dir).unwrap();
 
             // Tick A: wins the claim and commits successfully — no pidfile
@@ -1279,8 +1317,17 @@ mod tests {
                 stop::claim_model_fallback(sid, "limited"),
                 "tick A must win the claim"
             );
-            stop::commit_and_stop(sid, "limited", "resume", "/tmp/proj", 0, Some("opus"))
-                .expect("tick A's commit succeeds");
+            stop::commit_and_stop(&stop::Commit {
+                sid,
+                from_account: Some("limited"),
+                target_account: "limited",
+                handoff: "resume",
+                cwd: "/tmp/proj",
+                born: 0,
+                model_override: Some("opus"),
+                reason: crate::platform::relaunch::REASON_MODEL_FALLBACK,
+            })
+            .expect("tick A's commit succeeds");
             let marker_path = smart_dir.join(format!("{sid}.model-fallback"));
             let after_a = std::fs::read_to_string(&marker_path).expect("marker written by tick A");
 
@@ -1308,19 +1355,18 @@ mod tests {
         let sid = "sid-week-all-switch-0001";
         spawn_fake_managed_process(&mut fixture, sid);
 
-        let capture = capped_capture("/Users/example/.claude.limited");
+        let capture = capped_capture("limited");
         run_from_statusline(
             &format!(r#"{{"session_id": "{sid}", "cwd": "/tmp/proj"}}"#),
             &capture,
         );
 
-        let smart_dir = fixture.home.path().join(".claude.shared").join("smart");
+        let smart_dir = crate::paths::smart_dir_no_create();
 
-        let sentinel =
-            crate::platform::relaunch::read_relaunch(&smart_dir.join(format!("{sid}.relaunch")))
-                .expect("relaunch sentinel readable")
-                .expect("relaunch sentinel present");
-        assert_eq!(sentinel.target_profile, "healthy");
+        let sentinel = crate::platform::relaunch::read_relaunch(&crate::paths::sentinel(sid))
+            .expect("relaunch sentinel readable")
+            .expect("relaunch sentinel present");
+        assert_eq!(sentinel.target_account, "healthy");
         assert_eq!(
             sentinel.model_override, None,
             "an account-level cap must not set a model override"
@@ -1347,12 +1393,12 @@ mod tests {
         let sid = "sid-fable-sidecar-0001";
         spawn_fake_managed_process(&mut fixture, sid);
 
-        let smart_dir = fixture.home.path().join(".claude.shared").join("smart");
+        let smart_dir = crate::paths::smart_dir_no_create();
         std::fs::create_dir_all(&smart_dir).expect("create smart_dir");
         let sidecar_path = smart_dir.join(format!("{sid}.json"));
         let sidecar = crate::sidecar::Sidecar {
             session_id: Some(sid.to_string()),
-            profile: Some("limited".to_string()),
+            account_id: Some("limited".to_string()),
             passthru: Some(vec![
                 "--add-dir".to_string(),
                 "/tmp/proj".to_string(),
@@ -1364,7 +1410,7 @@ mod tests {
         crate::sidecar::write_sidecar(&sidecar_path, &sidecar).expect("write fixture sidecar");
         let before = std::fs::read(&sidecar_path).expect("read sidecar before");
 
-        let capture = week_fable_capped_capture("/Users/example/.claude.limited", None);
+        let capture = week_fable_capped_capture("limited", None);
         run_from_statusline(
             &format!(r#"{{"session_id": "{sid}", "cwd": "/tmp/proj"}}"#),
             &capture,
@@ -1375,5 +1421,191 @@ mod tests {
             before, after,
             "a model fallback must never rewrite the sidecar file at all"
         );
+    }
+    // ── decision 8: the hook reads csm's cache only ──────────────────────────
+
+    /// A `UsageData` where `limited` is over the cap and `healthy` is a
+    /// viable target, so a Stop hook on a `limited` session takes the tier-2
+    /// path through the target pick.
+    fn usage_limited_and_healthy() -> UsageData {
+        let mut data = usage_with_one_viable_target();
+        data.profiles.insert(
+            "limited".to_string(),
+            ProfileUsage {
+                session: Some(UsageSection {
+                    pct: 10,
+                    resets: None,
+                    resets_at: None,
+                }),
+                week_all: Some(UsageSection {
+                    pct: 100,
+                    resets: None,
+                    resets_at: None,
+                }),
+                ..Default::default()
+            },
+        );
+        data
+    }
+
+    fn write_session_sidecar(sid: &str, account: &str) {
+        let path = crate::paths::sidecar(sid);
+        std::fs::create_dir_all(path.parent().unwrap()).expect("sidecar dir");
+        let sidecar = crate::sidecar::Sidecar {
+            session_id: Some(sid.to_string()),
+            account_id: Some(account.to_string()),
+            ..Default::default()
+        };
+        crate::sidecar::write_sidecar(&path, &sidecar).expect("write sidecar");
+    }
+
+    /// The hook's whole limit path (tier-2 detection, the target pick, the
+    /// commit) runs off csm's cache even when that cache is stale and an
+    /// operator usage command is configured: nothing reaches the command,
+    /// the usage API, the OAuth token or profile endpoint, Orca's socket,
+    /// the Keychain or the process sweep. The
+    /// positive control shows the same fixture DOES reach the command
+    /// through the ordinary `usage::fetch`, so the probe is live.
+    #[test]
+    fn hook_limit_path_reaches_no_command_network_rpc_or_keychain() {
+        let _guard_cmd = crate::testenv::lock_for("CSM_USAGE_CMD");
+        let _guard_bin = crate::testenv::lock_for("CLAUDE_SMART_CLAUDE_BIN");
+        let _guard_ttl = crate::testenv::lock_for("CLAUDE_USAGE_TTL");
+        let prev_ttl = std::env::var_os("CLAUDE_USAGE_TTL");
+        // Every cache read counts as stale for `usage::fetch`.
+        crate::testenv::set_var("CLAUDE_USAGE_TTL", "0");
+        let mut fixture = isolated_env(&usage_limited_and_healthy());
+        let sid = "sid-cache-only-0001";
+        spawn_fake_managed_process(&mut fixture, sid);
+        write_session_sidecar(sid, "limited");
+        crate::usage::reach::take();
+
+        let input = detect::parse_input(&format!(
+            r#"{{"session_id":"{sid}","hook_event_name":"Stop","cwd":"/tmp/proj"}}"#
+        ))
+        .unwrap();
+        let result = run_with_input(input);
+        let reached = crate::usage::reach::take();
+
+        // Positive control: the ordinary fetch runs the command.
+        let _ = crate::usage::fetch();
+        let control = crate::usage::reach::take();
+
+        match prev_ttl {
+            Some(v) => crate::testenv::set_var("CLAUDE_USAGE_TTL", &v.to_string_lossy()),
+            None => crate::testenv::remove_var("CLAUDE_USAGE_TTL"),
+        }
+
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(reached, Vec::<&str>::new(), "the hook reached a probe step");
+        let sentinel = crate::platform::relaunch::read_relaunch(&crate::paths::sentinel(sid))
+            .expect("sentinel readable")
+            .expect("the cached reading drove a limit switch");
+        assert_eq!(sentinel.target_account, "healthy");
+        assert!(control.contains(&"usage-cmd"), "control: {control:?}");
+    }
+
+    /// A statusline tick claims `.switched` and commits hop 1 after the
+    /// hook's classify already passed its `.switched` check. The hook's arm
+    /// must lose the claim and commit nothing: a second commit would bump
+    /// the hop to 2 and the relaunch loop would refuse at its hop cap.
+    #[test]
+    fn a_hook_that_loses_the_claim_to_a_tick_commits_no_second_hop() {
+        let home = tempfile::tempdir().unwrap();
+        crate::testenv::with_test_home(home.path(), || {
+            let sid = "sid-claim-race-0001";
+            write_session_sidecar(sid, "limited");
+            let commit = stop::Commit {
+                sid,
+                from_account: Some("limited"),
+                target_account: "healthy",
+                handoff: "resume",
+                cwd: "/tmp/proj",
+                born: 0,
+                model_override: None,
+                reason: "limit",
+            };
+            // The tick: wins the claim and commits (an unmanaged session's
+            // stop is a no-op).
+            assert!(claim_for(&commit));
+            commit_or_release(&commit).expect("the tick commits");
+            assert_eq!(read_sidecar_hop(sid), 1);
+
+            // The hook, late: no second commit.
+            hook_limit_switch(&commit, "capped").expect("a lost claim is not an error");
+            assert_eq!(read_sidecar_hop(sid), 1, "the hop was bumped twice");
+            let sentinel = crate::platform::relaunch::read_relaunch(&crate::paths::sentinel(sid))
+                .expect("sentinel readable")
+                .expect("sentinel present");
+            assert_eq!(sentinel.hop, 1);
+            let log = std::fs::read_to_string(
+                crate::paths::smart_dir_no_create().join("limit-switch.log"),
+            )
+            .expect("log written");
+            assert!(log.contains("another caller already committed"), "{log}");
+        });
+    }
+
+    /// A SessionEnd with no transcript (`claude upgrade`) returns before any
+    /// read at all: no probe step, and not even the state dir is created.
+    #[test]
+    fn session_end_without_a_turn_returns_at_once() {
+        let _guard_cmd = crate::testenv::lock_for("CSM_USAGE_CMD");
+        let _guard_bin = crate::testenv::lock_for("CLAUDE_SMART_CLAUDE_BIN");
+        let _fixture = isolated_env(&usage_with_no_viable_target());
+        crate::usage::reach::take();
+
+        for raw in [
+            r#"{"session_id":"sid-end-0001","hook_event_name":"SessionEnd","reason":"other"}"#,
+            r#"{"session_id":"sid-end-0002","hook_event_name":"SessionEnd","transcript_path":""}"#,
+            r#"{"session_id":"sid-end-0003","hook_event_name":"SessionEnd","transcript_path":"/nonexistent/csm-test/t.jsonl"}"#,
+        ] {
+            let input = detect::parse_input(raw).unwrap();
+            assert!(detect::session_end_without_turn(&input), "{raw}");
+            assert!(run_with_input(input).is_ok());
+        }
+        assert_eq!(crate::usage::reach::take(), Vec::<&str>::new());
+        assert!(
+            !crate::paths::smart_dir_no_create().exists(),
+            "a turnless SessionEnd must not touch the state dir"
+        );
+    }
+
+    /// A SessionEnd that did have a turn still runs the (cache-only) check.
+    #[test]
+    fn session_end_with_a_transcript_is_not_fast_pathed() {
+        let dir = tempfile::tempdir().unwrap();
+        let t = dir.path().join("t.jsonl");
+        std::fs::write(&t, "{}\n").unwrap();
+        let input = detect::parse_input(&format!(
+            r#"{{"session_id":"s","hook_event_name":"SessionEnd","transcript_path":"{}"}}"#,
+            t.display()
+        ))
+        .unwrap();
+        assert!(!detect::session_end_without_turn(&input));
+        let stop = detect::parse_input(r#"{"session_id":"s","hook_event_name":"Stop"}"#).unwrap();
+        assert!(!detect::session_end_without_turn(&stop));
+    }
+
+    /// The statusline tick's limit path is cache-only too.
+    #[test]
+    fn statusline_tick_reaches_no_probe_step() {
+        let _guard_cmd = crate::testenv::lock_for("CSM_USAGE_CMD");
+        let _guard_bin = crate::testenv::lock_for("CLAUDE_SMART_CLAUDE_BIN");
+        let mut fixture = isolated_env(&usage_limited_and_healthy());
+        let sid = "sid-tick-cache-0001";
+        spawn_fake_managed_process(&mut fixture, sid);
+        crate::usage::reach::take();
+
+        run_from_statusline(
+            &format!(r#"{{"session_id": "{sid}", "cwd": "/tmp/proj"}}"#),
+            &capped_capture("limited"),
+        );
+
+        assert_eq!(crate::usage::reach::take(), Vec::<&str>::new());
+        let sentinel = crate::platform::relaunch::read_relaunch(&crate::paths::sentinel(sid))
+            .expect("sentinel readable")
+            .expect("sentinel present");
+        assert_eq!(sentinel.target_account, "healthy");
     }
 }

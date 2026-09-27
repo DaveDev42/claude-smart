@@ -1,16 +1,16 @@
 mod account;
-mod cas;
 mod cli;
 mod cmd;
 mod config;
+mod e2e;
 mod envvar;
 mod epoch;
-mod homeguard;
 mod hook;
+mod launch_context;
+mod orca;
 mod paths;
 mod picker;
 mod platform;
-mod provision;
 mod reaper;
 mod session;
 mod sidecar;
@@ -28,15 +28,17 @@ use std::ffi::OsString;
 use cmd::support::newuuid;
 
 fn main() -> anyhow::Result<()> {
+    use cli::reserved::Invocation;
+
+    e2e::guard();
     let args: Vec<OsString> = std::env::args_os().collect();
 
     // Top-level `--version`/`-V` and `--help`/`-h` belong to csm itself, not to
-    // claude. (To pass these through to claude, use `csm run -- --version`.)
-    // Intercept only when they are the very first token so `csm run --help`
-    // routing into cmd_run's own usage still works, and only when this
-    // invocation is not the `csm-hook` argv[0] alias — `csm-hook --version`
-    // must still reach `cmd_hook`, not print csm's own version/help.
-    if !cli::reserved::invoked_as_hook_alias(&args) && args.len() >= 2 {
+    // claude — but only under the name `csm`. `csm-hook --version` must reach
+    // `cmd_hook`, and the `claude` alias forwards both to the real claude so
+    // Orca's version probe sees claude's version. Intercept only as the very
+    // first token so `csm run --help` still routes into run's own usage.
+    if cli::reserved::invocation(&args) == Invocation::Csm && args.len() >= 2 {
         match args[1].to_string_lossy().as_ref() {
             "--version" | "-V" => {
                 println!("csm {}", env!("CARGO_PKG_VERSION"));
@@ -50,40 +52,24 @@ fn main() -> anyhow::Result<()> {
         }
     }
 
-    // argv[0]-aware dispatch: if this binary is invoked as a known alias, treat
-    // it as if that subcommand was the first argument (multi-call binary
-    // support). `cli::reserved::dispatch_subcommand` is the single tested
-    // source of truth for this rule, the reserved word list, and the one
-    // csm-global flag that may precede the subcommand word (`--profile`).
+    // argv[0]-aware dispatch (csm, csm-hook, the `claude` alias).
+    // `cli::reserved::dispatch_subcommand` is the single tested source of
+    // truth for this rule and the reserved word list.
     let dispatch = cli::reserved::dispatch_subcommand(&args);
     let rest: &[OsString] = &args[args.len() - dispatch.rest_len..];
 
-    // `csm --profile <name> <subcommand>`: pin CLAUDE_CONFIG_DIR so everything
-    // below — statusline, usage, hook, `profiles dir`, sidecar, the `claude`
-    // passthrough — reads that profile. `run` is the exception: it gets the
-    // flag re-injected instead, so `cli::parser`'s `--profile` stays the one
-    // place a launch resolves its pin.
-    if let Some(name) = dispatch.profile.as_deref()
-        && dispatch.subcommand != "run"
-    {
-        pin_global_profile(name)?;
-    }
-
     match dispatch.subcommand {
-        "run" => cmd::run::run(&cli::reserved::run_args_with_profile(
-            dispatch.profile.as_deref(),
-            rest,
-        )),
+        "run" => cmd::run::run(rest),
         "claude" => cmd::claude::cmd_claude(rest),
         "hook" => cmd::hook::cmd_hook(rest),
-        "profiles" => cmd::profiles::cmd_profiles(rest),
+        "accounts" => cmd::accounts::cmd_accounts(rest),
+        "orca" => cmd::orca::cmd_orca(rest),
+        "migrate" => cmd::migrate::cmd_migrate(rest),
         "config" => cmd::config::cmd_config(rest),
         "usage" => cmd::usage::cmd_usage(rest),
         "cas" => cmd::cas::cmd_cas(rest),
-        "pick-account" => cmd::pick_account::cmd_pick_account(rest),
         "scan" => cmd::scan::cmd_scan(rest),
         "reap" => reaper::cmd(rest),
-        "current-usage" => cmd::pick_account::cmd_current_usage(rest),
         "sidecar" => cmd::sidecar::cmd_sidecar(rest),
         "statusline" => statusline::run(rest),
         "completions" => cmd::completions::cmd_completions(rest),
@@ -97,30 +83,6 @@ fn main() -> anyhow::Result<()> {
             std::process::exit(1);
         }
     }
-}
-
-/// Pin `CLAUDE_CONFIG_DIR` for a csm-global `--profile <name>` that preceded a
-/// reserved subcommand word (`csm --profile work statusline`).
-///
-/// The name resolves through `ProfileMap` via the same
-/// `cmd::support::resolve_profile_dir` that `csm run --profile` uses — registry
-/// hit first, conventional `~/.claude.<name>` synthesis as the fallback — so
-/// both spellings land on the same directory, and the profile is provisioned
-/// the same best-effort way a launch provisions it.
-fn pin_global_profile(name: &str) -> anyhow::Result<()> {
-    use anyhow::Context as _;
-
-    let profiles = account::ProfileMap::load().context("csm: failed to load profiles.json")?;
-    let dir = cmd::support::resolve_profile_dir(name, &profiles)?;
-    provision::ensure_provisioned_soft(std::path::Path::new(&dir));
-
-    // SAFETY: this is `main()` before any subcommand handler runs and before
-    // anything in csm spawns a thread, so the process is single-threaded and
-    // no other thread can be reading the environment concurrently. (The only
-    // other `set_var` call sites in the crate are the test-only ones in
-    // `testenv`.)
-    unsafe { std::env::set_var("CLAUDE_CONFIG_DIR", &dir) };
-    Ok(())
 }
 
 /// Print the top-level `csm --help` surface (noun-verb).
@@ -137,72 +99,68 @@ fn print_help() {
     println!("csm {v} — claude-smart launcher\n");
     println!("USAGE");
     println!("  csm [claude-args...]                 bare = smart launch (implicit `csm run`)");
-    println!(
-        "  csm run [csm-flags] [-- claude...]   smart launcher (session + account + relaunch)"
-    );
-    println!("  csm [--profile <name>] <subcommand> ...\n");
+    println!("  csm run [csm-flags] [-- claude...]   smart launcher (session + relaunch)");
+    println!("  csm <subcommand> ...\n");
     print_run_flags();
     println!();
-    println!("PROFILES (registry — ~/.config/claude-as/profiles.json)");
-    println!("  csm profiles [list]                  list configured profiles");
-    println!("  csm profiles add  <name> [<dir>]     register (dir default ~/.claude.<name>)");
-    println!("  csm profiles set  <name> <dir>       register/overwrite a profile dir");
-    println!("  csm profiles rm   <name>             unregister (refused if it is the default)");
-    println!("  csm profiles use  <name>             set machine default + floor");
-    println!("  csm profiles edit                    interactive editor (TTY)");
-    println!("  csm profiles dir  [<name>]           print a profile's dir (default if omitted)");
+    println!("ACCOUNTS (Orca's Claude accounts — csm keeps no registry of its own)");
+    println!("  csm accounts [list]                  list accounts (active and D's marked)");
+    println!("  csm accounts use <id|prefix|email>   switch (Orca RPC when running, else offline)");
+    println!("  csm accounts add                     log in a new account");
+    println!("  csm accounts import <dir>...         import the login held by config dirs");
+    println!("  csm accounts rm <id|prefix|email>    remove a non-active account");
     println!(
-        "  csm profiles bootstrap [<name>|--all] provision profile env (dir + shared plugins/projects/sessions)"
+        "  csm accounts doctor [--fix] [--offline]   check store, stashes, quarantine and D\n"
     );
-    println!(
-        "  csm profiles doctor [--fix] [--fix-home] [<name>|--all]   check profile dirs / shared links; --fix repairs profiles, --fix-home repairs the ~/.claude shim\n"
-    );
+    println!("ORCA");
+    println!("  csm orca [status]                    Orca as csm sees it (never prints secrets)");
+    println!("  csm orca setup                       create the `claude` alias for Orca\n");
+    println!("MIGRATION (from the profile-based setup)");
+    println!("  csm migrate [plan]                   read-only: what import/retire would do");
+    println!("  csm migrate import [--dry-run]       import profile logins into Orca");
+    println!("  csm migrate retire [--dry-run] [name...]  retire verified profile dirs\n");
     println!("CONFIG (csm's own — ~/.config/claude-smart/config.json)");
     println!("  csm config [show]                    print the config JSON");
     println!("  csm config get launch-command        print the resolved launch command");
     println!(
         "  csm config set launch-command <cmd>...   launch <cmd> instead of `claude` (e.g. happy)"
     );
-    println!("  csm config unset launch-command      revert to launching `claude`\n");
-    println!("USAGE METERING (local, per profile)");
+    println!("  csm config unset launch-command      revert to launching `claude`");
     println!(
-        "  csm usage [--json] [--no-fetch] [--refresh] [--refresh-oauth]   multi-profile usage table (offline-aware)"
+        "  csm config get|set|unset min-claude-version [<v>]   the lowest claude a limit switch accepts beside an unsupervised session\n"
+    );
+    println!("USAGE METERING (local, per account)");
+    println!(
+        "  csm usage [--json] [--no-fetch] [--refresh]   multi-account usage table (offline-aware)"
     );
     println!(
         "  csm usage capture                    read statusLine stdin, merge into the store\n"
     );
     println!("OTHER");
-    println!("  csm pick-account [<cur>] [--include-current]   scoring → winner profile");
     println!("  csm scan [<cwd>]                     session TSV for the picker");
     println!(
         "  csm reap [--dry-run] [--term] [--all|--session <sid>]   kill orphan processes left by claude"
     );
     println!("  csm sidecar {{read|write|merge|flags}} <sid> [k=v...]");
-    println!("  csm statusline                       `<profile>@<host>` for the shell prompt");
+    println!("  csm statusline                       Claude Code statusLine segment");
     println!("  csm completions {{zsh|bash|pwsh}}      shell completions");
     println!("  csm newuuid                          fresh lowercase UUID v4");
     println!(
-        "  csm claude <args...>                 run claude under csm's profile, args forwarded verbatim"
-    );
-    println!(
-        "  csm cas ...                          eval-class shim contract (machine interface)\n"
+        "  csm claude <args...>                 run claude in csm's runtime dir, args verbatim\n"
     );
     println!("Words not listed above forward to `claude` (e.g. `csm mcp`, `csm doctor`).");
     println!("To pass a csm-reserved flag to claude, use `csm run -- <args>`.");
+    println!("Invoked as `claude` (the `csm orca setup` alias), claude's own subcommands,");
+    println!("--version and --help go to the real claude; csm's words are not dispatched.");
 }
 
 /// The `RUN FLAGS` block — shared by `csm --help` and [`print_run_help`], so
 /// the two can never drift.
 fn print_run_flags() {
-    println!("RUN FLAGS (account + session selection)");
-    println!("  --profile <name>                     launch under this profile (skip all picking)");
-    println!("  -i, --interactive                    manual pick: force account + session pickers");
+    println!("RUN FLAGS (session selection)");
+    println!("  -i, --interactive                    open the session picker");
     println!(
-        "  -A, --pick-account                   force an account pick this launch (overrides --no-pick)"
-    );
-    println!("  --no-pick                            keep current profile, no scoring");
-    println!(
-        "  -n, --new                            start a fresh session (skip the session picker)"
+        "  -n, --new                            start a fresh session (shadows claude's -n/--name)"
     );
     println!("  -c, --continue                       resume newest free session");
     println!("  -r, --resume [<id>|<alias>]          resume a session (csm also reads the id)");
@@ -218,11 +176,10 @@ fn print_run_flags() {
     println!(
         "  --permission-mode <p>                forwarded to claude; remembered across a limit-switch hop"
     );
-    println!("  (the six flags above are forwarded to claude AND read by csm; every other claude");
+    println!("  (csm stops reading flags at the first positional argument; every other claude");
     println!("   flag passes through untouched — use `csm run -- <args>` to force passthrough)");
-    println!("  (default: always opens the session picker — new / continue / pick existing —");
-    println!("   and auto-picks the best account by usage; opens the account picker when no");
-    println!("   usable usage data is available instead of silently staying put)");
+    println!("  (-p/--print or a piped stdin runs claude verbatim. Inside Orca nothing prompts:");
+    println!("   no session flag starts a fresh session. Elsewhere the session picker opens.)");
 }
 
 /// `csm run --help` — run's own usage, printed instead of being forwarded to

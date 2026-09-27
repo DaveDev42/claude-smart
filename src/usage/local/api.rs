@@ -141,12 +141,21 @@ pub(crate) fn http_client(
 pub fn fetch_usage(token: &str, base: &str) -> Result<OauthUsage, ApiError> {
     use std::time::Duration;
 
+    crate::usage::reach::note("usage-api");
+
     validate_base(base)?;
+    // Test guard: a test may only ever reach a loopback fake, never the
+    // real usage API.
+    #[cfg(test)]
+    if !(base.starts_with("http://127.0.0.1") || base.starts_with("http://localhost")) {
+        return Err(ApiError::UnsafeBase(format!("cfg(test): {base}")));
+    }
 
     let url = format!("{}/api/oauth/usage", base.trim_end_matches('/'));
 
+    // 10 s, as Orca (M:240053-240080).
     let client =
-        http_client(Duration::from_secs(8)).map_err(|e| ApiError::Network(e.to_string()))?;
+        http_client(Duration::from_secs(10)).map_err(|e| ApiError::Network(e.to_string()))?;
 
     let resp = client
         .get(&url)
@@ -599,6 +608,16 @@ mod tests {
             || {
                 assert_eq!(resolve_base(), "https://custom.example");
             },
+        );
+    }
+
+    /// Guard: under `cfg(test)` the real usage API is unreachable.
+    #[test]
+    fn fetch_usage_refuses_the_real_api_in_tests() {
+        let err = fetch_usage("tok_example", DEFAULT_BASE).unwrap_err();
+        assert!(
+            matches!(err, ApiError::UnsafeBase(ref b) if b.contains("cfg(test)")),
+            "{err:?}"
         );
     }
 }

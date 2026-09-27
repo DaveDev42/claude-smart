@@ -114,6 +114,46 @@ const NEVER_WITH_VALUE: &[&str] = &[
     "--json-schema",
 ];
 
+/// How many value tokens a claude flag takes, as far as csm knows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Arity {
+    /// A boolean flag.
+    Zero,
+    /// Exactly one value.
+    One,
+    /// One or more values, up to the next flag.
+    Many,
+}
+
+/// Flags that take one value but are never carried and never reach
+/// [`carry_passthru`]'s lists (they only matter to `cli::parser`'s
+/// first-positional rule, so their value is not mistaken for a prompt).
+const PARSER_ONE_VALUE: &[&str] = &[
+    "--permission-prompt-tool",
+    "--max-turns",
+    "--max-thinking-tokens",
+    "--advisor",
+    "--resume-session-at",
+];
+
+/// The arity of a claude flag name (no `=value` part), or `None` for a flag
+/// csm has never heard of. The parser treats an unknown flag as boolean, the
+/// choice that can never swallow a csm flag after it.
+pub fn arity(flag: &str) -> Option<Arity> {
+    if BOOLEAN.contains(&flag) {
+        Some(Arity::Zero)
+    } else if ONE_VALUE.contains(&flag)
+        || NEVER_WITH_VALUE.contains(&flag)
+        || PARSER_ONE_VALUE.contains(&flag)
+    {
+        Some(Arity::One)
+    } else if VARIADIC.contains(&flag) {
+        Some(Arity::Many)
+    } else {
+        None
+    }
+}
+
 /// Split a token into its flag name and whether it carried an inline value.
 ///
 /// `--settings=x` → `("--settings", true)`; `--settings` → `("--settings",
@@ -251,6 +291,16 @@ mod tests {
             .map(|s| s.to_string_lossy().into_owned())
             .collect();
         (carried, out.dropped)
+    }
+
+    #[test]
+    fn arity_knows_each_list() {
+        assert_eq!(arity("--verbose"), Some(Arity::Zero));
+        assert_eq!(arity("--settings"), Some(Arity::One));
+        assert_eq!(arity("--output-format"), Some(Arity::One));
+        assert_eq!(arity("--max-turns"), Some(Arity::One));
+        assert_eq!(arity("--add-dir"), Some(Arity::Many));
+        assert_eq!(arity("--no-such-flag"), None);
     }
 
     #[test]

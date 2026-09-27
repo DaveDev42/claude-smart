@@ -22,9 +22,16 @@ exclude      = [
     "CLAUDE.md",
     ".claude/",
     "e2e/",
+    "tools/",
     "release-please-config.json",
     ".release-please-manifest.json",
 ]
+
+# `e2e` builds the sandbox binary e2e/run.sh drives (src/e2e.rs): a fake
+# Keychain, a sandbox-only process table, an injectable Orca version and the
+# store-write points. Never enabled for a release or a registry build.
+[features]
+e2e = []
 
 [[bin]]
 name = "csm"
@@ -35,7 +42,7 @@ path = "src/main.rs"
 # serde model: sidecar/<sid>.json, .relaunch sentinel, .usage-cache.json,
 # profiles.json, hook stdin contract, scan index storage
 serde      = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde_json = { version = "1", features = ["preserve_order", "arbitrary_precision"] }
 
 # completions ONLY (csm completions {zsh|bash|pwsh}); never touches csm's own argv
 clap          = { version = "4", features = ["derive", "env"] }
@@ -107,7 +114,7 @@ features         = ["blocking", "rustls-no-provider"]
 # ─── POSIX-only ──────────────────────────────────────────────────────────────
 # tcsetpgrp/setpgid (foreground supervisor), kill() (hook SIGTERM), isatty (TTY gate)
 [target.'cfg(unix)'.dependencies]
-nix = { version = "0.31", features = ["hostname", "process", "signal", "term", "fs"] }
+nix = { version = "0.31", features = ["hostname", "process", "signal", "term", "fs", "user"] }
 
 # ─── Windows-only ────────────────────────────────────────────────────────────
 # GenerateConsoleCtrlEvent, SetConsoleCtrlHandler, WaitFor*Object, CreateProcess

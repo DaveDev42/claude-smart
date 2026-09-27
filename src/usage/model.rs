@@ -177,7 +177,7 @@ pub struct Attention {
     /// Stable, age-free description — see the struct doc.
     pub message: String,
     /// A complete, copy-pasteable shell command that resolves this warning:
-    /// `csm --profile <name>` for [`AttentionKind::NeedsRefresh`],
+    /// `csm accounts use <id>` for [`AttentionKind::NeedsRefresh`],
     /// `CLAUDE_CONFIG_DIR=<dir> claude auth login` for
     /// [`AttentionKind::NeedsLogin`].
     pub action: String,
@@ -586,7 +586,7 @@ mod tests {
         let att = Attention {
             kind: AttentionKind::NeedsRefresh,
             message: "access token expired".to_string(),
-            action: "csm --profile home".to_string(),
+            action: "csm accounts use home".to_string(),
             since_epoch: None,
         };
         let json = serde_json::to_string(&att).unwrap();

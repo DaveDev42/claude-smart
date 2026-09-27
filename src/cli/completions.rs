@@ -38,21 +38,16 @@ pub enum CompletionsSubcmd {
     /// Launch claude (default subcommand when no subcommand is given).
     #[command(name = "run")]
     Run {
-        /// Force interactive TTY mode.
+        /// Open the session picker.
         #[arg(short = 'i', long)]
         interactive: bool,
-        /// Start a fresh session (skip the session picker).
+        /// Start a fresh session (skip the session picker). Shadows claude's
+        /// `-n, --name`.
         #[arg(short = 'n', long)]
         new: bool,
         /// Continue the newest free session.
         #[arg(short = 'c', long)]
         continue_: bool,
-        /// Force an account pick even if the current account is healthy.
-        #[arg(short = 'A', long = "pick-account")]
-        pick_account: bool,
-        /// Suppress automatic account picking.
-        #[arg(long)]
-        no_pick: bool,
         /// Resume a specific session by UUID or title alias.
         #[arg(short = 'r', long, value_name = "ID_OR_ALIAS")]
         resume: Option<String>,
@@ -68,9 +63,6 @@ pub enum CompletionsSubcmd {
         /// Explicit session id (forwarded to claude as --session-id).
         #[arg(long, value_name = "UUID")]
         session_id: Option<String>,
-        /// Pin a specific Claude profile (skips account picking).
-        #[arg(long, value_name = "PROFILE")]
-        profile: Option<String>,
         /// Extra arguments forwarded verbatim to claude (after `--`).
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         passthru: Vec<String>,
@@ -79,39 +71,48 @@ pub enum CompletionsSubcmd {
     /// Stop/SubagentStop/SessionEnd hook (reads event JSON from stdin).
     #[command(name = "hook")]
     Hook {
-        /// Profile directory that owns this hook instance (CLAUDE_CONFIG_DIR for this profile).
+        /// Config directory that owns this hook instance (defaults to CLAUDE_CONFIG_DIR, then D).
         #[arg(long, value_name = "DIR")]
         owner: Option<String>,
     },
 
-    /// Claude-as profile switcher + registry manager (binary half; shim evals
-    /// the eval-class output, calls management verbs directly).
-    ///
-    /// Eval-class ops (after `--`, with `--eval --shell`): `<profile>`, `-`,
-    /// `-g <profile>`, `resync`, `status`.
-    /// Management verbs (direct, no `--eval`): `list`, `add <name> [<dir>]`,
-    /// `set <name> <dir>`, `remove|rm <name>`, `use <name>`, `edit`.
-    #[command(name = "cas")]
+    /// Deprecated. `--print-default-dir` prints csm's runtime dir; `--eval`
+    /// prints nothing (the profile switcher is gone).
+    #[command(name = "cas", hide = true)]
     Cas {
-        /// Emit the eval-able export line (required for profile switching).
+        /// Deprecated no-op (prints nothing on stdout).
         #[arg(long)]
         eval: bool,
-        /// Shell dialect for the export line (zsh|bash|pwsh).
+        /// Ignored.
         #[arg(long, value_name = "SHELL")]
         shell: Option<String>,
-        /// Print the resolved default CLAUDE_CONFIG_DIR and exit (floor SSOT).
+        /// Print csm's runtime dir `D` and exit.
         #[arg(long)]
         print_default_dir: bool,
-        /// Operation and its arguments (after `--`, or a management verb).
+        /// Ignored.
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         op_args: Vec<String>,
     },
 
-    /// Profile registry (human-facing noun-verb front over the cas handlers).
-    #[command(name = "profiles")]
-    Profiles {
+    /// Orca's Claude accounts: list, switch, add, import, remove, check.
+    #[command(name = "accounts")]
+    Accounts {
         #[command(subcommand)]
-        verb: Option<ProfilesVerb>,
+        verb: Option<AccountsVerb>,
+    },
+
+    /// Orca interop: status, and the `claude` alias for Orca's command override.
+    #[command(name = "orca")]
+    Orca {
+        #[command(subcommand)]
+        verb: Option<OrcaVerb>,
+    },
+
+    /// Move a profile-based install onto Orca's account model.
+    #[command(name = "migrate")]
+    Migrate {
+        #[command(subcommand)]
+        verb: Option<MigrateVerb>,
     },
 
     /// csm's own global config (~/.config/claude-smart/config.json).
@@ -121,7 +122,7 @@ pub enum CompletionsSubcmd {
         verb: Option<ConfigVerb>,
     },
 
-    /// Multi-profile usage table (registry∪local view), offline-aware.
+    /// Multi-account usage table (Orca accounts ∪ local view), offline-aware.
     #[command(name = "usage")]
     Usage {
         /// Emit the joined registry∪local view as JSON.
@@ -133,23 +134,8 @@ pub enum CompletionsSubcmd {
         /// Bypass the cache and every profile's own TTL; re-probe live.
         #[arg(long)]
         refresh: bool,
-        /// Headless collectors: refresh a profile's expired OAuth access
-        /// token when no Claude Code session is running under it.
-        #[arg(long)]
-        refresh_oauth: bool,
         #[command(subcommand)]
         verb: Option<UsageVerb>,
-    },
-
-    /// Pick the best account to launch under.
-    #[command(name = "pick-account")]
-    PickAccount {
-        /// Current profile name (to optionally exclude from candidates).
-        #[arg(value_name = "CURRENT")]
-        current: Option<String>,
-        /// Include the current profile in scoring; return empty on no-op.
-        #[arg(long)]
-        include_current: bool,
     },
 
     /// Scan a directory for Claude Code sessions and print TSV rows.
@@ -177,14 +163,6 @@ pub enum CompletionsSubcmd {
         session: Option<String>,
     },
 
-    /// Print session/week usage percentages for a profile.
-    #[command(name = "current-usage")]
-    CurrentUsage {
-        /// Profile name to query.
-        #[arg(value_name = "PROFILE")]
-        profile: String,
-    },
-
     /// Read/write/merge session sidecar state.
     #[command(name = "sidecar")]
     Sidecar {
@@ -199,7 +177,7 @@ pub enum CompletionsSubcmd {
         kv_args: Vec<String>,
     },
 
-    /// Print `<profile>@<host>` for shell prompt integration.
+    /// Render the Claude Code statusLine segment.
     #[command(name = "statusline")]
     Statusline,
 
@@ -214,7 +192,7 @@ pub enum CompletionsSubcmd {
     #[command(name = "newuuid")]
     Newuuid,
 
-    /// Run claude under csm's profile, arguments forwarded verbatim.
+    /// Run claude in csm's runtime dir, arguments forwarded verbatim.
     #[command(name = "claude")]
     Claude {
         /// Arguments handed to claude untouched (no csm parsing at all).
@@ -224,8 +202,7 @@ pub enum CompletionsSubcmd {
 }
 
 /// `csm usage <verb>` — the statusLine-stdin capture subverb, distinct from
-/// `csm usage`'s own flags (`--json`/`--no-fetch`/`--refresh`/
-/// `--refresh-oauth`).
+/// `csm usage`'s own flags (`--json`/`--no-fetch`/`--refresh`).
 #[derive(clap::Subcommand)]
 pub enum UsageVerb {
     /// Read statusLine JSON from stdin, merge into the local store.
@@ -233,48 +210,76 @@ pub enum UsageVerb {
     Capture,
 }
 
-/// `csm profiles <verb>` — registry management verbs.
+/// `csm accounts <verb>`.
 #[derive(clap::Subcommand)]
-pub enum ProfilesVerb {
-    /// List configured profiles (current/default marked).
+pub enum AccountsVerb {
+    /// List Orca's host accounts (active and D's account marked).
     #[command(name = "list")]
     List,
-    /// Register a new profile (dir defaults to ~/.claude.<name>).
-    #[command(name = "add")]
-    Add {
-        /// Profile name.
-        name: String,
-        /// Config dir (optional; defaults to ~/.claude.<name>).
-        dir: Option<String>,
-    },
-    /// Register/overwrite a profile's config dir.
-    #[command(name = "set")]
-    Set {
-        /// Profile name.
-        name: String,
-        /// Config dir.
-        dir: String,
-    },
-    /// Unregister a profile (refused if it is the default).
-    #[command(name = "rm", alias = "remove")]
-    Rm {
-        /// Profile name.
-        name: String,
-    },
-    /// Set the machine default profile (state file + platform floor).
+    /// Switch the active account (Orca RPC when Orca runs, else offline).
     #[command(name = "use")]
     Use {
-        /// Profile name.
-        name: String,
+        /// Account id, unique id prefix, or email.
+        account: String,
     },
-    /// Interactive editor (TTY).
-    #[command(name = "edit")]
-    Edit,
-    /// Print a profile's config dir (default profile when omitted).
-    #[command(name = "dir")]
-    Dir {
-        /// Profile name (default profile when omitted).
-        name: Option<String>,
+    /// Log in a new account (Orca's own flow when Orca runs).
+    #[command(name = "add")]
+    Add,
+    /// Import the login held by one or more existing config dirs.
+    #[command(name = "import")]
+    Import {
+        /// Config dirs to import from.
+        #[arg(required = true)]
+        dirs: Vec<String>,
+    },
+    /// Remove a non-active account.
+    #[command(name = "rm")]
+    Rm {
+        /// Account id, unique id prefix, or email.
+        account: String,
+    },
+    /// Check the account store, stashes, quarantine and D (never prints secrets).
+    #[command(name = "doctor")]
+    Doctor {
+        /// Repair what can be repaired safely.
+        #[arg(long)]
+        fix: bool,
+        /// Skip the profile check that needs the network.
+        #[arg(long)]
+        offline: bool,
+    },
+}
+
+/// `csm orca <verb>`.
+#[derive(clap::Subcommand)]
+pub enum OrcaVerb {
+    /// Show Orca's state as csm sees it (never prints secrets).
+    #[command(name = "status")]
+    Status,
+    /// Create the `claude` alias for Orca's `agentCmdOverrides.claude`.
+    #[command(name = "setup")]
+    Setup,
+}
+
+/// `csm migrate <verb>`.
+#[derive(clap::Subcommand)]
+pub enum MigrateVerb {
+    /// Read-only: what `import` and `retire` would do.
+    #[command(name = "plan")]
+    Plan,
+    /// Import profile logins into Orca and carry config over to ~/.claude.
+    #[command(name = "import")]
+    Import {
+        /// Print what would be done and change nothing.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Retire migrated profile dirs and the old profile registry.
+    #[command(name = "retire")]
+    Retire {
+        /// Print what would be done and change nothing.
+        #[arg(long)]
+        dry_run: bool,
     },
 }
 
@@ -287,13 +292,14 @@ pub enum ConfigVerb {
     /// Print the resolved value of a config key.
     #[command(name = "get")]
     Get {
-        /// Config key (currently: launch-command).
+        /// Config key: launch-command or min-claude-version.
         key: String,
     },
-    /// Set a config key. e.g. `set launch-command happy`.
+    /// Set a config key. e.g. `set launch-command happy`,
+    /// `set min-claude-version 2.1.283`.
     #[command(name = "set")]
     Set {
-        /// Config key (currently: launch-command).
+        /// Config key: launch-command or min-claude-version.
         key: String,
         /// Value tokens (the launch command argv).
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
@@ -302,7 +308,7 @@ pub enum ConfigVerb {
     /// Clear a config key (revert to default). e.g. `unset launch-command`.
     #[command(name = "unset")]
     Unset {
-        /// Config key (currently: launch-command).
+        /// Config key: launch-command or min-claude-version.
         key: String,
     },
 }
@@ -326,6 +332,18 @@ mod tests {
     use super::*;
 
     // ── completions output is non-empty for all shells ────────────────────────
+
+    /// `csm usage --refresh-oauth` is rejected as an unknown flag, so no
+    /// shell may offer it.
+    #[test]
+    fn completions_never_offer_refresh_oauth() {
+        for shell in [Shell::Zsh, Shell::Bash, Shell::PowerShell] {
+            let mut buf = Vec::new();
+            generate(shell, &mut buf);
+            let text = String::from_utf8_lossy(&buf);
+            assert!(!text.contains("refresh-oauth"), "{shell:?}");
+        }
+    }
 
     #[test]
     fn generate_zsh_completions_is_non_empty() {
@@ -397,14 +415,13 @@ mod tests {
         for sub in &[
             "run",
             "hook",
-            "profiles",
             "config",
             "usage",
-            "cas",
-            "pick-account",
+            "accounts",
+            "orca",
+            "migrate",
             "scan",
             "reap",
-            "current-usage",
             "sidecar",
             "statusline",
             "completions",
@@ -448,6 +465,8 @@ mod tests {
         use crate::cli::reserved::CSM_RESERVED_SUBCOMMANDS;
 
         let cmd = CsmCompletionsApp::command();
+        // Hidden subcommands (the deprecated `cas`) still count: dispatch
+        // still reserves the word.
         let mut names: Vec<&str> = cmd
             .get_subcommands()
             .map(|c| c.get_name())

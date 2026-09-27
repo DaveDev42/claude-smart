@@ -1,4 +1,4 @@
-//! Relaunch loop and the `RelaunchSentinel` serde model.
+//! Relaunch loop, the limit-switch sentinel and the follow file.
 //!
 //! The relaunch loop (`relaunch_loop`) is platform-agnostic and consumes a
 //! `&dyn Launcher` + `ProcCheck`.  The public entry point `run_relaunch_loop`
@@ -9,36 +9,87 @@
 //! `platform/windows.rs` and CLAUDE.md's "Known gaps" section).  Shipping the
 //! relaunch loop on Windows before those pass risks losing the supervisor
 //! (Ctrl-C kills it) or truncating the session transcript on a limit switch.
+//! On Windows a limit hit still switches the account; the user resumes by
+//! hand (`run_once` prints the one line that says how).
 //!
-//! ## RelaunchSentinel — read-compat with legacy zsh `write_relaunch`
+//! ## Who switches
 //!
-//! The legacy zsh helper wrote the sentinel via `jq` with `--argjson hop` (a JSON
-//! NUMBER) and `--argjson born` (a JSON NUMBER).  The Rust binary must round-trip
-//! these files that may already exist on disk at cutover.  Both fields are `i64`.
+//! The hook never switches: it writes the sentinel
+//! `<state>/sentinel/<sid>.json` and stops its child. The supervisor then
+//! runs `crate::account::limit_switch::run_hop`, which takes `switch.lock`,
+//! decides leader or follower, and (as leader) switches `D` through
+//! `orca::switch`. Every hop runs in the same `D`; only the account in it
+//! changes. A leader also drops `<state>/follow/<sid>.json` for each peer
+//! session still on the capped account, which that peer's own Stop hook
+//! turns into a relaunch at its next turn boundary.
 //!
-//! Compare with `Sidecar`: the sidecar `hop` was written by jq `--arg` (a JSON
-//! STRING).  The distinction is **per-file**, not ambiguous within one file.
-//! See `sidecar/mod.rs` for the complementary type.
+//! ## Recovery
+//!
+//! An unfinished switch left by a dead csm is repaired here only AFTER the
+//! child has spawned (a thread started right after the spawn), never before
+//! exec (design S8). A failed repair prints one line pointing at
+//! `csm accounts doctor --fix` (to csm's log in an Orca pane).
+//!
+//! ## Sentinel read-compat
+//!
+//! `hop` and `born` stay JSON numbers (the legacy zsh writer used
+//! `--argjson`); `target_profile` from an older binary reads as
+//! `target_account`, and every field this version added defaults.  Compare
+//! with `Sidecar`, whose `hop` is a JSON STRING (`sidecar/mod.rs`).
 
 use std::ffi::OsString;
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
-/// `<sid>.relaunch` — atomic JSON sentinel written by the hook, consumed by the
-/// supervisor's post-wait path.
+use crate::account::limit_switch::HopOutcome;
+
+// ─── sentinel ─────────────────────────────────────────────────────────────────
+
+/// The sentinel schema version this binary writes.
+pub const SENTINEL_V: u32 = 1;
+
+/// `reason` of a same-account model fallback (no switch).
+pub const REASON_MODEL_FALLBACK: &str = "model-fallback";
+/// `reason` of a peer relaunch after another session's switch (no switch).
+pub const REASON_FOLLOW: &str = "follow";
+
+fn sentinel_v() -> u32 {
+    SENTINEL_V
+}
+
+/// `<state>/sentinel/<sid>.json` — atomic JSON sentinel written by the hook,
+/// consumed by the supervisor's post-wait path.
 ///
-/// Field names match the legacy zsh `write_relaunch` jq output exactly —
-/// external readers of `<sid>.relaunch` depend on this: `session_id`,
-/// `target_profile`, `cwd`, `handoff`, `hop`, `born`.
+/// Design fields: `v`, `target_account`, `from_account`, `from_gen`,
+/// `reason`, `at`. The relaunch itself also needs `session_id`, `cwd`,
+/// `handoff`, `hop`, `born` and `model_override`, kept from the earlier
+/// sentinel.
 ///
-/// `hop` is a JSON **number** here (contrast with `Sidecar.hop` which is a JSON
-/// string).  `born` is compared against the `born` epoch written into `<sid>.pid`
-/// at the start of this loop iteration — the stale-sentinel rejection linchpin.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// `born` is compared against the `born` epoch written into `<sid>.pid` at the
+/// start of this loop iteration — the stale-sentinel rejection linchpin.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RelaunchSentinel {
+    #[serde(default = "sentinel_v")]
+    pub v: u32,
     pub session_id: String,
-    pub target_profile: String,
+    /// The account the hook picked (an Orca account id). For a model
+    /// fallback or a follow, the account the session resumes on.
+    #[serde(alias = "target_profile")]
+    pub target_account: String,
+    /// The session's account when the hook fired (`None` when unknown).
+    #[serde(default)]
+    pub from_account: Option<String>,
+    /// The switch journal's `gen` when the hook fired: a larger `gen` at
+    /// consume time means another csm already switched.
+    #[serde(default)]
+    pub from_gen: u64,
+    /// `limit:<dimension>`, [`REASON_MODEL_FALLBACK`] or [`REASON_FOLLOW`].
+    #[serde(default)]
+    pub reason: String,
+    /// Epoch seconds the hook wrote this.
+    #[serde(default)]
+    pub at: i64,
     pub cwd: String,
     pub handoff: String,
     /// JSON number.  The loop breaks when `hop > MAX_HOPS`.
@@ -47,60 +98,89 @@ pub struct RelaunchSentinel {
     pub born: i64,
     /// `Some(model)` for a same-account model fallback (a `week_fable` cap —
     /// see `crate::hook::detect::fable_fallback_model`): the hop resumes the
-    /// SAME session on this model instead of switching profiles.  `None` is
-    /// an ordinary account switch, the shape every sentinel had before the
-    /// fallback existed.  `#[serde(default)]` so an older sentinel written
-    /// before this field existed still reads back as `None`, never a parse
-    /// error (rollback safety, same contract as every other field here).
+    /// SAME session on this model instead of switching accounts.
     #[serde(default)]
     pub model_override: Option<String>,
 }
 
+impl RelaunchSentinel {
+    /// Does consuming this sentinel ask for an account switch?
+    pub fn wants_switch(&self) -> bool {
+        self.model_override.is_none() && self.reason != REASON_FOLLOW
+    }
+}
+
 /// Maximum number of limit-switch hops before the relaunch loop breaks.
-/// Matches the legacy zsh `MAX_HOPS=1` constant.
-// Only the unix relaunch loop reads this; on Windows the loop is gated off
-// (`run_relaunch_loop` → `run_once`), so the const is unused in the Windows bin
-// build (still exercised by the cfg(test) suite). Kept for when the Windows loop
-// is ungated.
+/// Matches the legacy zsh `MAX_HOPS=1` constant. A follow does not count.
 #[cfg_attr(windows, allow(dead_code))]
 pub const MAX_HOPS: i64 = 1;
 
-/// Read `<sid>.relaunch` from `path`.  Returns `None` if the file is absent;
-/// propagates I/O or parse errors.
-// Unused in the Windows bin build (relaunch loop gated off); see `MAX_HOPS`.
-#[cfg_attr(windows, allow(dead_code))]
+/// Read a sentinel from `path`.  Returns `None` if the file is absent;
+/// propagates I/O or parse errors (the error never quotes the file).
 pub fn read_relaunch(path: &Path) -> anyhow::Result<Option<RelaunchSentinel>> {
+    read_json(path)
+}
+
+/// Write `sentinel` atomically to `path` (parent created 0700).
+pub fn write_relaunch(path: &Path, sentinel: &RelaunchSentinel) -> anyhow::Result<()> {
+    write_json(path, sentinel)
+}
+
+// ─── follow file ──────────────────────────────────────────────────────────────
+
+/// `<state>/follow/<sid>.json`: another session's leader switched `D` away
+/// from this session's account. The peer relaunches on its next Stop hook
+/// when `at` is not older than its own launch.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FollowFile {
+    #[serde(default = "sentinel_v")]
+    pub v: u32,
+    /// The switch journal's `gen` after the leader's switch.
+    #[serde(default, rename = "gen")]
+    pub generation: u64,
+    pub to_account: String,
+    /// Epoch seconds the leader wrote this.
+    #[serde(default)]
+    pub at: i64,
+}
+
+pub fn read_follow(path: &Path) -> anyhow::Result<Option<FollowFile>> {
+    read_json(path)
+}
+
+pub fn write_follow(path: &Path, follow: &FollowFile) -> anyhow::Result<()> {
+    write_json(path, follow)
+}
+
+fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> anyhow::Result<Option<T>> {
     match std::fs::read_to_string(path) {
-        Ok(s) => Ok(Some(serde_json::from_str(&s)?)),
+        Ok(s) => serde_json::from_str(&s)
+            .map(Some)
+            .map_err(|e| anyhow::anyhow!("{}: unparseable ({:?})", path.display(), e.classify())),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(e.into()),
     }
 }
 
-/// Write `sentinel` atomically to `path` via a temp file + rename (same filesystem).
-pub fn write_relaunch(path: &Path, sentinel: &RelaunchSentinel) -> anyhow::Result<()> {
-    let tmp = path.with_extension("relaunch.tmp");
-    let json = serde_json::to_string(sentinel)?;
-    std::fs::write(&tmp, json)?;
-    // Clean up the tmp file if the atomic rename fails (e.g. cross-filesystem),
-    // so a failed write never leaves a stale .relaunch.tmp on disk.
-    std::fs::rename(&tmp, path).inspect_err(|_| {
-        let _ = std::fs::remove_file(&tmp);
-    })?;
+fn write_json<T: Serialize>(path: &Path, value: &T) -> anyhow::Result<()> {
+    if let Some(parent) = path.parent() {
+        crate::orca::fsx::create_dir_all(parent, 0o700)?;
+    }
+    let json = serde_json::to_vec(value)?;
+    crate::orca::fsx::write_atomic(path, &json, crate::orca::fsx::WriteOpts::PRIVATE)?;
     Ok(())
 }
 
+// ─── loop ─────────────────────────────────────────────────────────────────────
+
 /// Entry point for the foreground relaunch loop (unix).
 ///
-/// `launcher`    — platform-specific `Launcher` impl (POSIX or Windows).
-/// `spec`        — launch parameters (CLI argv, sidecar sid, profile dir, etc.).
-///
 /// The loop runs until:
-/// - No `.relaunch` sentinel appears after claude exits, OR
+/// - no sentinel appears after claude exits, OR
 /// - `sentinel.born < launch_born` (stale sentinel — ignore), OR
-/// - `sentinel.hop > MAX_HOPS`, OR
-/// - `target_profile` is unknown (abort), OR
-/// - A sentinel atomic-consume race is detected.
+/// - `sentinel.hop > MAX_HOPS` (a follow is exempt), OR
+/// - a recovery of an unfinished switch failed (one line, no relaunch), OR
+/// - a sentinel atomic-consume race is detected.
 #[cfg(not(windows))]
 pub fn run_relaunch_loop(
     launcher: &dyn crate::platform::launcher::Launcher,
@@ -111,8 +191,8 @@ pub fn run_relaunch_loop(
 
 /// Entry point on Windows — the console-stop relaunch path is gated OFF until its
 /// two BLOCKING empirical checks pass (see module doc + `platform/windows.rs`).
-/// Falls back to a single launch with no relaunch so an unverified supervisor can
-/// never eat an interactive Ctrl-C or truncate the transcript on a switch.
+/// Falls back to a single launch: a limit still switches the account after
+/// the child exits, then one line tells the user how to resume.
 #[cfg(windows)]
 pub fn run_relaunch_loop(
     launcher: &dyn crate::platform::launcher::Launcher,
@@ -121,35 +201,74 @@ pub fn run_relaunch_loop(
     run_once(launcher, spec)
 }
 
-/// Single launch with no relaunch handling — the Windows fall-back while the
-/// console-stop relaunch loop is gated off. Spawns claude once in the foreground,
-/// cleans up `<sid>.pid`, and propagates the child's exit code. Any `.relaunch`
-/// sentinel the hook may have written is intentionally ignored (no relaunch).
+/// Single launch with no relaunch — the Windows fall-back while the
+/// console-stop relaunch loop is gated off. A sentinel the hook wrote still
+/// runs the switch (leader or follower), then says how to resume by hand.
 #[cfg(windows)]
 fn run_once(
     launcher: &dyn crate::platform::launcher::Launcher,
     spec: &LaunchSpec,
 ) -> anyhow::Result<()> {
-    use std::collections::HashMap;
-
     use crate::paths;
 
     let sid = spec.session_id.clone();
     let pid_path = paths::pid_file(&sid);
+    let sentinel_path = paths::sentinel(&sid);
+    let _ = std::fs::remove_file(&sentinel_path);
 
-    // Ensure the launch profile is provisioned (no-op on non-unix, where the
-    // symlink is handled OS-side). Idempotent + best-effort.
-    crate::provision::ensure_provisioned_soft(&spec.profile_dir);
-
-    let mut env: HashMap<OsString, OsString> = HashMap::new();
-    env.insert(
-        OsString::from("CLAUDE_CONFIG_DIR"),
-        spec.profile_dir.clone().into_os_string(),
-    );
-
-    let (status, _handle) = launcher.run_foreground(&sid, &spec.cli, &env)?;
+    let mut recovery = None;
+    let mut on_spawn = || recovery = start_recovery(&spec.pin);
+    let (status, handle) = launcher.run_foreground(&sid, &spec.cli, &spec.env, &mut on_spawn)?;
+    let mut repair = finish_recovery(spec, &sid, recovery);
     let _ = std::fs::remove_file(&pid_path);
+
+    if let Ok(Some(sentinel)) = read_relaunch(&sentinel_path) {
+        let _ = std::fs::remove_file(&sentinel_path);
+        if repair == Repair::Busy && sentinel.born >= handle.born {
+            repair = retry_recovery(spec, &sid);
+        }
+        if !repair.blocks_relaunch() && sentinel.born >= handle.born && sentinel.wants_switch() {
+            let outcome =
+                crate::account::limit_switch::run_hop(&sentinel, &sid, &spec.pin, &mut |line| {
+                    say(spec, &sid, line, false)
+                });
+            let account = hop_account(
+                &outcome,
+                || d_account_now(&spec.pin),
+                sentinel.from_account.clone(),
+            );
+            // Nothing is resumed here: the line says where the account is
+            // now and the next one says how to resume.
+            let line = hop_line(&sentinel, &outcome, account.as_deref(), false);
+            say(spec, &sid, &line, true);
+            let short = crate::hook::sid_short(&sid);
+            say(
+                spec,
+                &sid,
+                &format!("csm: resume with `csm --resume {short}`"),
+                true,
+            );
+        } else if sentinel.born >= handle.born && !sentinel.wants_switch() {
+            // A model fallback (or a follow) stopped claude too: never
+            // leave the session stopped without a word.
+            let short = crate::hook::sid_short(&sid);
+            say(spec, &sid, &windows_resume_hint(&sentinel, short), true);
+        }
+    }
     exit_with(status)
+}
+
+/// The line a Windows launch prints for a consumed sentinel that switched
+/// no account (a model fallback or a follow): how to resume by hand, with
+/// the fallback model when there is one. Pure.
+#[cfg(any(windows, test))]
+fn windows_resume_hint(sentinel: &RelaunchSentinel, short: &str) -> String {
+    match sentinel.model_override.as_deref() {
+        Some(m) => format!(
+            "csm: this model's weekly limit is reached; resume on {m} with `csm --resume {short} --model {m}`"
+        ),
+        None => format!("csm: resume with `csm --resume {short}`"),
+    }
 }
 
 /// The full platform-agnostic relaunch loop (used on unix; gated off on Windows,
@@ -160,27 +279,23 @@ fn relaunch_loop(
     launcher: &dyn crate::platform::launcher::Launcher,
     spec: &LaunchSpec,
 ) -> anyhow::Result<()> {
-    use std::collections::HashMap;
-
     use crate::paths;
     use crate::platform::pid;
 
     let sid = spec.session_id.clone();
-    let relaunch_path = paths::relaunch(&sid);
+    let sentinel_path = paths::sentinel(&sid);
     let pid_path = paths::pid_file(&sid);
 
-    // The CLI mutates across hops (profile swap + resume + handoff prompt); start
-    // from the cold-launch CLI the caller built.
+    // The CLI mutates across hops (resume + handoff prompt); start from the
+    // cold-launch CLI the caller built. Every hop runs in the same `D`.
     let mut cli: Vec<OsString> = spec.cli.clone();
-    let mut profile_dir = spec.profile_dir.clone();
+    let mut first = true;
 
     loop {
         // Clobber guard: if another live csm already owns this sid's pidfile,
         // do not stomp it — abort this loop (the other supervisor is in charge).
         if let Ok(Some((other_pid, _born))) = pid::read_pid_file(&pid_path) {
             use crate::platform::proc_check::ProcCheck;
-            // Our own previous iteration will have left a pidfile for a now-dead
-            // pid; only bail if the recorded pid is a DIFFERENT live claude/node.
             if other_pid != 0
                 && crate::platform::PlatformProcCheck::is_live_claude_or_node(other_pid)
             {
@@ -191,81 +306,136 @@ fn relaunch_loop(
         }
 
         // A stale sentinel from a prior chain must never be consumed by this
-        // launch — remove anything older than the launch we are about to make.
-        // (Defensive: the born-check below is the real guard.)
-        let _ = std::fs::remove_file(&relaunch_path);
+        // launch. (Defensive: the born-check below is the real guard.)
+        let _ = std::fs::remove_file(&sentinel_path);
 
-        // Ensure this hop's profile satisfies the provisioning invariants
-        // (dir exists, plugins → shared SSOT) BEFORE launching claude under it.
-        // Idempotent + best-effort: a hiccup must not block the relaunch.
-        crate::provision::ensure_provisioned_soft(&profile_dir);
+        // Recovery of an unfinished switch runs once per supervisor, on a
+        // thread started right after the child spawns, never before exec.
+        let mut recovery = None;
+        let mut on_spawn = || {
+            if first {
+                recovery = start_recovery(&spec.pin);
+            }
+        };
+        let (status, handle) = launcher.run_foreground(&sid, &cli, &spec.env, &mut on_spawn)?;
+        first = false;
+        let mut repair = finish_recovery(spec, &sid, recovery);
 
-        // Per-launch child env: pin CLAUDE_CONFIG_DIR for this hop's profile.
-        let mut env: HashMap<OsString, OsString> = HashMap::new();
-        env.insert(
-            OsString::from("CLAUDE_CONFIG_DIR"),
-            profile_dir.clone().into_os_string(),
-        );
-
-        // Launch claude in the foreground and block until it exits. The launcher
-        // writes `<sid>.pid` itself immediately after spawn (so the hook can read
-        // it mid-session) — we do NOT write it here.
-        let (status, handle) = launcher.run_foreground(&sid, &cli, &env)?;
-
-        // Did the hook drop a relaunch sentinel for THIS incarnation?
-        let sentinel = match read_relaunch(&relaunch_path) {
+        // Did the hook drop a sentinel for THIS incarnation?
+        let sentinel = match read_relaunch(&sentinel_path) {
             Ok(Some(s)) => s,
-            // No sentinel → ordinary exit; we are done.
             Ok(None) => {
                 let _ = std::fs::remove_file(&pid_path);
                 return exit_with(status);
             }
             Err(e) => {
+                let _ = std::fs::remove_file(&sentinel_path);
                 let _ = std::fs::remove_file(&pid_path);
                 return Err(e);
             }
         };
 
-        // Born-check: reject a sentinel written for a PRIOR launch (the linchpin
-        // against consuming a stale handoff). The hook stamps the sentinel with
-        // the pidfile's born; it must be >= the born of the launch we just ran.
+        // Born-check: reject a sentinel written for a PRIOR launch.
         if sentinel.born < handle.born {
-            // Stale — ignore, treat as ordinary exit.
-            let _ = std::fs::remove_file(&relaunch_path);
+            let _ = std::fs::remove_file(&sentinel_path);
             let _ = std::fs::remove_file(&pid_path);
             return exit_with(status);
         }
 
-        // Atomic consume: remove the sentinel so a crash mid-relaunch cannot
-        // replay it. If removal fails (already gone — another consumer raced us),
-        // stop.
-        if std::fs::remove_file(&relaunch_path).is_err() {
+        // Atomic consume: a crash mid-relaunch cannot replay it.
+        if std::fs::remove_file(&sentinel_path).is_err() {
             let _ = std::fs::remove_file(&pid_path);
             return exit_with(status);
         }
 
-        // Hop cap: bound the number of automatic profile switches per chain.
-        if sentinel.hop > MAX_HOPS {
-            eprintln!("csm: limit-switch hop cap ({MAX_HOPS}) reached — not relaunching again");
+        // The recovery thread found switch.lock held (a switch or a login in
+        // progress): nothing was repaired and nothing failed. The child is
+        // stopped now, so try once more before the hop.
+        if repair == Repair::Busy {
+            repair = retry_recovery(spec, &sid);
+        }
+        if repair.blocks_relaunch() {
             let _ = std::fs::remove_file(&pid_path);
             return exit_with(status);
         }
 
-        // Resolve the target profile → config dir. Unknown target = abort (do not
-        // silently fall back to the same profile, which would loop pointlessly).
-        let profiles = crate::account::profiles::ProfileMap::load().unwrap_or_default();
-        let next_dir = match profiles.get(&sentinel.target_profile) {
-            Some(d) => std::path::PathBuf::from(d),
-            None => {
-                eprintln!(
-                    "csm: relaunch target profile '{}' is unknown — aborting relaunch",
-                    sentinel.target_profile
+        // Hop cap: bound the automatic switches per chain. A follow spends
+        // no hop, so it is never capped here.
+        if sentinel.reason != REASON_FOLLOW && sentinel.hop > MAX_HOPS {
+            say(
+                spec,
+                &sid,
+                &format!("csm: limit-switch hop cap ({MAX_HOPS}) reached — not relaunching again"),
+                true,
+            );
+            let _ = std::fs::remove_file(&pid_path);
+            return exit_with(status);
+        }
+
+        // Lead or follow the switch (a model fallback and a follow switch
+        // nothing), then say so in one line.
+        let account = if sentinel.wants_switch() {
+            let outcome =
+                crate::account::limit_switch::run_hop(&sentinel, &sid, &spec.pin, &mut |line| {
+                    say(spec, &sid, line, false)
+                });
+            if outcome == HopOutcome::LockBusy {
+                // Another csm still holds switch.lock and may be switching
+                // `D`: starting claude there now would race it.
+                say(
+                    spec,
+                    &sid,
+                    &hop_line(&sentinel, &outcome, None, false),
+                    true,
+                );
+                let short = crate::hook::sid_short(&sid);
+                say(
+                    spec,
+                    &sid,
+                    &format!("csm: resume with `csm --resume {short}`"),
+                    true,
                 );
                 let _ = std::fs::remove_file(&pid_path);
                 return exit_with(status);
             }
+            let account = hop_account(
+                &outcome,
+                || d_account_now(&spec.pin),
+                sentinel.from_account.clone(),
+            );
+            say(
+                spec,
+                &sid,
+                &hop_line(&sentinel, &outcome, account.as_deref(), true),
+                true,
+            );
+            account
+        } else {
+            let account = no_switch_account(&sentinel, || d_account_now(&spec.pin));
+            let line = match &sentinel.model_override {
+                Some(model) => format!(
+                    "csm: model-scoped cap on {}; resumed on model {model}",
+                    label(&sentinel.target_account)
+                ),
+                None => format!(
+                    "csm: another session switched the account; resumed on {}",
+                    label(account.as_deref().unwrap_or_default())
+                ),
+            };
+            say(spec, &sid, &line, true);
+            account
         };
-        profile_dir = next_dir;
+
+        // Record this incarnation's account and launch time: usage captures
+        // and the follow check key on them.
+        let _ = crate::sidecar::merge_sidecar(
+            &paths::sidecar(&sid),
+            &crate::sidecar::Sidecar {
+                account_id: account,
+                born: Some(crate::epoch::now_secs() as i64),
+                ..Default::default()
+            },
+        );
 
         // Build the next iteration's CLI: same sid, resume the session, re-apply
         // the launch flags the sidecar remembers, and inject the handoff prompt
@@ -273,9 +443,6 @@ fn relaunch_loop(
         let remembered = crate::sidecar::read_sidecar(&paths::sidecar(&sid)).unwrap_or_default();
         let (next_cli, dropped) = build_next_cli(&sid, &sentinel, &remembered);
         if !dropped.is_empty() {
-            // The switch changed the session's argv. Say so where every other
-            // limit-switch event is recorded, so a session that comes back
-            // without something it was launched with is explainable.
             let _ = crate::hook::notify::append_log(
                 &sid,
                 &format!(
@@ -287,6 +454,247 @@ fn relaunch_loop(
         }
         cli = next_cli;
     }
+}
+
+/// An account's label (email local part, else id prefix).
+fn label(id: &str) -> String {
+    if id.is_empty() {
+        return "the current account".into();
+    }
+    crate::account::AccountSet::load().label(id)
+}
+
+/// The account `D` holds now (its `oauthAccount` mapped to one stash), `D`
+/// being the child's (the launch's pin applied). Reads files only.
+fn d_account_now(pin: &crate::launch_context::ConfigDirPin) -> Option<String> {
+    crate::account::AccountSet::load_pinned(pin).current
+}
+
+/// The account the next incarnation runs on. After a switch or a follow it
+/// is the target. After a Stay it is whatever `D` holds now, read after the
+/// hop: another supervisor may have switched `D` while this one waited for
+/// `switch.lock` and gave up, and the sidecar must not keep naming the
+/// capped account then. The sentinel's `from` is the fallback when `D`'s
+/// identity maps to no single account. Pure apart from `d_now`.
+fn hop_account(
+    outcome: &HopOutcome,
+    d_now: impl FnOnce() -> Option<String>,
+    from: Option<String>,
+) -> Option<String> {
+    match outcome {
+        HopOutcome::Followed { to } | HopOutcome::Switched { to, .. } => Some(to.clone()),
+        HopOutcome::Stay { .. } | HopOutcome::LockBusy => d_now().or(from),
+    }
+}
+
+/// The account a relaunch that switched nothing runs on. A model fallback
+/// stays on the sentinel's own account. A follow runs on whatever `D` holds
+/// now: its file names the target of the switch it was written for, and a
+/// later switch (another leader, or the user in Orca) may have moved `D`
+/// again since, so recording the follow's target would file every later
+/// usage capture under the wrong account. The follow's target is the
+/// fallback when `D`'s identity maps to no single account. Pure apart from
+/// `d_now`. Unix only: Windows does not relaunch a follow.
+#[cfg(any(not(windows), test))]
+fn no_switch_account(
+    sentinel: &RelaunchSentinel,
+    d_now: impl FnOnce() -> Option<String>,
+) -> Option<String> {
+    let target = Some(sentinel.target_account.clone()).filter(|a| !a.is_empty());
+    if sentinel.model_override.is_some() {
+        return target;
+    }
+    d_now().or(target)
+}
+
+/// The one relaunch line for a hop outcome; `now_on` is [`hop_account`]'s
+/// answer. `resumed` is false on Windows, where the session is not relaunched
+/// and the caller prints how to resume it by hand. Pure over its inputs
+/// apart from the label lookup.
+fn hop_line(
+    sentinel: &RelaunchSentinel,
+    outcome: &HopOutcome,
+    now_on: Option<&str>,
+    resumed: bool,
+) -> String {
+    let from = sentinel
+        .from_account
+        .as_deref()
+        .map(label)
+        .unwrap_or_else(|| "the current account".into());
+    let now_on = now_on.map(label).unwrap_or_else(|| from.clone());
+    hop_line_with(&from, &now_on, outcome, resumed, label)
+}
+
+/// [`hop_line`] with the labels injected. Pure.
+fn hop_line_with(
+    from: &str,
+    now_on: &str,
+    outcome: &HopOutcome,
+    resumed: bool,
+    label: impl Fn(&str) -> String,
+) -> String {
+    let on = if resumed { "resumed on" } else { "now on" };
+    match outcome {
+        HopOutcome::Switched { to, .. } | HopOutcome::Followed { to } => {
+            format!("csm: account {from} capped; {on} {}", label(to))
+        }
+        HopOutcome::Stay { reason } => {
+            format!("csm: account {from} capped; no switch ({reason}); {on} {now_on}")
+        }
+        HopOutcome::LockBusy => format!(
+            "csm: account {from} capped; another csm still holds switch.lock, so the session was not relaunched"
+        ),
+    }
+}
+
+/// Print `line` on stderr unless the launch is quiet (an Orca pane), where
+/// only `always` lines (the one relaunch line, fatal errors) print. Every
+/// line also goes to csm's log.
+fn say(spec: &LaunchSpec, sid: &str, line: &str, always: bool) {
+    if shown_on_stderr(spec.quiet, always) {
+        eprintln!("{line}");
+    }
+    let _ = crate::hook::notify::append_log(sid, line);
+}
+
+/// Whether a [`say`] line reaches stderr. Pure.
+fn shown_on_stderr(quiet: bool, always: bool) -> bool {
+    always || !quiet
+}
+
+/// How the repair of an unfinished switch went, as the relaunch loop sees it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Repair {
+    /// Nothing pending, or repaired.
+    Done,
+    /// Another csm held `switch.lock` for the whole wait: nothing was
+    /// attempted and `D` was not touched. Not a failure.
+    Busy,
+    /// The repair ran and failed; `D` was left neutral. The text says why.
+    Failed(String),
+    /// Orca runs and the repair waits for it to stop (see
+    /// [`crate::orca::switch::Recovery::Deferred`]): nothing was written.
+    /// Not a failure, and not worth a retry while Orca runs.
+    Deferred(String),
+}
+
+impl Repair {
+    /// Pure: map [`crate::orca::switch::recover`]'s answer.
+    fn from_recovery(r: Result<crate::orca::switch::Recovery, crate::orca::OrcaError>) -> Repair {
+        use crate::orca::switch::Recovery;
+        match r {
+            Ok(Recovery::Busy) => Repair::Busy,
+            Ok(Recovery::Failed(why)) => Repair::Failed(why),
+            Ok(Recovery::Deferred(why)) => Repair::Deferred(why),
+            Err(e) => Repair::Failed(e.to_string()),
+            Ok(_) => Repair::Done,
+        }
+    }
+
+    /// Design §3 Recovery: no session is relaunched only when a repair ran
+    /// and failed. A busy lock holder is not that. Pure.
+    fn blocks_relaunch(&self) -> bool {
+        matches!(self, Repair::Failed(_))
+    }
+}
+
+/// Whether the journal says a switch is unfinished.
+fn journal_pending() -> bool {
+    let state = crate::paths::smart_dir_no_create();
+    crate::orca::switch::read_journal(&state).is_some_and(|j| j.pending())
+}
+
+/// Start the repair of an unfinished switch on a thread, when the journal
+/// says one is pending. Called right after the child spawns.
+fn start_recovery(
+    pin: &crate::launch_context::ConfigDirPin,
+) -> Option<std::thread::JoinHandle<Repair>> {
+    if !journal_pending() {
+        return None;
+    }
+    let pin = pin.clone();
+    std::thread::Builder::new()
+        .name("csm-recover".into())
+        .spawn(move || recover_now(&pin))
+        .ok()
+}
+
+/// Run [`crate::orca::switch::recover`].
+/// It runs while this supervisor's claude child starts in `D`, usually
+/// before that child has registered in `D/sessions`, so the switch env
+/// counts a live claude regardless of the scan: the repair then uses Orca's
+/// materialize order (one `.claude.json` rewrite beside a live writer) and
+/// skips the refresh the child may be racing.
+fn recover_now(pin: &crate::launch_context::ConfigDirPin) -> Repair {
+    use crate::orca::switch::recover;
+    let procs = crate::orca::live::SystemProcs;
+    let ctx = match crate::orca::context::Context::current_pinned(&procs, pin) {
+        Ok(c) => c,
+        Err(e) => return Repair::Failed(e.to_string()),
+    };
+    let http = crate::orca::http::SystemHttp::from_env();
+    Repair::from_recovery(ctx.with_switch_env_child(&procs, &http, true, recover))
+}
+
+/// Join the recovery thread and [`report_repair`] its answer.
+fn finish_recovery(
+    spec: &LaunchSpec,
+    sid: &str,
+    recovery: Option<std::thread::JoinHandle<Repair>>,
+) -> Repair {
+    let r = recovery.and_then(|h| h.join().ok()).unwrap_or(Repair::Done);
+    report_repair(spec, sid, r)
+}
+
+/// A second try after the recovery thread found `switch.lock` busy, once
+/// the child has exited: skipped when the holder already settled the
+/// journal. Still busy is not a failure either; the hop then waits for the
+/// lock itself.
+fn retry_recovery(spec: &LaunchSpec, sid: &str) -> Repair {
+    if !journal_pending() {
+        return Repair::Done;
+    }
+    report_repair(spec, sid, recover_now(&spec.pin))
+}
+
+/// Say once how a repair went: a failure gets the doctor line, a busy lock
+/// a log line.
+fn report_repair(spec: &LaunchSpec, sid: &str, r: Repair) -> Repair {
+    match &r {
+        Repair::Failed(why) => say(
+            spec,
+            sid,
+            &recovery_failed_line(why),
+            RECOVERY_FAILED_ALWAYS,
+        ),
+        Repair::Busy => {
+            let _ = crate::hook::notify::append_log(
+                sid,
+                "csm: an unfinished account switch was not repaired: another csm holds switch.lock",
+            );
+        }
+        Repair::Deferred(why) => {
+            let _ = crate::hook::notify::append_log(
+                sid,
+                &format!("csm: an unfinished account switch was not repaired: {why}"),
+            );
+        }
+        Repair::Done => {}
+    }
+    r
+}
+
+/// A failed repair is not fatal (claude already ran and its status is
+/// returned), so in an Orca pane its line goes to csm's log only (design
+/// section 3, Recovery).
+const RECOVERY_FAILED_ALWAYS: bool = false;
+
+/// Pure.
+fn recovery_failed_line(why: &str) -> String {
+    format!(
+        "csm: an unfinished account switch could not be repaired ({why}); run `csm accounts doctor --fix`"
+    )
 }
 
 /// Build the claude CLI for the next relaunch hop: resume the same session,
@@ -381,20 +789,24 @@ fn exit_with(status: std::process::ExitStatus) -> anyhow::Result<()> {
 }
 
 /// Parameters for a single `csm run` invocation, threaded through the relaunch loop.
-///
-/// All fields are intentionally `pub` — the loop builds the next iteration's spec
-/// from the consumed sentinel and the previous launch's sidecar.
 pub struct LaunchSpec {
-    /// The session id (`--session-id`).  A fresh UUID on cold launch; the same
+    /// The session id (`--session-id`). A fresh UUID on cold launch; the same
     /// sid across all hops in one relaunch chain.
     pub session_id: String,
-    /// Absolute path to the `CLAUDE_CONFIG_DIR` for this launch.
-    pub profile_dir: std::path::PathBuf,
-    /// The cold-launch working directory. Carried for completeness/diagnostics;
-    /// the relaunch loop never re-applies it because every hop runs inside the
-    /// same supervisor process, so claude naturally inherits the original cwd
-    /// (hops change only the profile, not the directory). `main` uses cwd directly
-    /// for session scanning before building the spec.
+    /// The child's `CLAUDE_CONFIG_DIR` pin (also inside `env`). The
+    /// supervisor applies it to every read of `D` it makes itself (the limit
+    /// switch, the recovery, the sidecar's account), since its own process
+    /// environment keeps the inherited value.
+    pub pin: crate::launch_context::ConfigDirPin,
+    /// The child's env changes: the `CLAUDE_CONFIG_DIR` pin (only when the
+    /// inherited value differs from `D`) and, when the active account is
+    /// Orca-managed, the credential variables to strip.
+    pub env: crate::platform::launcher::ChildEnv,
+    /// An Orca pane or structured launch: only fatal errors and the one
+    /// relaunch line reach stderr; everything else goes to csm's log.
+    pub quiet: bool,
+    /// The cold-launch working directory. Carried for diagnostics; every hop
+    /// runs inside the same supervisor process, so claude inherits it.
     #[allow(dead_code)]
     pub cwd: std::path::PathBuf,
     /// Full CLI to pass to claude (everything after `csm run [csm-flags]`).
@@ -408,13 +820,37 @@ mod tests {
     fn sentinel(handoff: &str) -> RelaunchSentinel {
         RelaunchSentinel {
             session_id: "abc123".to_string(),
-            target_profile: "home".to_string(),
+            v: SENTINEL_V,
+            target_account: "home".to_string(),
+            from_account: None,
+            from_gen: 0,
+            reason: String::new(),
+            at: 0,
             cwd: "/home/you/projects".to_string(),
             handoff: handoff.to_string(),
             hop: 1,
             born: 1,
             model_override: None,
         }
+    }
+
+    #[test]
+    fn a_windows_stop_that_switched_nothing_still_says_how_to_resume() {
+        let mut s = sentinel("");
+        s.reason = REASON_MODEL_FALLBACK.into();
+        s.model_override = Some("opus".into());
+        assert!(!s.wants_switch());
+        let line = windows_resume_hint(&s, "abc1");
+        assert!(line.contains("csm --resume abc1 --model opus"), "{line}");
+        s.reason = REASON_FOLLOW.into();
+        s.model_override = None;
+        assert!(!s.wants_switch());
+        assert_eq!(
+            windows_resume_hint(&s, "abc1"),
+            "csm: resume with `csm --resume abc1`"
+        );
+        // Peers follow by relaunching, which only the unix loop does.
+        assert_eq!(crate::hook::detect::follows_supported(), !cfg!(windows));
     }
 
     fn strs(v: &[OsString]) -> Vec<String> {
@@ -655,7 +1091,12 @@ mod tests {
     fn roundtrip_sentinel() {
         let sentinel = RelaunchSentinel {
             session_id: "abc123".to_string(),
-            target_profile: "home".to_string(),
+            v: SENTINEL_V,
+            target_account: "home".to_string(),
+            from_account: None,
+            from_gen: 0,
+            reason: String::new(),
+            at: 0,
             cwd: "/home/you/projects".to_string(),
             handoff: "resume".to_string(),
             hop: 1,
@@ -665,11 +1106,13 @@ mod tests {
         let json = serde_json::to_string(&sentinel).unwrap();
         let back: RelaunchSentinel = serde_json::from_str(&json).unwrap();
         assert_eq!(back.session_id, sentinel.session_id);
-        assert_eq!(back.target_profile, sentinel.target_profile);
+        assert_eq!(back.target_account, sentinel.target_account);
         assert_eq!(back.hop, sentinel.hop);
         assert_eq!(back.born, sentinel.born);
     }
 
+    /// The earlier sentinel spelled the target `target_profile`; the alias
+    /// keeps such a file readable across an upgrade.
     #[test]
     fn field_names_match_legacy_zsh() {
         // The legacy zsh write_relaunch used these exact JSON key names.
@@ -684,7 +1127,7 @@ mod tests {
         }"#;
         let s: RelaunchSentinel = serde_json::from_str(json).unwrap();
         assert_eq!(s.session_id, "sid-1");
-        assert_eq!(s.target_profile, "work");
+        assert_eq!(s.target_account, "work");
         assert_eq!(s.hop, 0_i64);
         assert_eq!(s.born, 1_700_000_000_i64);
     }
@@ -702,7 +1145,7 @@ mod tests {
         }"#;
         let s: RelaunchSentinel = serde_json::from_str(json).expect("unknown field must not abort");
         assert_eq!(s.session_id, "sid-9");
-        assert_eq!(s.target_profile, "work");
+        assert_eq!(s.target_account, "work");
         assert_eq!(s.hop, 1_i64);
     }
 
@@ -744,7 +1187,12 @@ mod tests {
         let path = tmp_dir.path().join("test.relaunch");
         let sentinel = RelaunchSentinel {
             session_id: "test-sid".to_string(),
-            target_profile: "home".to_string(),
+            v: SENTINEL_V,
+            target_account: "home".to_string(),
+            from_account: None,
+            from_gen: 0,
+            reason: String::new(),
+            at: 0,
             cwd: "/tmp".to_string(),
             handoff: "resume".to_string(),
             hop: 0,
@@ -800,7 +1248,12 @@ mod tests {
 
         let sentinel = RelaunchSentinel {
             session_id: "abc123".to_string(),
-            target_profile: "home".to_string(),
+            v: SENTINEL_V,
+            target_account: "home".to_string(),
+            from_account: None,
+            from_gen: 0,
+            reason: String::new(),
+            at: 0,
             cwd: "/home/you/projects".to_string(),
             handoff: "resume".to_string(),
             hop: 2,
@@ -812,5 +1265,217 @@ mod tests {
             sentinel_json["hop"].is_number(),
             "relaunch sentinel hop must serialize as a JSON number, got {sentinel_json}"
         );
+    }
+
+    #[test]
+    fn hop_line_names_the_outcome() {
+        let label = |id: &str| format!("L-{id}");
+        let switched = HopOutcome::Switched {
+            from: Some("a1".into()),
+            to: "b2".into(),
+            generation: 3,
+        };
+        assert_eq!(
+            hop_line_with("alice", "x", &switched, true, label),
+            "csm: account alice capped; resumed on L-b2"
+        );
+        let followed = HopOutcome::Followed { to: "c3".into() };
+        assert_eq!(
+            hop_line_with("alice", "x", &followed, true, label),
+            "csm: account alice capped; resumed on L-c3"
+        );
+        let stay = HopOutcome::Stay {
+            reason: "no other account has headroom".into(),
+        };
+        assert_eq!(
+            hop_line_with("alice", "alice", &stay, true, label),
+            "csm: account alice capped; no switch (no other account has headroom); resumed on alice"
+        );
+        assert_eq!(
+            hop_line_with("alice", "bob", &stay, true, label),
+            "csm: account alice capped; no switch (no other account has headroom); resumed on bob"
+        );
+        // Windows (no relaunch): never claims the session was resumed.
+        assert_eq!(
+            hop_line_with("alice", "x", &switched, false, label),
+            "csm: account alice capped; now on L-b2"
+        );
+        assert_eq!(
+            hop_line_with("alice", "bob", &stay, false, label),
+            "csm: account alice capped; no switch (no other account has headroom); now on bob"
+        );
+    }
+
+    #[test]
+    fn a_stay_records_the_account_d_holds_now() {
+        let stay = HopOutcome::Stay {
+            reason: "cannot take switch.lock".into(),
+        };
+        // A peer supervisor moved D to b while this one waited for the lock.
+        assert_eq!(
+            hop_account(&stay, || Some("b".into()), Some("a".into())),
+            Some("b".into())
+        );
+        // D's identity maps to no single account: keep the sentinel's.
+        assert_eq!(
+            hop_account(&stay, || None, Some("a".into())),
+            Some("a".into())
+        );
+        // A switch or a follow never reads D.
+        let switched = HopOutcome::Switched {
+            from: Some("a".into()),
+            to: "c".into(),
+            generation: 1,
+        };
+        assert_eq!(
+            hop_account(&switched, || panic!("D read"), Some("a".into())),
+            Some("c".into())
+        );
+    }
+
+    #[test]
+    fn a_follow_records_the_account_d_holds_now() {
+        // A follow written for an earlier switch (to "home"); a later switch
+        // moved D on to c before this session reached its turn boundary.
+        let mut s = sentinel("");
+        s.reason = REASON_FOLLOW.into();
+        assert_eq!(no_switch_account(&s, || Some("c".into())), Some("c".into()));
+        // D's identity maps to no single account: the follow's target.
+        assert_eq!(no_switch_account(&s, || None), Some("home".into()));
+        // A model fallback stays on its own account and never reads D.
+        s.model_override = Some("sonnet".into());
+        assert_eq!(
+            no_switch_account(&s, || panic!("D read")),
+            Some("home".into())
+        );
+    }
+
+    #[test]
+    fn the_pin_moves_the_context_to_the_childs_d() {
+        use crate::launch_context::ConfigDirPin;
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let orca_d = tmp.path().join("orca-d");
+        let mut env = crate::orca::HostEnv::for_test(&home, crate::orca::HostOs::Linux);
+        // A login dotfile exported another dir into the pane.
+        env.claude_config_dir = Some(tmp.path().join("dotfile-d").to_string_lossy().into_owned());
+        let procs = crate::orca::live::SystemProcs;
+
+        let mut set = env.clone();
+        ConfigDirPin::Set(orca_d.clone()).apply_to(&mut set);
+        let ctx = crate::orca::context::Context::from_env(set, &procs);
+        assert_eq!(ctx.paths.config_dir, orca_d);
+        assert_eq!(ctx.paths.config_path, orca_d.join(".claude.json"));
+
+        // Orca main runs without the variable: claude's default layout,
+        // with the identity in ~/.claude.json.
+        let mut unset = env.clone();
+        ConfigDirPin::Unset.apply_to(&mut unset);
+        let ctx = crate::orca::context::Context::from_env(unset, &procs);
+        assert_eq!(ctx.paths.config_dir, home.join(".claude"));
+        assert_eq!(ctx.paths.config_path, home.join(".claude.json"));
+
+        let mut leave = env.clone();
+        ConfigDirPin::Leave.apply_to(&mut leave);
+        assert_eq!(leave.claude_config_dir, env.claude_config_dir);
+    }
+
+    /// `d_account_now` reads the pinned `D`, not the inherited one: the
+    /// inherited `~/.claude.json` names alice, the child's `D` names bob,
+    /// and only the pin decides which account the next incarnation is on.
+    #[test]
+    fn d_account_now_reads_the_pinned_d() {
+        use crate::launch_context::ConfigDirPin;
+        use crate::orca::testsupport::{make_stash, record_json, write_store};
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        crate::testenv::with_test_home(&home, || {
+            let env = crate::orca::HostEnv::current().unwrap();
+            let ud = crate::orca::userdata::resolve(&env, |_| false).dir;
+            make_stash(&ud, "id-a", Some(br#"{"accountUuid":"u-a"}"#), None);
+            make_stash(&ud, "id-b", Some(br#"{"accountUuid":"u-b"}"#), None);
+            let recs = [
+                record_json(&ud, "id-a", "alice@example.com", None),
+                record_json(&ud, "id-b", "bob@example.com", None),
+            ];
+            write_store(&ud, &recs, Some("id-a"));
+            // The inherited layout: no CLAUDE_CONFIG_DIR, identity in
+            // ~/.claude.json.
+            std::fs::create_dir_all(home.join(".claude")).unwrap();
+            std::fs::write(
+                home.join(".claude.json"),
+                r#"{"oauthAccount":{"accountUuid":"u-a"}}"#,
+            )
+            .unwrap();
+            let orca_d = tmp.path().join("orca-d");
+            std::fs::create_dir_all(&orca_d).unwrap();
+            std::fs::write(
+                orca_d.join(".claude.json"),
+                r#"{"oauthAccount":{"accountUuid":"u-b"}}"#,
+            )
+            .unwrap();
+
+            assert_eq!(d_account_now(&ConfigDirPin::Leave).as_deref(), Some("id-a"));
+            assert_eq!(
+                d_account_now(&ConfigDirPin::Set(orca_d.clone())).as_deref(),
+                Some("id-b")
+            );
+        });
+    }
+
+    /// A recovery that only found `switch.lock` held is not a failed
+    /// repair: it neither blocks the relaunch nor prints the doctor line.
+    /// Only a repair that ran and failed (or errored) blocks it.
+    #[test]
+    fn a_busy_switch_lock_is_not_a_failed_repair() {
+        use crate::orca::switch::Recovery;
+        let busy = Repair::from_recovery(Ok(Recovery::Busy));
+        assert_eq!(busy, Repair::Busy);
+        assert!(!busy.blocks_relaunch());
+        assert_eq!(Repair::from_recovery(Ok(Recovery::Nothing)), Repair::Done);
+        assert!(!Repair::Done.blocks_relaunch());
+        let deferred = Repair::from_recovery(Ok(Recovery::Deferred("Orca runs".into())));
+        assert_eq!(deferred, Repair::Deferred("Orca runs".into()));
+        assert!(!deferred.blocks_relaunch());
+        let failed = Repair::from_recovery(Ok(Recovery::Failed("x".into())));
+        assert_eq!(failed, Repair::Failed("x".into()));
+        assert!(failed.blocks_relaunch());
+        let err = Repair::from_recovery(Err(crate::orca::OrcaError::Refused("y".into())));
+        assert!(err.blocks_relaunch());
+    }
+
+    #[test]
+    fn a_lock_busy_hop_says_it_did_not_relaunch() {
+        let line = hop_line_with("alice", "alice", &HopOutcome::LockBusy, false, |s| s.into());
+        assert!(line.contains("alice capped"), "{line}");
+        assert!(line.contains("not relaunched"), "{line}");
+    }
+
+    #[test]
+    fn recovery_failed_line_points_at_doctor() {
+        let line = recovery_failed_line("journal unreadable");
+        assert!(line.contains("journal unreadable"));
+        assert!(line.contains("csm accounts doctor --fix"));
+    }
+
+    #[test]
+    fn a_failed_repair_stays_off_an_orca_panes_stderr() {
+        // Quiet (an Orca pane): log only. Otherwise stderr too.
+        assert!(!shown_on_stderr(true, RECOVERY_FAILED_ALWAYS));
+        assert!(shown_on_stderr(false, RECOVERY_FAILED_ALWAYS));
+        // The relaunch line and fatal errors still reach a pane.
+        assert!(shown_on_stderr(true, true));
+    }
+
+    #[test]
+    fn follow_and_fallback_sentinels_do_not_switch() {
+        let mut s = sentinel("");
+        assert!(s.wants_switch());
+        s.reason = REASON_FOLLOW.into();
+        assert!(!s.wants_switch());
+        let mut s = sentinel("");
+        s.model_override = Some("opus".into());
+        assert!(!s.wants_switch());
     }
 }

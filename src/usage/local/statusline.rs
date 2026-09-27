@@ -38,6 +38,29 @@ use super::display;
 pub struct StatuslinePayload {
     #[serde(default)]
     pub rate_limits: Option<RateLimits>,
+    /// Kept loose (`Value`) so an unexpected shape never fails the parse.
+    #[serde(default)]
+    pub session_id: Option<serde_json::Value>,
+    #[serde(default)]
+    pub cost: Option<serde_json::Value>,
+}
+
+impl StatuslinePayload {
+    /// The payload's `session_id`, when it is a non-empty string.
+    pub fn session_id(&self) -> Option<String> {
+        self.session_id
+            .as_ref()
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+    }
+
+    /// `cost.total_duration_ms` in whole seconds, when it is a sane number.
+    pub fn duration_secs(&self) -> Option<i64> {
+        let ms = self.cost.as_ref()?.get("total_duration_ms")?.as_f64()?;
+        (ms.is_finite() && ms >= 0.0).then(|| (ms / 1000.0) as i64)
+    }
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -194,7 +217,7 @@ mod tests {
             attention: Some(Attention {
                 kind: AttentionKind::NeedsRefresh,
                 message: "access token expired".to_string(),
-                action: "csm --profile home".to_string(),
+                action: "csm accounts use home".to_string(),
                 since_epoch: Some(1),
             }),
             ..Default::default()

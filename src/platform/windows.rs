@@ -28,7 +28,6 @@
 
 #![cfg(windows)]
 
-use std::collections::HashMap;
 use std::ffi::OsString;
 use std::io;
 use std::os::windows::process::CommandExt;
@@ -36,14 +35,13 @@ use std::process::{Command, ExitStatus};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use windows_sys::Win32::Foundation::{FALSE, HANDLE, INVALID_HANDLE_VALUE, TRUE};
+use windows_sys::Win32::Foundation::{FALSE, TRUE};
 use windows_sys::Win32::System::Console::{
-    CONSOLE_MODE, CTRL_BREAK_EVENT, CTRL_C_EVENT, GenerateConsoleCtrlEvent, GetConsoleMode,
-    GetStdHandle, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, SetConsoleCtrlHandler,
+    CTRL_BREAK_EVENT, CTRL_C_EVENT, GenerateConsoleCtrlEvent, SetConsoleCtrlHandler,
 };
 use windows_sys::core::BOOL;
 
-use super::launcher::{ChildHandle, Launcher};
+use super::launcher::{ChildEnv, ChildHandle, Launcher};
 
 /// `CREATE_NEW_PROCESS_GROUP` — claude becomes its own console process group so
 /// `GenerateConsoleCtrlEvent` can target it without hitting the whole console.
@@ -95,7 +93,8 @@ impl Launcher for WindowsLauncher {
         &self,
         sid: &str,
         cli: &[OsString],
-        env: &HashMap<OsString, OsString>,
+        env: &ChildEnv,
+        on_spawn: &mut dyn FnMut(),
     ) -> io::Result<(ExitStatus, ChildHandle)> {
         let born = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -105,14 +104,12 @@ impl Launcher for WindowsLauncher {
         // Resolve the launch command: CLAUDE_SMART_CLAUDE_BIN env > config.json
         // `launchCommand` > "claude". out[0] is the binary; out[1..] are tokens
         // prepended to the claude-style argv (multi-token, e.g. `npx happy`).
-        let launch = crate::config::resolve_launch_command();
+        let launch = crate::config::launch_command_for_spawn()?;
         let (bin, prefix) = launch.split_first().expect("resolver returns ≥1 token");
         let mut cmd = Command::new(bin);
         cmd.args(prefix);
         cmd.args(cli);
-        for (k, v) in env {
-            cmd.env(k, v);
-        }
+        env.apply(&mut cmd);
         // Own process group so GenerateConsoleCtrlEvent can target claude alone.
         cmd.creation_flags(CREATE_NEW_PROCESS_GROUP);
         // stdio inherited by default (shares the console) — never piped.
@@ -130,6 +127,7 @@ impl Launcher for WindowsLauncher {
 
         // Write the pidfile NOW (born-timing): the hook reads it mid-session.
         let _ = crate::platform::pid::write_pid_file(&crate::paths::pid_file(sid), pid, born);
+        on_spawn();
 
         let stop_flag = crate::paths::stop_flag(sid);
         let grace = Duration::from_millis(crate::envvar::u64_or("CLAUDE_SWITCH_GRACE_MS", 5_000));
@@ -185,50 +183,5 @@ fn supervise(
         }
 
         std::thread::sleep(POLL);
-    }
-}
-
-/// `true` when `handle` is a live console handle with a readable console
-/// mode. Rejects a null or `INVALID_HANDLE_VALUE` handle before calling
-/// `GetConsoleMode`, so a closed or redirected handle never reaches the API.
-fn handle_is_console(handle: HANDLE) -> bool {
-    if handle.is_null() || handle == INVALID_HANDLE_VALUE {
-        return false;
-    }
-    let mut mode: CONSOLE_MODE = 0;
-    // SAFETY: `handle` was checked non-null and not `INVALID_HANDLE_VALUE`
-    // above; `mode` is a valid, uniquely-owned out-pointer for the call.
-    unsafe { GetConsoleMode(handle, &mut mode) != 0 }
-}
-
-/// `(stdin_is_console, stdout_is_console)`, each from its own
-/// `GetConsoleMode` check. Exposed separately, not just ANDed together, so a
-/// caller can tell "one stream is genuinely redirected" (one `true`, one
-/// `false`) apart from "neither handle is a console" (both `false`), which
-/// an MSYS/Cygwin pty also produces on a genuinely interactive session.
-///
-/// This is the `GetConsoleMode`-based counterpart to the Unix `isatty` gate
-/// used by `crate::cmd::support::is_interactive`: a nonzero window handle
-/// from `GetConsoleWindow` is not enough on its own — a plain
-/// `ssh host '<cmd>'` session still returns one — so the caller checks each
-/// std handle's own console-mode result rather than a window handle.
-pub(crate) fn console_handles() -> (bool, bool) {
-    // SAFETY: `GetStdHandle` with a documented `STD_*_HANDLE` constant; the
-    // call has no other preconditions.
-    let stdin_ok = handle_is_console(unsafe { GetStdHandle(STD_INPUT_HANDLE) });
-    // SAFETY: same as above.
-    let stdout_ok = handle_is_console(unsafe { GetStdHandle(STD_OUTPUT_HANDLE) });
-    (stdin_ok, stdout_ok)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn console_mode_is_false_for_a_non_console_handle() {
-        use std::os::windows::io::AsRawHandle;
-        let file = tempfile::tempfile().expect("tempfile");
-        assert!(!handle_is_console(file.as_raw_handle() as HANDLE));
     }
 }

@@ -1,17 +1,22 @@
 //! Single source of truth for the two disjoint reserved-subcommand-word sets
 //! and the argv[0]-aware dispatch rule that picks between them.
 //!
-//! `CSM_RESERVED_SUBCOMMANDS` is the exact word list `main()` used to match
-//! inline at `args[1]`; `CLAUDE_RESERVED_SUBCOMMANDS` exists only so tests can
-//! assert the two sets stay disjoint (CLAUDE.md invariant 2 — csm must never
-//! collide with a claude subcommand). Any word not in the csm set falls
-//! through to an implicit `csm run` and reaches `claude` verbatim.
+//! `CSM_RESERVED_SUBCOMMANDS` is the word list `main()` matches at `args[1]`;
+//! `CLAUDE_RESERVED_SUBCOMMANDS` is claude's own list. The two must stay
+//! disjoint (CLAUDE.md Invariant 2 — csm must never collide with a claude
+//! subcommand). Any word not in the csm set falls through to an implicit
+//! `csm run` and reaches `claude` verbatim. Nothing is peeled in front of the
+//! word: there is no csm-global flag any more.
 //!
-//! One csm-global flag may sit in front of the subcommand word:
-//! `csm --profile <name> <subcommand>`. [`dispatch_subcommand`] peels it off
-//! and hands the name back so `main()` can pin `CLAUDE_CONFIG_DIR` before the
-//! subcommand runs. Nothing else is peeled — every other leading token means
-//! the whole argument list belongs to the implicit `run`.
+//! argv[0] picks one of three rule sets ([`Invocation`]):
+//! - `csm` — the csm words above.
+//! - `csm-hook` — always `hook`.
+//! - `claude` (the alias `csm orca setup` creates for Orca's
+//!   `agentCmdOverrides.claude`) — csm words are never dispatched. A claude
+//!   subcommand word at `args[1]` (every [`CLAUDE_RESERVED_SUBCOMMANDS`]
+//!   entry), `--version`/`-v`/`-V` or `--help`/`-h` goes to the real claude
+//!   verbatim (the `claude` passthrough), so Orca's version probe and hook
+//!   installer see claude itself. Everything else is the implicit `run`.
 
 use std::ffi::OsString;
 
@@ -20,33 +25,32 @@ use std::ffi::OsString;
 pub(crate) const CSM_RESERVED_SUBCOMMANDS: &[&str] = &[
     "run",
     "hook",
-    "profiles",
     "config",
     "usage",
+    // Deprecated compat only: `--print-default-dir` and a no-op `--eval`.
     "cas",
-    "pick-account",
     "scan",
-    "current-usage",
     "sidecar",
     "statusline",
     "completions",
     "newuuid",
     "reap",
+    "accounts",
+    "orca",
+    "migrate",
     // The documented passthrough verb. `claude` is NOT one of claude's own
     // subcommands (`claude claude` is not a thing), so reserving the word
-    // costs nothing and gives `csm claude <args…>` — claude under csm's
-    // profile, arguments forwarded verbatim.
+    // costs nothing and gives `csm claude <args…>` — claude in csm's runtime
+    // dir, arguments forwarded verbatim.
     "claude",
 ];
 
 /// `claude`'s own reserved subcommand words, as `claude --help` lists them.
-/// Never matched against by `dispatch_subcommand` — this list exists so
-/// `csm_and_claude_reserved_sets_are_disjoint` can assert the two sets never
-/// overlap, so it is otherwise dead outside `#[cfg(test)]`.
+/// The disjointness test asserts csm never claims one, and the `claude`
+/// argv[0] alias forwards every one of them to the real claude.
 ///
 /// Keep it a superset rather than a minimal one: an entry csm must never claim
 /// is cheap, and a missing entry is how a collision ships.
-#[allow(dead_code)]
 pub(crate) const CLAUDE_RESERVED_SUBCOMMANDS: &[&str] = &[
     "agents",
     "attach",
@@ -57,6 +61,7 @@ pub(crate) const CLAUDE_RESERVED_SUBCOMMANDS: &[&str] = &[
     "fix",
     "gateway",
     "import",
+    "import-conversations",
     "install",
     "kill",
     "lists",
@@ -65,24 +70,39 @@ pub(crate) const CLAUDE_RESERVED_SUBCOMMANDS: &[&str] = &[
     "plugin",
     "plugins",
     "project",
+    "rc",
+    "remote-control",
     "respawn",
     "rm",
+    "sandbox",
     "sessions",
     "setup-token",
     "stop",
     "terminal",
     "ultrareview",
     "update",
+    "upgrade",
     "worktree",
 ];
 
-/// True when `argv[0]` is the `csm-hook` alias (symlink/rename form), the one
-/// case where dispatch does not look at `args[1]` at all. `main()` uses this
-/// to guard its top-level `--version`/`-V`/`--help`/`-h` interception so that
-/// `csm-hook --version` still routes to `cmd_hook` instead of printing csm's
-/// own version/help.
-pub(crate) fn invoked_as_hook_alias(args: &[OsString]) -> bool {
-    let argv0 = args
+/// Flags the `claude` alias hands to the real claude when they come first:
+/// Orca's `reportVersion` probe runs `<override> --version`.
+const CLAUDE_ALIAS_EXEC_FLAGS: &[&str] = &["--version", "-v", "-V", "--help", "-h"];
+
+/// Which name csm was invoked under.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Invocation {
+    /// `csm` (or any other name).
+    Csm,
+    /// `csm-hook`.
+    Hook,
+    /// `claude` / `claude.exe` — the alias for Orca's command override.
+    ClaudeAlias,
+}
+
+/// Classify `argv[0]` by its lowercased file stem.
+pub(crate) fn invocation(args: &[OsString]) -> Invocation {
+    let stem = args
         .first()
         .and_then(|a| {
             std::path::Path::new(a)
@@ -91,8 +111,11 @@ pub(crate) fn invoked_as_hook_alias(args: &[OsString]) -> bool {
                 .map(str::to_ascii_lowercase)
         })
         .unwrap_or_default();
-
-    argv0 == "csm-hook"
+    match stem.as_str() {
+        "csm-hook" => Invocation::Hook,
+        "claude" => Invocation::ClaudeAlias,
+        _ => Invocation::Csm,
+    }
 }
 
 /// Where [`dispatch_subcommand`] routed an argument list.
@@ -107,61 +130,47 @@ pub(crate) struct Dispatch {
     pub(crate) subcommand: &'static str,
     /// Count of trailing args belonging to `subcommand`.
     pub(crate) rest_len: usize,
-    /// The csm-global `--profile <name>` that preceded the subcommand word,
-    /// if any. Always `None` for the implicit `run` fallthrough, where the
-    /// `--profile` tokens stay in `rest` for `cli::parser` to consume.
-    pub(crate) profile: Option<String>,
 }
 
-impl Dispatch {
-    /// A dispatch with no csm-global `--profile`.
-    fn bare(subcommand: &'static str, rest_len: usize) -> Self {
-        Dispatch {
-            subcommand,
-            rest_len,
-            profile: None,
-        }
-    }
-}
-
-/// argv[0]-aware dispatch: which subcommand word to route to, how many
-/// trailing args belong to it, and the csm-global `--profile` that preceded
-/// the word.
+/// argv[0]-aware dispatch: which subcommand word to route to and how many
+/// trailing args belong to it.
 ///
-/// - `csm-hook` argv[0] (symlink/rename form) → `hook` with everything after
-///   argv[0] as `rest` (the alias takes no csm-global flags).
-/// - Leading `--profile <name>` / `--profile=<name>` pairs are peeled off
-///   (repeatable, last wins). If a reserved word follows, that word is
-///   dispatched with `rest` = the tokens after it and the peeled name is
-///   returned — this is what makes `csm --profile work statusline` run the
-///   statusline under `work` instead of forwarding `statusline` to claude as
-///   a prompt.
-/// - Otherwise `args[1]` matched against `CSM_RESERVED_SUBCOMMANDS` → that
-///   word with `rest` = `args[2..]`.
-/// - Anything else — a bare `csm`, a dangling `--profile`, or a non-reserved
-///   token like `csm --profile work -p 'hi'` — falls through to the implicit
-///   `run` with `rest` = EVERYTHING after argv[0], `--profile` tokens
-///   included, and `profile: None`. `csm run`'s own parser then handles that
-///   form exactly as it always has.
+/// - `csm-hook` → `hook` with everything after argv[0] as `rest`.
+/// - `claude` alias → `claude` (the passthrough) with `rest` = `args[1..]`
+///   when `args[1]` is a claude subcommand word or a version/help flag,
+///   else the implicit `run` with `rest` = `args[1..]`. csm's own words are
+///   never dispatched under this name.
+/// - `csm`: `args[1]` matched against `CSM_RESERVED_SUBCOMMANDS` → that word
+///   with `rest` = `args[2..]`; anything else → the implicit `run` with
+///   `rest` = everything after argv[0].
 pub(crate) fn dispatch_subcommand(args: &[OsString]) -> Dispatch {
-    if invoked_as_hook_alias(args) {
-        return Dispatch::bare("hook", args.len().saturating_sub(1));
+    let after_argv0 = args.len().saturating_sub(1);
+    let first = args.get(1).map(|a| a.to_string_lossy());
+    match invocation(args) {
+        Invocation::Hook => Dispatch {
+            subcommand: "hook",
+            rest_len: after_argv0,
+        },
+        Invocation::ClaudeAlias => {
+            let exec_claude = first.as_deref().is_some_and(|w| {
+                CLAUDE_RESERVED_SUBCOMMANDS.contains(&w) || CLAUDE_ALIAS_EXEC_FLAGS.contains(&w)
+            });
+            Dispatch {
+                subcommand: if exec_claude { "claude" } else { "run" },
+                rest_len: after_argv0,
+            }
+        }
+        Invocation::Csm => match first.as_deref().and_then(reserved_word) {
+            Some(word) => Dispatch {
+                subcommand: word,
+                rest_len: args.len() - 2,
+            },
+            None => Dispatch {
+                subcommand: "run",
+                rest_len: after_argv0,
+            },
+        },
     }
-
-    let (idx, profile) = peel_global_profile(args);
-
-    if let Some(word) = args
-        .get(idx)
-        .and_then(|a| reserved_word(a.to_string_lossy().as_ref()))
-    {
-        return Dispatch {
-            subcommand: word,
-            rest_len: args.len() - idx - 1,
-            profile,
-        };
-    }
-
-    Dispatch::bare("run", args.len().saturating_sub(1))
 }
 
 /// The `CSM_RESERVED_SUBCOMMANDS` entry equal to `candidate`, if any.
@@ -170,61 +179,6 @@ fn reserved_word(candidate: &str) -> Option<&'static str> {
         .iter()
         .copied()
         .find(|w| *w == candidate)
-}
-
-/// Peel leading csm-global `--profile <name>` / `--profile=<name>` pairs off
-/// `args[1..]`, last one winning. Returns the index of the first token that is
-/// not part of such a pair, plus the peeled name.
-///
-/// Only `--profile` is global: `-p` is claude's own print flag and `-P` is not
-/// csm's, so neither is ever consumed here.
-///
-/// A dangling `--profile` — no value at all, or a dash-prefixed next token,
-/// the same guard `cli::parser::consume_required_value` applies — stops the
-/// peel AT that token, so the caller falls through to the implicit `run` and
-/// the run parser sees the arguments exactly as typed.
-fn peel_global_profile(args: &[OsString]) -> (usize, Option<String>) {
-    let mut idx = 1;
-    let mut profile: Option<String> = None;
-
-    while idx < args.len() {
-        let token = args[idx].to_string_lossy();
-        if let Some(value) = token.strip_prefix("--profile=") {
-            if value.is_empty() {
-                break;
-            }
-            profile = Some(value.to_owned());
-            idx += 1;
-        } else if token == "--profile" {
-            match args.get(idx + 1).map(|v| v.to_string_lossy()) {
-                Some(value) if !value.is_empty() && !value.starts_with('-') => {
-                    profile = Some(value.into_owned());
-                    idx += 2;
-                }
-                _ => break,
-            }
-        } else {
-            break;
-        }
-    }
-
-    (idx, profile)
-}
-
-/// Rebuild `csm run`'s argument list when a csm-global `--profile` preceded an
-/// explicit `run` word (`csm --profile work run -c`).
-///
-/// The flag is re-injected in front of run's own args so the pin travels
-/// through the SAME `cli::parser` `--profile` path as `csm run --profile work
-/// -c` (explicit choice, skip all picking) instead of being silently dropped.
-pub(crate) fn run_args_with_profile(profile: Option<&str>, rest: &[OsString]) -> Vec<OsString> {
-    let mut out: Vec<OsString> = Vec::with_capacity(rest.len() + 2);
-    if let Some(name) = profile {
-        out.push(OsString::from("--profile"));
-        out.push(OsString::from(name));
-    }
-    out.extend_from_slice(rest);
-    out
 }
 
 #[cfg(test)]
@@ -248,15 +202,15 @@ mod tests {
     /// pre-empt the `csm-hook` argv[0] alias — `csm-hook --version` has to
     /// reach `cmd_hook`, not print csm's own version.
     #[test]
-    fn invoked_as_hook_alias_true_for_csm_hook_argv0() {
+    fn hook_alias_is_recognised_for_csm_hook_argv0() {
         let a = vec![OsString::from("csm-hook"), OsString::from("--version")];
-        assert!(invoked_as_hook_alias(&a));
+        assert_eq!(invocation(&a), Invocation::Hook);
     }
 
     #[test]
-    fn invoked_as_hook_alias_false_for_plain_csm() {
+    fn plain_csm_is_not_the_hook_alias() {
         let a = vec![OsString::from("csm"), OsString::from("--version")];
-        assert!(!invoked_as_hook_alias(&a));
+        assert_eq!(invocation(&a), Invocation::Csm);
     }
 
     // ══════════════════════════════════════════════════════════════════════════
@@ -271,16 +225,20 @@ mod tests {
         ss.iter().map(|s| OsString::from(*s)).collect()
     }
 
-    /// Dispatch `ss` and return `(subcommand, rest, profile)` — `rest` sliced
-    /// exactly the way `main()` slices it, as plain strings for comparison.
-    fn routed(ss: &[&str]) -> (&'static str, Vec<String>, Option<String>) {
+    /// Dispatch `ss` and return `(subcommand, rest)` — `rest` sliced exactly
+    /// the way `main()` slices it, as plain strings for comparison.
+    fn routed(ss: &[&str]) -> (&'static str, Vec<String>) {
         let a = argv(ss);
         let d = dispatch_subcommand(&a);
         let rest: Vec<String> = a[a.len() - d.rest_len..]
             .iter()
             .map(|s| s.to_string_lossy().into_owned())
             .collect();
-        (d.subcommand, rest, d.profile)
+        (d.subcommand, rest)
+    }
+
+    fn strings(ss: &[&str]) -> Vec<String> {
+        ss.iter().map(|s| (*s).to_owned()).collect()
     }
 
     // ── explicit subcommands ──────────────────────────────────────────────────
@@ -302,17 +260,27 @@ mod tests {
     }
 
     #[test]
-    fn dispatch_explicit_pick_account() {
-        let a = argv(&["csm", "pick-account", "home", "--include-current"]);
-        assert_eq!(dispatch_subcommand(&a).subcommand, "pick-account");
+    fn dispatch_explicit_accounts_orca_migrate() {
+        assert_eq!(
+            routed(&["csm", "accounts", "use", "alice@example.com"]),
+            ("accounts", strings(&["use", "alice@example.com"]))
+        );
+        assert_eq!(
+            routed(&["csm", "orca", "status"]),
+            ("orca", strings(&["status"]))
+        );
+        assert_eq!(
+            routed(&["csm", "migrate", "plan"]),
+            ("migrate", strings(&["plan"]))
+        );
     }
 
+    /// The retired words are no longer csm's: they reach claude as prompts.
     #[test]
-    fn dispatch_explicit_profiles() {
-        let a = argv(&["csm", "profiles", "list"]);
-        let d = dispatch_subcommand(&a);
-        assert_eq!(d.subcommand, "profiles");
-        assert_eq!(d.rest_len, 1);
+    fn dispatch_retired_words_fall_through_to_run() {
+        for w in ["profiles", "pick-account", "current-usage"] {
+            assert_eq!(routed(&["csm", w]).0, "run", "{w}");
+        }
     }
 
     #[test]
@@ -345,7 +313,6 @@ mod tests {
         let d = dispatch_subcommand(&a);
         assert_eq!(d.subcommand, "claude");
         assert_eq!(d.rest_len, 1);
-        assert_eq!(d.profile, None);
     }
 
     /// A word that is NOT a reserved csm subcommand falls through to `run`
@@ -368,14 +335,6 @@ mod tests {
         let a = argv(&["csm", "scan", "/tmp/project"]);
         let d = dispatch_subcommand(&a);
         assert_eq!(d.subcommand, "scan");
-        assert_eq!(d.rest_len, 1);
-    }
-
-    #[test]
-    fn dispatch_explicit_current_usage() {
-        let a = argv(&["csm", "current-usage", "home"]);
-        let d = dispatch_subcommand(&a);
-        assert_eq!(d.subcommand, "current-usage");
         assert_eq!(d.rest_len, 1);
     }
 
@@ -433,171 +392,111 @@ mod tests {
 
     #[test]
     fn dispatch_explicit_run_subcommand() {
-        let a = argv(&["csm", "run", "-c", "--profile=work"]);
+        let a = argv(&["csm", "run", "-c", "-n"]);
         let d = dispatch_subcommand(&a);
         assert_eq!(d.subcommand, "run");
         assert_eq!(d.rest_len, 2);
     }
 
-    // ── csm-global `--profile` before the subcommand word ─────────────────────
-    //
-    // The bug (issue #25): `csm --profile home statusline` used to dispatch as
-    // an implicit `run`, run's parser ate `--profile home`, and `statusline`
-    // reached claude as a PROMPT — a full session instead of a status line.
-
+    /// There is no csm-global flag: a leading `--profile` is an ordinary
+    /// launch token and the whole list goes to `run`.
     #[test]
-    fn dispatch_global_profile_then_reserved_word() {
+    fn dispatch_leading_profile_flag_is_run() {
         assert_eq!(
             routed(&["csm", "--profile", "home", "statusline"]),
-            ("statusline", vec![], Some("home".to_owned()))
+            ("run", strings(&["--profile", "home", "statusline"]))
         );
     }
 
+    // ── the `claude` argv[0] alias ────────────────────────────────────────────
+
     #[test]
-    fn dispatch_global_profile_equals_form_keeps_subcommand_args() {
+    fn invocation_by_stem() {
+        assert_eq!(invocation(&argv(&["csm"])), Invocation::Csm);
+        assert_eq!(invocation(&argv(&["/usr/local/bin/csm"])), Invocation::Csm);
+        assert_eq!(invocation(&argv(&["csm-hook"])), Invocation::Hook);
+        assert_eq!(invocation(&argv(&["claude"])), Invocation::ClaudeAlias);
         assert_eq!(
-            routed(&["csm", "--profile=home", "usage", "--json"]),
-            ("usage", vec!["--json".to_owned()], Some("home".to_owned()))
+            invocation(&argv(&["/Users/example/.local/state/csm/bin/claude"])),
+            Invocation::ClaudeAlias
         );
+        assert_eq!(invocation(&argv(&["Claude.EXE"])), Invocation::ClaudeAlias);
+        assert_eq!(invocation(&argv(&[])), Invocation::Csm);
     }
 
+    /// Every claude subcommand word reaches the real claude verbatim under
+    /// the alias, the word included.
     #[test]
-    fn dispatch_global_profile_before_claude_passthrough() {
-        assert_eq!(
-            routed(&["csm", "--profile", "home", "claude", "mcp", "list"]),
-            (
-                "claude",
-                vec!["mcp".to_owned(), "list".to_owned()],
-                Some("home".to_owned())
-            )
-        );
+    fn alias_forwards_every_claude_word_to_claude() {
+        for w in CLAUDE_RESERVED_SUBCOMMANDS {
+            assert_eq!(
+                routed(&["claude", w, "--x"]),
+                ("claude", strings(&[w, "--x"])),
+                "`claude {w}` under the alias must exec the real claude"
+            );
+        }
     }
 
-    /// No reserved word follows, so this is an ordinary launch: `run` gets
-    /// EVERY token back (the `--profile` pair included) and dispatch reports
-    /// no global profile, leaving `cli::parser` to pin it exactly as before.
+    /// Claude Code 2.1.283's top-level commands and their aliases, read from
+    /// its command table: `claude upgrade` under the alias must update claude,
+    /// not start a csm session.
     #[test]
-    fn dispatch_global_profile_then_non_reserved_token_is_unchanged_run() {
-        assert_eq!(
-            routed(&["csm", "--profile", "home", "-p", "hi"]),
-            (
-                "run",
-                vec![
-                    "--profile".to_owned(),
-                    "home".to_owned(),
-                    "-p".to_owned(),
-                    "hi".to_owned()
-                ],
-                None
-            )
-        );
-    }
-
-    #[test]
-    fn dispatch_dangling_global_profile_is_run() {
-        assert_eq!(
-            routed(&["csm", "--profile"]),
-            ("run", vec!["--profile".to_owned()], None)
-        );
-    }
-
-    /// A dash-prefixed value is not a profile name (same guard the run parser
-    /// applies), so the whole thing is an ordinary launch.
-    #[test]
-    fn dispatch_global_profile_with_flag_value_is_run() {
-        assert_eq!(
-            routed(&["csm", "--profile", "--interactive", "statusline"]),
-            (
-                "run",
-                vec![
-                    "--profile".to_owned(),
-                    "--interactive".to_owned(),
-                    "statusline".to_owned()
-                ],
-                None
-            )
-        );
-    }
-
-    #[test]
-    fn dispatch_repeated_global_profile_last_wins() {
-        assert_eq!(
-            routed(&[
-                "csm",
-                "--profile",
-                "home",
-                "--profile",
-                "work",
-                "statusline"
-            ]),
-            ("statusline", vec![], Some("work".to_owned()))
-        );
-    }
-
-    /// `-p` is claude's print flag and `-P` is nobody's — neither is a csm
-    /// global, so both stay ordinary `run` tokens.
-    #[test]
-    fn dispatch_short_p_flags_are_not_global_profile() {
-        for flag in ["-p", "-P"] {
-            let (cmd, rest, profile) = routed(&["csm", flag, "home", "statusline"]);
-            assert_eq!(cmd, "run", "`csm {flag} …` must stay an implicit run");
-            assert_eq!(rest.len(), 3);
-            assert_eq!(profile, None);
+    fn reserved_list_covers_claude_2_1_283_top_level_words() {
+        for w in [
+            "agents",
+            "auth",
+            "auto-mode",
+            "doctor",
+            "gateway",
+            "import",
+            "import-conversations",
+            "install",
+            "mcp",
+            "plugin",
+            "plugins",
+            "project",
+            "rc",
+            "remote-control",
+            "sandbox",
+            "setup-token",
+            "ultrareview",
+            "update",
+            "upgrade",
+        ] {
+            assert!(CLAUDE_RESERVED_SUBCOMMANDS.contains(&w), "missing {w}");
         }
     }
 
     #[test]
-    fn dispatch_global_profile_before_explicit_run_word() {
+    fn alias_forwards_version_and_help_flags() {
+        for f in ["--version", "-v", "-V", "--help", "-h"] {
+            assert_eq!(routed(&["claude", f]), ("claude", strings(&[f])), "{f}");
+        }
+    }
+
+    /// csm's own words are never dispatched under the alias: `claude usage`
+    /// is a launch whose prompt is "usage".
+    #[test]
+    fn alias_never_dispatches_csm_words() {
+        for w in CSM_RESERVED_SUBCOMMANDS {
+            assert_eq!(
+                routed(&["claude", w]),
+                ("run", strings(&[w])),
+                "`claude {w}` under the alias must be an implicit run"
+            );
+        }
+    }
+
+    #[test]
+    fn alias_launch_shapes_go_to_run() {
+        assert_eq!(routed(&["claude"]), ("run", vec![]));
         assert_eq!(
-            routed(&["csm", "--profile", "home", "run", "-c"]),
-            ("run", vec!["-c".to_owned()], Some("home".to_owned()))
+            routed(&["claude", "-n", "--resume", "abc"]),
+            ("run", strings(&["-n", "--resume", "abc"]))
         );
-    }
-
-    // ── run_args_with_profile ─────────────────────────────────────────────────
-
-    #[test]
-    fn run_args_with_profile_reinjects_the_flag() {
-        let rest = argv(&["-c", "--model", "claude-x-1"]);
         assert_eq!(
-            run_args_with_profile(Some("work"), &rest),
-            argv(&["--profile", "work", "-c", "--model", "claude-x-1"])
+            routed(&["claude", "-p", "--version"]),
+            ("run", strings(&["-p", "--version"]))
         );
-    }
-
-    #[test]
-    fn run_args_with_profile_none_is_rest_unchanged() {
-        let rest = argv(&["-c", "hello"]);
-        assert_eq!(run_args_with_profile(None, &rest), rest);
-    }
-
-    // ── argv[0]-aware hook dispatch ───────────────────────────────────────────
-
-    #[test]
-    fn dispatch_argv0_csm_hook_routes_to_hook() {
-        let a = argv(&["csm-hook", "--owner", "/tmp/dir"]);
-        let d = dispatch_subcommand(&a);
-        assert_eq!(d.subcommand, "hook");
-        assert_eq!(d.rest_len, 2);
-        assert_eq!(d.profile, None);
-    }
-
-    #[test]
-    fn dispatch_argv0_csm_hook_no_args() {
-        let a = argv(&["csm-hook"]);
-        let d = dispatch_subcommand(&a);
-        assert_eq!(d.subcommand, "hook");
-        assert_eq!(d.rest_len, 0);
-    }
-
-    /// The alias never peels csm globals: `csm-hook --profile home` is the
-    /// hook with those two tokens as its own args, not a profile pin.
-    #[test]
-    fn dispatch_argv0_csm_hook_ignores_global_profile() {
-        let a = argv(&["csm-hook", "--profile", "home"]);
-        let d = dispatch_subcommand(&a);
-        assert_eq!(d.subcommand, "hook");
-        assert_eq!(d.rest_len, 2);
-        assert_eq!(d.profile, None);
     }
 }

@@ -1,3 +1,4 @@
+pub mod child;
 pub mod launcher;
 pub mod pid;
 pub(crate) mod proc;

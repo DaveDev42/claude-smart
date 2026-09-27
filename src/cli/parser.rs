@@ -6,24 +6,37 @@
 //! about; everything else accumulates in `passthru`.
 //!
 //! Handles arg parsing in full:
-//! - Consumed-internally flags: `-i`/`--interactive`, `-n`/`--new`,
-//!   `-c`/`--continue`, `-A`/`--pick-account`, `--no-pick`, `-r`/`--resume`,
-//!   `--permission-mode`, `--effort`, `--model`, `--session-id`, `--profile`.
+//! - Consumed-internally flags: `-i`/`--interactive` (session picker only),
+//!   `-n`/`--new`, `-c`/`--continue`, `-r`/`--resume`, `--permission-mode`,
+//!   `--effort`, `--model`, `--session-id`.
+//! - **`-n` shadows claude's `-n, --name <name>`.** Under `csm`/`csm run`,
+//!   `-n` is csm's no-value "fresh session" flag, because Orca's
+//!   `agentDefaultArgs` depend on it. This is the second documented
+//!   exception to Invariant 2 (the first is `-h`/`--help`); `csm run -- -n x`
+//!   and `--name x` still reach claude.
+//! - **Stops at the first positional.** The first token that is neither a
+//!   flag nor the value of a flag (claude's arities come from
+//!   [`crate::cli::carry::arity`]) ends csm's parsing: it and everything after
+//!   forward verbatim, so an Orca launch's trailing prompt can never be read
+//!   as csm flags. An unknown claude flag counts as boolean.
 //! - `-h`/`--help` **only while nothing has been forwarded yet** → run's own
 //!   help. Once a passthru token exists (`csm run -p --help`) or the `--`
 //!   boundary has been crossed (`csm run -- --help`), it is claude's flag and
 //!   forwards verbatim.
 //! - **Equals-form:** `--resume=<id>`, `--permission-mode=<m>`,
-//!   `--effort=<e>`, `--model=<m>`, `--session-id=<id>`, `--profile=<p>`.
+//!   `--effort=<e>`, `--model=<m>`, `--session-id=<id>`.
 //! - **`-r`/`--resume` alias resolution:** non-UUID value → alias token;
 //!   missing / dash-prefixed next token → promote to picker ([`ResumeArg::Picker`]).
 //! - `--` stops parsing; everything after goes verbatim into `passthru`.
-//! - Unknown flags / positional args go into `passthru`.
+//! - Unknown flags go into `passthru`; so does the first positional and
+//!   everything after it.
 //!
 //! Matches the legacy shell implementation's `while (( $# )); do … done`
 //! arg-parse block.
 
 use std::ffi::OsString;
+
+use crate::cli::carry::Arity;
 
 // ─── types ────────────────────────────────────────────────────────────────────
 
@@ -59,29 +72,22 @@ pub enum ResumeArg {
 ///
 /// Reproduces the legacy shell implementation's local variables:
 /// ```zsh
-/// local want_picker=false want_continue=false pick_account=false no_pick=false
-/// local want_new=false
-/// local resume_id="" o_mode="" o_effort="" o_model="" o_session="" o_profile=""
+/// local want_picker=false want_continue=false want_new=false
+/// local resume_id="" o_mode="" o_effort="" o_model="" o_session=""
 /// ```
 #[derive(Debug, Default, PartialEq)]
 pub struct Flags {
-    /// `-i` / `--interactive` — manual pick. Forces BOTH pickers: skips account
-    /// auto-pick and always opens the recommendation-ordered account picker, and
-    /// opens the session picker. `--profile <p>` still wins. (`want_picker=true`
-    /// in the zsh source — which forced only the session picker.)
+    /// `-i` / `--interactive` — open the session picker. (`want_picker=true`
+    /// in the zsh source.)
     pub interactive: bool,
-    /// `-n` / `--new` — start a fresh session, skip the session picker.
-    /// (`want_new=true` in the zsh source)
+    /// `-n` / `--new` — start a fresh session, skip the session picker. A
+    /// no-value boolean here, shadowing claude's `-n, --name <name>`; an
+    /// explicit `--resume <id>` wins over it. (`want_new=true` in the zsh
+    /// source)
     pub new: bool,
     /// `-c` / `--continue` — continue the newest free session.
     /// (`want_continue=true` in the zsh source)
     pub continue_: bool,
-    /// `-A` / `--pick-account` — force an account pick.
-    /// (`pick_account=true` in the zsh source)
-    pub pick_account: bool,
-    /// `--no-pick` — suppress all automatic account picking.
-    /// (`no_pick=true` in the zsh source)
-    pub no_pick: bool,
     /// `-r` / `--resume [<id-or-alias>]`
     ///   - `None`                    → flag absent
     ///   - `Some(ResumeArg::Id(s))`  → value supplied (UUID or alias token)
@@ -101,9 +107,6 @@ pub struct Flags {
     /// `--session-id <id>` / `--session-id=<id>`
     /// (`o_session` in the zsh source)
     pub session_id: Option<String>,
-    /// `--profile <p>` / `--profile=<p>`
-    /// (`o_profile` in the zsh source)
-    pub profile: Option<String>,
     /// `-h` / `--help` seen before anything was forwarded to claude — print
     /// `csm run`'s own usage and exit instead of launching.
     ///
@@ -176,14 +179,6 @@ pub fn parse(args: &[OsString]) -> ParsedArgs {
             flags.continue_ = true;
             continue;
         }
-        if s == "-A" || s == "--pick-account" {
-            flags.pick_account = true;
-            continue;
-        }
-        if s == "--no-pick" {
-            flags.no_pick = true;
-            continue;
-        }
 
         // ── -r / --resume [<id-or-alias>] ─────────────────────────────────────
         // When the next token is absent or starts with '-', promote to the
@@ -237,18 +232,34 @@ pub fn parse(args: &[OsString]) -> ParsedArgs {
             continue;
         }
 
-        // ── --profile ─────────────────────────────────────────────────────────
-        if s == "--profile" {
-            flags.profile = consume_required_value(&mut iter);
-            continue;
-        }
-        if let Some(val) = strip_eq_prefix(&s, "--profile") {
-            flags.profile = Some(val.to_owned());
+        // ── claude's own flags and the first positional ──────────────────────
+        if s.starts_with('-') {
+            // A claude flag: forward it with its values so they are not taken
+            // for the first positional. `--flag=value` carries its own.
+            passthru.push(arg.clone());
+            if !s.contains('=') {
+                match crate::cli::carry::arity(&s) {
+                    Some(Arity::One) => {
+                        if let Some(v) = iter.next_if(|n| !n.to_string_lossy().starts_with('-')) {
+                            passthru.push(v.clone());
+                        }
+                    }
+                    Some(Arity::Many) => {
+                        while let Some(v) = iter.next_if(|n| !n.to_string_lossy().starts_with('-'))
+                        {
+                            passthru.push(v.clone());
+                        }
+                    }
+                    Some(Arity::Zero) | None => {}
+                }
+            }
             continue;
         }
 
-        // Unrecognised argument: forward verbatim to claude.
+        // The first positional: it and everything after reach claude verbatim.
         passthru.push(arg.clone());
+        passthru.extend(iter.cloned());
+        break;
     }
 
     ParsedArgs { flags, passthru }
@@ -292,8 +303,7 @@ fn consume_value_or_picker(
 /// If there is no next argument or the next starts with `-`, returns `None`
 /// without advancing the iterator (leaving the next token for the main loop).
 ///
-/// Used for `--permission-mode`, `--effort`, `--model`, `--session-id`,
-/// `--profile`.  Mirrors zsh's `shift 2` form with the implicit "next token
+/// Used for `--permission-mode`, `--effort`, `--model`, `--session-id`.  Mirrors zsh's `shift 2` form with the implicit "next token
 /// must not be a flag" guard.
 fn consume_required_value(
     iter: &mut std::iter::Peekable<std::slice::Iter<'_, OsString>>,
@@ -329,8 +339,6 @@ mod tests {
         let r = parse(&os_args(&["-i"]));
         assert!(r.flags.interactive);
         assert!(!r.flags.continue_);
-        assert!(!r.flags.pick_account);
-        assert!(!r.flags.no_pick);
     }
 
     #[test]
@@ -347,16 +355,14 @@ mod tests {
         assert!(!r.flags.new);
     }
 
+    /// The removed account flags are claude's now (well, unknown flags):
+    /// they forward instead of being consumed.
     #[test]
-    fn parse_pick_account_short() {
-        let r = parse(&os_args(&["-A"]));
-        assert!(r.flags.pick_account);
-    }
-
-    #[test]
-    fn parse_no_pick() {
-        let r = parse(&os_args(&["--no-pick"]));
-        assert!(r.flags.no_pick);
+    fn removed_account_flags_forward() {
+        let r = parse(&os_args(&["-A", "--no-pick", "--pick-account"]));
+        assert_eq!(r.passthru, os_args(&["-A", "--no-pick", "--pick-account"]));
+        let r = parse(&os_args(&["--profile=home"]));
+        assert_eq!(r.passthru, os_args(&["--profile=home"]));
     }
 
     // ══════════════════════════════════════════════════════════════════════════
@@ -381,13 +387,6 @@ mod tests {
     fn parse_continue_long() {
         let r = parse(&os_args(&["--continue"]));
         assert!(r.flags.continue_);
-        assert!(r.passthru.is_empty());
-    }
-
-    #[test]
-    fn parse_pick_account_long() {
-        let r = parse(&os_args(&["--pick-account"]));
-        assert!(r.flags.pick_account);
         assert!(r.passthru.is_empty());
     }
 
@@ -544,13 +543,6 @@ mod tests {
         assert!(r.passthru.is_empty());
     }
 
-    #[test]
-    fn parse_profile_space() {
-        let r = parse(&os_args(&["--profile", "home"]));
-        assert_eq!(r.flags.profile.as_deref(), Some("home"));
-        assert!(r.passthru.is_empty());
-    }
-
     // ══════════════════════════════════════════════════════════════════════════
     // Value flags — equals-form
     // ══════════════════════════════════════════════════════════════════════════
@@ -587,12 +579,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn parse_profile_equals() {
-        let r = parse(&os_args(&["--profile=home"]));
-        assert_eq!(r.flags.profile.as_deref(), Some("home"));
-    }
-
     // ══════════════════════════════════════════════════════════════════════════
     // Space-form vs equals-form equivalence
     // ══════════════════════════════════════════════════════════════════════════
@@ -624,13 +610,6 @@ mod tests {
         let r_space = parse(&os_args(&["--session-id", id]));
         let r_eq = parse(&os_args(&[&format!("--session-id={id}")]));
         assert_eq!(r_space.flags.session_id, r_eq.flags.session_id);
-    }
-
-    #[test]
-    fn profile_space_and_equals_equivalent() {
-        let r_space = parse(&os_args(&["--profile", "work"]));
-        let r_eq = parse(&os_args(&["--profile=work"]));
-        assert_eq!(r_space.flags.profile, r_eq.flags.profile);
     }
 
     // ══════════════════════════════════════════════════════════════════════════
@@ -740,38 +719,19 @@ mod tests {
 
     #[test]
     fn all_boolean_flags_together() {
-        let r = parse(&os_args(&["-i", "-c", "-A", "--no-pick"]));
+        let r = parse(&os_args(&["-i", "-c", "-n"]));
         assert!(r.flags.interactive);
         assert!(r.flags.continue_);
-        assert!(r.flags.pick_account);
-        assert!(r.flags.no_pick);
+        assert!(r.flags.new);
         assert!(r.passthru.is_empty());
     }
 
     #[test]
     fn all_boolean_flags_long_forms() {
-        let r = parse(&os_args(&[
-            "--interactive",
-            "--continue",
-            "--pick-account",
-            "--no-pick",
-        ]));
+        let r = parse(&os_args(&["--interactive", "--continue", "--new"]));
         assert!(r.flags.interactive);
         assert!(r.flags.continue_);
-        assert!(r.flags.pick_account);
-        assert!(r.flags.no_pick);
-    }
-
-    /// Reproduces the real-world `csm -i -A` invocation from the legacy
-    /// shell implementation's doc-comment: "pick a session AND the best
-    /// account".
-    #[test]
-    fn interactive_plus_pick_account() {
-        let r = parse(&os_args(&["-i", "-A"]));
-        assert!(r.flags.interactive);
-        assert!(r.flags.pick_account);
-        assert!(!r.flags.no_pick);
-        assert!(r.passthru.is_empty());
+        assert!(r.flags.new);
     }
 
     /// `csm --permission-mode plan --effort high` from the legacy shell doc.
@@ -785,16 +745,8 @@ mod tests {
 
     #[test]
     fn combined_flags_passthru_and_double_dash() {
-        let r = parse(&os_args(&[
-            "-c",
-            "--profile=work",
-            "--effort",
-            "low",
-            "--",
-            "extra",
-        ]));
+        let r = parse(&os_args(&["-c", "--effort", "low", "--", "extra"]));
         assert!(r.flags.continue_);
-        assert_eq!(r.flags.profile.as_deref(), Some("work"));
         assert_eq!(r.flags.effort.as_deref(), Some("low"));
         assert_eq!(r.passthru, os_args(&["extra"]));
     }
@@ -856,18 +808,6 @@ mod tests {
     }
 
     #[test]
-    fn profile_work_equals_form() {
-        let r = parse(&os_args(&["--profile=work"]));
-        assert_eq!(r.flags.profile.as_deref(), Some("work"));
-    }
-
-    #[test]
-    fn profile_space_form_work() {
-        let r = parse(&os_args(&["--profile", "work"]));
-        assert_eq!(r.flags.profile.as_deref(), Some("work"));
-    }
-
-    #[test]
     fn unknown_flag_before_and_after_csm_flag() {
         // Interleaved: unknown flag, then csm flag, then unknown flag
         let r = parse(&os_args(&["--output-format=json", "--continue", "--print"]));
@@ -891,6 +831,77 @@ mod tests {
             ))
         );
         assert_eq!(r.passthru, os_args(&["resume"]));
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════
+    // First positional ends csm parsing
+    // ══════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn csm_flags_after_the_first_positional_forward() {
+        let r = parse(&os_args(&[
+            "-c",
+            "fix the -n bug",
+            "-n",
+            "-i",
+            "--model",
+            "x",
+        ]));
+        assert!(r.flags.continue_);
+        assert!(!r.flags.new);
+        assert!(!r.flags.interactive);
+        assert!(r.flags.model.is_none());
+        assert_eq!(
+            r.passthru,
+            os_args(&["fix the -n bug", "-n", "-i", "--model", "x"])
+        );
+    }
+
+    #[test]
+    fn a_claude_flag_value_is_not_the_first_positional() {
+        let r = parse(&os_args(&["--settings", "s.json", "-n", "hello"]));
+        assert!(r.flags.new);
+        assert_eq!(r.passthru, os_args(&["--settings", "s.json", "hello"]));
+    }
+
+    #[test]
+    fn variadic_values_run_until_the_next_flag() {
+        let r = parse(&os_args(&["--add-dir", "/a", "/b", "-n", "prompt"]));
+        assert!(r.flags.new);
+        assert_eq!(r.passthru, os_args(&["--add-dir", "/a", "/b", "prompt"]));
+    }
+
+    #[test]
+    fn an_unknown_flag_is_boolean_so_the_next_word_is_positional() {
+        let r = parse(&os_args(&["--whatever", "word", "-n"]));
+        assert!(!r.flags.new);
+        assert_eq!(r.passthru, os_args(&["--whatever", "word", "-n"]));
+    }
+
+    #[test]
+    fn double_dash_after_a_positional_forwards_verbatim() {
+        let r = parse(&os_args(&["prompt", "--", "-c"]));
+        assert!(!r.flags.continue_);
+        assert_eq!(r.passthru, os_args(&["prompt", "--", "-c"]));
+    }
+
+    /// Orca's shape: default args (`-n`) then `--resume <id>`. `-n` is csm's
+    /// boolean, and the explicit resume id is what the launch uses.
+    #[test]
+    fn new_plus_resume_id_keeps_both_for_run_to_order() {
+        let r = parse(&os_args(&[
+            "-n",
+            "--resume",
+            "aaaabbbb-cccc-dddd-eeee-ffffaaaabbbb",
+        ]));
+        assert!(r.flags.new);
+        assert_eq!(
+            r.flags.resume,
+            Some(ResumeArg::Id(
+                "aaaabbbb-cccc-dddd-eeee-ffffaaaabbbb".to_owned()
+            ))
+        );
+        assert!(r.passthru.is_empty());
     }
 
     // ══════════════════════════════════════════════════════════════════════════

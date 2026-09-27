@@ -1,29 +1,28 @@
-//! `csm usage [--json] [--no-fetch] [--refresh] [--refresh-oauth]` /
-//! `csm usage capture`.
+//! `csm usage [--json] [--no-fetch] [--refresh]` / `csm usage capture`.
 
 use std::ffi::OsString;
 
-use anyhow::Context as _;
-
 use crate::cmd::support::{CAPTURE_STDIN_CAP_BYTES, read_stdin_capped};
+use crate::usage::local::{CollectOpts, OrcaUsage};
 use crate::{account, hook, paths, usage};
 
-/// `csm usage [--json] [--no-fetch] [--refresh] [--refresh-oauth]` /
-/// `csm usage capture`
+/// `csm usage [--json] [--no-fetch] [--refresh]` / `csm usage capture`
 ///
-/// Multi-profile usage table joining the registry with the local per-profile
-/// usage store. Offline-aware: serves the stale positive cache with an age
-/// header when local collection is unreachable (no credentials, no network).
-/// `--no-fetch` reads only the cache (never touches credentials/network) for
-/// fast scripted reads; `--refresh` bypasses the cache and every profile's own
-/// store-record TTL, forcing a live re-probe of each profile.
+/// One row per Orca host account (labelled by email and organization),
+/// joined with the local per-account usage store. Offline-aware: serves the
+/// stale positive cache with an age header when collection is unreachable.
 ///
-/// `--refresh-oauth` (or `CSM_OAUTH_REFRESH=1`) is the headless-collector
-/// opt-in: it permits `usage::local::refresh` to mint a new access token for
-/// a profile whose own has expired while no Claude Code session is running
-/// under it. It is resolved here and threaded explicitly down the fetch
-/// chain, so no other entry point (statusline, picker, sidecar, hook) can
-/// ever trigger a credential write.
+/// Where the numbers come from (design section 8): the account `D` holds
+/// from its statusLine captures and its runtime grant; inactive accounts
+/// from Orca's cached usage (`accounts.list{refreshUsage:false}`) while Orca
+/// runs, else from their stash tokens.
+///
+/// `--no-fetch` reads only the cache. `--refresh` bypasses the cache and
+/// every account's store TTL, asks a running Orca to re-probe its inactive
+/// accounts (`refreshUsage:true`, up to 30 s), and — with Orca stopped —
+/// refreshes a stash grant that expires within 5 min, as Orca would. The
+/// former `--refresh-oauth` / `CSM_OAUTH_REFRESH` opt-in is gone: that
+/// refresh is now part of `--refresh`.
 ///
 /// `csm usage capture` is the statusLine-stdin capture path (see
 /// [`cmd_usage_capture`]) — a distinct subverb, not a flag.
@@ -39,46 +38,47 @@ pub(crate) fn cmd_usage(args: &[OsString]) -> anyhow::Result<()> {
     let mut json = false;
     let mut no_fetch = false;
     let mut refresh = false;
-    let mut refresh_oauth = false;
     for a in args {
         match a.to_string_lossy().as_ref() {
             "--json" => json = true,
             "--no-fetch" => no_fetch = true,
             "--refresh" => refresh = true,
-            "--refresh-oauth" => refresh_oauth = true,
             "-h" | "--help" => {
-                println!("usage: csm usage [--json] [--no-fetch] [--refresh] [--refresh-oauth]");
+                println!("usage: csm usage [--json] [--no-fetch] [--refresh]");
                 println!("       csm usage capture");
-                println!("  --json      emit the joined registry∪local view as JSON");
+                println!("  --json      emit the joined accounts∪local view as JSON");
                 println!("  --no-fetch  read only the local cache (no live collection)");
-                println!(
-                    "  --refresh   bypass the cache and every profile's own TTL; re-probe live"
-                );
-                println!("  --refresh-oauth  for headless collectors: refresh a profile's expired");
-                println!("              OAuth access token when no Claude Code session is running");
-                println!(
-                    "              under it (env CSM_OAUTH_REFRESH=1; not supported on macOS)"
-                );
+                println!("  --refresh   bypass every cache; ask a running Orca to re-probe, or");
+                println!("              (Orca stopped) refresh stash grants that are due");
                 println!(
                     "  capture     read statusLine JSON from stdin, merge into the local store"
                 );
                 return Ok(());
             }
             other => anyhow::bail!(
-                "csm usage: unknown flag '{other}' (try --json | --no-fetch | --refresh | \
-                 --refresh-oauth | capture)"
+                "csm usage: unknown flag '{other}' (try --json | --no-fetch | --refresh | capture)"
             ),
         }
     }
-    // Flag OR env — resolved once, here, and passed down explicitly.
-    let refresh_oauth = refresh_oauth || usage::local::refresh::opt_in_from_env();
 
-    let profiles =
-        account::ProfileMap::load().context("csm usage: failed to load profiles.json")?;
-    // "Configured" now simply means the registry isn't empty — local
-    // collection needs no separate opt-in env (unlike the retired remote
-    // transport, which required two site-specific env vars to name it).
-    let configured = !profiles.is_empty();
+    // Orca's live list when it runs (the store lags it on Orca 1.4.214+).
+    let accounts = account::AccountSet::load_live();
+    // "Configured" means Orca lists at least one host account.
+    let configured = !accounts.is_empty();
+    let ids = accounts.ids_sorted();
+    let opts = if refresh {
+        CollectOpts {
+            force: true,
+            orca: OrcaUsage::Refresh(usage::LIMIT_PICK_TIMEOUT),
+            refresh_stash: true,
+            ..CollectOpts::standard()
+        }
+    } else {
+        CollectOpts {
+            orca: OrcaUsage::Cached,
+            ..CollectOpts::standard()
+        }
+    };
 
     // Resolve usage data + freshness. `--no-fetch` reads the cache directly;
     // `--refresh` forces fetch_with(true) (cache + per-profile TTL bypass);
@@ -102,7 +102,7 @@ pub(crate) fn cmd_usage(args: &[OsString]) -> anyhow::Result<()> {
             .and_then(|d| usage::local::oldest_profile_age_secs(d, chrono::Utc::now()));
         (cached, stale)
     } else {
-        let fetch_result = usage::fetch_with(refresh, refresh_oauth);
+        let fetch_result = usage::fetch_with(&opts);
         match fetch_result {
             Ok(d) => {
                 let stale = usage::local::oldest_profile_age_secs(&d, chrono::Utc::now());
@@ -119,7 +119,8 @@ pub(crate) fn cmd_usage(args: &[OsString]) -> anyhow::Result<()> {
         }
     };
 
-    let rpt = report::build_report(&profiles, data.as_ref(), configured, stale_secs);
+    let mut rpt = report::build_report(&ids, data.as_ref(), configured, stale_secs);
+    report::label_rows(&mut rpt, &accounts.accounts);
 
     if json {
         println!("{}", report::render_json(&rpt)?);
@@ -138,13 +139,14 @@ pub(crate) fn read_usage_cache() -> Option<usage::UsageData> {
 }
 
 /// `csm usage capture` — read a statusLine JSON payload from stdin and merge
-/// its `rate_limits` into the active profile's local usage store record (see
+/// its `rate_limits` into the store record of the account the session runs
+/// on (see
 /// `usage::local::record_statusline_payload`).
 ///
 /// This is meant to run silently as a fire-and-forget tail of a
 /// `statusline-command.sh`/`.ps1` (e.g. `printf '%s' "$input" | csm usage
 /// capture &`), so it swallows every error — a malformed/partial payload, an
-/// unresolvable profile, an unset `CLAUDE_CONFIG_DIR`, a throttled write — and
+/// unattributable session, a throttled write — and
 /// unconditionally prints nothing and exits 0. A statusLine command that fires
 /// roughly once a second must never let a transient capture failure surface
 /// as prompt noise or a non-zero exit.

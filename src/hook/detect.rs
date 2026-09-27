@@ -11,7 +11,7 @@
 //!   "session_id":       "01234567-...",
 //!   "cwd":              "/Users/example/Projects/...",
 //!   "reason":           "stop",
-//!   "transcript_path":  "/Users/example/.claude.shared/projects/.../session.jsonl"
+//!   "transcript_path":  "/Users/example/.claude/projects/.../session.jsonl"
 //! }
 //! ```
 //!
@@ -209,10 +209,11 @@ pub struct HookInput {
     pub reason: Option<String>,
 
     /// Path to the `.jsonl` transcript file for this session. Claude Code
-    /// still sends this on every event (part of the stdin contract in the
-    /// module doc above); nothing in this crate reads it since the tier-1 and
-    /// tier-3 transcript scanners that used to were deleted.
-    #[allow(dead_code)]
+    /// sends it on every event (part of the stdin contract in the module
+    /// doc above). Only the SessionEnd fast path reads it
+    /// ([`session_end_without_turn`]): a missing or empty transcript tells a
+    /// turnless end (`claude upgrade` and similar one-shot commands) from a
+    /// real session.
     pub transcript_path: Option<String>,
 
     /// Event name: "Stop" | "SubagentStop" | "SessionEnd" | "StopFailure" | ...
@@ -306,32 +307,43 @@ pub enum Decision {
         message: String,
     },
 
-    /// Full limit-switch: emit notify + write sentinel + stop the supervisor.
+    /// Full limit-switch: log + write sentinel + stop the supervisor.
     LimitSwitch {
-        /// OSC 777 body to emit on stdout.
+        /// The log line body.
         message: String,
-        /// Profile to switch to.
-        target_profile: String,
+        /// The account id the hook proposes; the supervisor re-checks it
+        /// under `switch.lock` before any switch (see
+        /// [`crate::account::limit_switch`]).
+        target_account: String,
+        /// The account id the session ran on (empty when unknown).
+        from_account: String,
         /// Handoff prompt for the resumed session.
         handoff: String,
         /// Working directory (from hook input cwd, falling back to empty string).
         cwd: String,
         /// Born epoch from the PID file (carried into the sentinel).
         born: i64,
-        /// The dimension that tripped this verdict. Not read by any caller
-        /// yet — both `run_with_input` and `run_from_statusline` bind it as
-        /// `dimension: _` — this is the plumbing a later commit branches on.
-        #[allow(dead_code)]
+        /// The dimension that tripped this verdict (the sentinel's `reason`).
         dimension: LimitDimension,
         /// `Some(model)` when this is a same-account model fallback (a
         /// `week_fable` cap with the fallback enabled and not already used
         /// this session — see [`fable_fallback_model`]) rather than an
-        /// account switch; `target_profile` then equals the current profile.
+        /// account switch; `target_account` then equals `from_account`.
         /// `None` is the ordinary account-switch path. `commit_and_stop`
         /// branches on this to skip the account-switch bookkeeping (hop bump,
         /// `.switched`, `.last-switch`) and write the one-shot
         /// `.model-fallback` marker instead.
         model_override: Option<String>,
+    },
+
+    /// A peer session's leader switched this session's account away
+    /// (`<state>/follow/<sid>.json`, newer than this session's launch): stop
+    /// at this turn boundary and relaunch on the new account. Never spends a
+    /// hop and never switches anything itself.
+    Follow {
+        follow: crate::platform::relaunch::FollowFile,
+        cwd: String,
+        born: i64,
     },
 }
 
@@ -437,8 +449,8 @@ pub fn parse_input(raw: &str) -> anyhow::Result<HookInput> {
 /// 11. Build the handoff prompt — 5b gets its own wording (see
 ///     [`build_fallback_handoff`])
 ///     → LimitSwitch
-pub fn classify(input: &HookInput, owner_dir: &Path) -> anyhow::Result<Decision> {
-    classify_with(input, owner_dir, None)
+pub fn classify(input: &HookInput, account: &str) -> anyhow::Result<Decision> {
+    classify_with(input, account, None)
 }
 
 /// [`classify`] with a limit the caller has already established from evidence
@@ -459,7 +471,7 @@ pub fn classify(input: &HookInput, owner_dir: &Path) -> anyhow::Result<Decision>
 /// cooldown, hop guard) applies unchanged. `None` is the ordinary hook path.
 pub fn classify_with(
     input: &HookInput,
-    owner_dir: &Path,
+    account: &str,
     live_limit: Option<&LimitHit>,
 ) -> anyhow::Result<Decision> {
     use crate::paths;
@@ -487,6 +499,18 @@ pub fn classify_with(
         .map(is_user_quit_reason)
         .unwrap_or(false);
 
+    // ── 2b. A peer's switch comes first at a turn boundary ─────────────────────
+    // A leader already moved `D` to another account and left this session a
+    // follow file. This session's own reading is still its old account's, most
+    // likely capped, and acting on it would only reach the cooldown the
+    // leader just stamped and skip, stranding the session on the old grant.
+    // So an applicable follow wins over detection (design §4 "Peers").
+    if checks_follow_first(input, live_limit, user_quit)
+        && let follow @ Decision::Follow { .. } = follow_decision(sid, input, account)
+    {
+        return Ok(follow);
+    }
+
     // ── 3. Detect (tier-0 StopFailure / tier-2) ──────────────────────────────
     // Shell: the legacy shell implementation (tier-0 has no shell analogue —
     // StopFailure is a hook event class the shell implementation predates).
@@ -500,7 +524,7 @@ pub fn classify_with(
     // ── 4. No limit → exit (no side effects) ─────────────────────────────────
     // Shell: the legacy shell implementation
     let (limited_msg, definitive, dimension, week_fable_resets_at) =
-        match detect_limit(input, owner_dir, live_limit) {
+        match detect_limit(input, account, live_limit) {
             Detection::NotLimit => {
                 // StopFailure for a non-limit API error (overloaded,
                 // authentication_failed, invalid_request, ...). Not something to
@@ -511,10 +535,7 @@ pub fn classify_with(
                 return Ok(Decision::Skip);
             }
             Detection::NoSignal => {
-                if user_quit {
-                    // Shell: `_log "user-quit-skip" "reason=${reason}"`
-                    // No notification — this is just a log entry when no limit detected.
-                }
+                // An applicable follow was taken at step 2b.
                 return Ok(Decision::Skip);
             }
             Detection::Limited {
@@ -542,15 +563,23 @@ pub fn classify_with(
     // ── 5. User-quit + limited → one-shot notify (deduped via .detected) ─────
     // Shell: the legacy shell implementation
     // NEVER kill/relaunch on a session the user explicitly closed.
+    let labels = crate::account::AccountSet::load();
+    let label = |id: &str| -> String {
+        if id.is_empty() {
+            "unknown account".to_owned()
+        } else {
+            labels.label(id)
+        }
+    };
+    let current_label = label(account);
     if user_quit {
-        let profile_name = owner_dir_to_profile_name(owner_dir);
         let body = format!(
-            "[{profile_name}] hit {limited_msg} — you quit, so not relaunching; next csm will pick a healthy account"
+            "[{current_label}] hit {limited_msg} — you quit, so not relaunching; next csm will pick a healthy account"
         );
         return Ok(notify_once(sid, body));
     }
 
-    let current_profile = owner_dir_to_profile_name(owner_dir);
+    let current_profile = account.to_owned();
 
     // ── 5b. Fable-cap same-account model fallback ─────────────────────────────
     // A model-scoped weekly cap (week_fable) does not mean the account is out
@@ -672,17 +701,20 @@ pub fn classify_with(
                 // No viable target (all saturated/errored, or fetch miss)
                 // Shell: the legacy shell implementation
                 let body = format!(
-                    "[{current_profile}] hit {limited_msg} — no account with headroom to switch to"
+                    "[{current_label}] hit {limited_msg} — no account with headroom to switch to"
                 );
                 return Ok(notify_once(sid, body));
             }
         }
     };
+    let target_label = label(&target_profile);
 
     // ── 7. Detect-only mode (CLAUDE_AUTO_SWITCH_RELAUNCH != "1") ─────────────
     // Shell: the legacy shell implementation
     // Default is "1" (relaunch enabled). Explicit =0 → notify-only.
     // MUST run before any state mutation — does NOT claim .switched or cooldown.
+    // The manual command names the target by its label, which `csm accounts
+    // use` resolves (email local part or id prefix).
     if !relaunch_enabled() {
         let sid_short = crate::hook::sid_short(sid);
         // A 5b fallback never switches accounts (`target_profile ==
@@ -693,10 +725,10 @@ pub fn classify_with(
         // the capped model.
         let body = match &fallback_model {
             Some(model) => format!(
-                "[{current_profile}] hit {limited_msg} → resume on model [{model}], same account (auto-relaunch OFF; csm --profile {current_profile} --resume {sid_short} --model {model})"
+                "[{current_label}] hit {limited_msg} → resume on model [{model}], same account (auto-relaunch OFF; csm --resume {sid_short} --model {model})"
             ),
             None => format!(
-                "[{current_profile}] hit {limited_msg} → switch to [{target_profile}] (auto-relaunch OFF; csm --profile {target_profile} --resume {sid_short})"
+                "[{current_label}] hit {limited_msg} → switch to [{target_label}] (auto-relaunch OFF; csm accounts use {target_label}; csm --resume {sid_short})"
             ),
         };
         return Ok(notify_once(sid, body));
@@ -711,10 +743,10 @@ pub fn classify_with(
             // the model to resume on, not an account switch to itself.
             let body = match &fallback_model {
                 Some(model) => format!(
-                    "[{current_profile}] hit {limited_msg} → resume on model [{model}], same account (csm --profile {current_profile} --resume {sid_short} --model {model})"
+                    "[{current_label}] hit {limited_msg} → resume on model [{model}], same account (csm --resume {sid_short} --model {model})"
                 ),
                 None => format!(
-                    "[{current_profile}] hit {limited_msg} → switch to [{target_profile}] by hand (csm --profile {target_profile} --resume {sid_short})"
+                    "[{current_label}] hit {limited_msg} → switch to [{target_label}] by hand (csm accounts use {target_label}; csm --resume {sid_short})"
                 ),
             };
             return Ok(notify_once(sid, body));
@@ -784,17 +816,17 @@ pub fn classify_with(
     // `build_fallback_handoff`'s own doc).
     let sid_short = crate::hook::sid_short(sid);
     let handoff = match &fallback_model {
-        Some(model) => build_fallback_handoff(sid_short, &current_profile, model),
-        None => build_handoff(sid_short, &current_profile, &target_profile, next_hop),
+        Some(model) => build_fallback_handoff(sid_short, &current_label, model),
+        None => build_handoff(sid_short, &current_label, &target_label, next_hop),
     };
 
     let message = if let Some(model) = &fallback_model {
         format!(
-            "[{current_profile}] hit {limited_msg} → falling back to model [{model}] (same account)"
+            "[{current_label}] hit {limited_msg} → falling back to model [{model}] (same account)"
         )
     } else {
         format!(
-            "[{current_profile}] hit {limited_msg} → switching to [{target_profile}] (hop {next_hop})"
+            "[{current_label}] hit {limited_msg} → switching to [{target_label}] (hop {next_hop})"
         )
     };
     let cwd_str = input
@@ -805,7 +837,8 @@ pub fn classify_with(
 
     Ok(Decision::LimitSwitch {
         message,
-        target_profile,
+        target_account: target_profile,
+        from_account: current_profile,
         handoff,
         cwd: cwd_str,
         born: born_epoch,
@@ -889,7 +922,7 @@ enum Detection {
 }
 
 /// Steps 3-4: tier-0 StopFailure / tier-2 usage-cache check.
-fn detect_limit(input: &HookInput, owner_dir: &Path, live_limit: Option<&LimitHit>) -> Detection {
+fn detect_limit(input: &HookInput, account: &str, live_limit: Option<&LimitHit>) -> Detection {
     match (live_limit, stop_failure_limit(input)) {
         (Some(hit), _) => Detection::Limited {
             message: hit.message.clone(),
@@ -904,7 +937,7 @@ fn detect_limit(input: &HookInput, owner_dir: &Path, live_limit: Option<&LimitHi
             resets_at: None,
         },
         (None, StopFailureVerdict::NotLimit) => Detection::NotLimit,
-        (None, StopFailureVerdict::NotApplicable) => match detect_usage_threshold_hit(owner_dir) {
+        (None, StopFailureVerdict::NotApplicable) => match detect_usage_threshold_hit(account) {
             Some(hit) => Detection::Limited {
                 message: hit.message,
                 definitive: false,
@@ -953,6 +986,97 @@ fn pick_target(current_profile: &str) -> Option<String> {
 /// enabled); any other value means detect-only (notify, don't relaunch).
 fn relaunch_enabled() -> bool {
     std::env::var("CLAUDE_AUTO_SWITCH_RELAUNCH").unwrap_or_else(|_| "1".to_string()) == "1"
+}
+
+/// `true` for a `SessionEnd` with no turn to act on: no transcript path, or
+/// one that is not a non-empty file (one `stat`, nothing else). `claude
+/// upgrade` and other one-shot commands fire `SessionEnd` this way, and all
+/// `SessionEnd` hooks share a 1.5 s budget, so the hook returns at once.
+pub(crate) fn session_end_without_turn(input: &HookInput) -> bool {
+    if input.hook_event_name.as_deref() != Some("SessionEnd") {
+        return false;
+    }
+    match input.transcript_path.as_deref().filter(|p| !p.is_empty()) {
+        None => true,
+        Some(p) => std::fs::metadata(p)
+            .map(|m| !m.is_file() || m.len() == 0)
+            .unwrap_or(true),
+    }
+}
+
+// ─── follow (a peer's leader switched this session's account) ───────────────
+
+/// `true` for the events that mark a main-turn boundary: `Stop`, and a
+/// payload with no event name (older shapes). `SubagentStop`, `SessionEnd`
+/// and `StopFailure` are not where a session should be restarted.
+pub(crate) fn is_turn_boundary(input: &HookInput) -> bool {
+    matches!(input.hook_event_name.as_deref(), None | Some("Stop"))
+}
+
+/// Pure: does this event check for a follow file before detection? Only at a
+/// main-turn boundary, never on a statusline tick (`live_limit`) and never
+/// for a session the user quit.
+pub(crate) fn checks_follow_first(
+    input: &HookInput,
+    live_limit: Option<&LimitHit>,
+    user_quit: bool,
+) -> bool {
+    !user_quit && live_limit.is_none() && is_turn_boundary(input)
+}
+
+/// Pure: does a follow file still apply to this session? It must be newer
+/// than the session's launch (`born`, the pid file's epoch) and name an
+/// account other than the one the session is on now (`account`, empty when
+/// unknown).
+pub(crate) fn follow_applies(
+    follow: &crate::platform::relaunch::FollowFile,
+    account: &str,
+    born: i64,
+) -> bool {
+    follow.at >= born && !follow.to_account.is_empty() && follow.to_account != account
+}
+
+/// The follow check at a turn boundary: read `<state>/follow/<sid>.json`
+/// and, when it applies to this csm-supervised session, stop it for a
+/// relaunch on the new account. A follow that no longer applies is removed.
+/// The kill switches and the relaunch knob apply as for a limit switch.
+fn follow_decision(sid: &str, input: &HookInput, account: &str) -> Decision {
+    // Windows has no relaunch loop (see `crate::platform::relaunch`): a
+    // follow there would only stop a healthy session, and the leader writes
+    // no follow files on Windows either.
+    if !follows_supported() {
+        return Decision::Skip;
+    }
+    let path = crate::paths::follow(sid);
+    if !path.exists() {
+        return Decision::Skip;
+    }
+    let Ok(Some(follow)) = crate::platform::relaunch::read_follow(&path) else {
+        let _ = std::fs::remove_file(&path);
+        return Decision::Skip;
+    };
+    if kill_switches_engaged() || !relaunch_enabled() {
+        return Decision::Skip;
+    }
+    let ManagedGate::Live { born } = managed_session(sid) else {
+        return Decision::Skip;
+    };
+    if !follow_applies(&follow, account, born) {
+        let _ = std::fs::remove_file(&path);
+        return Decision::Skip;
+    }
+    let cwd = input
+        .cwd
+        .clone()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| ".".to_string());
+    Decision::Follow { follow, cwd, born }
+}
+
+/// Whether a peer follows a leader's switch by relaunching: only where the
+/// relaunch loop runs (not Windows, where it is gated off).
+pub(crate) fn follows_supported() -> bool {
+    !cfg!(windows)
 }
 
 // ─── fable fallback (model-scoped weekly cap, same-account) ─────────────────
@@ -1275,9 +1399,13 @@ pub(crate) fn cooldown_should_block(definitive: bool, window_blocked: bool) -> b
 /// directly-tested `Option<String>` contract). For a `WeekFable` hit,
 /// `resets_at` is patched in afterward from the same profile lookup — see
 /// [`LimitHit`]'s doc.
-fn detect_usage_threshold_hit(owner_dir: &Path) -> Option<LimitHit> {
-    let profile = owner_dir_to_profile_name(owner_dir);
-    let data = crate::usage::fetch().ok()?;
+fn detect_usage_threshold_hit(account: &str) -> Option<LimitHit> {
+    if account.is_empty() {
+        return None;
+    }
+    let profile = account.to_owned();
+    // csm's own cache and store only (design decision 8).
+    let data = crate::usage::fetch_cached().ok()?;
     let (session_pct, week_pct) = data.current_usage(&profile)?;
     let week_fable = data
         .profiles
@@ -1418,22 +1546,6 @@ pub(crate) fn resolve_target_from_pick(
     match result {
         Ok(Some(name)) => Some(name),
         Ok(None) | Err(_) => None,
-    }
-}
-
-/// Derive the profile name from the owner dir by taking the last path segment
-/// and stripping the `.claude.` prefix.
-///
-/// e.g. `/Users/example/.claude.home` → `"home"`
-///      `/Users/example/.claude.work` → `"work"`
-///      (unknown dir) → use the last segment as-is
-pub(crate) fn owner_dir_to_profile_name(owner_dir: &Path) -> String {
-    let seg = owner_dir.file_name().and_then(|n| n.to_str()).unwrap_or("");
-    // Strip leading `.claude.` prefix if present
-    if let Some(stripped) = seg.strip_prefix(".claude.") {
-        stripped.to_string()
-    } else {
-        seg.to_string()
     }
 }
 
@@ -1653,7 +1765,6 @@ pub(crate) fn set_test_now(epoch: i64) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::Path;
 
     // ── HookInput serde tests ──────────────────────────────────────────────────
 
@@ -1664,7 +1775,7 @@ mod tests {
             "session_id": "01234567-89ab-cdef-0123-456789abcdef",
             "cwd": "/Users/example/Projects/github.com/foo",
             "reason": "stop",
-            "transcript_path": "/Users/example/.claude.shared/projects/-Users-example-Projects-github-com-foo/01234567-89ab-cdef-0123-456789abcdef.jsonl"
+            "transcript_path": "/Users/example/.claude/projects/-Users-example-Projects-github-com-foo/01234567-89ab-cdef-0123-456789abcdef.jsonl"
         }"#;
         let input: HookInput = serde_json::from_str(json).expect("deserialize full payload");
         assert_eq!(
@@ -1741,7 +1852,7 @@ mod tests {
         let json = r#"{
             "hook_event_name": "Status",
             "session_id": "01234567-89ab-cdef-0123-456789abcdef",
-            "transcript_path": "/Users/example/.claude.shared/projects/foo/01234567.jsonl",
+            "transcript_path": "/Users/example/.claude/projects/foo/01234567.jsonl",
             "cwd": "/Users/example/Projects/foo",
             "model": {"id": "claude-fable-5-1", "display_name": "Fable 5.1"},
             "workspace": {"current_dir": "/Users/example/Projects/foo", "project_dir": "/Users/example/Projects/foo"},
@@ -1786,13 +1897,12 @@ mod tests {
     #[test]
     fn classify_with_live_limit_but_no_session_id_is_skip() {
         let input = parse_input(r#"{"cwd": "/Users/example/Projects/foo"}"#).unwrap();
-        let dir = tempfile::TempDir::new().unwrap();
         let hit = LimitHit {
             dimension: LimitDimension::WeekAll,
             message: "week_all 100%".to_string(),
             resets_at: None,
         };
-        let decision = classify_with(&input, dir.path(), Some(&hit)).unwrap();
+        let decision = classify_with(&input, "acct-1", Some(&hit)).unwrap();
         assert!(matches!(decision, Decision::Skip));
     }
 
@@ -1803,7 +1913,7 @@ mod tests {
     fn hook_input_stop_failure_rate_limit_payload() {
         let json = r#"{
             "session_id": "01234567-89ab-cdef-0123-456789abcdef",
-            "transcript_path": "/Users/example/.claude.shared/projects/foo/01234567-89ab-cdef-0123-456789abcdef.jsonl",
+            "transcript_path": "/Users/example/.claude/projects/foo/01234567-89ab-cdef-0123-456789abcdef.jsonl",
             "cwd": "/Users/example/Projects/github.com/foo",
             "permission_mode": "default",
             "hook_event_name": "StopFailure",
@@ -1831,7 +1941,7 @@ mod tests {
             "session_id": "01234567-89ab-cdef-0123-456789abcdef",
             "cwd": "/Users/example/Projects/github.com/foo",
             "reason": "stop",
-            "transcript_path": "/Users/example/.claude.shared/projects/foo/01234567-89ab-cdef-0123-456789abcdef.jsonl"
+            "transcript_path": "/Users/example/.claude/projects/foo/01234567-89ab-cdef-0123-456789abcdef.jsonl"
         }"#;
         let input: HookInput = serde_json::from_str(json).expect("deserialize plain Stop payload");
         assert_eq!(input.reason.as_deref(), Some("stop"));
@@ -1895,6 +2005,101 @@ mod tests {
         assert!(!is_user_quit_reason("SubagentStop"));
     }
 
+    // ── follow ──────────────────────────────────────────────────────────────
+
+    fn follow(to: &str, at: i64) -> crate::platform::relaunch::FollowFile {
+        crate::platform::relaunch::FollowFile {
+            v: 1,
+            generation: 3,
+            to_account: to.to_owned(),
+            at,
+        }
+    }
+
+    #[test]
+    fn follow_applies_only_when_newer_and_elsewhere() {
+        assert!(follow_applies(&follow("b", 200), "a", 100));
+        assert!(follow_applies(&follow("b", 100), "a", 100));
+        assert!(
+            !follow_applies(&follow("b", 99), "a", 100),
+            "older than launch"
+        );
+        assert!(
+            !follow_applies(&follow("a", 200), "a", 100),
+            "already there"
+        );
+        assert!(!follow_applies(&follow("", 200), "a", 100), "no target");
+        assert!(
+            follow_applies(&follow("b", 200), "", 100),
+            "unknown account"
+        );
+    }
+
+    #[test]
+    fn turn_boundary_is_stop_or_untagged() {
+        let mut input = parse_input(r#"{"session_id": "s"}"#).unwrap();
+        assert!(is_turn_boundary(&input));
+        for (ev, want) in [
+            ("Stop", true),
+            ("SubagentStop", false),
+            ("SessionEnd", false),
+            ("StopFailure", false),
+        ] {
+            input.hook_event_name = Some(ev.to_owned());
+            assert_eq!(is_turn_boundary(&input), want, "{ev}");
+        }
+    }
+
+    /// A Stop checks for a follow before its own (possibly capped) reading; a
+    /// statusline tick, a quit session and a non-boundary event never do.
+    #[test]
+    fn follow_is_checked_first_only_at_a_turn_boundary() {
+        let stop = parse_input(r#"{"session_id": "s", "hook_event_name": "Stop"}"#).unwrap();
+        let failure =
+            parse_input(r#"{"session_id": "s", "hook_event_name": "StopFailure"}"#).unwrap();
+        let hit = LimitHit {
+            dimension: LimitDimension::WeekAll,
+            message: "capped".into(),
+            resets_at: None,
+        };
+        assert!(checks_follow_first(&stop, None, false));
+        assert!(!checks_follow_first(&stop, Some(&hit), false), "a tick");
+        assert!(!checks_follow_first(&stop, None, true), "the user quit");
+        assert!(
+            !checks_follow_first(&failure, None, false),
+            "not a boundary"
+        );
+    }
+
+    /// No follow file: a Stop with no limit stays a Skip and touches nothing.
+    #[test]
+    fn stop_without_follow_file_is_skip() {
+        let home = tempfile::TempDir::new().unwrap();
+        crate::testenv::with_test_home(home.path(), || {
+            let input = parse_input(
+                r#"{"session_id": "11111111-2222-3333-4444-555555555555", "hook_event_name": "Stop"}"#,
+            )
+            .unwrap();
+            let d = follow_decision("11111111-2222-3333-4444-555555555555", &input, "a");
+            assert!(matches!(d, Decision::Skip));
+        });
+    }
+
+    /// An unreadable follow file is removed, never acted on.
+    #[test]
+    fn unreadable_follow_file_is_removed() {
+        let home = tempfile::TempDir::new().unwrap();
+        crate::testenv::with_test_home(home.path(), || {
+            let sid = "11111111-2222-3333-4444-555555555555";
+            let path = crate::paths::follow(sid);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, "not json").unwrap();
+            let input = parse_input(r#"{"session_id": "s", "hook_event_name": "Stop"}"#).unwrap();
+            assert!(matches!(follow_decision(sid, &input, "a"), Decision::Skip));
+            assert!(!path.exists());
+        });
+    }
+
     // ── constant tests ─────────────────────────────────────────────────────────
 
     /// MAX_HOPS constant is 1 (the hop guard).
@@ -1907,27 +2112,6 @@ mod tests {
     #[test]
     fn last_switch_cooldown_is_300() {
         assert_eq!(LAST_SWITCH_COOLDOWN_SECS, 300);
-    }
-
-    // ── owner_dir_to_profile_name tests ───────────────────────────────────────
-
-    #[test]
-    fn owner_dir_profile_name_home() {
-        let p = Path::new("/Users/example/.claude.home");
-        assert_eq!(owner_dir_to_profile_name(p), "home");
-    }
-
-    #[test]
-    fn owner_dir_profile_name_work() {
-        let p = Path::new("/home/you/.claude.work");
-        assert_eq!(owner_dir_to_profile_name(p), "work");
-    }
-
-    #[test]
-    fn owner_dir_profile_name_no_prefix() {
-        // If no ".claude." prefix, use the last segment verbatim
-        let p = Path::new("/home/you/mydir");
-        assert_eq!(owner_dir_to_profile_name(p), "mydir");
     }
 
     // ── build_handoff tests ────────────────────────────────────────────────────
@@ -2456,7 +2640,6 @@ mod tests {
     /// None` can never expire the one-shot fallback marker.
     #[test]
     fn detect_usage_threshold_hit_week_fable_carries_resets_at() {
-        let _guard = crate::testenv::lock_for("CSM_USAGE_CMD");
         let home = tempfile::TempDir::new().unwrap();
 
         let mut profiles = std::collections::HashMap::new();
@@ -2477,20 +2660,14 @@ mod tests {
             errors: None,
             ..Default::default()
         };
-        let usage_file = home.path().join("usage-cmd.json");
-        std::fs::write(&usage_file, serde_json::to_string(&usage).unwrap()).unwrap();
 
-        let prior_cmd = std::env::var_os("CSM_USAGE_CMD");
-        crate::testenv::set_var("CSM_USAGE_CMD", &format!("cat {}", usage_file.display()));
-
+        // The hook reads csm's usage cache only (design decision 8).
         let hit = crate::testenv::with_test_home(home.path(), || {
-            detect_usage_threshold_hit(Path::new("/Users/example/.claude.limited"))
+            let cache = crate::paths::usage_cache();
+            std::fs::create_dir_all(cache.parent().unwrap()).unwrap();
+            std::fs::write(&cache, serde_json::to_string(&usage).unwrap()).unwrap();
+            detect_usage_threshold_hit("limited")
         });
-
-        match prior_cmd {
-            Some(v) => crate::testenv::set_var("CSM_USAGE_CMD", &v.to_string_lossy()),
-            None => crate::testenv::remove_var("CSM_USAGE_CMD"),
-        }
 
         let hit = hit.expect("week_fable at 100% must trip the tier-2 check");
         assert_eq!(hit.dimension, LimitDimension::WeekFable);
@@ -2554,9 +2731,9 @@ mod tests {
             message: "week_fable 100%".to_string(),
             resets_at: Some(1_789_646_400),
         };
-        // owner_dir is unread on the live_limit branch (it's the tier-2 file
-        // path), so any path works — Path::new(".") avoids a tempfile dep.
-        let detection = detect_limit(&input, Path::new("."), Some(&hit));
+        // The account is unread on the live_limit branch (tier-2 is the only
+        // reader), so any id works.
+        let detection = detect_limit(&input, "acct-1", Some(&hit));
         assert_eq!(
             detection,
             Detection::Limited {
@@ -2761,8 +2938,8 @@ mod tests {
     #[test]
     fn marker_read_parses_epoch_and_profile() {
         let home = tempfile::TempDir::new().unwrap();
-        std::fs::create_dir_all(home.path().join(".claude.shared").join("smart")).unwrap();
         crate::testenv::with_test_home(home.path(), || {
+            std::fs::create_dir_all(crate::paths::smart_dir_no_create()).unwrap();
             let sid = "sid-marker-read-0001";
             std::fs::write(crate::paths::model_fallback(sid), "1700000000 work").unwrap();
             assert_eq!(
@@ -2779,8 +2956,8 @@ mod tests {
     #[test]
     fn marker_read_rejects_epoch_only_old_shape() {
         let home = tempfile::TempDir::new().unwrap();
-        std::fs::create_dir_all(home.path().join(".claude.shared").join("smart")).unwrap();
         crate::testenv::with_test_home(home.path(), || {
+            std::fs::create_dir_all(crate::paths::smart_dir_no_create()).unwrap();
             let sid = "sid-marker-read-old-shape-0001";
             std::fs::write(crate::paths::model_fallback(sid), "1700000000").unwrap();
             assert_eq!(model_fallback_marker_read(sid), None);
@@ -2791,8 +2968,8 @@ mod tests {
     #[test]
     fn marker_read_missing_file_is_none() {
         let home = tempfile::TempDir::new().unwrap();
-        std::fs::create_dir_all(home.path().join(".claude.shared").join("smart")).unwrap();
         crate::testenv::with_test_home(home.path(), || {
+            std::fs::create_dir_all(crate::paths::smart_dir_no_create()).unwrap();
             assert_eq!(
                 model_fallback_marker_read("sid-marker-read-missing-0001"),
                 None

@@ -85,7 +85,12 @@ fn kill_one(pid: u32, signal: KillSignal) -> KillOutcome {
         KillSignal::Kill => Signal::SIGKILL,
         KillSignal::Term => Signal::SIGTERM,
     };
-    match kill(Pid::from_raw(pid as i32), sig) {
+    // 0 would signal csm's own group and a pid above i32::MAX wraps to a
+    // group (or, as -1, every process the user owns): never send those.
+    let Some(target) = crate::platform::child::signal_pid(pid) else {
+        return KillOutcome::Failed(format!("refusing to signal pid {pid}"));
+    };
+    match kill(Pid::from_raw(target), sig) {
         Ok(()) => KillOutcome::Signalled,
         // The process is already gone — the goal is met.
         Err(Errno::ESRCH) => KillOutcome::AlreadyGone,
@@ -105,6 +110,10 @@ fn kill_one(pid: u32, _signal: KillSignal) -> KillOutcome {
     // (or not ours) — treat "gone" as success since the goal is met.
     //
     // `HANDLE` is a raw pointer; the failure sentinel is null.
+    // Same pid sanity rule as the POSIX side (pid 0 is the idle process).
+    if crate::platform::child::signal_pid(pid).is_none() {
+        return KillOutcome::Failed(format!("refusing to signal pid {pid}"));
+    }
     unsafe {
         let handle = OpenProcess(PROCESS_TERMINATE, 0, pid);
         if handle.is_null() {

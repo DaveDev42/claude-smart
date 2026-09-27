@@ -28,7 +28,7 @@ pub trait ProcCheck {
 /// `base` must be the **basename only** (no path separators) with `.exe` already
 /// stripped on Windows.
 pub fn is_claude_or_node_name(base: &str) -> bool {
-    is_name_for(base, &crate::config::resolve_launch_command())
+    is_name_for(base, &crate::config::configured_launch_command())
 }
 
 /// Pure name-match seam (no env/file I/O): `base` is "ours" iff it is a
@@ -106,7 +106,7 @@ impl ProcCheck for SysinfoProcCheck {
                     p.exe.as_deref().and_then(|e| e.to_str()),
                     p.cmd.first().and_then(|s| s.to_str()),
                 ],
-                &crate::config::resolve_launch_command(),
+                &crate::config::configured_launch_command(),
             )
         })
     }
@@ -335,11 +335,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let link = dir.path().join("claude");
         std::os::unix::fs::symlink("/bin/sleep", &link).unwrap();
-        let mut child = std::process::Command::new(&link).arg("30").spawn().unwrap();
+        let mut child =
+            crate::platform::child::ChildGuard::spawn(std::process::Command::new(&link).arg("30"))
+                .unwrap();
         let pid = child.id();
         let live = wait_until_live_claude_or_node(pid, std::time::Duration::from_secs(5));
-        let _ = child.kill();
-        let _ = child.wait();
+        child.stop();
         assert!(live, "a live process launched as `claude` must pass");
         assert!(
             !SysinfoProcCheck::is_live_claude_or_node(pid),

@@ -1,73 +1,44 @@
-//! Account pick + scoring public surface.
+//! Account pick + scoring public surface, keyed by Orca account id.
 //!
-//! This module is the entry-point for account-selection logic:
-//!
-//! - [`pick_account`] — choose the best profile to launch under.
-//! - [`current_usage`] — emit `(session_pct, week_all_pct)` for one profile.
-//! - [`ProfileMap`] — re-exported profile→dir map loaded from `profiles.json`.
+//! - [`pick_account_gated`] — choose the best account to switch to.
+//! - [`AccountSet`] — Orca's host accounts keyed by account id, plus `D`
+//!   (csm keeps no registry of its own; see [`crate::orca`]).
+//! - [`limit_switch`] — the supervisor's leader/follower decision.
 //!
 //! Submodules:
-//! - `profiles` — load `~/.config/claude-as/profiles.json`.
+//! - `accounts` — the read-only adapter over Orca's account list.
 //! - `scoring`  — scoring/tie-break/exclusions; complete, fixture-tested.
 //! - `reset`    — parse `"Jun 4 at 9pm (Asia/Seoul)"` → UTC epoch; complete,
 //!   fixture-tested.
 
-pub mod profiles;
+pub mod accounts;
+pub mod limit_switch;
 pub mod reset;
 pub mod scoring;
 
-pub use profiles::ProfileMap;
+pub use accounts::AccountSet;
 
 use crate::usage::{self, UsageData};
 use scoring::{ScoringError, ScoringResult};
 
-/// Choose the best profile to switch to.
+/// Choose the best account to switch to, from csm's cached usage only
+/// ([`usage::fetch_cached`]: no usage command, network, Orca socket or
+/// Keychain, since the hook calls this; design decision 8).
 ///
-/// # Parameters
-/// - `current_profile`: name of the currently active profile (from the leaf of
-///   `CLAUDE_CONFIG_DIR`, or empty string when unset).
-/// - `include_current`: when `true`, return `Ok(None)` if the winner equals
-///   `current_profile` (no-op switch).
+/// - `current`: the account id the session is on (empty when unknown).
+/// - `include_current`: when `true`, return `Ok(None)` if the winner is
+///   `current` (no-op switch).
+/// - `apply_stale_gate`: `true` refuses to score on stale data; the reactive
+///   hook passes `false` because it must move off an already-limited
+///   account even on stale numbers. See [`scoring::pick_best`] for the gate.
 ///
-/// # Returns
-/// - `Ok(Some(name))` — caller should switch `CLAUDE_CONFIG_DIR` to this profile.
-/// - `Ok(None)` — winner is already current (`include_current` was `true`).
-/// - `Err(ScoringError::AllSaturated)` — no viable candidate; caller warns and
-///   keeps the current profile.
-/// - `Err(ScoringError::FetchFailed(_))` — usage collection failed / negative-cache
-///   active; caller opens the stale-usage interactive picker (see
-///   [`crate::picker::account`]).
-///
-/// Applies the staleness gate (proactive / CLI path). For the reactive hook —
-/// which must switch off an already-limited profile even on stale data — use
-/// [`pick_account_gated`] with `apply_stale_gate=false`.
-pub fn pick_account(current_profile: &str, include_current: bool) -> ScoringResult {
-    pick_account_gated(current_profile, include_current, true)
-}
-
-/// [`pick_account`] with explicit control over the staleness gate.
-///
-/// `apply_stale_gate=true` is the proactive / CLI behaviour (refuse to score on
-/// stale data → caller opens the picker). `apply_stale_gate=false` is the
-/// reactive-hook behaviour: the hook fires because the current profile already
-/// hit a limit and is non-interactive, so it scores even on stale numbers to
-/// pick the freshest-known best rather than strand the user on the limited
-/// profile. See [`scoring::pick_best`] for the gate rationale.
+/// `Ok(Some(id))` names the account; `Err(_)` means none is viable or the
+/// fetch failed.
 pub fn pick_account_gated(
-    current_profile: &str,
+    current: &str,
     include_current: bool,
     apply_stale_gate: bool,
 ) -> ScoringResult {
-    let data: UsageData = usage::fetch().map_err(ScoringError::FetchFailed)?;
-    scoring::pick_best_gated(&data, current_profile, include_current, apply_stale_gate)
-}
-
-/// Return `(session_pct, week_all_pct)` for `profile`, or `None` when the
-/// profile is errored, absent from the cache, or the fetch fails.
-///
-/// `current-usage <profile>` → `<session_pct> <week_all_pct>` on stdout, or
-/// empty (errored profile ⇒ empty).
-pub fn current_usage(profile: &str) -> Option<(i64, i64)> {
-    let data = usage::fetch().ok()?;
-    data.current_usage(profile)
+    let data: UsageData = usage::fetch_cached().map_err(ScoringError::FetchFailed)?;
+    scoring::pick_best_gated(&data, current, include_current, apply_stale_gate)
 }
