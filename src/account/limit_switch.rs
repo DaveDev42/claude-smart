@@ -37,9 +37,10 @@ use std::time::Duration;
 use crate::account::AccountSet;
 use crate::account::scoring;
 use crate::launch_context::ConfigDirPin;
+use crate::orca::HostEnv;
 use crate::orca::context::{Context, LOCK_WAIT};
 use crate::orca::fsx::SwitchLock;
-use crate::orca::http::SystemHttp;
+use crate::orca::http::{OauthHttp, SystemHttp};
 use crate::orca::live::{ProcFacts, SystemProcs};
 use crate::orca::{runtime, switch};
 use crate::platform::relaunch::{FollowFile, RelaunchSentinel, SENTINEL_V, write_follow};
@@ -72,6 +73,26 @@ pub fn hop_role(
         return HopRole::Follow(active.to_owned());
     }
     HopRole::Lead
+}
+
+/// The leader's second look, right before it switches: `decided` is the
+/// active account [`hop_role`] saw, `now` the one Orca names after the
+/// limit-pick fetch (which can take 30 s). When it moved (the user picked
+/// an account in Orca's GUI meanwhile), [`hop_role`] decides again over the
+/// new one, so a switch someone else made is followed, never overridden
+/// (design §4). Pure.
+pub fn recheck_role(
+    decided: Option<&str>,
+    now: Option<&str>,
+    from_gen: u64,
+    cur_gen: u64,
+    from_account: Option<&str>,
+    now_viable: bool,
+) -> HopRole {
+    if now == decided {
+        return HopRole::Lead;
+    }
+    hop_role(from_gen, cur_gen, from_account, now, now_viable)
 }
 
 /// Is `id` viable per `data` ([`scoring::is_viable_pcts`], the one
@@ -145,12 +166,38 @@ pub fn version_gate(version_output: Option<&str>, floor: &str) -> Result<(), Str
 
 // ─── I/O shell ────────────────────────────────────────────────────────────────
 
+/// The longest a limit leader holds `switch.lock`: its limit-pick fetch
+/// ([`crate::usage::LIMIT_PICK_TIMEOUT`]), then the switch: over RPC
+/// `selectClaude` ([`crate::orca::rpc::SELECT_TIMEOUT`]) after up to 15 s
+/// of "switch already in progress" retries, or offline a few 10 s profile
+/// and token calls, which [`LEADER_MARGIN`] covers.
+pub const LEADER_LOCK_HOLD: Duration = Duration::from_secs(
+    crate::usage::LIMIT_PICK_TIMEOUT.as_secs()
+        + crate::orca::rpc::SELECT_TIMEOUT.as_secs()
+        + 15
+        + LEADER_MARGIN.as_secs(),
+);
+
+/// Slack for a leader's offline network calls (profile veto, refresh) and
+/// its per-account usage fetches beyond the Orca list.
+const LEADER_MARGIN: Duration = Duration::from_secs(60);
+
 /// How long a hop waits for `switch.lock` in all. Its claude is already
-/// stopped, so it has nothing better to do than wait; the bound covers the
+/// stopped, so it has nothing better to do than wait. The bound covers the
 /// longest holder csm has, an interactive `accounts add` login
-/// ([`crate::orca::add::LOGIN_TIMEOUT`]), plus a limit leader's worst-case
-/// fetch and offline switch.
-pub const HOP_LOCK_WAIT: Duration = Duration::from_secs(300);
+/// ([`crate::orca::add::LOGIN_LOCK_HOLD`], which includes the redo when
+/// Orca comes up mid-login), queued behind or ahead of one limit leader
+/// ([`LEADER_LOCK_HOLD`]), plus a margin. Derived from its parts so a
+/// longer timeout in either cannot leave a queued hop timing out as
+/// [`HopOutcome::LockBusy`] (no relaunch).
+pub const HOP_LOCK_WAIT: Duration = Duration::from_secs(
+    crate::orca::add::LOGIN_LOCK_HOLD.as_secs() + LEADER_LOCK_HOLD.as_secs() + 30,
+);
+
+const _: () = assert!(
+    HOP_LOCK_WAIT.as_secs()
+        > crate::orca::add::LOGIN_LOCK_HOLD.as_secs() + LEADER_LOCK_HOLD.as_secs()
+);
 
 /// Take `switch.lock` for a hop: wait `first`, call `on_wait` once when that
 /// runs out, then wait until `total` has passed. A `WouldBlock` error means
@@ -211,6 +258,40 @@ pub fn run_hop(
         Ok(c) => c,
         Err(e) => return stay(format!("cannot resolve Orca's context: {e}")),
     };
+    let http = SystemHttp::from_env();
+    let mut limit_pick = |lock: &SwitchLock, env: &HostEnv| {
+        let (fresh, warnings) =
+            crate::usage::capture_warnings(|| crate::usage::fetch_for_limit_pick(lock, env));
+        (fresh.ok(), warnings)
+    };
+    run_hop_in(
+        &ctx,
+        &procs,
+        &http,
+        &mut limit_pick,
+        sentinel,
+        own_sid,
+        notice,
+    )
+}
+
+/// The leader's fresh usage read for its pick: the data (`None` when the
+/// fetch failed) and the collector's warnings. [`run_hop`] passes
+/// [`crate::usage::fetch_for_limit_pick`]; tests pass a canned answer.
+pub type LimitPickFetch<'a> =
+    dyn FnMut(&SwitchLock, &HostEnv) -> (Option<UsageData>, Vec<String>) + 'a;
+
+/// [`run_hop`] over an explicit context, process table, HTTP client and
+/// limit-pick fetch.
+fn run_hop_in(
+    ctx: &Context,
+    procs: &dyn ProcFacts,
+    http: &dyn OauthHttp,
+    limit_pick: &mut LimitPickFetch<'_>,
+    sentinel: &RelaunchSentinel,
+    own_sid: &str,
+    notice: &mut dyn FnMut(&str),
+) -> HopOutcome {
     let lock = match acquire_hop_lock(&ctx.state, LOCK_WAIT, HOP_LOCK_WAIT, &mut || {
         notice(LOCK_WAIT_NOTICE)
     }) {
@@ -221,7 +302,7 @@ pub fn run_hop(
     let cur_gen = switch::read_journal(&ctx.state)
         .map(|j| j.generation)
         .unwrap_or(0);
-    let running = ctx.orca_running(&procs);
+    let running = ctx.orca_running(procs);
     // Orca's live list when it runs: on Orca 1.4.214+ the store is an
     // export written at quit, so it lacks accounts added in this Orca
     // session and still names removed ones (which the RPC switch would then
@@ -256,10 +337,9 @@ pub fn run_hop(
     }
 
     // Leader.
-    let (fresh, warnings) =
-        crate::usage::capture_warnings(|| crate::usage::fetch_for_limit_pick(&lock, &ctx.env));
+    let (fresh, warnings) = limit_pick(&lock, &ctx.env);
     warnings.iter().for_each(|w| notice(w));
-    let fresh = fresh.ok().or(cached);
+    let fresh = fresh.or(cached);
     let target = match choose_target(
         &accounts,
         fresh.as_ref(),
@@ -269,13 +349,32 @@ pub fn run_hop(
         Ok(t) => t,
         Err(why) => return stay(why),
     };
-    if let Err(why) = unsupervised_gate(&ctx, &procs) {
+    if let Err(why) = unsupervised_gate(ctx, procs) {
         return stay(why);
     }
-    let http = SystemHttp::from_env();
-    let report = ctx.with_switch_env(&procs, &http, |env| {
-        switch::switch_held(env, &lock, &target)
-    });
+    // switch.lock does not hold Orca's GUI back: look again at what Orca
+    // names now, after the slow fetch, and follow a switch made meanwhile.
+    if running {
+        let now = AccountSet::load_live_with(&ctx.env);
+        if now.from_orca {
+            let now_active = now.active.clone().or_else(|| now.current.clone());
+            let now_viable = now_active
+                .as_deref()
+                .and_then(|a| fresh.as_ref().and_then(|d| viable_in(d, a)))
+                .unwrap_or(true);
+            if let HopRole::Follow(to) = recheck_role(
+                active.as_deref(),
+                now_active.as_deref(),
+                sentinel.from_gen,
+                cur_gen,
+                from.as_deref(),
+                now_viable,
+            ) {
+                return HopOutcome::Followed { to };
+            }
+        }
+    }
+    let report = ctx.with_switch_env(procs, http, |env| switch::switch_held(env, &lock, &target));
     let report = match report {
         Ok(r) => r,
         Err(e) => return stay(format!("the switch failed: {e}")),
@@ -484,6 +583,32 @@ mod tests {
         assert_eq!(hop_role(2, 3, Some("a"), Some("a"), false), HopRole::Lead);
     }
 
+    /// A GUI switch made while the leader fetched usage is followed; an
+    /// unchanged active account keeps the leader leading.
+    #[test]
+    fn the_leader_follows_a_gui_switch_made_during_its_fetch() {
+        // Decided Lead on a (capped, from a); the user picked c meanwhile.
+        assert_eq!(
+            recheck_role(Some("a"), Some("c"), 2, 2, Some("a"), true),
+            HopRole::Follow("c".into())
+        );
+        // Nothing moved: lead on.
+        assert_eq!(
+            recheck_role(Some("a"), Some("a"), 2, 2, Some("a"), false),
+            HopRole::Lead
+        );
+        // The user picked another capped account: lead to the target.
+        assert_eq!(
+            recheck_role(Some("a"), Some("c"), 2, 2, Some("a"), false),
+            HopRole::Lead
+        );
+        // Orca now names none: lead.
+        assert_eq!(
+            recheck_role(Some("a"), None, 2, 2, Some("a"), true),
+            HopRole::Lead
+        );
+    }
+
     #[test]
     fn hop_role_follows_a_gui_switch_only_onto_a_viable_account() {
         assert_eq!(
@@ -593,6 +718,96 @@ mod tests {
             )
         });
         assert!(matches!(out, HopOutcome::Stay { .. }), "{out:?}");
+    }
+
+    /// The leader's second look: Orca names `a` when the hop starts, and the
+    /// user picks `b` in Orca's GUI while the limit-pick fetch runs. The hop
+    /// follows `b` and never asks Orca to switch.
+    #[cfg(unix)]
+    #[test]
+    fn a_leader_follows_a_gui_switch_made_during_its_fetch() {
+        use crate::orca::HostOs;
+        use crate::orca::http::FakeHttp;
+        use crate::orca::testsupport::{
+            FakeOrca, FakeProcs, OrcaModel, model_handler, proc_info, record_json,
+        };
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::{Arc, Mutex};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let model = Arc::new(Mutex::new(OrcaModel::default()));
+        let lists = Arc::new(AtomicUsize::new(0));
+        let fake = {
+            let inner = model_handler(model.clone());
+            let (model, lists) = (model.clone(), lists.clone());
+            FakeOrca::start(move |req: &serde_json::Value| {
+                // Every list after the first sees the GUI's pick.
+                if req["method"] == "accounts.list" && lists.fetch_add(1, Ordering::SeqCst) >= 1 {
+                    model.lock().unwrap().active = Some("id-b".into());
+                }
+                inner(req)
+            })
+        };
+        {
+            let ud = fake.user_data();
+            let mut m = model.lock().unwrap();
+            m.accounts = vec![
+                record_json(ud, "id-a", "alice@example.com", None),
+                record_json(ud, "id-b", "bob@example.com", None),
+            ];
+            m.active = Some("id-a".into());
+        }
+        let mut env = crate::orca::HostEnv::for_test(&home, HostOs::MacOs);
+        env.orca_user_data_path = Some(fake.user_data().to_string_lossy().into_owned());
+        env.claude_config_dir = Some(home.join("claude-d").to_string_lossy().into_owned());
+        // Orca main is this process, as far as the liveness probe knows.
+        let procs = FakeProcs::default().with(proc_info(
+            std::process::id(),
+            "Orca",
+            Some("/Users/example/Applications/Orca.app/Contents/MacOS/Orca"),
+            &[],
+        ));
+        let ctx = Context::from_env(env, &procs);
+        assert!(ctx.orca_running(&procs));
+        let sentinel = RelaunchSentinel {
+            v: SENTINEL_V,
+            session_id: "11111111-2222-3333-4444-555555555555".into(),
+            target_account: "id-b".into(),
+            from_account: Some("id-a".into()),
+            from_gen: 0,
+            reason: "limit:week_all".into(),
+            at: 1,
+            cwd: ".".into(),
+            handoff: String::new(),
+            hop: 1,
+            born: 1,
+            model_override: None,
+        };
+        let mut fetches = 0;
+        let out = crate::testenv::with_test_home(&home, || {
+            run_hop_in(
+                &ctx,
+                &procs,
+                &FakeHttp::default(),
+                &mut |_: &SwitchLock, _: &HostEnv| {
+                    fetches += 1;
+                    (None, Vec::new())
+                },
+                &sentinel,
+                "11111111-2222-3333-4444-555555555555",
+                &mut |_| {},
+            )
+        });
+        assert_eq!(out, HopOutcome::Followed { to: "id-b".into() });
+        assert_eq!(fetches, 1, "the leader fetched before its second look");
+        let methods: Vec<String> = fake
+            .requests()
+            .iter()
+            .map(|r| r["method"].as_str().unwrap_or("").to_owned())
+            .collect();
+        assert_eq!(methods, ["accounts.list", "accounts.list"]);
     }
 
     /// A peer whose first wait for `switch.lock` runs out keeps waiting (it

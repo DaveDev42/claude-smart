@@ -1271,8 +1271,9 @@ pub(crate) fn attribute_capture(f: &CaptureFacts<'_>) -> Option<String> {
 }
 
 /// Record `D`'s `accountUuid` in `<state>/last-identity`; a change is a
-/// switch event and re-stamps `.last-switch`. Returns the last switch event
-/// (epoch), if any. The first sighting records the identity without
+/// switch event and re-stamps `.last-switch` (the cooldown) and
+/// `.last-identity-switch` (attribution). Returns the last identity switch
+/// event (epoch), if any. The first sighting records the identity without
 /// counting as a switch.
 pub(crate) fn note_identity(uuid: Option<&str>, now: i64) -> Option<i64> {
     let path = crate::paths::last_identity();
@@ -1287,11 +1288,24 @@ pub(crate) fn note_identity(uuid: Option<&str>, now: i64) -> Option<i64> {
         );
         if seen.is_some() {
             let _ = std::fs::write(crate::paths::last_switch(), now.to_string());
+            let _ = std::fs::write(crate::paths::last_identity_switch(), now.to_string());
         }
     }
-    std::fs::read_to_string(crate::paths::last_switch())
+    std::fs::read_to_string(crate::paths::last_identity_switch())
         .ok()
         .and_then(|s| s.trim().parse().ok())
+}
+
+/// The `born` stamp of a (re)launch on `D`'s identity `uuid`: note the
+/// identity first, so a switch that moved `D` since the last statusLine
+/// tick (a pre-launch switch, `accounts use`, Orca's GUI) is a switch event
+/// at or before this launch, not one the session's own first tick stamps
+/// after its `born` (which would drop every capture it makes). Returns the
+/// epoch to record as `born`.
+pub fn launch_born(uuid: Option<&str>) -> i64 {
+    let now = crate::epoch::now_secs() as i64;
+    let _ = note_identity(uuid, now);
+    now
 }
 
 /// Build the `StoreRecord` a statusline capture writes. Pure (no I/O) so the
@@ -1969,6 +1983,38 @@ mod tests {
                 std::fs::read_to_string(crate::paths::last_identity()).unwrap(),
                 "uuid-b"
             );
+            // A cooldown claim re-stamps `.last-switch` without a switch:
+            // attribution does not move.
+            std::fs::write(crate::paths::last_switch(), "400").unwrap();
+            assert_eq!(note_identity(Some("uuid-b"), 450), Some(200));
+        });
+    }
+
+    /// A launch after a switch no statusLine tick saw (a pre-launch switch,
+    /// `accounts use`, Orca's GUI): the launch notes `D`'s identity before
+    /// stamping `born`, so the session's own first tick finds no new switch
+    /// event and its captures count.
+    #[test]
+    fn a_launch_after_an_unseen_switch_keeps_its_captures() {
+        let home = tempfile::tempdir().unwrap();
+        crate::testenv::with_test_home(home.path(), || {
+            std::fs::create_dir_all(crate::paths::smart_dir_no_create()).unwrap();
+            // An earlier session ticked on a.
+            assert_eq!(note_identity(Some("uuid-a"), 100), None);
+            // D moved to b with no tick in between; the new session launches.
+            let born = launch_born(Some("uuid-b"));
+            // Its first tick, at or after born, sees b.
+            let last_switch = note_identity(Some("uuid-b"), born + 5);
+            assert!(last_switch.is_some_and(|s| s <= born), "{last_switch:?}");
+            let f = CaptureFacts {
+                sidecar_account: Some("id-b"),
+                sidecar_born: Some(born),
+                d_account: Some("id-b"),
+                last_switch,
+                now: born + 5,
+                ..Default::default()
+            };
+            assert_eq!(attribute_capture(&f).as_deref(), Some("id-b"));
         });
     }
 

@@ -174,7 +174,7 @@ impl Context {
             store_access_allowed: self.user_data.store_access_allowed(),
             lock_wait: LOCK_WAIT,
             redo: RedoOpts::default(),
-            rpc_timeout: rpc::LIST_TIMEOUT,
+            mutation_timeout: rpc::ADD_TIMEOUT,
         };
         f(&env)
     }

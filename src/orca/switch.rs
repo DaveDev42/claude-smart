@@ -31,11 +31,12 @@
 //! the account the store names (the `a == i` repair). If the repair fails,
 //! `D` is made neutral (no `oauthAccount`). With Orca running:
 //! - a switch away from the system default that may have written `D` is
-//!   put back to the snapshot first while Orca still names no account (Orca
-//!   writes nothing to `D` then, and its next select would capture the
-//!   half-written `D` over the snapshot, the only copy of the user's own
-//!   login); once Orca names an account the journal stays pending and the
-//!   answer says why ([`Recovery::Deferred`]);
+//!   not repaired: csm never writes `D` behind a running Orca (Invariant 6),
+//!   so it files the system-default snapshot's grants in the quarantine
+//!   (Orca's next select would capture the half-written `D` over the
+//!   snapshot, the only copy of the user's own login), refuses a switch,
+//!   and keeps the journal pending for the offline repair once Orca stops
+//!   ([`Recovery::Deferred`]);
 //! - otherwise the intent is cleared only when Orca's `D` is csm's, since
 //!   only then does Orca's own sync own it. With another or an unknown `D`
 //!   the journal stays pending for the offline repair once Orca stops.
@@ -102,7 +103,8 @@ pub struct SwitchState {
 /// One offline step (design section 3's numbering in brackets).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Step {
-    /// Clear a stale journal (its switch is subsumed by this one).
+    /// A stale journal: its switch is subsumed by this one once this one
+    /// commits; a failure puts it back pending.
     Recover,
     /// [3]
     ReadBack,
@@ -277,6 +279,13 @@ pub struct Journal {
     pub from: Option<String>,
     pub to: String,
     pub step: JournalStep,
+    /// A switch handed to a running Orca left `D` unsettled: its
+    /// pre-images could not be put back, or an earlier crash's state came
+    /// back, and Orca did not confirm a select that rewrote `D`. Orca then
+    /// believes `D` is in sync, so while it runs the journal waits for the
+    /// offline repair instead of being cleared for Orca's sync.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub orca_unconfirmed: bool,
     pub owner: Owner,
 }
 
@@ -304,7 +313,7 @@ fn write_journal(state: &Path, j: &Journal) -> Result<(), OrcaError> {
     fsx::create_dir_all(state, 0o700).map_err(|e| OrcaError::io("cannot create", state, e))?;
     let p = journal_path(state);
     let text = serde_json::to_vec_pretty(j).map_err(|e| OrcaError::Invalid(e.to_string()))?;
-    fsx::write_atomic(&p, &text, WriteOpts::PRIVATE)
+    fsx::write_atomic(&p, &text, WriteOpts::PRIVATE_DURABLE)
         .map_err(|e| OrcaError::io("cannot write", &p, e))
 }
 
@@ -621,23 +630,35 @@ fn switch_running(
     target: &str,
     journal: Option<Journal>,
 ) -> Result<SwitchReport, OrcaError> {
-    let snap = rpc::accounts_list(env.user_data, false, rpc::LIST_TIMEOUT)?;
-    // A crashed switch away from the system default may have left the
-    // target's grant in `D`. While Orca names no account it writes nothing
-    // to `D`, but the select below makes it capture `D` as the system
-    // default, over the snapshot that holds the user's own login: put the
-    // snapshot back first. Once Orca names an account, csm cannot tell what
-    // it captured, so it leaves the journal for `accounts doctor`.
-    let journal = match journal {
-        Some(mut j) if j.pending() && j.from.is_none() && null_switch_touched_d(j.step) => {
-            if let Some(a) = snap.claude.active_by_runtime.host.as_deref() {
-                return Err(OrcaError::Refused(orca_selected_since_crash(&j, a)));
+    let null_crash = journal
+        .as_ref()
+        .filter(|j| j.pending() && j.from.is_none() && null_switch_touched_d(j.step));
+    let snap = match rpc::accounts_list(env.user_data, false, rpc::LIST_TIMEOUT) {
+        Ok(s) => s,
+        Err(e) => {
+            // Keep the snapshot even without Orca's answer (see below).
+            if let Some(j) = null_crash {
+                keep_null_snapshot(env, j)?;
             }
-            settle_without_active(env, &mut j)?;
-            Some(j)
+            return Err(e.into());
         }
-        other => other,
     };
+    // A crashed switch away from the system default may have left the
+    // target's grant in `D`. The select below would make Orca capture that
+    // `D` as the system default, over the snapshot that holds the user's
+    // own login, and csm never writes `D` behind a running Orca (Invariant
+    // 6; a GUI select could interleave with such a write). So csm files the
+    // snapshot's grants in the quarantine, refuses, and leaves the journal
+    // pending for the offline repair once Orca stops. Once Orca names an
+    // account, csm cannot tell what it captured, so it refuses the same way.
+    if let Some(j) = null_crash {
+        return Err(OrcaError::Refused(
+            match snap.claude.active_by_runtime.host.as_deref() {
+                Some(a) => orca_selected_since_crash(j, a),
+                None => defer_null_crash(env, j)?,
+            },
+        ));
+    }
     let rec = snap
         .claude
         .accounts
@@ -693,6 +714,7 @@ fn switch_running(
                     from,
                     to: target.to_owned(),
                     step: JournalStep::Committed,
+                    orca_unconfirmed: false,
                     owner: env.owner.clone(),
                 },
             )?;
@@ -750,6 +772,10 @@ fn run_offline(
     steps: Vec<Step>,
 ) -> Result<SwitchReport, OrcaError> {
     let target = rec.id.clone();
+    // An earlier switch that never finished: `D` may be half written by it.
+    // This switch subsumes its repair only by committing; until then that
+    // journal must stay pending (see `fail`).
+    let prev_pending = prev.as_ref().filter(|j| j.pending()).cloned();
     let prev_gen = prev.as_ref().map(|j| j.generation).unwrap_or(0);
     let prev_account = prev.as_ref().and_then(|j| j.account.clone());
     let mut journal = Journal {
@@ -758,6 +784,7 @@ fn run_offline(
         from: active.clone(),
         to: target.clone(),
         step: JournalStep::Started,
+        orca_unconfirmed: false,
         owner: env.owner.clone(),
     };
     write_journal(env.state, &journal)?;
@@ -780,7 +807,12 @@ fn run_offline(
 
     // A failure: restore D when it was touched, then record the end state.
     // Anything short of a restored D leaves the journal pending, so the
-    // recovery repairs it.
+    // recovery repairs it. A restored D is only as good as it was before
+    // this switch: when an earlier switch was pending, D is (again) the
+    // state that crash left, so its journal goes back as it was instead of
+    // being closed. Closing it would drop the only record that D may hold
+    // one account's grant beside another's identity, which Orca's next
+    // start would read back into the wrong stash by email match.
     let fail = |journal: &mut Journal,
                 pre: &Option<runtime::PreImages>,
                 d_unrestored: bool,
@@ -790,13 +822,21 @@ fn run_offline(
                 None => true,
                 Some(p) => runtime::restore_preimages(&env.target_dir(), p).is_ok(),
             };
-        if restored {
+        let reopened = restored && prev_pending.is_some();
+        if let Some(p) = prev_pending.as_ref().filter(|_| restored) {
+            *journal = p.clone();
+        } else if restored {
             journal.step = JournalStep::RolledBack;
         } else if d_unrestored {
             journal.step = JournalStep::Materialize;
         }
         let _ = write_journal(env.state, journal);
-        if restored {
+        if reopened {
+            OrcaError::Refused(format!(
+                "{e}; an earlier switch did not finish and D still needs its repair, \
+                 run `csm accounts doctor --fix`"
+            ))
+        } else if restored {
             e
         } else {
             OrcaError::Refused(format!(
@@ -857,6 +897,13 @@ fn run_offline(
                 .map(|c| report.snapshot = Some(c))
             }
             Step::Refresh => {
+                // No unretired-legacy-dir gate here, unlike the usage
+                // collector's inactive refresh (design section 10 item 5):
+                // this grant is about to become `D`'s, and claude refreshes
+                // it there on first use anyway, so skipping would only move
+                // the same rotation later. Orca's own switch refreshes the
+                // same way, and migration step 7 (the floor switch) runs
+                // before retire by design.
                 let t = loaded.as_mut().expect("LoadTarget ran");
                 refresh::refresh_stash_if_needed(
                     env.user_data,
@@ -931,10 +978,7 @@ fn run_offline(
                             && let Some(p) = &pre
                             && let Err(f) = runtime::restore_preimages(&env.target_dir(), p)
                         {
-                            Some(format!(
-                                "D could not be restored ({}), run `csm accounts doctor --fix`",
-                                f.join(", ")
-                            ))
+                            Some(format!("D could not be restored ({})", f.join(", ")))
                         } else {
                             None
                         };
@@ -943,18 +987,58 @@ fn run_offline(
                             &RedoOp::Select { id: target.clone() },
                             env.timing.redo,
                         );
-                        // Orca confirmed the target: that is a switch like
-                        // any other, so bump the generation peers follow on
-                        // (a limit-switch peer checks `gen > from_gen`).
-                        if redo_switched(&redo) {
+                        let hand = handover(&HandoverFacts {
+                            at_l2: w == StoreWrite::OrcaAtL2,
+                            dir_agrees: (env.orca_dir_agrees)() == Some(true),
+                            redo_switched: redo_switched(&redo),
+                            reissued: matches!(redo, RedoOutcome::Reissued(_)),
+                            d_unrestored: unrestored.is_some(),
+                            prev_pending: prev_pending.is_some(),
+                        });
+                        // Orca confirmed the target in csm's D: that is a
+                        // switch like any other, so bump the generation
+                        // peers follow on (a limit-switch peer checks
+                        // `gen > from_gen`).
+                        if hand.bump {
                             journal.generation += 1;
                             journal.account = Some(target.clone());
                             report.generation = journal.generation;
                         }
-                        journal.step = JournalStep::HandedToOrca;
+                        match hand.journal {
+                            HandoverJournal::Close => journal.step = JournalStep::HandedToOrca,
+                            HandoverJournal::KeepPending => journal.orca_unconfirmed = true,
+                            // D is back in the state an earlier crash left:
+                            // its journal goes back as it was (see `fail`),
+                            // marked so a recovery while Orca runs does not
+                            // clear it for Orca's sync, which ran before
+                            // csm put that state back.
+                            HandoverJournal::Reopen => {
+                                if let Some(p) = &prev_pending {
+                                    journal = p.clone();
+                                    journal.orca_unconfirmed = true;
+                                    report.generation = journal.generation;
+                                }
+                            }
+                        }
+                        let still_pending = hand.journal != HandoverJournal::Close;
                         write_journal(env.state, &journal)?;
+                        let unrestored = unrestored.map(|u| {
+                            if still_pending {
+                                format!(
+                                    "{u}; `csm accounts doctor --fix` repairs it once Orca stops"
+                                )
+                            } else {
+                                u
+                            }
+                        });
                         report.route = Route::OfflineThenRpc;
                         report.outcome = handed_outcome(&redo, unrestored.as_deref())?;
+                        if let Some(why) = hand.not_switched {
+                            report.outcome = Outcome::Uncertain(match unrestored {
+                                Some(u) => format!("{why}; {u}"),
+                                None => why.to_owned(),
+                            });
+                        }
                         report.redo = Some(redo);
                         report.steps.push(step);
                         return Ok(report);
@@ -998,6 +1082,93 @@ fn redo_switched(redo: &RedoOutcome) -> bool {
     matches!(redo, RedoOutcome::AlreadyDone(_) | RedoOutcome::Reissued(_))
 }
 
+/// What a switch handed to Orca at L0/L1/L2 knows.
+#[derive(Debug, Clone, Copy, Default)]
+struct HandoverFacts {
+    /// Orca appeared after the rename: `D` holds the target as written.
+    /// Otherwise (L0/L1) `D` was put back to its pre-images.
+    at_l2: bool,
+    /// Orca main's `CLAUDE_CONFIG_DIR` is csm's `D` (`Some(true)` only).
+    dir_agrees: bool,
+    /// Orca shows the target (it did already, or it took the reissue).
+    redo_switched: bool,
+    /// csm reissued the select and Orca took it: Orca's select ran after
+    /// csm put `D` back, so it rewrote Orca's runtime dir.
+    reissued: bool,
+    /// `D`'s pre-images could not be put back.
+    d_unrestored: bool,
+    /// An earlier switch was pending when this one started.
+    prev_pending: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HandoverJournal {
+    /// Orca owns `D` now, or `D` is back to a clean state.
+    Close,
+    /// Keep the last step: the offline repair runs once Orca stops.
+    KeepPending,
+    /// Write the earlier pending journal back.
+    Reopen,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Handover {
+    journal: HandoverJournal,
+    bump: bool,
+    /// Why csm's `D` did not switch although Orca may have.
+    not_switched: Option<&'static str>,
+}
+
+/// Decide the journal of a switch handed to Orca. Pure.
+///
+/// Orca's select rewrites only Orca's own runtime dir, so it repairs
+/// csm's `D` only when the two agree. At L0/L1 csm put `D` back to its
+/// pre-images; when an earlier switch was pending, those pre-images are
+/// the state that crash left, which only Orca's own select (reissued after
+/// the restore, in csm's `D`) overwrites. Otherwise the earlier journal
+/// goes back as it was, the way a failed switch leaves it, so its repair
+/// is not lost.
+fn handover(f: &HandoverFacts) -> Handover {
+    let orca_rewrote_d = f.dir_agrees && f.reissued;
+    if !f.at_l2 && !f.d_unrestored && f.prev_pending && !orca_rewrote_d {
+        return Handover {
+            journal: HandoverJournal::Reopen,
+            bump: false,
+            not_switched: Some(
+                "Orca started during the switch; an earlier switch did not finish and D \
+                 still needs its repair, run `csm accounts doctor --fix` once Orca stops",
+            ),
+        };
+    }
+    if !f.at_l2 && !f.dir_agrees {
+        return Handover {
+            journal: HandoverJournal::KeepPending,
+            bump: false,
+            not_switched: Some(
+                "Orca started during the switch and does not run with csm's D (or csm cannot \
+                 tell), so its select does not reach csm's D; csm repairs D once Orca stops",
+            ),
+        };
+    }
+    Handover {
+        journal: if handed_leaves_pending(f.redo_switched, f.d_unrestored) {
+            HandoverJournal::KeepPending
+        } else {
+            HandoverJournal::Close
+        },
+        bump: f.redo_switched && (f.at_l2 || f.dir_agrees),
+        not_switched: None,
+    }
+}
+
+/// Whether a switch handed to Orca at L0/L1/L2 leaves the journal pending:
+/// `D`'s pre-images could not be put back and Orca did not confirm its own
+/// select (which rewrites `D`). The journal then keeps its last step, so
+/// `accounts doctor --fix` or a launch repairs `D` once Orca stops. Pure.
+fn handed_leaves_pending(redo_switched: bool, d_unrestored: bool) -> bool {
+    d_unrestored && !redo_switched
+}
+
 /// The outcome of a switch handed to Orca at L0/L1/L2, from the RPC redo
 /// and a failed restore of `D`'s pre-images. A restore failure is never
 /// dropped: it turns a success into [`Outcome::Uncertain`] and is added to a
@@ -1018,6 +1189,98 @@ fn handed_outcome(redo: &RedoOutcome, unrestored: Option<&str>) -> Result<Outcom
             ))));
         }
         RedoOutcome::Uncertain(why) => Outcome::Uncertain(with(why)),
+    })
+}
+
+// ─── offline attribution ──────────────────────────────────────────────────────
+
+/// What [`attribute_offline`] did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Attribution {
+    /// The store names no active account: Orca's start does not read `D`
+    /// back, so nothing was done.
+    NoActiveAccount,
+    /// The read-back ran. `identity_cleared`: `D`'s `oauthAccount` was
+    /// removed afterwards.
+    Done {
+        readback: ReadBackReport,
+        identity_cleared: bool,
+    },
+}
+
+/// Attribute `D`'s runtime grants with Orca stopped, without switching:
+/// step 3 of the offline switch (the read-back with the profile veto) on
+/// its own, then `D` made neutral.
+///
+/// For the migration's step 7 when the switch cannot run offline (a
+/// SQLite-backed store, or the floor profile has no account). Orca's first
+/// start reads `D` back while nothing is written yet
+/// (runtime-auth-readback.ts, `lastWrittenCredentialsJson === null`): a
+/// candidate matched by the email in `D`'s `oauthAccount` and fresher than
+/// that account's stash is written into it with no profile check. So csm
+/// first files each grant with its owner (or in the quarantine), then
+/// removes `D`'s `oauthAccount`: without it Orca's matcher accepts a grant
+/// only by an equal refresh token (runtime-auth-credential-matching.ts),
+/// which is the owner csm just stored it with. The identity goes only when
+/// the store names an active account, whose materialize on Orca's start
+/// writes it again; with none, `D` is the system default Orca captures and
+/// is left alone. Writes stashes, csm's quarantine and `D`'s
+/// `.claude.json` only, never the store.
+pub fn attribute_offline(env: &SwitchEnv<'_>) -> Result<Attribution, OrcaError> {
+    let _lock = SwitchLock::acquire(env.state, env.timing.lock_wait)
+        .map_err(|e| OrcaError::io("cannot take", &env.state.join(fsx::SWITCH_LOCK), e))?;
+    if env.live.mark().running {
+        return Err(OrcaError::Refused(
+            "Orca is running; its own sync owns D".into(),
+        ));
+    }
+    if !env.version_ok {
+        return Err(OrcaError::Refused(
+            "the installed Orca version is not one csm was tested with".into(),
+        ));
+    }
+    if !env.store_access_allowed {
+        return Err(OrcaError::Refused(
+            "this userData is not csm's to write".into(),
+        ));
+    }
+    let Some(view) = load_view(env.data_file)? else {
+        return Ok(Attribution::NoActiveAccount);
+    };
+    let Some(active) = named_active(&view).and_then(|id| view.account(&id).cloned()) else {
+        return Ok(Attribution::NoActiveAccount);
+    };
+    let exclude = raw_stash_credentials(env, &active);
+    let readback = readback::read_back(&ReadBack {
+        os: env.os,
+        user_data: env.user_data,
+        paths: env.paths,
+        keychain_user: env.keychain_user,
+        records: &view.accounts,
+        exclude: exclude.as_ref().map(|s| s.expose()),
+        live_claude: (env.live_claude)(),
+        http: env.http,
+        quarantine: &env.quarantine(),
+        now_ms: super::now_ms(),
+        migration: false,
+    })?;
+    // Orca came up during the read-back: never write `D` behind it.
+    if env.live.mark().running {
+        return Ok(Attribution::Done {
+            readback,
+            identity_cleared: false,
+        });
+    }
+    let identity_cleared = matches!(
+        read_runtime_identity(env.paths),
+        RuntimeIdentity::Present(_)
+    );
+    if identity_cleared {
+        runtime::clear_identity(env.paths)?;
+    }
+    Ok(Attribution::Done {
+        readback,
+        identity_cleared,
     })
 }
 
@@ -1045,6 +1308,10 @@ pub enum Recovery {
     Untouched,
     /// `D` now holds the account the store names.
     Repaired(Box<SwitchReport>),
+    /// Orca started during the repair, which was handed to it, and the
+    /// hand-over did not verify (no answer, or `D` could not be put back).
+    /// csm wrote nothing behind the running Orca. The text says why.
+    Uncertain(String),
     /// The repair failed; `D` was made neutral. The error text says why.
     Failed(String),
     /// Another csm held `switch.lock` for the whole wait (a switch in
@@ -1090,12 +1357,40 @@ pub fn recover(env: &SwitchEnv<'_>) -> Result<Recovery, OrcaError> {
         return settle_without_active(env, &mut j);
     };
     match switch_locked(env, &id) {
-        Ok(r) => Ok(Recovery::Repaired(Box::new(r))),
+        Ok(r) => Ok(repaired(r)),
         Err(e) => {
             let mut j = read_journal(env.state).unwrap_or(j);
+            // Orca came up between the check above and the switch's own L0
+            // (its first RPC then failed while the socket was not yet
+            // listening), or during the offline steps: csm never writes `D`
+            // behind a running Orca.
+            if env.live.mark().running {
+                return Ok(orca_came_up(j.pending(), &e.to_string()));
+            }
             neutral(&mut j)?;
             Ok(Recovery::Failed(e.to_string()))
         }
+    }
+}
+
+/// A repair's switch report as a [`Recovery`]: an uncertain hand-over to an
+/// Orca that started meanwhile is not a repair. Pure.
+fn repaired(r: SwitchReport) -> Recovery {
+    match &r.outcome {
+        Outcome::Uncertain(why) => Recovery::Uncertain(why.clone()),
+        Outcome::Switched | Outcome::AlreadyActive => Recovery::Repaired(Box::new(r)),
+    }
+}
+
+/// A repair that failed after Orca came up: nothing more is written.
+/// `pending`: the journal still says the switch is unfinished. Pure.
+fn orca_came_up(pending: bool, why: &str) -> Recovery {
+    if pending {
+        Recovery::Deferred(format!(
+            "Orca started during the repair ({why}); csm repairs D once Orca stops"
+        ))
+    } else {
+        Recovery::Uncertain(format!("Orca started during the repair: {why}"))
     }
 }
 
@@ -1106,14 +1401,33 @@ fn recover_with_orca(env: &SwitchEnv<'_>, j: &mut Journal) -> Result<Recovery, O
         // writes it at quit).
         return match rpc::accounts_list(env.user_data, false, rpc::LIST_TIMEOUT) {
             Ok(snap) => match snap.claude.active_by_runtime.host.as_deref() {
-                None => settle_without_active(env, j),
+                None => Ok(Recovery::Deferred(defer_null_crash(env, j)?)),
                 Some(a) => Ok(Recovery::Deferred(orca_selected_since_crash(j, a))),
             },
-            Err(e) => Ok(Recovery::Deferred(format!(
-                "a switch away from the system default did not finish and Orca does not \
-                 say whether it selected an account since ({e}); csm repairs it once Orca stops"
-            ))),
+            // No answer (Orca still starting, a busy socket): keep the
+            // snapshot anyway. Preserving reads only the snapshot and writes
+            // only csm's quarantine, and a GUI select right after would
+            // force-capture the half-written `D` over it.
+            Err(e) => {
+                let kept = keep_null_snapshot(env, j)?;
+                Ok(Recovery::Deferred(format!(
+                    "a switch away from the system default did not finish and Orca does not \
+                     say whether it selected an account since ({e}); csm repairs it once Orca \
+                     stops{kept}"
+                )))
+            }
         };
+    }
+    if j.orca_unconfirmed {
+        // Handed to Orca without Orca confirming a select that rewrote `D`
+        // (see `handover`): Orca believes `D` is in sync, so its own sync
+        // does not repair it. Clearing the journal here would drop the
+        // repair the hand-over promised for once Orca stops.
+        return Ok(Recovery::Deferred(
+            "a switch handed to Orca left D unsettled and Orca did not confirm rewriting it; \
+             csm repairs it once Orca stops (`csm accounts doctor --fix`)"
+                .into(),
+        ));
     }
     match (env.orca_dir_agrees)() {
         Some(true) => {
@@ -1132,6 +1446,40 @@ fn recover_with_orca(env: &SwitchEnv<'_>, j: &mut Journal) -> Result<Recovery, O
                 .into(),
         )),
     }
+}
+
+/// A crashed switch away from the system default while Orca runs and names
+/// no account: file the snapshot's grants in the quarantine (csm's own
+/// state; `D` and Orca's files are not touched) and say why the repair
+/// waits. The journal stays pending.
+fn defer_null_crash(env: &SwitchEnv<'_>, j: &Journal) -> Result<String, OrcaError> {
+    let kept = keep_null_snapshot(env, j)?;
+    Ok(format!(
+        "a switch from the system default to {} did not finish, and csm does not write D \
+         while Orca runs{kept}. Quit Orca and run `csm accounts doctor --fix`",
+        j.to
+    ))
+}
+
+/// File the system-default snapshot's grants in the quarantine for a
+/// crashed switch away from the system default (idempotent; `D` and Orca's
+/// files are not touched). Returns the note suffix naming what was kept.
+fn keep_null_snapshot(env: &SwitchEnv<'_>, j: &Journal) -> Result<String, OrcaError> {
+    let managed = read_stash_grant(env, &j.to);
+    let filed = sysdefault::preserve_snapshot(
+        env.user_data,
+        managed.as_ref().map(|s| s.expose()),
+        &env.quarantine(),
+        super::now_ms(),
+    )?;
+    Ok(if filed.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "; the system default's grants are kept in csm's quarantine ({})",
+            filed.join(", ")
+        )
+    })
 }
 
 /// The note for a crashed switch away from the system default that Orca
@@ -1408,6 +1756,7 @@ mod tests {
             from: Some("id-a".into()),
             to: "id-b".into(),
             step: JournalStep::Materialize,
+            orca_unconfirmed: false,
             owner: Owner {
                 pid: 1,
                 born: Some(2),
@@ -1427,6 +1776,7 @@ mod tests {
             assert!(
                 !Journal {
                     step: s,
+                    orca_unconfirmed: false,
                     ..j.clone()
                 }
                 .pending()
@@ -1608,6 +1958,54 @@ mod tests {
         assert!(!read_journal(&w.state).unwrap().pending());
     }
 
+    /// An offline a -> b switch with a live claude (Orca's order) died after
+    /// writing b's grant and before the identity: b's grant sits beside a's
+    /// `oauthAccount`, the store still names a, the journal is pending. The
+    /// next switch fails before it writes `D` (no network for the profile
+    /// veto): the earlier journal must stay pending, since `D` still needs
+    /// its repair. Closing it would let Orca's next start file b's grant
+    /// into a's stash by email match.
+    #[test]
+    fn a_failed_switch_over_a_pending_journal_keeps_it_pending() {
+        let w = World::new(None);
+        std::fs::write(&w.paths.credentials_path, b_creds()).unwrap();
+        let crashed = Journal {
+            generation: 3,
+            account: Some("id-a".into()),
+            from: Some("id-a".into()),
+            to: "id-b".into(),
+            step: JournalStep::LoadTarget,
+            orca_unconfirmed: false,
+            owner: Owner {
+                pid: 1,
+                born: Some(1),
+            },
+        };
+        write_journal(&w.state, &crashed).unwrap();
+        let live = ScriptedLiveness::stopped();
+        let http = FakeHttp::default();
+        let err = switch(&w.env(&live, &http), "id-b").unwrap_err();
+        assert!(err.to_string().contains("doctor --fix"), "{err}");
+        let j = read_journal(&w.state).unwrap();
+        assert!(j.pending(), "{j:?}");
+        assert_eq!(j, crashed);
+        assert_eq!(w.d_creds(), b_creds());
+        assert_eq!(w.store_active().as_deref(), Some("id-a"));
+        // The repair still runs; with the profile endpoint still silent it
+        // fails, and D is left neutral (no identity to match b's grant by).
+        match recover(&w.env(&live, &http)).unwrap() {
+            Recovery::Failed(_) => {}
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(d_uuid(&w.paths), None);
+        // Without an earlier pending journal the same failure closes it.
+        let w = World::new(None);
+        std::fs::write(&w.paths.credentials_path, b_creds()).unwrap();
+        let err = switch(&w.env(&live, &http), "id-b").unwrap_err();
+        assert!(matches!(err, OrcaError::Network(_)), "{err}");
+        assert!(!read_journal(&w.state).unwrap().pending());
+    }
+
     #[test]
     fn a_first_switch_from_no_account_captures_the_system_default() {
         let w = World::new(None);
@@ -1686,6 +2084,159 @@ mod tests {
         assert!(read_journal(&w.state).is_none());
     }
 
+    /// Migration step 7 with a SQLite-backed store: no offline switch, but
+    /// `D`'s grants are attributed with the profile veto and `D`'s identity
+    /// is cleared, so Orca's first start (nothing written yet) cannot file
+    /// a's grant into b's stash by the email in `D`'s `oauthAccount`.
+    #[test]
+    fn offline_attribution_files_d_grants_and_neutralizes_d_without_the_store() {
+        let w = World::new(None);
+        std::fs::write(
+            w.choice
+                .path
+                .with_file_name(crate::orca::userdata::STATE_DB),
+            b"",
+        )
+        .unwrap();
+        let store_before = std::fs::read(&w.choice.path).unwrap();
+        // a's rotated grant beside b's identity: what Orca's cold read-back
+        // would match to b by email.
+        let fresher = creds_json("at-a2", "rt-a2", 4_100_000_000_000);
+        std::fs::write(&w.paths.credentials_path, &fresher).unwrap();
+        std::fs::write(
+            &w.paths.config_path,
+            json!({"numStartups": 1, "oauthAccount": oauth_json("u-b", "bob@example.com", None)})
+                .to_string(),
+        )
+        .unwrap();
+        let live = ScriptedLiveness::stopped();
+        let http = FakeHttp::default().profile_uuid("at-a2", "u-a");
+        let Attribution::Done {
+            readback,
+            identity_cleared,
+        } = attribute_offline(&w.env(&live, &http)).unwrap()
+        else {
+            panic!("the store names an active account");
+        };
+        assert!(identity_cleared);
+        assert_eq!(readback.candidates, 1);
+        // b's stash is untouched; the grant sits with a or in the quarantine.
+        let b = Stash::open(&w.ud, "id-b", None).unwrap();
+        assert_eq!(b.credentials(OS).unwrap().unwrap().expose(), b_creds());
+        let a = Stash::open(&w.ud, "id-a", None).unwrap();
+        let in_a = a.credentials(OS).unwrap().unwrap().expose() == fresher;
+        let q = Quarantine::new(OS, &w.state);
+        let in_q = q
+            .list()
+            .iter()
+            .any(|m| q.get(&m.fingerprint).unwrap().unwrap().expose() == fresher);
+        assert!(in_a || in_q, "{readback:?}");
+        // D: grant kept, identity gone, other keys intact; store untouched.
+        assert_eq!(w.d_creds(), fresher);
+        assert!(matches!(
+            read_runtime_identity(&w.paths),
+            RuntimeIdentity::None
+        ));
+        let cfg: Value =
+            serde_json::from_slice(&std::fs::read(&w.paths.config_path).unwrap()).unwrap();
+        assert_eq!(cfg["numStartups"], json!(1));
+        assert_eq!(std::fs::read(&w.choice.path).unwrap(), store_before);
+        assert!(read_journal(&w.state).is_none());
+    }
+
+    #[test]
+    fn offline_attribution_refuses_a_running_orca_and_skips_no_active_account() {
+        let w = World::new(None);
+        let cfg_before = std::fs::read(&w.paths.config_path).unwrap();
+        let running = ScriptedLiveness::new(vec![crate::orca::testsupport::running_mark()]);
+        let http = FakeHttp::default();
+        assert!(matches!(
+            attribute_offline(&w.env(&running, &http)),
+            Err(OrcaError::Refused(_))
+        ));
+        assert_eq!(std::fs::read(&w.paths.config_path).unwrap(), cfg_before);
+        // No network for the veto: an error, and D keeps its identity.
+        std::fs::write(
+            &w.paths.credentials_path,
+            creds_json("at-a2", "rt-a2", 4_100_000_000_000),
+        )
+        .unwrap();
+        let stopped = ScriptedLiveness::stopped();
+        assert!(matches!(
+            attribute_offline(&w.env(&stopped, &http)),
+            Err(OrcaError::Network(_))
+        ));
+        assert_eq!(std::fs::read(&w.paths.config_path).unwrap(), cfg_before);
+        // No active account: D is the system default, left alone.
+        let recs: Vec<Value> = ["id-a", "id-b"]
+            .iter()
+            .zip(["alice@example.com", "bob@example.com"])
+            .map(|(id, e)| record_json(&w.ud, id, e, None))
+            .collect();
+        write_store(&w.ud, &recs, None);
+        assert_eq!(
+            attribute_offline(&w.env(&stopped, &http)).unwrap(),
+            Attribution::NoActiveAccount
+        );
+        assert_eq!(std::fs::read(&w.paths.config_path).unwrap(), cfg_before);
+    }
+
+    /// Round 8: attribute_offline's safety branches. Orca coming up during
+    /// the read-back leaves `D`'s identity in place (never written behind a
+    /// running Orca), and an untested Orca version or a userData that is
+    /// not csm's to write refuses with `D` and the stashes unchanged.
+    #[test]
+    fn offline_attribution_never_writes_d_behind_an_orca_that_came_up() {
+        let w = World::new(None);
+        let fresher = creds_json("at-a2", "rt-a2", 4_100_000_000_000);
+        std::fs::write(&w.paths.credentials_path, &fresher).unwrap();
+        std::fs::write(
+            &w.paths.config_path,
+            json!({"oauthAccount": oauth_json("u-b", "bob@example.com", None)}).to_string(),
+        )
+        .unwrap();
+        let cfg_before = std::fs::read(&w.paths.config_path).unwrap();
+        let stash_bytes = |id: &str| {
+            Stash::open(&w.ud, id, None)
+                .unwrap()
+                .credentials(OS)
+                .unwrap()
+                .map(|s| s.expose().to_owned())
+        };
+        let (a_before, b_before) = (stash_bytes("id-a"), stash_bytes("id-b"));
+        let http = FakeHttp::default().profile_uuid("at-a2", "u-a");
+        for (version_ok, store_access_allowed) in [(false, true), (true, false)] {
+            let live = ScriptedLiveness::stopped();
+            let mut env = w.env(&live, &http);
+            env.version_ok = version_ok;
+            env.store_access_allowed = store_access_allowed;
+            assert!(matches!(
+                attribute_offline(&env),
+                Err(OrcaError::Refused(_))
+            ));
+            assert_eq!(std::fs::read(&w.paths.config_path).unwrap(), cfg_before);
+            assert_eq!(w.d_creds(), fresher);
+            assert_eq!(stash_bytes("id-a"), a_before);
+            assert_eq!(stash_bytes("id-b"), b_before);
+            assert!(Quarantine::new(OS, &w.state).list().is_empty());
+        }
+        // Stopped at the first check, running after the read-back.
+        let live = ScriptedLiveness::appears_at(1);
+        let Attribution::Done {
+            identity_cleared, ..
+        } = attribute_offline(&w.env(&live, &http)).unwrap()
+        else {
+            panic!("the store names an active account");
+        };
+        assert!(!identity_cleared);
+        assert_eq!(live.checks(), 2);
+        assert_eq!(std::fs::read(&w.paths.config_path).unwrap(), cfg_before);
+        assert!(matches!(
+            read_runtime_identity(&w.paths),
+            RuntimeIdentity::Present(_)
+        ));
+    }
+
     #[test]
     fn an_unusable_last_synced_stash_still_gets_a_read_back() {
         let w = World::new(None);
@@ -1761,6 +2312,7 @@ mod tests {
                 from: Some("id-a".into()),
                 to: "id-b".into(),
                 step: JournalStep::Materialize,
+                orca_unconfirmed: false,
                 owner: Owner {
                     pid: 1,
                     born: Some(1),
@@ -1801,6 +2353,7 @@ mod tests {
             from: Some("id-a".into()),
             to: "id-b".into(),
             step: JournalStep::Materialize,
+            orca_unconfirmed: false,
             owner: Owner {
                 pid: 1,
                 born: Some(1),
@@ -1846,6 +2399,7 @@ mod tests {
                 from: Some("id-a".into()),
                 to: "id-b".into(),
                 step: JournalStep::Materialize,
+                orca_unconfirmed: false,
                 owner: Owner {
                     pid: 1,
                     born: Some(1),
@@ -1914,6 +2468,7 @@ mod tests {
                 from: None,
                 to: "id-b".into(),
                 step,
+                orca_unconfirmed: false,
                 owner: Owner {
                     pid: 1,
                     born: Some(1),
@@ -1992,6 +2547,7 @@ mod tests {
                 from: Some("id-a".into()),
                 to: "id-b".into(),
                 step: JournalStep::Materialize,
+                orca_unconfirmed: false,
                 owner: Owner {
                     pid: 1,
                     born: Some(1),
@@ -2142,6 +2698,7 @@ mod tests {
             from: Some("id-a".into()),
             to: "id-b".into(),
             step: JournalStep::Materialize,
+            orca_unconfirmed: false,
             owner: Owner {
                 pid: 1,
                 born: Some(1),
@@ -2173,6 +2730,55 @@ mod tests {
         );
     }
 
+    /// A hand-over that kept its journal pending (D could not be put back,
+    /// Orca did not confirm a select that rewrote it) is not cleared for
+    /// Orca's sync while Orca runs, even with Orca on csm's D: Orca believes
+    /// D is in sync, so only csm's offline repair fixes it.
+    #[test]
+    fn an_unconfirmed_hand_over_waits_for_the_offline_repair() {
+        let w = World::new(None);
+        let j = Journal {
+            generation: 3,
+            account: Some("id-a".into()),
+            from: Some("id-a".into()),
+            to: "id-b".into(),
+            step: JournalStep::Store,
+            orca_unconfirmed: true,
+            owner: Owner {
+                pid: 1,
+                born: Some(1),
+            },
+        };
+        write_journal(&w.state, &j).unwrap();
+        std::fs::write(&w.paths.credentials_path, b_creds()).unwrap();
+        std::fs::write(&w.paths.config_path, "{}").unwrap();
+        let live = ScriptedLiveness::new(vec![crate::orca::testsupport::running_mark()]);
+        let http = FakeHttp::default();
+        match recover(&w.env(&live, &http)).unwrap() {
+            Recovery::Deferred(why) => assert!(why.contains("once Orca stops"), "{why}"),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(read_journal(&w.state).unwrap(), j);
+        assert!(read_journal(&w.state).unwrap().pending());
+        assert_eq!(w.d_creds(), b_creds());
+        // Once Orca stops the offline repair runs and a fresh journal
+        // (without the mark) replaces it.
+        let stopped = ScriptedLiveness::stopped();
+        assert!(matches!(
+            recover(&w.env(&stopped, &http)).unwrap(),
+            Recovery::Repaired(_)
+        ));
+        let after = read_journal(&w.state).unwrap();
+        assert!(!after.pending() && !after.orca_unconfirmed, "{after:?}");
+        assert_eq!(w.d_creds(), a_creds());
+        // A journal written before the field existed reads as unmarked.
+        let old = br#"{"gen":1,"account":null,"from":null,"to":"id-b","step":"store","owner":{"pid":1,"born":1}}"#;
+        let j: Journal = serde_json::from_slice(old).unwrap();
+        assert!(!j.orca_unconfirmed && j.pending());
+        let text = serde_json::to_string(&after).unwrap();
+        assert!(!text.contains("orca_unconfirmed"), "{text}");
+    }
+
     #[test]
     fn a_switch_from_the_system_default_that_died_before_the_snapshot_leaves_d_alone() {
         let (w, s, _so) = null_world();
@@ -2184,6 +2790,7 @@ mod tests {
                 from: None,
                 to: "id-b".into(),
                 step: JournalStep::LoadTarget,
+                orca_unconfirmed: false,
                 owner: Owner {
                     pid: 1,
                     born: Some(1),
@@ -2203,6 +2810,166 @@ mod tests {
         assert!(!read_journal(&w.state).unwrap().pending());
         assert!(null_switch_touched_d(JournalStep::CaptureSnapshot));
         assert!(!null_switch_touched_d(JournalStep::Started));
+    }
+
+    /// Orca comes up between recover's own liveness check and the switch's
+    /// L0; the switch's first RPC then fails (no socket yet). The repair
+    /// must not clear `D`'s identity behind the running Orca, and the
+    /// journal stays pending for a repair once Orca stops.
+    #[test]
+    fn recovery_never_neutralizes_d_behind_an_orca_that_came_up() {
+        let w = World::new(None);
+        std::fs::write(&w.paths.credentials_path, b_creds()).unwrap();
+        std::fs::write(
+            &w.paths.config_path,
+            json!({"oauthAccount": oauth_json("u-b", "bob@example.com", None)}).to_string(),
+        )
+        .unwrap();
+        let j = Journal {
+            generation: 4,
+            account: Some("id-a".into()),
+            from: Some("id-a".into()),
+            to: "id-b".into(),
+            step: JournalStep::Materialize,
+            orca_unconfirmed: false,
+            owner: Owner {
+                pid: 1,
+                born: Some(1),
+            },
+        };
+        write_journal(&w.state, &j).unwrap();
+        // Check 0: recover's own (stopped); check 1: the switch's L0.
+        let live = ScriptedLiveness::appears_at(1);
+        let http = FakeHttp::default();
+        match recover(&w.env(&live, &http)).unwrap() {
+            Recovery::Deferred(why) => assert!(why.contains("Orca started"), "{why}"),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(read_journal(&w.state).unwrap(), j);
+        assert_eq!(w.d_creds(), b_creds());
+        assert_eq!(d_uuid(&w.paths).as_deref(), Some("u-b"));
+    }
+
+    #[test]
+    fn an_uncertain_hand_over_is_not_a_repair() {
+        let report = |outcome| SwitchReport {
+            route: Route::OfflineThenRpc,
+            outcome,
+            to: "id-a".into(),
+            generation: 1,
+            steps: Vec::new(),
+            readback: None,
+            snapshot: None,
+            refresh: None,
+            redo: None,
+        };
+        match repaired(report(Outcome::Uncertain("no answer".into()))) {
+            Recovery::Uncertain(why) => assert_eq!(why, "no answer"),
+            other => panic!("{other:?}"),
+        }
+        assert!(matches!(
+            repaired(report(Outcome::Switched)),
+            Recovery::Repaired(_)
+        ));
+        assert!(matches!(
+            repaired(report(Outcome::AlreadyActive)),
+            Recovery::Repaired(_)
+        ));
+        assert!(matches!(orca_came_up(true, "x"), Recovery::Deferred(_)));
+        assert!(matches!(orca_came_up(false, "x"), Recovery::Uncertain(_)));
+    }
+
+    /// `D` left half written at L0/L1 keeps the journal pending unless
+    /// Orca's own select (which rewrites `D`) was confirmed.
+    #[test]
+    fn an_unrestored_d_keeps_the_journal_pending_unless_orca_switched() {
+        let ok = RedoOutcome::Reissued(json!({}));
+        let done = RedoOutcome::AlreadyDone(rpc::ClaudeSnapshot {
+            accounts: Vec::new(),
+            active_account_id: Some("id-b".into()),
+            active_by_runtime: Default::default(),
+        });
+        let failed = RedoOutcome::Failed("busy".into());
+        let silent = RedoOutcome::Uncertain("no answer".into());
+        let p = |r: &RedoOutcome, u: bool| handed_leaves_pending(redo_switched(r), u);
+        assert!(!p(&ok, true));
+        assert!(!p(&done, true));
+        assert!(p(&failed, true));
+        assert!(p(&silent, true));
+        for r in [&ok, &done, &failed, &silent] {
+            assert!(!p(r, false));
+        }
+    }
+
+    /// The hand-over closes the journal only when Orca's select reaches
+    /// csm's `D` or `D` is back to a clean state. A `D` put back to the
+    /// state an earlier crash left reopens that crash's journal unless
+    /// Orca's reissued select rewrote it; an Orca on another runtime dir
+    /// never closes an L0/L1 hand-over, and neither reports a switch.
+    #[test]
+    fn a_handover_closes_the_journal_only_when_d_is_settled() {
+        let base = HandoverFacts {
+            dir_agrees: true,
+            redo_switched: true,
+            reissued: true,
+            ..Default::default()
+        };
+        // The plain case: Orca took the select in csm's D.
+        let h = handover(&base);
+        assert_eq!(h.journal, HandoverJournal::Close);
+        assert!(h.bump && h.not_switched.is_none());
+        // Orca already showed the target, D back to a crashed state.
+        let crashed = HandoverFacts {
+            reissued: false,
+            prev_pending: true,
+            ..base
+        };
+        let h = handover(&crashed);
+        assert_eq!(h.journal, HandoverJournal::Reopen);
+        assert!(!h.bump && h.not_switched.is_some());
+        // The same with a refused or unanswered redo.
+        let h = handover(&HandoverFacts {
+            redo_switched: false,
+            ..crashed
+        });
+        assert_eq!(h.journal, HandoverJournal::Reopen);
+        // Orca's reissued select after the restore rewrote D.
+        assert_eq!(
+            handover(&HandoverFacts {
+                prev_pending: true,
+                ..base
+            })
+            .journal,
+            HandoverJournal::Close
+        );
+        // Orca on another (or an unreadable) runtime dir.
+        for prev_pending in [false, true] {
+            let h = handover(&HandoverFacts {
+                dir_agrees: false,
+                prev_pending,
+                ..base
+            });
+            assert_ne!(h.journal, HandoverJournal::Close, "{prev_pending}");
+            assert!(!h.bump && h.not_switched.is_some());
+        }
+        // At L2 D holds the target as written: no reopen.
+        let h = handover(&HandoverFacts {
+            at_l2: true,
+            dir_agrees: false,
+            prev_pending: true,
+            reissued: false,
+            ..base
+        });
+        assert_eq!(h.journal, HandoverJournal::Close);
+        assert!(h.not_switched.is_none());
+        // A D that could not be put back and no confirmed select: pending.
+        let h = handover(&HandoverFacts {
+            redo_switched: false,
+            reissued: false,
+            d_unrestored: true,
+            ..base
+        });
+        assert_eq!(h.journal, HandoverJournal::KeepPending);
     }
 
     #[test]
@@ -2297,11 +3064,34 @@ mod tests {
             (fake, w, s, so, model)
         }
 
+        /// Invariant 6: with Orca running csm writes nothing to `D`, even to
+        /// put the system default back. It files the snapshot's grant in
+        /// the quarantine (so Orca's next select, capturing the half-written
+        /// `D`, cannot lose the user's login) and defers the repair; once
+        /// Orca stops, the offline recovery puts `D` back.
         #[test]
-        fn a_running_orca_with_no_account_gets_the_system_default_back_first() {
+        fn a_running_orca_with_no_account_defers_and_keeps_the_system_default() {
             let (fake, w, s, so, _model) = running_null_world();
             let live = ScriptedLiveness::new(vec![running_mark()]);
             let http = FakeHttp::default();
+            match recover(&w.env(&live, &http)).unwrap() {
+                Recovery::Deferred(why) => assert!(why.contains("quarantine"), "{why}"),
+                other => panic!("{other:?}"),
+            }
+            assert_eq!(w.d_creds(), b_creds(), "D is not written");
+            assert_eq!(d_uuid(&w.paths), None);
+            snapshot_holds(&w, &s, &so);
+            assert!(read_journal(&w.state).unwrap().pending());
+            let q = Quarantine::new(OS, &w.state);
+            let fp = crate::orca::quarantine::fingerprint(&s);
+            assert_eq!(q.get(&fp).unwrap().unwrap().expose(), s);
+            assert!(
+                fake.requests()
+                    .iter()
+                    .all(|r| r["method"] != "accounts.selectClaude")
+            );
+            // Orca stops: the offline recovery restores the system default.
+            let live = ScriptedLiveness::stopped();
             match recover(&w.env(&live, &http)).unwrap() {
                 Recovery::RestoredSystemDefault(r) => {
                     assert_eq!(r.restored, vec!["file".to_owned()])
@@ -2310,13 +3100,43 @@ mod tests {
             }
             assert_eq!(w.d_creds(), s);
             assert_eq!(d_uuid(&w.paths).as_deref(), Some("u-s"));
-            snapshot_holds(&w, &s, &so);
             assert!(!read_journal(&w.state).unwrap().pending());
+        }
+
+        /// Orca runs but its `accounts.list` fails (still starting, a busy
+        /// socket): csm cannot tell whether it selected an account, and a
+        /// GUI select right after would capture the half-written `D` over
+        /// the snapshot. The snapshot's grant is kept either way, by the
+        /// recovery and by an RPC switch that stops at the failed list.
+        #[test]
+        fn a_running_orca_that_does_not_list_still_keeps_the_system_default() {
+            let fake = FakeOrca::start(|_: &Value| vec![FakeOrca::err("busy", "not ready")]);
+            let (w, s, so) = null_world_in(Some(fake.user_data()));
+            crash_after_write_file(&w, JournalStep::Materialize);
+            let live = ScriptedLiveness::new(vec![running_mark()]);
+            let http = FakeHttp::default();
+            let fp = crate::orca::quarantine::fingerprint(&s);
+            match recover(&w.env(&live, &http)).unwrap() {
+                Recovery::Deferred(why) => {
+                    assert!(why.contains("does not say") && why.contains(&fp), "{why}")
+                }
+                other => panic!("{other:?}"),
+            }
+            assert_eq!(w.d_creds(), b_creds(), "D is not written");
+            snapshot_holds(&w, &s, &so);
+            assert!(read_journal(&w.state).unwrap().pending());
+            let q = Quarantine::new(OS, &w.state);
+            assert_eq!(q.get(&fp).unwrap().unwrap().expose(), s);
+            // The same through an RPC switch: nothing selected, still kept.
+            q.remove(&fp).unwrap();
+            assert!(switch(&w.env(&live, &http), "id-a").is_err());
+            assert_eq!(q.get(&fp).unwrap().unwrap().expose(), s);
             assert!(
                 fake.requests()
                     .iter()
                     .all(|r| r["method"] != "accounts.selectClaude")
             );
+            assert!(read_journal(&w.state).unwrap().pending());
         }
 
         #[test]
@@ -2342,22 +3162,30 @@ mod tests {
         }
 
         #[test]
-        fn an_rpc_switch_settles_a_crashed_switch_from_the_system_default_before_selecting() {
+        fn an_rpc_switch_over_a_crashed_switch_from_the_system_default_refuses() {
             let (fake, w, s, so, _model) = running_null_world();
             let live = ScriptedLiveness::new(vec![running_mark()]);
             let http = FakeHttp::default();
-            // The fake Orca answers the select without materializing, so
-            // the switch itself fails verification; what matters is that
-            // D and the snapshot were settled before the select.
-            let _ = switch(&w.env(&live, &http), "id-a");
+            // Selecting would make Orca capture the half-written D over the
+            // snapshot, and csm may not put D back behind a running Orca:
+            // the switch is refused, the snapshot's grant is quarantined.
+            let err = switch(&w.env(&live, &http), "id-a").unwrap_err();
+            assert!(err.to_string().contains("doctor --fix"), "{err}");
             assert!(
                 fake.requests()
                     .iter()
-                    .any(|r| r["method"] == "accounts.selectClaude")
+                    .all(|r| r["method"] != "accounts.selectClaude")
             );
-            assert_eq!(w.d_creds(), s);
+            assert_eq!(w.d_creds(), b_creds());
             snapshot_holds(&w, &s, &so);
-            assert!(read_journal(&w.state).is_some_and(|j| !j.pending()));
+            assert!(read_journal(&w.state).is_some_and(|j| j.pending()));
+            let fp = crate::orca::quarantine::fingerprint(&s);
+            assert!(
+                Quarantine::new(OS, &w.state)
+                    .list()
+                    .iter()
+                    .any(|m| m.fingerprint == fp)
+            );
         }
 
         fn running_world(materialize_on_select: bool) -> (FakeOrca, World, Arc<Mutex<OrcaModel>>) {

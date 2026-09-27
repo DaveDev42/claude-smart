@@ -27,7 +27,9 @@ summary.
   adds the seams the harness needs: the Keychain runner calls
   `/usr/bin/perl e2e/fakes/security.pl` instead of `/usr/bin/security`, the
   Orca process-table scan only counts processes under the sandbox, the Orca
-  version comes from the sandbox's bundle or `CSM_E2E_ORCA_VERSION`, and
+  version comes from the sandbox's bundle or `CSM_E2E_ORCA_VERSION`, the
+  login session's `CLAUDE_CONFIG_DIR` (which `csm migrate` checks) comes
+  from `CSM_E2E_SESSION_FLOOR` instead of launchd or the registry, and
   the store writer can run a hook at its two commit points. A default
   build has none of this.
 - Every `csm` call runs under `env -i` with a whitelisted environment:

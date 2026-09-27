@@ -501,7 +501,7 @@ sc_accounts_import_rm() {
   check "offline rm exits 0" eq "$RC" 0
   check "offline rm says so" has "$LOGS/out" "csm: removed .*(offline)"
   check "carol's record is gone" test -z "$(the_new_id)"
-  check "carol's stash is gone" test ! -e "$UD/claude-accounts/$c"
+  check "carol's stash is gone" test ! -e "$STASH_UD/claude-accounts/$c"
 
   start_orca || return
   csm accounts import "$dir"
@@ -649,6 +649,25 @@ sc_migrate() {
   check_not "import refuses while Orca runs" eq "$RC" 0
   check "and imports nothing" eq "$(world ids | wc -l | tr -d ' ')" 2
   stop_orca
+
+  # The login session still names the floor dir although this shell does
+  # not: an Orca started from the Dock would take it as D.
+  EXTRA=("CSM_E2E_SESSION_FLOOR=$HOME_DIR/.claude.work")
+  csm migrate import
+  EXTRA=()
+  check_not "import refuses while the session floor remains" eq "$RC" 0
+  check "and names it" has_fixed "$LOGS/out" "login session's CLAUDE_CONFIG_DIR"
+  check "and imports nothing" eq "$(world ids | wc -l | tr -d ' ')" 2
+
+  # A leftover `cas` shim exports CLAUDE_CONFIG_DIR=~/.claude: the switch
+  # would then write ~/.claude/.claude.json while step 5 merges into
+  # ~/.claude.json, so import refuses that too.
+  EXTRA=("CLAUDE_CONFIG_DIR=$HOME_DIR/.claude")
+  csm migrate import
+  EXTRA=()
+  check_not "import refuses CLAUDE_CONFIG_DIR=~/.claude" eq "$RC" 0
+  check "and says why" has_fixed "$LOGS/out" "~/.claude/.claude.json"
+  check "and imports nothing" eq "$(world ids | wc -l | tr -d ' ')" 2
 
   csm migrate import
   check "import exits 0" eq "$RC" 0

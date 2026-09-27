@@ -8,7 +8,7 @@
  * - FAKE_ORCA_HOLDER=<userData>: the fake Orca's main process. It points
  *   <userData>/SingletonLock at "<hostname>-<pid>" the way Chromium does,
  *   waits for SIGTERM, then removes the lock. run.sh hard-links this binary
- *   to an `Orca`/`orca` path so csm's main-executable match accepts it.
+ *   to an `Orca`/`orca-ide` path so csm's main-executable match accepts it.
  * - `--version`: print a Claude Code version line and exit.
  * - `auth status --json`: print a logged-in status object and exit.
  * - `-p` / `--print` before `--`, `mcp` as the first word, or a stdin that

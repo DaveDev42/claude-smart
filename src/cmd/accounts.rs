@@ -289,7 +289,11 @@ fn use_account(query: &str) -> anyhow::Result<()> {
 
 // ─── add / import / rm ────────────────────────────────────────────────────────
 
-fn change_line(verb: &str, c: &AccountChange) -> String {
+/// How a finished add, import or rm reads, and whether it counts as done.
+/// A redo Orca refused did not happen, and one it did not confirm may not
+/// have: neither is reported as `verb` or exits 0. `Err` holds the line to
+/// print before the non-zero exit. Pure.
+fn change_outcome(verb: &str, c: &AccountChange) -> Result<String, String> {
     let who = match (&c.email, &c.id) {
         (Some(e), Some(id)) => format!("{e} ({id})"),
         (Some(e), None) => e.clone(),
@@ -301,11 +305,36 @@ fn change_line(verb: &str, c: &AccountChange) -> String {
         add::Route::Offline => "offline",
         add::Route::OfflineThenRpc => "offline, then via Orca",
     };
-    let mut s = format!("csm: {verb} {who} ({route})");
-    if let Some(l) = &c.leftover {
-        s.push_str(&format!("; left for `csm accounts doctor`: {l}"));
+    let leftover = c
+        .leftover
+        .as_ref()
+        .map(|l| format!("; left for `csm accounts doctor`: {l}"))
+        .unwrap_or_default();
+    match &c.redo {
+        Some(crate::orca::store::RedoOutcome::Failed(why)) => Err(format!(
+            "csm: {who} was not {verb}: Orca refused it ({why}){leftover}"
+        )),
+        Some(crate::orca::store::RedoOutcome::Uncertain(why)) => Err(format!(
+            "csm: {who} may not be {verb}: it was handed to Orca, which did not confirm it \
+             ({why}); check `csm accounts doctor`{leftover}"
+        )),
+        _ => Ok(format!("csm: {verb} {who} ({route}){leftover}")),
     }
-    s
+}
+
+/// Print a finished change; `Err` (non-zero exit) when Orca refused or did
+/// not confirm it ([`change_outcome`]).
+fn report_change(cmd: &str, verb: &str, c: &AccountChange) -> anyhow::Result<()> {
+    match change_outcome(verb, c) {
+        Ok(line) => {
+            println!("{line}");
+            Ok(())
+        }
+        Err(line) => {
+            eprintln!("{line}");
+            bail!("csm accounts {cmd}: Orca did not confirm the change")
+        }
+    }
 }
 
 fn add_account() -> anyhow::Result<()> {
@@ -319,8 +348,7 @@ fn add_account() -> anyhow::Result<()> {
     }
     let cli = SystemClaude::configured().context("csm accounts add")?;
     let change = ctx.with_accounts_env(&procs, |env| add::login_add(env, &cli))?;
-    println!("{}", change_line("added", &change));
-    Ok(())
+    report_change("add", "added", &change)
 }
 
 /// The running Orca's own CLI ([`add::orca_cli_candidates`]): its bundled
@@ -376,7 +404,13 @@ fn import(dirs: &[PathBuf]) -> anyhow::Result<()> {
     let mut failed = 0usize;
     for dir in dirs {
         match ctx.with_accounts_env(&procs, |env| add::import(env, &cli, dir, None)) {
-            Ok(c) => println!("{}", change_line("imported", &c)),
+            Ok(c) => match change_outcome("imported", &c) {
+                Ok(line) => println!("{line}"),
+                Err(line) => {
+                    failed += 1;
+                    eprintln!("{line}");
+                }
+            },
             Err(e) => {
                 failed += 1;
                 eprintln!("csm accounts import: {}: {e}", dir.display());
@@ -402,8 +436,7 @@ fn remove(query: &str) -> anyhow::Result<()> {
     let procs = SystemProcs;
     let ctx = Context::current(&procs)?;
     let change = ctx.with_accounts_env(&procs, |env| add::remove(env, &id))?;
-    println!("{}", change_line("removed", &change));
-    Ok(())
+    report_change("rm", "removed", &change)
 }
 
 // ─── doctor ───────────────────────────────────────────────────────────────────
@@ -527,12 +560,32 @@ pub(crate) fn findings(f: &DoctorFacts) -> Vec<Finding> {
         .collect();
     for q in &f.quarantine {
         let held = stash_fps.get(q.fingerprint.as_str());
+        // A pre-login copy that stayed: an `accounts add` login stopped
+        // before its cleanup, so the unscoped item may still hold the new
+        // login's grant beside D's identity, which Orca's read-back files
+        // under the active account.
+        let interrupted = if held.is_none() && q.reason == "pre-login" {
+            format!(
+                ": an `accounts add` login was interrupted; if the {} Keychain item now holds \
+                 another grant, put this one back there before Orca starts",
+                crate::orca::keychain::RUNTIME_SERVICE
+            )
+        } else {
+            String::new()
+        };
         let text = format!(
-            "quarantined grant {} ({}){}",
+            "quarantined grant {} ({}){}{interrupted}",
             q.fingerprint,
             qentry_details(q, &f.accounts),
-            held.map(|id| format!(": stash {id} already holds it"))
-                .unwrap_or_default()
+            held.map(|id| if q.reason == "extra-logins" {
+                format!(
+                    ": stash {id} holds its Claude grant but not the MCP logins beside it; \
+                     --fix keeps it until the stash holds those too"
+                )
+            } else {
+                format!(": stash {id} already holds it")
+            })
+            .unwrap_or_default()
         );
         let fix = held.map(|id| Fix::PurgeQuarantine {
             fingerprint: q.fingerprint.clone(),
@@ -653,6 +706,7 @@ fn recovery_line(r: &switch::Recovery) -> String {
             line
         }
         switch::Recovery::Repaired(rep) => format!("D now holds {}", rep.to),
+        switch::Recovery::Uncertain(why) => format!("the repair did not verify: {why}"),
         switch::Recovery::Failed(why) => format!("repair failed, D was made neutral: {why}"),
         switch::Recovery::Busy => {
             "another csm holds switch.lock; nothing was repaired, try again later".into()
@@ -675,7 +729,7 @@ enum Verdict {
 /// The verdict on one recovery. Pure.
 fn recovery_verdict(r: &switch::Recovery) -> Verdict {
     match r {
-        switch::Recovery::Failed(_) => Verdict::Failed,
+        switch::Recovery::Failed(_) | switch::Recovery::Uncertain(_) => Verdict::Failed,
         switch::Recovery::Busy | switch::Recovery::Deferred(_) => Verdict::Skipped,
         switch::Recovery::Nothing
         | switch::Recovery::ClearedForOrca
@@ -910,6 +964,53 @@ mod tests {
     use crate::orca::testsupport::{FakeProcs, creds_json, make_stash, oauth_json, record_json};
     use crate::orca::{HostEnv, HostOs};
 
+    /// An add, import or rm Orca refused or did not confirm is not
+    /// reported as done and exits non-zero.
+    #[test]
+    fn change_outcome_fails_a_refused_or_unconfirmed_redo() {
+        use crate::orca::store::RedoOutcome;
+        let change = |redo, leftover: Option<&str>| AccountChange {
+            route: add::Route::OfflineThenRpc,
+            id: None,
+            email: Some("carol@example.com".into()),
+            redo,
+            leftover: leftover.map(str::to_owned),
+        };
+        let ok = change_outcome("added", &change(None, None)).unwrap();
+        assert_eq!(ok, "csm: added carol@example.com (offline, then via Orca)");
+        let e = change_outcome(
+            "added",
+            &change(
+                Some(RedoOutcome::Failed("duplicate".into())),
+                Some("stash x"),
+            ),
+        )
+        .unwrap_err();
+        assert!(
+            e.contains("was not added") && e.contains("duplicate"),
+            "{e}"
+        );
+        assert!(e.contains("stash x"), "{e}");
+        let e = change_outcome(
+            "imported",
+            &change(Some(RedoOutcome::Uncertain("timeout".into())), None),
+        )
+        .unwrap_err();
+        assert!(
+            e.contains("may not be imported") && e.contains("doctor"),
+            "{e}"
+        );
+        assert!(report_change("add", "added", &change(None, None)).is_ok());
+        assert!(
+            report_change(
+                "add",
+                "added",
+                &change(Some(RedoOutcome::Failed("no".into())), None)
+            )
+            .is_err()
+        );
+    }
+
     fn os(ss: &[&str]) -> Vec<OsString> {
         ss.iter().map(OsString::from).collect()
     }
@@ -935,6 +1036,13 @@ mod tests {
             recovery_verdict(&Recovery::Deferred("Orca runs".into())),
             Verdict::Skipped
         );
+        // A hand-over to an Orca that came up mid-repair and did not
+        // verify is not a fix: doctor exits non-zero.
+        assert_eq!(
+            recovery_verdict(&Recovery::Uncertain("no answer".into())),
+            Verdict::Failed
+        );
+        assert!(recovery_line(&Recovery::Uncertain("no answer".into())).contains("did not verify"));
         assert_eq!(recovery_verdict(&Recovery::Nothing), Verdict::Fixed);
         assert_eq!(recovery_verdict(&Recovery::ClearedForOrca), Verdict::Fixed);
         assert_eq!(fix_summary(0, 0), None);
@@ -1006,6 +1114,57 @@ mod tests {
         assert!(lines[1].starts_with("*  bob@example.com"), "{out}");
         assert!(lines[1].contains("bbbb2222") && lines[1].ends_with("Acme"));
         assert!(render_list(&[], None, None).contains("no Claude accounts"));
+    }
+
+    /// Round 8: a pre-login copy left in the quarantine is named as an
+    /// interrupted login, with what to check before Orca starts.
+    #[test]
+    fn a_leftover_pre_login_copy_is_named_as_an_interrupted_login() {
+        assert_eq!(reason_name(Reason::PreLogin), "pre-login");
+        let f = DoctorFacts {
+            quarantine: vec![QEntry {
+                fingerprint: "fp-pre".into(),
+                reason: reason_name(Reason::PreLogin),
+                source: "legacy-keychain".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let out = findings(&f);
+        let line = &out
+            .iter()
+            .find(|x| x.text.contains("fp-pre"))
+            .expect("listed")
+            .text;
+        assert!(
+            line.contains("interrupted") && line.contains("before Orca starts"),
+            "{line}"
+        );
+    }
+
+    /// Round 8: a retired copy that also holds MCP logins is not reported
+    /// as one the stash already holds.
+    #[test]
+    fn an_extra_logins_copy_is_not_reported_as_held() {
+        assert_eq!(reason_name(Reason::ExtraLogins), "extra-logins");
+        let f = DoctorFacts {
+            quarantine: vec![QEntry {
+                fingerprint: "fp-x".into(),
+                reason: reason_name(Reason::ExtraLogins),
+                source: "file".into(),
+                ..Default::default()
+            }],
+            stash_fingerprints: vec![("acct-a".into(), "fp-x".into())],
+            ..Default::default()
+        };
+        let out = findings(&f);
+        let line = &out
+            .iter()
+            .find(|x| x.text.contains("fp-x"))
+            .expect("listed")
+            .text;
+        assert!(!line.contains("already holds it"), "{line}");
+        assert!(line.contains("MCP logins"), "{line}");
     }
 
     #[test]

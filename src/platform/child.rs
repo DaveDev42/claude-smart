@@ -53,6 +53,79 @@ pub fn own_group(cmd: &mut Command) -> &mut Command {
     cmd
 }
 
+/// Keeps csm alive through a terminal interrupt while an interactive child
+/// (one that stays in csm's process group) runs, so the cleanup after it
+/// still happens. On unix it installs a no-op handler, not `SIG_IGN`, for
+/// `SIGINT` and `SIGHUP`: a caught signal is reset to its default on
+/// `exec`, so the child still gets Ctrl-C and a closed terminal and exits,
+/// while csm only sees its read or wait interrupted (`SA_RESTART`) and goes
+/// on. [`DeferInterrupts::take`] (or the drop) puts the previous handlers
+/// back. A no-op elsewhere. `SIGTERM` and `SIGKILL` are not deferred.
+pub struct DeferInterrupts {
+    held: bool,
+}
+
+#[cfg(unix)]
+extern "C" fn defer_interrupt_noop(_: std::ffi::c_int) {}
+
+/// Guards alive, and the handlers the first one replaced. Counted so that
+/// overlapping guards (threads, tests) never leave the no-op installed.
+#[cfg(unix)]
+type SavedHandlers = Vec<(nix::sys::signal::Signal, nix::sys::signal::SigAction)>;
+#[cfg(unix)]
+static DEFERRED: std::sync::Mutex<(usize, SavedHandlers)> = std::sync::Mutex::new((0, Vec::new()));
+
+impl DeferInterrupts {
+    pub fn install() -> DeferInterrupts {
+        #[cfg(unix)]
+        {
+            use nix::sys::signal::{SaFlags, SigAction, SigHandler, SigSet, Signal, sigaction};
+            let mut g = DEFERRED.lock().unwrap_or_else(|e| e.into_inner());
+            if g.0 == 0 {
+                let act = SigAction::new(
+                    SigHandler::Handler(defer_interrupt_noop),
+                    SaFlags::SA_RESTART,
+                    SigSet::empty(),
+                );
+                g.1.clear();
+                for sig in [Signal::SIGINT, Signal::SIGHUP] {
+                    // SAFETY: the handler is async-signal-safe (it does nothing).
+                    if let Ok(old) = unsafe { sigaction(sig, &act) } {
+                        g.1.push((sig, old));
+                    }
+                }
+            }
+            g.0 += 1;
+        }
+        DeferInterrupts { held: true }
+    }
+
+    /// Release this guard now; the last one alive puts the previous
+    /// handlers back. Idempotent.
+    pub fn take(&mut self) {
+        let held = std::mem::take(&mut self.held);
+        #[cfg(unix)]
+        if held {
+            let mut g = DEFERRED.lock().unwrap_or_else(|e| e.into_inner());
+            g.0 = g.0.saturating_sub(1);
+            if g.0 == 0 {
+                for (sig, old) in g.1.drain(..) {
+                    // SAFETY: restores the disposition `install` read.
+                    let _ = unsafe { nix::sys::signal::sigaction(sig, &old) };
+                }
+            }
+        }
+        #[cfg(not(unix))]
+        let _ = held;
+    }
+}
+
+impl Drop for DeferInterrupts {
+    fn drop(&mut self) {
+        self.take();
+    }
+}
+
 /// SIGKILL the child and, when it was started with [`own_group`]
 /// (`grouped`), its whole process group. Safe while the child is unreaped:
 /// its pid, and so its group id, cannot be reused before the reap.
@@ -234,5 +307,44 @@ mod tests {
         assert!(g.stop(), "the guard reaps its child");
         let r = nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None);
         assert_eq!(r, Err(nix::errno::Errno::ESRCH));
+    }
+
+    /// The login's interrupt guard: while any guard lives SIGINT and SIGHUP
+    /// run a handler (reset on `exec`, so children still get them), and
+    /// the last guard puts the default back.
+    #[cfg(unix)]
+    #[test]
+    fn deferred_interrupts_are_counted_and_restored() {
+        use nix::sys::signal::{SaFlags, SigAction, SigHandler, SigSet, Signal, sigaction};
+        fn current(sig: Signal) -> SigHandler {
+            let probe = SigAction::new(SigHandler::SigDfl, SaFlags::empty(), SigSet::empty());
+            // SAFETY: reads the disposition and puts it straight back.
+            let old = unsafe { sigaction(sig, &probe) }.unwrap();
+            unsafe { sigaction(sig, &old) }.unwrap();
+            old.handler()
+        }
+        let mut a = DeferInterrupts::install();
+        let b = DeferInterrupts::install();
+        {
+            let _g = DEFERRED.lock().unwrap();
+            for sig in [Signal::SIGINT, Signal::SIGHUP] {
+                assert!(matches!(current(sig), SigHandler::Handler(_)), "{sig:?}");
+            }
+        }
+        a.take();
+        a.take();
+        {
+            let _g = DEFERRED.lock().unwrap();
+            assert!(matches!(current(Signal::SIGINT), SigHandler::Handler(_)));
+        }
+        drop(b);
+        let g = DEFERRED.lock().unwrap();
+        // Another test's login may hold a guard; only a count of 0 says
+        // the handlers must be back.
+        if g.0 == 0 {
+            for sig in [Signal::SIGINT, Signal::SIGHUP] {
+                assert!(!matches!(current(sig), SigHandler::Handler(_)), "{sig:?}");
+            }
+        }
     }
 }

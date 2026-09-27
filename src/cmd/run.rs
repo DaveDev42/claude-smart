@@ -33,6 +33,41 @@ enum SessionResolution {
     Resume(String),
 }
 
+/// Which session flag decides this launch's session, before any disk or
+/// picker I/O. The order is the contract: `--session-id` > `--resume <id>`
+/// > `-r` (picker) > `-n` > `-i` > `-c` > a fresh session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SessionChoice<'a> {
+    Explicit(&'a str),
+    ResumeId(&'a str),
+    ResumePicker,
+    New,
+    Interactive,
+    Continue,
+    Fresh,
+}
+
+/// Pick the [`SessionChoice`] for `flags`. Pure.
+fn session_choice(flags: &crate::cli::parser::Flags) -> SessionChoice<'_> {
+    use crate::cli::parser::ResumeArg;
+    if let Some(sid) = &flags.session_id {
+        SessionChoice::Explicit(sid)
+    } else if let Some(r) = &flags.resume {
+        match r {
+            ResumeArg::Id(raw) => SessionChoice::ResumeId(raw),
+            ResumeArg::Picker => SessionChoice::ResumePicker,
+        }
+    } else if flags.new {
+        SessionChoice::New
+    } else if flags.interactive {
+        SessionChoice::Interactive
+    } else if flags.continue_ {
+        SessionChoice::Continue
+    } else {
+        SessionChoice::Fresh
+    }
+}
+
 impl SessionResolution {
     /// The session id string, regardless of fresh/resume.
     fn sid(&self) -> &str {
@@ -65,7 +100,7 @@ impl SessionResolution {
 /// starts; csm's own lines go to its log except fatal errors and the one
 /// relaunch line.
 pub(crate) fn run(args: &[OsString]) -> anyhow::Result<()> {
-    use crate::cli::parser::{ResumeArg, parse};
+    use crate::cli::parser::parse;
     use platform::relaunch::LaunchSpec;
     use session::alias::looks_like_uuid;
 
@@ -129,52 +164,39 @@ pub(crate) fn run(args: &[OsString]) -> anyhow::Result<()> {
     // brand-new session (→ `--session-id`, create) or an existing one off disk
     // (→ `--resume`, continue). Passing an existing id via `--session-id` is what
     // produced the `Error: Session ID … is already in use` failure.
-    let resolution: SessionResolution = if let Some(explicit_sid) = &flags.session_id {
+    let resolution: SessionResolution = match session_choice(flags) {
         // `--session-id <uuid>`: the user explicitly asked to CREATE this id.
-        SessionResolution::Fresh(explicit_sid.clone())
-    } else if let Some(resume_arg) = &flags.resume {
-        match resume_arg {
-            ResumeArg::Id(raw) => {
-                // Resolve alias if not UUID-shaped. Either way this is an
-                // existing session the user asked to resume.
-                let sid = if looks_like_uuid(raw) {
-                    raw.clone()
-                } else {
-                    session::resolve_alias(raw).with_context(|| {
-                        format!("csm: --resume alias resolution failed for {raw:?}")
-                    })?
-                };
-                SessionResolution::Resume(sid)
-            }
-            ResumeArg::Picker => match resolve_session_via_picker(&cwd)? {
+        SessionChoice::Explicit(sid) => SessionResolution::Fresh(sid.to_owned()),
+        SessionChoice::ResumeId(raw) => {
+            // Resolve alias if not UUID-shaped. Either way this is an
+            // existing session the user asked to resume.
+            let sid = if looks_like_uuid(raw) {
+                raw.to_owned()
+            } else {
+                session::resolve_alias(raw)
+                    .with_context(|| format!("csm: --resume alias resolution failed for {raw:?}"))?
+            };
+            SessionResolution::Resume(sid)
+        }
+        // `-r` without an id, and `-i`/`--interactive`: the session picker.
+        SessionChoice::ResumePicker | SessionChoice::Interactive => {
+            match resolve_session_via_picker(&cwd)? {
                 Some(res) => res,
                 None => {
                     eprintln!("csm: cancelled.");
                     return Ok(());
                 }
-            },
-        }
-    } else if flags.new {
-        // `-n`/`--new`: explicit fresh session, no picker.
-        SessionResolution::Fresh(newuuid())
-    } else if flags.interactive {
-        // `-i`/`--interactive`: open session picker.
-        match resolve_session_via_picker(&cwd)? {
-            Some(res) => res,
-            None => {
-                eprintln!("csm: cancelled.");
-                return Ok(());
             }
         }
-    } else if flags.continue_ {
+        // `-n`/`--new`: explicit fresh session, no picker.
+        SessionChoice::New => SessionResolution::Fresh(newuuid()),
         // `-c`/`--continue`: newest free session (Resume) or fresh.
-        match newest_free_sid(&cwd)? {
+        SessionChoice::Continue => match newest_free_sid(&cwd)? {
             Some(sid) => SessionResolution::Resume(sid),
             None => SessionResolution::Fresh(newuuid()),
-        }
-    } else {
+        },
         // Default (no session flag): a fresh session, in every context.
-        SessionResolution::Fresh(newuuid())
+        SessionChoice::Fresh => SessionResolution::Fresh(newuuid()),
     };
 
     let session_id: String = resolution.sid().to_owned();
@@ -195,8 +217,9 @@ pub(crate) fn run(args: &[OsString]) -> anyhow::Result<()> {
     // because the sidecar could not be written.
     // The account and launch time key usage captures and the follow check.
     let mut remembered = remembered_from_launch(flags, &parsed.passthru);
-    remembered.account_id = accounts.current.clone();
-    remembered.born = Some(crate::epoch::now_secs() as i64);
+    let (account_id, born) = launch_stamp(dir.as_ref());
+    remembered.account_id = account_id;
+    remembered.born = Some(born);
     let _ = sidecar::merge_sidecar(&sidecar_path, &remembered);
 
     let spec = LaunchSpec {
@@ -228,6 +251,20 @@ fn launch_accounts(dir: Option<&launch_context::LaunchDir>) -> account::AccountS
         Some(d) => account::AccountSet::load_pinned(&d.pin),
         None => account::AccountSet::load(),
     }
+}
+
+/// The account and `born` stamp this launch records, from a read of `D`
+/// taken right before the spawn. The `accounts` read at the top of `run` is
+/// older than the session picker, which waits on the user for as long as
+/// they like; a switch that lands meanwhile (a peer's limit hop, Orca's GUI)
+/// makes it stale. Handing that stale identity to `launch_born` would log a
+/// switch back to it, then the next statusLine tick a switch forward again,
+/// and every session born before that second event would lose its captures
+/// (and with them the statusLine limit trigger).
+fn launch_stamp(dir: Option<&launch_context::LaunchDir>) -> (Option<String>, i64) {
+    let now = launch_accounts(dir);
+    let born = crate::usage::local::launch_born(now.current_uuid.as_deref());
+    (now.current, born)
 }
 
 /// What this launch hands the sidecar to remember: the mode/effort/model the
@@ -546,7 +583,9 @@ fn prelaunch_recovery() {
         Ok(Recovery::Busy) => return,
         // Orca runs and the repair has to wait for it to stop: nothing was
         // written, and the reason is worth one line.
-        Ok(Recovery::Deferred(why)) => {
+        // Orca started during the repair (the hand-over did not verify):
+        // Orca owns D now, and the line says why.
+        Ok(Recovery::Deferred(why) | Recovery::Uncertain(why)) => {
             eprintln!("csm: an unfinished account switch was not repaired: {why}");
             return;
         }
@@ -561,6 +600,102 @@ fn prelaunch_recovery() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A switch that landed while the session picker was open: the
+    /// sidecar's account and `born` come from `D` as it is at the spawn,
+    /// and the launch logs no switch back to the account the pre-picker
+    /// read saw.
+    #[test]
+    fn the_launch_stamp_reads_d_after_the_picker() {
+        use crate::orca::testsupport::{make_stash, record_json, write_store};
+        use crate::orca::userdata::{HostOs, default_user_data};
+        let home = tempfile::tempdir().unwrap();
+        let ud = default_user_data(HostOs::current(), home.path(), None, None);
+        write_store(
+            &ud,
+            &[
+                record_json(&ud, "id-a", "alice@example.com", None),
+                record_json(&ud, "id-b", "bob@example.com", None),
+            ],
+            Some("id-a"),
+        );
+        make_stash(&ud, "id-a", Some(br#"{"accountUuid":"u-a"}"#), None);
+        make_stash(&ud, "id-b", Some(br#"{"accountUuid":"u-b"}"#), None);
+        let d = home.path().join("claude-d");
+        std::fs::create_dir_all(&d).unwrap();
+        let dir = launch_context::LaunchDir {
+            d: d.clone(),
+            pin: launch_context::ConfigDirPin::Set(d.clone()),
+        };
+        crate::testenv::with_test_home(home.path(), || {
+            std::fs::create_dir_all(crate::paths::smart_dir_no_create()).unwrap();
+            let set_d = |uuid: &str| {
+                std::fs::write(
+                    d.join(".claude.json"),
+                    format!(r#"{{"oauthAccount":{{"accountUuid":"{uuid}"}}}}"#),
+                )
+                .unwrap();
+            };
+            // Before the picker: D on a, and a statusLine tick saw it.
+            set_d("u-a");
+            let before = launch_accounts(Some(&dir));
+            assert_eq!(before.current.as_deref(), Some("id-a"));
+            crate::usage::local::note_identity(Some("u-a"), 100);
+            // While the picker is open, a peer's hop moves D to b and notes it.
+            set_d("u-b");
+            crate::usage::local::note_identity(Some("u-b"), 200);
+            // The user picks a session; the stamp reads D now.
+            let (account, born) = launch_stamp(Some(&dir));
+            assert_eq!(account.as_deref(), Some("id-b"));
+            assert!(born >= 200);
+            assert_eq!(
+                std::fs::read_to_string(crate::paths::last_identity()).unwrap(),
+                "u-b",
+                "no switch back to the pre-picker identity"
+            );
+            assert_eq!(
+                std::fs::read_to_string(crate::paths::last_identity_switch())
+                    .unwrap()
+                    .trim(),
+                "200",
+                "the hop's switch event stays the last one"
+            );
+        });
+    }
+
+    fn choice_of(args: &[&str]) -> String {
+        let argv: Vec<OsString> = args.iter().map(OsString::from).collect();
+        let parsed = crate::cli::parser::parse(&argv);
+        format!("{:?}", session_choice(&parsed.flags))
+    }
+
+    /// The session-flag precedence: `--session-id` > `--resume <id>` > `-r`
+    /// (picker) > `-n` > `-i` > `-c` > fresh, pair by pair, whatever the
+    /// order on the command line.
+    #[test]
+    fn session_choice_precedence() {
+        let sid = "11111111-2222-4333-8444-555555555555";
+        let rid = "66666666-7777-4888-9999-aaaaaaaaaaaa";
+        assert_eq!(choice_of(&[]), "Fresh");
+        assert_eq!(choice_of(&["-c"]), "Continue");
+        assert_eq!(choice_of(&["-i"]), "Interactive");
+        assert_eq!(choice_of(&["-n"]), "New");
+        assert_eq!(choice_of(&["-r"]), "ResumePicker");
+        let resume = format!("ResumeId({rid:?})");
+        let explicit = format!("Explicit({sid:?})");
+        // An explicit `--resume <id>` wins over `-n`, in either order.
+        assert_eq!(choice_of(&["-n", "--resume", rid]), resume);
+        assert_eq!(choice_of(&["--resume", rid, "-n"]), resume);
+        // `--session-id` wins over `--resume`.
+        assert_eq!(choice_of(&["--resume", rid, "--session-id", sid]), explicit);
+        assert_eq!(choice_of(&["--session-id", sid, "-r", rid]), explicit);
+        // `-n` wins over `-i` and `-c`; `-i` wins over `-c`.
+        assert_eq!(choice_of(&["-c", "-n"]), "New");
+        assert_eq!(choice_of(&["-n", "-i"]), "New");
+        assert_eq!(choice_of(&["-c", "-i"]), "Interactive");
+        // A bare `-r` (picker) still wins over `-n`.
+        assert_eq!(choice_of(&["-n", "-r"]), "ResumePicker");
+    }
 
     // ── child_env ─────────────────────────────────────────────────────────────
 

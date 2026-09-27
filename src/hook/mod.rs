@@ -1577,10 +1577,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let t = dir.path().join("t.jsonl");
         std::fs::write(&t, "{}\n").unwrap();
-        let input = detect::parse_input(&format!(
-            r#"{{"session_id":"s","hook_event_name":"SessionEnd","transcript_path":"{}"}}"#,
-            t.display()
-        ))
+        let input = detect::parse_input(
+            &serde_json::json!({
+                "session_id": "s",
+                "hook_event_name": "SessionEnd",
+                "transcript_path": t,
+            })
+            .to_string(),
+        )
         .unwrap();
         assert!(!detect::session_end_without_turn(&input));
         let stop = detect::parse_input(r#"{"session_id":"s","hook_event_name":"Stop"}"#).unwrap();

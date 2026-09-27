@@ -279,6 +279,29 @@ fn relaunch_loop(
     launcher: &dyn crate::platform::launcher::Launcher,
     spec: &LaunchSpec,
 ) -> anyhow::Result<()> {
+    relaunch_loop_with(launcher, spec, &start_recovery, &repair_before_respawn)
+}
+
+/// Starts the repair of an unfinished switch right after a spawn
+/// ([`start_recovery`] outside tests).
+#[cfg(not(windows))]
+type RecoveryStart<'a> =
+    dyn Fn(&crate::launch_context::ConfigDirPin) -> Option<std::thread::JoinHandle<Repair>> + 'a;
+
+/// Repairs an unfinished switch before a relaunch hop spawns; `None` when
+/// nothing is pending ([`repair_before_respawn`] outside tests).
+#[cfg(not(windows))]
+type RecoveryNow<'a> = dyn Fn(&crate::launch_context::ConfigDirPin) -> Option<Repair> + 'a;
+
+/// [`relaunch_loop`] with the recovery starter and the pre-relaunch repair
+/// injected.
+#[cfg(not(windows))]
+fn relaunch_loop_with(
+    launcher: &dyn crate::platform::launcher::Launcher,
+    spec: &LaunchSpec,
+    start: &RecoveryStart<'_>,
+    now: &RecoveryNow<'_>,
+) -> anyhow::Result<()> {
     use crate::paths;
     use crate::platform::pid;
 
@@ -289,7 +312,6 @@ fn relaunch_loop(
     // The CLI mutates across hops (resume + handoff prompt); start from the
     // cold-launch CLI the caller built. Every hop runs in the same `D`.
     let mut cli: Vec<OsString> = spec.cli.clone();
-    let mut first = true;
 
     loop {
         // Clobber guard: if another live csm already owns this sid's pidfile,
@@ -309,16 +331,16 @@ fn relaunch_loop(
         // launch. (Defensive: the born-check below is the real guard.)
         let _ = std::fs::remove_file(&sentinel_path);
 
-        // Recovery of an unfinished switch runs once per supervisor, on a
-        // thread started right after the child spawns, never before exec.
+        // Recovery of an unfinished switch runs on a thread started right
+        // after the child spawns, never before the first exec (an Orca pane
+        // must not wait on it). It runs on every spawn whose journal is
+        // pending, not just the first; a relaunch hop also repairs before
+        // its spawn (below), so this thread then finds nothing to do.
         let mut recovery = None;
         let mut on_spawn = || {
-            if first {
-                recovery = start_recovery(&spec.pin);
-            }
+            recovery = start(&spec.pin);
         };
         let (status, handle) = launcher.run_foreground(&sid, &cli, &spec.env, &mut on_spawn)?;
-        first = false;
         let mut repair = finish_recovery(spec, &sid, recovery);
 
         // Did the hook drop a sentinel for THIS incarnation?
@@ -373,8 +395,8 @@ fn relaunch_loop(
         }
 
         // Lead or follow the switch (a model fallback and a follow switch
-        // nothing), then say so in one line.
-        let account = if sentinel.wants_switch() {
+        // nothing).
+        let outcome = if sentinel.wants_switch() {
             let outcome =
                 crate::account::limit_switch::run_hop(&sentinel, &sid, &spec.pin, &mut |line| {
                     say(spec, &sid, line, false)
@@ -398,41 +420,76 @@ fn relaunch_loop(
                 let _ = std::fs::remove_file(&pid_path);
                 return exit_with(status);
             }
-            let account = hop_account(
-                &outcome,
-                || d_account_now(&spec.pin),
-                sentinel.from_account.clone(),
-            );
-            say(
-                spec,
-                &sid,
-                &hop_line(&sentinel, &outcome, account.as_deref(), true),
-                true,
-            );
-            account
+            Some(outcome)
         } else {
-            let account = no_switch_account(&sentinel, || d_account_now(&spec.pin));
-            let line = match &sentinel.model_override {
-                Some(model) => format!(
-                    "csm: model-scoped cap on {}; resumed on model {model}",
-                    label(&sentinel.target_account)
-                ),
-                None => format!(
-                    "csm: another session switched the account; resumed on {}",
-                    label(account.as_deref().unwrap_or_default())
-                ),
-            };
-            say(spec, &sid, &line, true);
-            account
+            None
+        };
+
+        // A hop whose switch failed with `D` half written (a failed restore,
+        // a failed verify) leaves the journal pending. Repair it now, while
+        // no child of this chain runs, instead of relaunching into that `D`
+        // and leaving the repair to a thread racing the new child, which
+        // could load (and refresh) a mismatched grant/identity pair first.
+        // It runs before the account is read and the resume line printed:
+        // the repair may move `D`, and a failed one keeps the session down,
+        // which is then the one line an Orca pane shows.
+        if let Some(r) = now(&spec.pin) {
+            if let Repair::Failed(why) = &r {
+                let short = crate::hook::sid_short(&sid);
+                say(spec, &sid, &not_resumed_line(why, short), true);
+                let _ = std::fs::remove_file(&pid_path);
+                return exit_with(status);
+            }
+            report_repair(spec, &sid, r);
+        }
+
+        // Say in one line where the session resumes.
+        let account = match &outcome {
+            Some(outcome) => {
+                let account = hop_account(
+                    outcome,
+                    || d_account_now(&spec.pin),
+                    sentinel.from_account.clone(),
+                );
+                say(
+                    spec,
+                    &sid,
+                    &hop_line(&sentinel, outcome, account.as_deref(), true),
+                    true,
+                );
+                account
+            }
+            None => {
+                let account = no_switch_account(&sentinel, || d_account_now(&spec.pin));
+                let line = match &sentinel.model_override {
+                    Some(model) => format!(
+                        "csm: model-scoped cap on {}; resumed on model {model}",
+                        label(&sentinel.target_account)
+                    ),
+                    None => format!(
+                        "csm: another session switched the account; resumed on {}",
+                        label(account.as_deref().unwrap_or_default())
+                    ),
+                };
+                say(spec, &sid, &line, true);
+                account
+            }
         };
 
         // Record this incarnation's account and launch time: usage captures
-        // and the follow check key on them.
+        // and the follow check key on them. `D`'s identity is noted first
+        // (a follow or a Stay may find `D` moved by another supervisor, and
+        // no tick has seen it yet), so this incarnation's captures count.
+        let born = crate::usage::local::launch_born(
+            crate::account::AccountSet::load_pinned(&spec.pin)
+                .current_uuid
+                .as_deref(),
+        );
         let _ = crate::sidecar::merge_sidecar(
             &paths::sidecar(&sid),
             &crate::sidecar::Sidecar {
                 account_id: account,
-                born: Some(crate::epoch::now_secs() as i64),
+                born: Some(born),
                 ..Default::default()
             },
         );
@@ -587,6 +644,12 @@ impl Repair {
             Ok(Recovery::Busy) => Repair::Busy,
             Ok(Recovery::Failed(why)) => Repair::Failed(why),
             Ok(Recovery::Deferred(why)) => Repair::Deferred(why),
+            // Orca started during the repair and now owns `D`, as with a
+            // repair handed to it on purpose: not a reason to keep the
+            // session down, but worth the log line.
+            Ok(Recovery::Uncertain(why)) => Repair::Deferred(format!(
+                "the repair was handed to Orca and did not verify: {why}"
+            )),
             Err(e) => Repair::Failed(e.to_string()),
             Ok(_) => Repair::Done,
         }
@@ -616,17 +679,25 @@ fn start_recovery(
     let pin = pin.clone();
     std::thread::Builder::new()
         .name("csm-recover".into())
-        .spawn(move || recover_now(&pin))
+        .spawn(move || recover_now(&pin, true))
         .ok()
 }
 
+/// Before a relaunch hop spawns: repair an unfinished switch in the
+/// foreground, `None` when the journal has nothing pending. No child of
+/// this chain runs, so the live-claude scan decides the materialize order.
+#[cfg(not(windows))]
+fn repair_before_respawn(pin: &crate::launch_context::ConfigDirPin) -> Option<Repair> {
+    journal_pending().then(|| recover_now(pin, false))
+}
+
 /// Run [`crate::orca::switch::recover`].
-/// It runs while this supervisor's claude child starts in `D`, usually
-/// before that child has registered in `D/sessions`, so the switch env
-/// counts a live claude regardless of the scan: the repair then uses Orca's
-/// materialize order (one `.claude.json` rewrite beside a live writer) and
-/// skips the refresh the child may be racing.
-fn recover_now(pin: &crate::launch_context::ConfigDirPin) -> Repair {
+/// With `child_live` it runs while this supervisor's claude child starts in
+/// `D`, usually before that child has registered in `D/sessions`, so the
+/// switch env counts a live claude regardless of the scan: the repair then
+/// uses Orca's materialize order (one `.claude.json` rewrite beside a live
+/// writer) and skips the refresh the child may be racing.
+fn recover_now(pin: &crate::launch_context::ConfigDirPin, child_live: bool) -> Repair {
     use crate::orca::switch::recover;
     let procs = crate::orca::live::SystemProcs;
     let ctx = match crate::orca::context::Context::current_pinned(&procs, pin) {
@@ -634,7 +705,7 @@ fn recover_now(pin: &crate::launch_context::ConfigDirPin) -> Repair {
         Err(e) => return Repair::Failed(e.to_string()),
     };
     let http = crate::orca::http::SystemHttp::from_env();
-    Repair::from_recovery(ctx.with_switch_env_child(&procs, &http, true, recover))
+    Repair::from_recovery(ctx.with_switch_env_child(&procs, &http, child_live, recover))
 }
 
 /// Join the recovery thread and [`report_repair`] its answer.
@@ -655,7 +726,7 @@ fn retry_recovery(spec: &LaunchSpec, sid: &str) -> Repair {
     if !journal_pending() {
         return Repair::Done;
     }
-    report_repair(spec, sid, recover_now(&spec.pin))
+    report_repair(spec, sid, recover_now(&spec.pin, true))
 }
 
 /// Say once how a repair went: a failure gets the doctor line, a busy lock
@@ -689,6 +760,16 @@ fn report_repair(spec: &LaunchSpec, sid: &str, r: Repair) -> Repair {
 /// returned), so in an Orca pane its line goes to csm's log only (design
 /// section 3, Recovery).
 const RECOVERY_FAILED_ALWAYS: bool = false;
+
+/// The one line of a relaunch that a failed pre-relaunch repair kept
+/// down. Pure.
+#[cfg(not(windows))]
+fn not_resumed_line(why: &str, short: &str) -> String {
+    format!(
+        "csm: an unfinished account switch could not be repaired ({why}), so the session was \
+         not resumed; run `csm accounts doctor --fix`, then `csm --resume {short}`"
+    )
+}
 
 /// Pure.
 fn recovery_failed_line(why: &str) -> String {
@@ -1424,6 +1505,190 @@ mod tests {
         });
     }
 
+    /// A fake launcher: spawn `n` calls `on_spawn`, and while `n` is below
+    /// `follows` its child "exits" leaving a follow sentinel for itself.
+    #[cfg(unix)]
+    struct FollowingLauncher {
+        follows: usize,
+        spawns: std::cell::Cell<usize>,
+    }
+
+    #[cfg(unix)]
+    impl crate::platform::launcher::Launcher for FollowingLauncher {
+        fn run_foreground(
+            &self,
+            sid: &str,
+            _cli: &[OsString],
+            _env: &crate::platform::launcher::ChildEnv,
+            on_spawn: &mut dyn FnMut(),
+        ) -> std::io::Result<(
+            std::process::ExitStatus,
+            crate::platform::launcher::ChildHandle,
+        )> {
+            use std::os::unix::process::ExitStatusExt;
+            let n = self.spawns.get();
+            self.spawns.set(n + 1);
+            on_spawn();
+            let born = 100 + n as i64;
+            if n < self.follows {
+                let mut s = sentinel("");
+                s.session_id = sid.to_owned();
+                s.reason = REASON_FOLLOW.into();
+                s.target_account = "id-b".into();
+                s.born = born;
+                write_relaunch(&crate::paths::sentinel(sid), &s).unwrap();
+            }
+            Ok((
+                std::process::ExitStatus::from_raw(0),
+                crate::platform::launcher::ChildHandle { pid: 0, born },
+            ))
+        }
+    }
+
+    /// Every spawn gets its own recovery, not only the first: a hop whose
+    /// switch failed with `D` half written leaves the journal pending and
+    /// relaunches into that `D`, and the next child must not run in it
+    /// unrepaired.
+    #[cfg(unix)]
+    #[test]
+    fn recovery_starts_on_every_spawn_of_a_relaunch_chain() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let launcher = FollowingLauncher {
+            follows: 2,
+            spawns: std::cell::Cell::new(0),
+        };
+        let spec = LaunchSpec {
+            session_id: "11111111-2222-3333-4444-555555555555".into(),
+            pin: crate::launch_context::ConfigDirPin::Leave,
+            env: Default::default(),
+            quiet: true,
+            cwd: tmp.path().to_path_buf(),
+            cli: Vec::new(),
+        };
+        let starts = std::cell::Cell::new(0usize);
+        let start = |_: &crate::launch_context::ConfigDirPin| {
+            starts.set(starts.get() + 1);
+            Some(std::thread::spawn(|| Repair::Done))
+        };
+        let nows = std::cell::Cell::new(0usize);
+        let now = |_: &crate::launch_context::ConfigDirPin| {
+            nows.set(nows.get() + 1);
+            None
+        };
+        crate::testenv::with_test_home(&home, || {
+            relaunch_loop_with(&launcher, &spec, &start, &now).unwrap();
+        });
+        assert_eq!(launcher.spawns.get(), 3, "two follows, then a plain exit");
+        assert_eq!(starts.get(), 3, "one recovery start per spawn");
+        assert_eq!(nows.get(), 2, "one foreground repair check per relaunch");
+    }
+
+    /// A relaunch hop repairs a pending switch before it spawns, with no
+    /// child of the chain running; a repair that fails keeps the session
+    /// down instead of starting claude in a half-written `D`.
+    #[cfg(unix)]
+    #[test]
+    fn a_hop_repairs_before_the_relaunch_and_a_failed_repair_blocks_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let launcher = FollowingLauncher {
+            follows: 2,
+            spawns: std::cell::Cell::new(0),
+        };
+        let spec = LaunchSpec {
+            session_id: "11111111-2222-3333-4444-666666666666".into(),
+            pin: crate::launch_context::ConfigDirPin::Leave,
+            env: Default::default(),
+            quiet: true,
+            cwd: tmp.path().to_path_buf(),
+            cli: Vec::new(),
+        };
+        let start = |_: &crate::launch_context::ConfigDirPin| None;
+        let spawns_at_repair = std::cell::Cell::new(None);
+        let now = |_: &crate::launch_context::ConfigDirPin| {
+            spawns_at_repair.set(Some(launcher.spawns.get()));
+            Some(Repair::Failed("restore failed".into()))
+        };
+        let log = crate::testenv::with_test_home(&home, || {
+            relaunch_loop_with(&launcher, &spec, &start, &now).unwrap();
+            std::fs::read_to_string(crate::paths::smart_dir().unwrap().join("limit-switch.log"))
+                .unwrap_or_default()
+        });
+        // The pane's one line says the session is down, and nothing
+        // claimed a resume first.
+        assert!(log.contains("was not resumed"), "{log}");
+        assert!(log.contains("csm --resume 11111111"), "{log}");
+        assert!(!log.contains("resumed on"), "{log}");
+        assert_eq!(
+            spawns_at_repair.get(),
+            Some(1),
+            "the repair ran after the first child and before any relaunch"
+        );
+        assert_eq!(
+            launcher.spawns.get(),
+            1,
+            "no relaunch after a failed repair"
+        );
+    }
+
+    /// A repair before the relaunch that moves `D` decides the account the
+    /// next incarnation is recorded on: the sidecar names the account `D`
+    /// holds after the repair, not the one it held when the child exited
+    /// (usage captures are filed under the sidecar's account).
+    #[cfg(unix)]
+    #[test]
+    fn the_recorded_account_is_read_after_the_repair() {
+        use crate::orca::testsupport::{make_stash, record_json, write_store};
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let sid = "11111111-2222-3333-4444-777777777777";
+        let launcher = FollowingLauncher {
+            follows: 1,
+            spawns: std::cell::Cell::new(0),
+        };
+        let spec = LaunchSpec {
+            session_id: sid.into(),
+            pin: crate::launch_context::ConfigDirPin::Leave,
+            env: Default::default(),
+            quiet: true,
+            cwd: tmp.path().to_path_buf(),
+            cli: Vec::new(),
+        };
+        let identity = |uuid: &str| format!(r#"{{"oauthAccount":{{"accountUuid":"{uuid}"}}}}"#);
+        let start = |_: &crate::launch_context::ConfigDirPin| None;
+        // The follow names id-b and `D` holds id-b when the child exits;
+        // the repair then puts id-a back.
+        let now = |_: &crate::launch_context::ConfigDirPin| {
+            std::fs::write(home.join(".claude.json"), identity("u-a")).unwrap();
+            Some(Repair::Done)
+        };
+        let recorded = crate::testenv::with_test_home(&home, || {
+            let env = crate::orca::HostEnv::current().unwrap();
+            let ud = crate::orca::userdata::resolve(&env, |_| false).dir;
+            make_stash(&ud, "id-a", Some(br#"{"accountUuid":"u-a"}"#), None);
+            make_stash(&ud, "id-b", Some(br#"{"accountUuid":"u-b"}"#), None);
+            let recs = [
+                record_json(&ud, "id-a", "alice@example.com", None),
+                record_json(&ud, "id-b", "bob@example.com", None),
+            ];
+            write_store(&ud, &recs, Some("id-b"));
+            std::fs::create_dir_all(home.join(".claude")).unwrap();
+            std::fs::write(home.join(".claude.json"), identity("u-b")).unwrap();
+            relaunch_loop_with(&launcher, &spec, &start, &now).unwrap();
+            crate::sidecar::read_sidecar(&crate::paths::sidecar(sid)).unwrap_or_default()
+        });
+        assert_eq!(launcher.spawns.get(), 2, "one follow, then a plain exit");
+        assert_eq!(
+            recorded.account_id.as_deref(),
+            Some("id-a"),
+            "the account `D` holds after the repair"
+        );
+    }
+
     /// A recovery that only found `switch.lock` held is not a failed
     /// repair: it neither blocks the relaunch nor prints the doctor line.
     /// Only a repair that ran and failed (or errored) blocks it.
@@ -1438,6 +1703,12 @@ mod tests {
         let deferred = Repair::from_recovery(Ok(Recovery::Deferred("Orca runs".into())));
         assert_eq!(deferred, Repair::Deferred("Orca runs".into()));
         assert!(!deferred.blocks_relaunch());
+        let uncertain = Repair::from_recovery(Ok(Recovery::Uncertain("no answer".into())));
+        assert!(
+            matches!(&uncertain, Repair::Deferred(why) if why.contains("no answer")),
+            "{uncertain:?}"
+        );
+        assert!(!uncertain.blocks_relaunch());
         let failed = Repair::from_recovery(Ok(Recovery::Failed("x".into())));
         assert_eq!(failed, Repair::Failed("x".into()));
         assert!(failed.blocks_relaunch());

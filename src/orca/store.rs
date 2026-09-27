@@ -626,10 +626,13 @@ pub struct RedoOpts {
     pub poll: Duration,
 }
 
+/// How long a redo waits for Orca's socket to answer (design §2 step 5).
+pub const REDO_WAIT: Duration = Duration::from_secs(15);
+
 impl Default for RedoOpts {
     fn default() -> Self {
         RedoOpts {
-            wait: Duration::from_secs(15),
+            wait: REDO_WAIT,
             poll: Duration::from_millis(250),
         }
     }

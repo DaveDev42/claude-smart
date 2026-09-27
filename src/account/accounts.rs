@@ -176,20 +176,46 @@ impl AccountSet {
         };
         let records: Vec<_> = all.into_iter().filter(|a| a.is_host()).collect();
         let ra = runtime::runtime_account(&paths, &ud.dir, &records);
-        let current = match ra.account {
+        let unmatched = matches!(ra.account, Some(UuidMatch::None));
+        let mut current = match ra.account {
             Some(UuidMatch::Unique(id)) => Some(id),
             _ => None,
         };
+        let mut accounts: Vec<AccountEntry> = records
+            .iter()
+            .map(|a| AccountEntry {
+                id: a.id.clone(),
+                email: a.email.clone(),
+                organization_name: a.organization_name.clone(),
+                managed_auth_path: a.managed_auth_path.clone(),
+            })
+            .collect();
+        // A SQLite-backed profile's store is an export frozen at Orca's last
+        // quit: an account added since has a stash but no record. When `D`
+        // names no listed account, look for it among those stashes (files
+        // only, so the hook and the statusline may do it too).
+        if !from_orca
+            && unmatched
+            && userdata::data_file(&ud.dir).has_state_db()
+            && let Some(u) = uuid_of(&ra.identity)
+        {
+            let extra = runtime::unlisted_stash_identities(&ud.dir, &records);
+            if let UuidMatch::Unique(id) = runtime::match_account_uuid(&u, &extra) {
+                let email = extra
+                    .iter()
+                    .find(|(i, _)| *i == id)
+                    .and_then(|(_, ident)| ident.as_ref()?.email.clone());
+                accounts.push(AccountEntry {
+                    id: id.clone(),
+                    email,
+                    organization_name: None,
+                    managed_auth_path: None,
+                });
+                current = Some(id);
+            }
+        }
         AccountSet {
-            accounts: records
-                .iter()
-                .map(|a| AccountEntry {
-                    id: a.id.clone(),
-                    email: a.email.clone(),
-                    organization_name: a.organization_name.clone(),
-                    managed_auth_path: a.managed_auth_path.clone(),
-                })
-                .collect(),
+            accounts,
             active,
             from_orca,
             current,
@@ -428,17 +454,19 @@ mod tests {
         let ud = home.join(".config/orca");
         let file = ud.join("profiles/local-default/orca-data.json");
         std::fs::create_dir_all(file.parent().unwrap()).unwrap();
-        let ud_s = ud.to_string_lossy();
+        // JSON-escaped, so a Windows path with backslashes stays valid.
+        let auth =
+            serde_json::to_string(&crate::orca::stash::default_auth_dir(&ud, "id-a")).unwrap();
         std::fs::write(
             &file,
             format!(
                 concat!(
                     r#"{{"schemaVersion":1,"settings":{{"claudeManagedAccounts":["#,
-                    r#"{{"id":"id-a","email":"alice@example.com","managedAuthPath":"{ud}/claude-accounts/id-a/auth","managedAuthRuntime":"host"}},"#,
+                    r#"{{"id":"id-a","email":"alice@example.com","managedAuthPath":{auth},"managedAuthRuntime":"host"}},"#,
                     r#"{{"id":"id-w","email":"bob@example.com","managedAuthRuntime":"wsl","wslDistro":"Ubuntu"}}"#,
                     r#"],"activeClaudeManagedAccountId":"id-a","activeClaudeManagedAccountIdsByRuntime":{{"host":"id-a","wsl":{{}}}}}}}}"#
                 ),
-                ud = ud_s
+                auth = auth
             ),
         )
         .unwrap();
@@ -459,6 +487,64 @@ mod tests {
         assert_eq!(set.active.as_deref(), Some("id-a"));
         assert_eq!(set.current.as_deref(), Some("id-a"));
         assert_eq!(set.runtime_dir, d);
+    }
+
+    /// Orca 1.4.214 profile with `profile-state.db`: `orca-data.json` is the
+    /// export from Orca's last quit, so an account added (and made active)
+    /// since has a stash but no record. `D`'s identity still maps to it,
+    /// from the stash's own `oauth-account.json`, with no RPC. Without the
+    /// database a stash no record names is an orphan and never counts.
+    #[test]
+    fn a_sqlite_profile_maps_d_to_a_stash_the_export_lacks() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        let mut env = HostEnv::for_test(home, HostOs::Linux);
+        let d = home.join("claude-d");
+        env.claude_config_dir = Some(d.to_string_lossy().into_owned());
+        let ud = home.join(".config/orca");
+        let file = ud.join("profiles/local-default/orca-data.json");
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        let auth =
+            serde_json::to_string(&crate::orca::stash::default_auth_dir(&ud, "id-a")).unwrap();
+        std::fs::write(
+            &file,
+            format!(
+                concat!(
+                    r#"{{"schemaVersion":1,"settings":{{"claudeManagedAccounts":["#,
+                    r#"{{"id":"id-a","email":"alice@example.com","managedAuthPath":{auth},"managedAuthRuntime":"host"}}"#,
+                    r#"],"activeClaudeManagedAccountId":"id-a","activeClaudeManagedAccountIdsByRuntime":{{"host":"id-a","wsl":{{}}}}}}}}"#
+                ),
+                auth = auth
+            ),
+        )
+        .unwrap();
+        crate::orca::testsupport::make_stash(&ud, "id-a", Some(br#"{"accountUuid":"u-a"}"#), None);
+        crate::orca::testsupport::make_stash(
+            &ud,
+            "id-new",
+            Some(br#"{"accountUuid":"u-new","emailAddress":"carol@example.com"}"#),
+            None,
+        );
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(
+            d.join(".claude.json"),
+            r#"{"oauthAccount":{"accountUuid":"u-new"}}"#,
+        )
+        .unwrap();
+
+        let set = AccountSet::load_with(&env);
+        assert_eq!(
+            set.current, None,
+            "no database: an unlisted stash is an orphan"
+        );
+        assert_eq!(set.ids_sorted(), vec!["id-a"]);
+
+        std::fs::write(file.with_file_name(crate::orca::userdata::STATE_DB), b"").unwrap();
+        let set = AccountSet::load_with(&env);
+        assert_eq!(set.current.as_deref(), Some("id-new"));
+        assert_eq!(set.current_uuid.as_deref(), Some("u-new"));
+        assert_eq!(set.label("id-new"), "carol");
+        assert_eq!(set.active.as_deref(), Some("id-a"));
     }
 
     /// Orca's live list: every record it names, with the store's

@@ -188,9 +188,18 @@ pub fn last_switch() -> PathBuf {
 
 /// `<state>/last-identity` — the last `oauthAccount.accountUuid` csm saw in
 /// `D`. A change is a switch event (whoever made it) and re-stamps
-/// [`last_switch`].
+/// [`last_switch`] and [`last_identity_switch`].
 pub fn last_identity() -> PathBuf {
     smart_dir_no_create().join("last-identity")
+}
+
+/// `<state>/.last-identity-switch` — when `D`'s identity last changed (bare
+/// epoch). Usage-capture attribution keys on it, not on [`last_switch`]: the
+/// cooldown claim re-stamps that one when a switch is only about to be
+/// asked for, and a claim that ends in no switch must not orphan the
+/// captures of every session already running.
+pub fn last_identity_switch() -> PathBuf {
+    smart_dir_no_create().join(".last-identity-switch")
 }
 
 /// `<smart_dir>/titles.tsv` — session-name alias index (`title \t sid \t mtime`).

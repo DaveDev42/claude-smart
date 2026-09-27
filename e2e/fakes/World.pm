@@ -113,7 +113,16 @@ sub write_index {
 sub load_store { return read_json(store_path()) // die "no store at " . store_path() . "\n"; }
 sub save_store { write_json(store_path(), $_[0]); }
 
-sub stash_dir { return ud() . "/claude-accounts/$_[0]/auth"; }
+# Orca resolves the stash root per call after app.setName('Orca'), so it
+# lives under the late userData <appData>/Orca. On macOS's case-insensitive
+# filesystem that is the canonical dir; on Linux it is a separate dir.
+sub late_ud {
+    my $u = ud();
+    return $u if $^O eq 'darwin' || $u !~ m{/orca\z};
+    (my $late = $u) =~ s{/orca\z}{/Orca};
+    return $late;
+}
+sub stash_dir { return late_ud() . "/claude-accounts/$_[0]/auth"; }
 
 sub record {
     my ($id, $email, $org, $ts) = @_;
@@ -174,7 +183,7 @@ sub stash_oauth { return read_json(stash_dir($_[0]) . '/oauth-account.json'); }
 
 sub stash_remove {
     my ($id) = @_;
-    remove_tree(ud() . "/claude-accounts/$id");
+    remove_tree(late_ud() . "/claude-accounts/$id");
     kc_del($STASH_SERVICE, $id) if is_mac();
 }
 

@@ -106,6 +106,27 @@ pub fn default_auth_dir(user_data: &Path, id: &str) -> PathBuf {
     claude_accounts_root(user_data).join(id).join("auth")
 }
 
+/// The `managedAuthPath` a record stores for a verified auth dir: the path
+/// Orca's own `create()` would store, which is Node's JavaScript
+/// `realpathSync` output. On Windows Rust's `canonicalize` returns the
+/// verbatim form (`\\?\C:\…`, `\\?\UNC\server\share\…`) that Node never
+/// produces, and Orca's ownership check (`resolveOwnedClaudeManagedAuthPath`
+/// compares the candidate's realpath against a plain `C:\…` root by
+/// prefix) would reject such a record: listed, but never selectable,
+/// readable or removable. Strip the verbatim prefix. A path without one is
+/// returned as is, so this is a no-op off Windows. Pure.
+pub fn record_path(real: &str) -> String {
+    if let Some(rest) = real.strip_prefix(r"\\?\UNC\") {
+        return format!(r"\\{rest}");
+    }
+    match real.strip_prefix(r"\\?\") {
+        // Only a drive path has a plain spelling (`C:\…`); any other
+        // verbatim form (a volume GUID) is kept.
+        Some(rest) if rest.as_bytes().get(1) == Some(&b':') => rest.to_owned(),
+        _ => real.to_owned(),
+    }
+}
+
 /// An account id usable as one path component.
 fn id_is_component(id: &str) -> bool {
     !id.is_empty()
@@ -458,6 +479,28 @@ mod tests {
     use crate::orca::testsupport::FakeSecurity;
     use crate::orca::testsupport::make_stash;
 
+    /// The record keeps Node's realpath spelling: Rust's Windows verbatim
+    /// prefix goes, everything else is untouched.
+    #[test]
+    fn record_path_drops_the_windows_verbatim_prefix() {
+        assert_eq!(
+            record_path(r"\\?\C:\Users\example\AppData\Roaming\orca\claude-accounts\id\auth"),
+            r"C:\Users\example\AppData\Roaming\orca\claude-accounts\id\auth"
+        );
+        assert_eq!(
+            record_path(r"\\?\UNC\server\share\orca\claude-accounts\id\auth"),
+            r"\\server\share\orca\claude-accounts\id\auth"
+        );
+        // A volume GUID path has no plain spelling: kept.
+        let guid = r"\\?\Volume{0000}\orca\claude-accounts\id\auth";
+        assert_eq!(record_path(guid), guid);
+        assert_eq!(
+            record_path("/Users/example/Library/Application Support/orca/claude-accounts/id/auth"),
+            "/Users/example/Library/Application Support/orca/claude-accounts/id/auth"
+        );
+        assert_eq!(record_path(r"C:\x\auth"), r"C:\x\auth");
+    }
+
     #[test]
     fn a_well_formed_stash_passes_q2i() {
         let dir = tempfile::tempdir().unwrap();
@@ -474,6 +517,56 @@ mod tests {
         let explicit = default_auth_dir(ud, "id-1");
         let s2 = Stash::open(ud, "id-1", Some(explicit.to_str().unwrap())).unwrap();
         assert_eq!(s, s2);
+    }
+
+    /// When the disk shows Orca keeping stashes under the late userData
+    /// (`<appData>/Orca`) and the store under the canonical one
+    /// (`<appData>/orca`), two dirs on a case-sensitive filesystem, csm must
+    /// look where Orca put the stash; on a case-insensitive one they are one
+    /// dir. (The canonical-only layout is `stashes_under_the_canonical_dir_stay_there`.)
+    #[cfg(unix)]
+    #[test]
+    fn stashes_live_under_the_late_userdata() {
+        use crate::orca::userdata::late_user_data;
+        let dir = tempfile::tempdir().unwrap();
+        let ud = dir.path().join(".config").join("orca");
+        std::fs::create_dir_all(&ud).unwrap();
+        std::fs::write(ud.join("orca-data.json"), "{}").unwrap();
+        let late = dir.path().join(".config").join("Orca");
+        let case_sensitive = !late.exists();
+
+        // Orca's own layout: the stash under the late dir, the record's
+        // managedAuthPath spelled with it.
+        let auth = late.join("claude-accounts").join("id-1").join("auth");
+        std::fs::create_dir_all(&auth).unwrap();
+        std::fs::write(auth.join(MARKER_FILE), "id-1\n").unwrap();
+        let s = Stash::open(&ud, "id-1", Some(auth.to_str().unwrap())).unwrap();
+        assert_eq!(Stash::open(&ud, "id-1", None).unwrap(), s);
+
+        if case_sensitive {
+            assert_eq!(late_user_data(&ud), late);
+            assert!(default_auth_dir(&ud, "id-1").starts_with(&late));
+            // A stash under the canonical dir is not where Orca looks.
+            let stray = ud.join("claude-accounts").join("id-2").join("auth");
+            std::fs::create_dir_all(&stray).unwrap();
+            std::fs::write(stray.join(MARKER_FILE), "id-2\n").unwrap();
+            assert_eq!(
+                Stash::open(&ud, "id-2", Some(stray.to_str().unwrap())),
+                Err(StashError::Outside)
+            );
+            assert_eq!(
+                crate::orca::sysdefault::snapshot_path(&ud),
+                late.join(crate::orca::sysdefault::DIR)
+                    .join(crate::orca::sysdefault::FILE)
+            );
+        } else {
+            assert_eq!(late_user_data(&ud), ud);
+        }
+
+        // A sandbox userData not named `orca` never moves.
+        let sandbox = dir.path().join("sandbox-ud");
+        std::fs::create_dir_all(&sandbox).unwrap();
+        assert_eq!(late_user_data(&sandbox), sandbox);
     }
 
     #[test]

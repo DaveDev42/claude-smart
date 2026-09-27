@@ -228,15 +228,20 @@ mod tests {
     #[cfg(unix)]
     use serde_json::json;
 
-    fn store_json(ud_str: &str) -> String {
+    fn store_json(ud: &std::path::Path) -> String {
+        // JSON-escaped, so a Windows path with backslashes stays valid.
+        let auth = |id: &str| {
+            serde_json::to_string(&crate::orca::stash::default_auth_dir(ud, id)).unwrap()
+        };
         format!(
             concat!(
                 r#"{{"schemaVersion":1,"settings":{{"claudeManagedAccounts":["#,
-                r#"{{"id":"id-a","email":"alice@example.com","managedAuthPath":"{ud}/claude-accounts/id-a/auth","managedAuthRuntime":"host","wslDistro":null,"wslLinuxAuthPath":null,"authMethod":"subscription-oauth","organizationUuid":null,"organizationName":null,"createdAt":1,"updatedAt":1,"lastAuthenticatedAt":1}},"#,
-                r#"{{"id":"id-b","email":"bob@example.com","managedAuthPath":"{ud}/claude-accounts/id-b/auth","managedAuthRuntime":"host","wslDistro":null,"wslLinuxAuthPath":null,"authMethod":"subscription-oauth","organizationUuid":"org-acme","organizationName":"Acme","createdAt":2,"updatedAt":2,"lastAuthenticatedAt":2}}"#,
+                r#"{{"id":"id-a","email":"alice@example.com","managedAuthPath":{a},"managedAuthRuntime":"host","wslDistro":null,"wslLinuxAuthPath":null,"authMethod":"subscription-oauth","organizationUuid":null,"organizationName":null,"createdAt":1,"updatedAt":1,"lastAuthenticatedAt":1}},"#,
+                r#"{{"id":"id-b","email":"bob@example.com","managedAuthPath":{b},"managedAuthRuntime":"host","wslDistro":null,"wslLinuxAuthPath":null,"authMethod":"subscription-oauth","organizationUuid":"org-acme","organizationName":"Acme","createdAt":2,"updatedAt":2,"lastAuthenticatedAt":2}}"#,
                 r#"],"activeClaudeManagedAccountId":"id-a","activeClaudeManagedAccountIdsByRuntime":{{"host":"id-a","wsl":{{}}}}}}}}"#
             ),
-            ud = ud_str
+            a = auth("id-a"),
+            b = auth("id-b")
         )
     }
 
@@ -268,7 +273,7 @@ mod tests {
         let ud = dir.path().join(".config/orca");
         let file = ud.join("profiles/local-default/orca-data.json");
         std::fs::create_dir_all(file.parent().unwrap()).unwrap();
-        std::fs::write(&file, store_json(ud.to_str().unwrap())).unwrap();
+        std::fs::write(&file, store_json(&ud)).unwrap();
         make_stash(&ud, "id-a", Some(br#"{"accountUuid":"u-a"}"#), None);
         make_stash(&ud, "id-b", Some(br#"{"accountUuid":"u-b"}"#), None);
         let d = dir.path().join("claude-d");
@@ -316,8 +321,8 @@ mod tests {
         let me = std::process::id();
         let facts = FakeProcs::default().with(crate::orca::testsupport::proc_info(
             me,
-            "orca",
-            Some("/opt/Orca/orca"),
+            "orca-ide",
+            Some("/opt/Orca/orca-ide"),
             &[],
         ));
         let v = snapshot_with(

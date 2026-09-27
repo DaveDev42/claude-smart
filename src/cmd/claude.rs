@@ -6,7 +6,7 @@
 //! nothing to pin: the child runs in csm's runtime dir `D` (Orca's
 //! `CLAUDE_CONFIG_DIR`, else `~/.claude`), and `CLAUDE_CONFIG_DIR` is set only
 //! when the inherited value would put claude somewhere other than `D`
-//! ([`crate::launch_context::config_dir_pin`]).
+//! ([`crate::launch_context::runtime_dir_pin`]).
 //!
 //! That makes the verb the escape hatch for claude's own subcommands and
 //! flags (`csm claude mcp list`, `csm claude --version`) without the
@@ -39,8 +39,9 @@ pub(crate) struct Passthrough {
 /// `csm claude <args…>`
 ///
 /// The I/O shell: resolve `D`, decide whether the child needs a
-/// `CLAUDE_CONFIG_DIR` pin, then exec. Both decisions are pure functions
-/// ([`launch_context::config_dir_pin`], [`plan`]) so they can be unit-tested
+/// `CLAUDE_CONFIG_DIR` pin ([`launch_context::runtime_dir_pin`]), then exec.
+/// Both decisions rest on pure functions ([`launch_context::config_dir_pin`],
+/// which `runtime_dir_pin` applies, and [`plan`]) so they can be unit-tested
 /// without a claude binary anywhere near the test.
 pub(crate) fn cmd_claude(args: &[OsString]) -> anyhow::Result<()> {
     let plan = plan(

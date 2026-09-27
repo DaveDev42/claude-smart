@@ -119,6 +119,15 @@ pub const LOGIN_DIR_PREFIX: &str = "orca-claude-login-";
 pub const LOGIN_TIMEOUT: Duration = Duration::from_secs(180);
 /// `claude auth status` timeout (T9i / a9i).
 pub const STATUS_TIMEOUT: Duration = Duration::from_secs(20);
+/// The longest [`login_add`] holds `switch.lock`: the login, the status,
+/// and, when Orca came up meanwhile, the redo's wait for its socket plus
+/// `addClaudeFromConfigDir` (the Keychain cleanup after that is quick).
+pub const LOGIN_LOCK_HOLD: Duration = Duration::from_secs(
+    LOGIN_TIMEOUT.as_secs()
+        + STATUS_TIMEOUT.as_secs()
+        + store::REDO_WAIT.as_secs()
+        + super::rpc::ADD_TIMEOUT.as_secs(),
+);
 
 // ─── the claude seam ──────────────────────────────────────────────────────────
 
@@ -374,7 +383,12 @@ pub struct AccountsEnv<'a> {
     pub store_access_allowed: bool,
     pub lock_wait: Duration,
     pub redo: RedoOpts,
-    pub rpc_timeout: Duration,
+    /// The timeout of `accounts.addClaudeFromConfigDir` and
+    /// `accounts.removeClaude`: Orca queues them behind any running account
+    /// mutation, and the add runs `claude auth status` (up to 20 s) inside
+    /// it, so they get [`rpc::ADD_TIMEOUT`], the wait Orca's own CLI uses,
+    /// never the short list timeout.
+    pub mutation_timeout: Duration,
 }
 
 /// Which route ran.
@@ -523,7 +537,7 @@ fn persist(
         let _ = undo(s);
         return Err(OrcaError::Refused(format!("cannot write the stash: {e}")));
     }
-    let path = s.auth_dir.to_string_lossy().into_owned();
+    let path = stash::record_path(&s.auth_dir.to_string_lossy());
     let now = super::now_ms();
     let rec = record::new_record(
         &NewRecord {
@@ -678,7 +692,7 @@ fn import_with(
             env.user_data,
             &dir_s,
             previous_legacy_sha256,
-            env.rpc_timeout,
+            env.mutation_timeout,
         )?;
         return Ok(AccountChange {
             route: Route::Rpc,
@@ -725,6 +739,19 @@ fn import_with(
 }
 
 // ─── login ────────────────────────────────────────────────────────────────────
+
+/// The `previousLegacyCredentialsSha256` csm hands Orca when Orca imports
+/// a login dir csm ran the login in. Without one, Orca's capture compares
+/// the unscoped item with its value at the time of the import, not before
+/// the login, so a login that wrote only that item (Claude Code before
+/// 2.1.220) would be refused although csm's own capture took it. With no
+/// item before the login, the digest of the empty string stands for
+/// "absent": Orca skips an empty item, so any present one counts as
+/// changed, as in [`choose_captured`] with `prev_unscoped = None`. Off
+/// macOS Orca reads no Keychain item and no digest is sent. Pure.
+pub fn login_legacy_digest(os: HostOs, before: Option<&str>) -> Option<String> {
+    (os == HostOs::MacOs).then(|| sha256_hex(before.unwrap_or_default().as_bytes()))
+}
 
 /// mkdtemp(`<tmp>/orca-claude-login-`) plus realpath (D9i).
 fn make_login_dir() -> Result<PathBuf, OrcaError> {
@@ -792,6 +819,114 @@ pub fn unscoped_restore(
     }
 }
 
+/// The quarantine entry holding the unscoped item's pre-login value.
+struct Prefiled {
+    fingerprint: String,
+    /// The entry existed before this login (filed for another reason):
+    /// it is neither relabelled nor removed.
+    preexisting: bool,
+}
+
+/// File the unscoped item's pre-login value `v` in the quarantine.
+fn prefile_before(env: &AccountsEnv<'_>, v: &str) -> Result<Prefiled, OrcaError> {
+    let q = Quarantine::new(env.os, env.state);
+    let fingerprint = super::quarantine::fingerprint(v);
+    let preexisting = q.list().iter().any(|m| m.fingerprint == fingerprint);
+    q.file(
+        v,
+        Reason::PreLogin,
+        "legacy-keychain",
+        None,
+        None,
+        super::now_ms(),
+    )?;
+    Ok(Prefiled {
+        fingerprint,
+        preexisting,
+    })
+}
+
+/// Put the unscoped `Claude Code-credentials` item back to its pre-login
+/// value `before`, touching only what the login changed
+/// ([`unscoped_restore`]), and drop the pre-login quarantine copy once the
+/// item holds that value again. Returns what was left for the operator.
+/// macOS only; the caller holds `switch.lock`.
+fn restore_unscoped(
+    env: &AccountsEnv<'_>,
+    before: Option<&SecretString>,
+    prefiled: Option<&Prefiled>,
+    login_values: &[&str],
+) -> Vec<String> {
+    let mut leftovers = Vec::new();
+    let now = keychain::read_runtime_scoped(None, env.keychain_user);
+    let decision = unscoped_restore(
+        before.map(|s| s.expose()),
+        now.as_ref()
+            .map(|v| v.as_ref().map(|s| s.expose()))
+            .map_err(|_| ()),
+        login_values,
+    );
+    let item = || format!("the {} Keychain item", keychain::RUNTIME_SERVICE);
+    // The pre-login copy is dropped once the item holds that value
+    // again (or never changed); otherwise it stays filed.
+    let mut item_restored = false;
+    match (decision, before) {
+        (UnscopedRestore::Leave, _) => item_restored = now.is_ok(),
+        (UnscopedRestore::Write, Some(v)) => {
+            if keychain::write_runtime_scoped(v.expose(), None, env.keychain_user).is_err() {
+                leftovers.push(item());
+            } else {
+                item_restored = true;
+            }
+        }
+        (UnscopedRestore::Delete, _) => {
+            if keychain::delete_runtime_scoped(None, env.keychain_user).is_err() {
+                leftovers.push(item());
+            }
+        }
+        (UnscopedRestore::KeepAndQuarantine, Some(v)) => {
+            let q = Quarantine::new(env.os, env.state);
+            if let Some(p) = prefiled.filter(|p| !p.preexisting) {
+                let _ = q.set_reason(&p.fingerprint, Reason::ChangedDuringLogin);
+            }
+            match q.file(
+                v.expose(),
+                Reason::ChangedDuringLogin,
+                "legacy-keychain",
+                None,
+                None,
+                super::now_ms(),
+            ) {
+                Ok(f) => leftovers.push(format!(
+                    "{} changed during the login and was left as is; its pre-login grant is quarantined as {}",
+                    item(),
+                    f.fingerprint()
+                )),
+                Err(_) => leftovers.push(format!(
+                    "{} changed during the login and was left as is; its pre-login grant could not be quarantined",
+                    item()
+                )),
+            }
+        }
+        (UnscopedRestore::Write | UnscopedRestore::KeepAndQuarantine, None) => {
+            unreachable!("unscoped_restore writes or files only a pre-login value")
+        }
+    }
+    if item_restored
+        && let Some(p) = prefiled.filter(|p| !p.preexisting)
+        && Quarantine::new(env.os, env.state)
+            .remove(&p.fingerprint)
+            .is_err()
+    {
+        leftovers.push(format!(
+            "the pre-login copy of {} in the quarantine ({})",
+            item(),
+            p.fingerprint
+        ));
+    }
+    leftovers
+}
+
 /// Log in a new account with Orca stopped (E9i + add()).
 ///
 /// `switch.lock` is held from before the login until the finally block has
@@ -815,7 +950,38 @@ pub fn login_add(env: &AccountsEnv<'_>, cli: &dyn ClaudeCli) -> Result<AccountCh
     } else {
         None
     };
+    // `before` lives only in this process until the finally block puts it
+    // back, and the interactive login shares csm's process group: a Ctrl-C
+    // or a kill in between would lose it (with `D` = ~/.claude it may be
+    // the only copy of the active account's newest grant). So a durable
+    // copy goes into the quarantine first; the finally block drops it once
+    // the item is back. A copy that cannot be kept refuses the login.
+    let prefiled = match &before {
+        None => None,
+        Some(v) => match prefile_before(env, v.expose()) {
+            Ok(p) => Some(p),
+            Err(e) => {
+                let _ = fsx::remove_dir_all(&dir);
+                return Err(OrcaError::Refused(format!(
+                    "cannot keep a copy of the {} Keychain item before the login ({e})",
+                    keychain::RUNTIME_SERVICE
+                )));
+            }
+        },
+    };
     let mut captured: Option<SecretString> = None;
+    // The unscoped item holds the login's grant (Claude Code before 2.1
+    // writes it) beside `D`'s unchanged `oauthAccount`, which names the
+    // active account, from the login until it is put back. Orca's read-back
+    // would file that grant into the active account's stash by email, so
+    // the item goes back right after the capture, before the store patch
+    // or the redo over RPC (Orca's order: claude-login-session.ts restores
+    // it in its finally, before the caller persists). A Ctrl-C or a closed
+    // terminal during the login reaches claude, which exits, and csm still
+    // runs this restore: csm itself ignores SIGINT/SIGHUP until then.
+    let mut restored = false;
+    let mut early_leftovers: Vec<String> = Vec::new();
+    let mut signals = crate::platform::child::DeferInterrupts::install();
     let result = (|| -> Result<AccountChange, OrcaError> {
         let login = cli
             .run(&["auth", "login", "--claudeai"], &dir, LOGIN_TIMEOUT, true)
@@ -837,36 +1003,132 @@ pub fn login_add(env: &AccountsEnv<'_>, cli: &dyn ClaudeCli) -> Result<AccountCh
             None,
         )?;
         captured = Some(SecretString::new(cap.creds.expose().to_owned()));
+        if env.os == HostOs::MacOs {
+            let dir_item = keychain::read_runtime_scoped(Some(&d), env.keychain_user)
+                .ok()
+                .flatten();
+            // The login wrote only the unscoped item: keep its grant in the
+            // login dir's scoped item too, so a redo's
+            // `addClaudeFromConfigDir` still finds it once the unscoped item
+            // is back (it skips a legacy item equal to the pre-login one).
+            if dir_item.is_none() {
+                let _ =
+                    keychain::write_runtime_scoped(cap.creds.expose(), Some(&d), env.keychain_user);
+            }
+            let values: Vec<&str> = [
+                dir_item.as_ref().map(|s| s.expose()),
+                Some(cap.creds.expose()),
+            ]
+            .into_iter()
+            .flatten()
+            .collect();
+            early_leftovers = restore_unscoped(env, before.as_ref(), prefiled.as_ref(), &values);
+            restored = true;
+        }
+        signals.take();
+        let key = identity_key(&cap.identity)?;
+        let op = RedoOp::Add {
+            config_dir: d.clone(),
+            previous_legacy_sha256: login_legacy_digest(
+                env.os,
+                before.as_ref().map(|s| s.expose()),
+            ),
+            identity: key,
+        };
         if env.live.mark().running {
-            // Orca came up during the login: let it import the dir.
-            rpc::add_claude_from_config_dir(env.user_data, &d, None, env.rpc_timeout)?;
+            // Orca came up during the login: let it import the dir, the way
+            // the store-write protocol redoes an add (look for the identity
+            // first, then `addClaudeFromConfigDir` with Orca's own 60 s
+            // wait). A timeout there may still be delivered, so the outcome
+            // decides below whether the grant is filed before the cleanup.
+            let redo = store::redo_over_rpc(env.user_data, &op, env.redo);
+            // csm wrote nothing, so an identity Orca already shows was there
+            // before this login: Orca's own add refuses it as a duplicate
+            // (persist's findDuplicateClaudeAccount), and so does csm's
+            // offline path. The fresh grant is placed nowhere; the error
+            // path below files it.
+            if matches!(redo, RedoOutcome::AlreadyDone(_)) {
+                return Err(OrcaError::Refused(
+                    "This Claude account is already added.".into(),
+                ));
+            }
             return Ok(AccountChange {
-                route: Route::Rpc,
+                route: Route::OfflineThenRpc,
                 id: None,
                 email: cap.identity.email.clone(),
-                redo: None,
+                redo: Some(redo),
                 leftover: None,
             });
         }
-        let key = identity_key(&cap.identity)?;
-        persist(
-            env,
-            &cap,
-            Some(RedoOp::Add {
-                config_dir: d.clone(),
-                previous_legacy_sha256: None,
-                identity: key,
-            }),
-        )
+        persist(env, &cap, Some(op))
     })();
+    // An add Orca did not confirm (no answer, a timeout that may still be
+    // running, a refusal), or one that failed after the capture (the store
+    // refused the record, no email): the login dir and its Keychain item
+    // are about to go, and they may hold the only copy of the fresh grant.
+    // File it first.
+    let keep = match &result {
+        Ok(c) => matches!(
+            c.redo,
+            Some(RedoOutcome::Uncertain(_) | RedoOutcome::Failed(_))
+        )
+        .then_some(Reason::AddUnconfirmed),
+        Err(_) => Some(Reason::LoginNotAdded),
+    };
+    let unconfirmed = matches!(
+        &result,
+        Ok(AccountChange {
+            redo: Some(RedoOutcome::Uncertain(_)),
+            ..
+        })
+    );
+    let mut kept_note = None;
+    // The grant needed filing and the quarantine refused it (a full or
+    // read-only state dir, a Keychain error): the login dir and its
+    // Keychain item are then its only copies, and the cleanup keeps them.
+    let mut grant_unfiled = false;
+    if let Some(reason) = keep
+        && let Some(c) = &captured
+    {
+        let q = Quarantine::new(env.os, env.state);
+        kept_note = Some(
+            match q.file(c.expose(), reason, "login", None, None, super::now_ms()) {
+                // Only an unconfirmed add may still show up in Orca; a
+                // refused or failed one never will.
+                Ok(f) if unconfirmed => format!(
+                    "the login's grant is quarantined as {} until Orca shows the account",
+                    f.fingerprint()
+                ),
+                Ok(f) => format!("the login's grant is quarantined as {}", f.fingerprint()),
+                Err(_) => {
+                    grant_unfiled = true;
+                    format!(
+                        "the login's grant could not be quarantined, so the login dir {} and its Keychain item keep it",
+                        dir.display()
+                    )
+                }
+            },
+        );
+    }
     // The finally block, still under the lock: the dir's Keychain item, the
-    // unscoped item (only what the login changed), the dir.
-    let mut leftovers = Vec::new();
+    // unscoped item (only what the login changed, unless the restore above
+    // already ran), the dir.
+    let mut leftovers = early_leftovers;
     if env.os == HostOs::MacOs {
         let dir_item = keychain::read_runtime_scoped(Some(&d), env.keychain_user)
             .ok()
             .flatten();
-        if keychain::delete_runtime_scoped(Some(&d), env.keychain_user).is_err() {
+        if grant_unfiled {
+            // Keep the dir's item. When the login wrote only the unscoped
+            // item, which the restore below puts back to its pre-login
+            // value, copy the grant into the dir's item first.
+            if dir_item.is_none()
+                && let Some(c) = &captured
+                && keychain::write_runtime_scoped(c.expose(), Some(&d), env.keychain_user).is_err()
+            {
+                leftovers.push("the login's grant could not be kept in a Keychain item".to_owned());
+            }
+        } else if keychain::delete_runtime_scoped(Some(&d), env.keychain_user).is_err() {
             leftovers.push("the login dir's Keychain item".to_owned());
         }
         let login_values: Vec<&str> = [dir_item.as_ref(), captured.as_ref()]
@@ -874,57 +1136,30 @@ pub fn login_add(env: &AccountsEnv<'_>, cli: &dyn ClaudeCli) -> Result<AccountCh
             .flatten()
             .map(|s| s.expose())
             .collect();
-        let now = keychain::read_runtime_scoped(None, env.keychain_user);
-        let decision = unscoped_restore(
-            before.as_ref().map(|s| s.expose()),
-            now.as_ref()
-                .map(|v| v.as_ref().map(|s| s.expose()))
-                .map_err(|_| ()),
-            &login_values,
-        );
-        let item = || format!("the {} Keychain item", keychain::RUNTIME_SERVICE);
-        match (decision, &before) {
-            (UnscopedRestore::Leave, _) => {}
-            (UnscopedRestore::Write, Some(v)) => {
-                if keychain::write_runtime_scoped(v.expose(), None, env.keychain_user).is_err() {
-                    leftovers.push(item());
-                }
-            }
-            (UnscopedRestore::Delete, _) => {
-                if keychain::delete_runtime_scoped(None, env.keychain_user).is_err() {
-                    leftovers.push(item());
-                }
-            }
-            (UnscopedRestore::KeepAndQuarantine, Some(v)) => {
-                let q = Quarantine::new(env.os, env.state);
-                match q.file(
-                    v.expose(),
-                    Reason::ChangedDuringLogin,
-                    "legacy-keychain",
-                    None,
-                    None,
-                    super::now_ms(),
-                ) {
-                    Ok(f) => leftovers.push(format!(
-                        "{} changed during the login and was left as is; its pre-login grant is quarantined as {}",
-                        item(),
-                        f.fingerprint()
-                    )),
-                    Err(_) => leftovers.push(format!(
-                        "{} changed during the login and was left as is; its pre-login grant could not be quarantined",
-                        item()
-                    )),
-                }
-            }
-            (UnscopedRestore::Write | UnscopedRestore::KeepAndQuarantine, None) => {
-                unreachable!("unscoped_restore writes or files only a pre-login value")
-            }
+        if !restored {
+            leftovers.extend(restore_unscoped(
+                env,
+                before.as_ref(),
+                prefiled.as_ref(),
+                &login_values,
+            ));
         }
     }
-    if fsx::remove_dir_all(&dir).is_err() {
+    drop(signals);
+    if !grant_unfiled && fsx::remove_dir_all(&dir).is_err() {
         leftovers.push(dir.display().to_string());
     }
-    let mut change = result?;
+    leftovers.extend(kept_note);
+    let mut change = match result {
+        Ok(c) => c,
+        Err(e) if leftovers.is_empty() => return Err(e),
+        Err(e) => {
+            return Err(OrcaError::Refused(format!(
+                "{e}; not cleaned up: {}",
+                leftovers.join(", ")
+            )));
+        }
+    };
     if !leftovers.is_empty() {
         let extra = format!("not cleaned up: {}", leftovers.join(", "));
         change.leftover = Some(match change.leftover.take() {
@@ -942,7 +1177,7 @@ pub fn login_add(env: &AccountsEnv<'_>, cli: &dyn ClaudeCli) -> Result<AccountCh
 pub fn remove(env: &AccountsEnv<'_>, id: &str) -> Result<AccountChange, OrcaError> {
     let _lock = lock(env)?;
     if env.live.mark().running {
-        rpc::remove_claude(env.user_data, id, env.rpc_timeout)?;
+        rpc::remove_claude(env.user_data, id, env.mutation_timeout)?;
         return Ok(AccountChange {
             route: Route::Rpc,
             id: Some(id.to_owned()),
@@ -1107,15 +1342,31 @@ pub fn purge_quarantine(env: &AccountsEnv<'_>, fp: &str, holder: &str) -> Result
         None => None,
     };
     let stash = Stash::open(env.user_data, holder, path.as_deref())?;
-    let held = stash
+    let Some(creds) = stash
         .credentials(env.os)?
-        .is_some_and(|c| super::quarantine::fingerprint(c.expose()) == fp);
-    if !held {
+        .filter(|c| super::quarantine::fingerprint(c.expose()) == fp)
+    else {
         return Err(OrcaError::Refused(format!(
             "stash {holder} no longer holds quarantine entry {fp}; kept"
         )));
+    };
+    // The fingerprint names only the Claude grant: an entry that also holds
+    // MCP logins the stash lacks is not superseded.
+    let q = Quarantine::new(env.os, env.state);
+    if let Some(entry) = q.get(fp)? {
+        let extra = super::quarantine::uncovered(
+            &super::quarantine::side_state(entry.expose()),
+            &super::quarantine::side_state(creds.expose()),
+        );
+        if !extra.is_empty() {
+            return Err(OrcaError::Refused(format!(
+                "quarantine entry {fp} also holds {} that stash {holder} lacks; kept (log in to \
+                 those MCP servers again, then rerun)",
+                extra.join(", ")
+            )));
+        }
     }
-    Quarantine::new(env.os, env.state).remove(fp)
+    q.remove(fp)
 }
 
 // ─── tests ────────────────────────────────────────────────────────────────────
@@ -1285,7 +1536,7 @@ mod tests {
                     wait: Duration::from_millis(300),
                     poll: Duration::from_millis(20),
                 },
-                rpc_timeout: Duration::from_secs(2),
+                mutation_timeout: Duration::from_secs(2),
             }
         }
 
@@ -1320,6 +1571,15 @@ mod tests {
         assert_eq!(v.accounts[2].id, id);
         assert_eq!(v.active_host_id(), Some("id-a"));
         let s = Stash::open(&w.ud, &id, v.accounts[2].managed_auth_path.as_deref()).unwrap();
+        // The record stores the path Orca's own create() would (Node's
+        // realpath form), never the Windows verbatim `\\?\` form, which
+        // Orca's ownership check rejects.
+        let p = v.accounts[2].managed_auth_path.clone().unwrap();
+        assert!(!p.starts_with(r"\\?\"), "{p}");
+        assert_eq!(
+            std::fs::canonicalize(&p).unwrap(),
+            std::fs::canonicalize(stash::default_auth_dir(&w.ud, &id)).unwrap()
+        );
         assert_eq!(
             s.credentials(HostOs::Linux).unwrap().unwrap().expose(),
             grant
@@ -1433,6 +1693,124 @@ mod tests {
         );
     }
 
+    /// Orca comes up during the login and does not confirm the import (no
+    /// answer here; a real Orca may still be inside its 20 s `auth status`
+    /// when a short timeout fires). The login dir is cleaned up, so the
+    /// fresh grant is filed in the quarantine first, never lost.
+    #[test]
+    fn an_unconfirmed_add_by_an_orca_that_came_up_quarantines_the_grant() {
+        let w = world();
+        let grant = creds_json("at-c", "rt-c", 5);
+        let cli = FakeClaude {
+            creds: grant.clone(),
+            status: r#"{"email":"carol@example.com","organizationUuid":null}"#.into(),
+            calls: Mutex::new(Vec::new()),
+        };
+        let live = ScriptedLiveness::appears_at(0);
+        let c = login_add(&w.env(&live), &cli).unwrap();
+        assert_eq!(c.route, Route::OfflineThenRpc);
+        assert!(matches!(c.redo, Some(RedoOutcome::Uncertain(_))), "{c:?}");
+        let fp = crate::orca::quarantine::fingerprint(&grant);
+        assert!(
+            c.leftover.as_deref().is_some_and(|l| l.contains(&fp)),
+            "{c:?}"
+        );
+        let q = Quarantine::new(HostOs::Linux, w.tmp.path());
+        let list = q.list();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].reason, Reason::AddUnconfirmed);
+        assert_eq!(q.get(&fp).unwrap().unwrap().expose(), grant);
+        // Orca owns the add: csm wrote no record and no stash.
+        assert_eq!(w.view().accounts.len(), 2);
+        let dir = &cli.calls.lock().unwrap()[0].1;
+        assert!(!dir.exists());
+    }
+
+    /// An add that fails after the capture (here the store already holds
+    /// the identity) files the fresh grant before the login dir goes, and
+    /// the error names it.
+    #[test]
+    fn a_login_whose_add_fails_quarantines_the_grant() {
+        let w = world();
+        let grant = creds_json("at-a2", "rt-a2", 5);
+        let cli = FakeClaude {
+            creds: grant.clone(),
+            status: r#"{"email":"alice@example.com","organizationUuid":null}"#.into(),
+            calls: Mutex::new(Vec::new()),
+        };
+        let live = ScriptedLiveness::stopped();
+        let e = login_add(&w.env(&live), &cli).unwrap_err().to_string();
+        let fp = crate::orca::quarantine::fingerprint(&grant);
+        assert!(e.contains("already added") && e.contains(&fp), "{e}");
+        let q = Quarantine::new(HostOs::Linux, w.tmp.path());
+        let list = q.list();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].reason, Reason::LoginNotAdded);
+        assert_eq!(q.get(&fp).unwrap().unwrap().expose(), grant);
+        assert_eq!(w.view().accounts.len(), 2);
+        assert!(!cli.calls.lock().unwrap()[0].1.exists());
+    }
+
+    /// The grant needed filing and the quarantine refused it: the login dir
+    /// is then its only copy, so the cleanup keeps it and the error says
+    /// where it is.
+    #[test]
+    fn a_login_grant_the_quarantine_refuses_keeps_the_login_dir() {
+        let w = world();
+        // A file where the quarantine dir should be: every filing fails.
+        std::fs::write(w.tmp.path().join("quarantine"), "x").unwrap();
+        let grant = creds_json("at-a2", "rt-a2", 5);
+        let cli = FakeClaude {
+            creds: grant.clone(),
+            status: r#"{"email":"alice@example.com","organizationUuid":null}"#.into(),
+            calls: Mutex::new(Vec::new()),
+        };
+        let live = ScriptedLiveness::stopped();
+        let e = login_add(&w.env(&live), &cli).unwrap_err().to_string();
+        let dir = cli.calls.lock().unwrap()[0].1.clone();
+        let kept = std::fs::read_to_string(dir.join(".credentials.json"));
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            e.contains("could not be quarantined") && e.contains(&dir.display().to_string()),
+            "{e}"
+        );
+        assert_eq!(kept.unwrap(), grant, "the login dir keeps the grant");
+    }
+
+    /// The digest handed to Orca for a login dir makes Orca's capture take
+    /// the same grant csm's own capture took from the pre-login value.
+    #[test]
+    fn the_login_digest_matches_the_pre_login_baseline() {
+        use HostOs::*;
+        assert_eq!(login_legacy_digest(Linux, Some("B")), None);
+        assert_eq!(login_legacy_digest(Windows, None), None);
+        let s = |v: &str| Some(v.to_owned());
+        // A login that wrote only the unscoped item.
+        for before in [None, Some("B")] {
+            let digest = login_legacy_digest(MacOs, before).unwrap();
+            assert_eq!(
+                choose_captured(MacOs, None, s("NEW"), before, None, None),
+                s("NEW")
+            );
+            assert_eq!(
+                choose_captured(MacOs, None, s("NEW"), None, Some(&digest), None),
+                s("NEW"),
+                "{before:?}"
+            );
+        }
+        // A login that left the unscoped item alone: neither takes it.
+        let digest = login_legacy_digest(MacOs, Some("B")).unwrap();
+        assert_eq!(digest, sha256_hex(b"B"));
+        assert_eq!(
+            choose_captured(MacOs, None, s("B"), Some("B"), None, s("F")),
+            s("F")
+        );
+        assert_eq!(
+            choose_captured(MacOs, None, s("B"), None, Some(&digest), s("F")),
+            s("F")
+        );
+    }
+
     #[test]
     fn login_add_runs_claude_in_a_temp_dir_and_cleans_it() {
         let w = world();
@@ -1532,7 +1910,7 @@ mod tests {
     fn orca_cli_on_linux_is_orca_ide_never_the_screen_reader() {
         let got = orca_cli_candidates(
             HostOs::Linux,
-            Some(Path::new("/opt/Orca/orca")),
+            Some(Path::new("/opt/Orca/orca-ide")),
             &LINUX_INSTALL_DIRS.map(PathBuf::from),
             &[PathBuf::from("/usr/bin")],
         );
@@ -1692,6 +2070,226 @@ mod tests {
         }
     }
 
+    /// A fake login of Claude Code before 2.1: it writes only the unscoped
+    /// item.
+    #[cfg(unix)]
+    struct LegacyMacClaude {
+        user: KeychainUser,
+        grant: String,
+    }
+
+    #[cfg(unix)]
+    impl ClaudeCli for LegacyMacClaude {
+        fn run(&self, args: &[&str], _: &Path, _: Duration, _: bool) -> io::Result<CliOutput> {
+            if args[..2] == ["auth", "login"] {
+                keychain::write_runtime_scoped(&self.grant, None, &self.user).unwrap();
+            }
+            Ok(CliOutput {
+                success: true,
+                stdout: r#"{"email":"carol@example.com"}"#.into(),
+            })
+        }
+    }
+
+    /// Each liveness check after the login records the fake Keychain:
+    /// (unscoped item, every scoped `Claude Code-credentials-*` value).
+    #[cfg(unix)]
+    type KeychainAtMarks = std::sync::Arc<Mutex<Vec<(Option<Vec<u8>>, Vec<Vec<u8>>)>>>;
+
+    #[cfg(unix)]
+    fn record_keychain_at_marks(
+        live: ScriptedLiveness,
+        fake: &crate::orca::testsupport::FakeSecurity,
+        acct: &str,
+        marks: usize,
+    ) -> (ScriptedLiveness, KeychainAtMarks) {
+        let hex = |b: &[u8]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
+        let items = fake.root().join("items");
+        let unscoped = items.join(format!(
+            "{}.{}",
+            hex(keychain::RUNTIME_SERVICE.as_bytes()),
+            hex(acct.as_bytes())
+        ));
+        let scoped_prefix = hex(format!("{}-", keychain::RUNTIME_SERVICE).as_bytes());
+        let seen: KeychainAtMarks = Default::default();
+        let mut live = live;
+        for n in 0..marks {
+            let (items, unscoped, scoped_prefix, seen) = (
+                items.clone(),
+                unscoped.clone(),
+                scoped_prefix.clone(),
+                seen.clone(),
+            );
+            live = live.on_check(n, move || {
+                let scoped = std::fs::read_dir(&items)
+                    .unwrap()
+                    .filter_map(|e| {
+                        let e = e.ok()?;
+                        let name = e.file_name().into_string().ok()?;
+                        name.starts_with(&scoped_prefix)
+                            .then(|| std::fs::read(e.path()).unwrap())
+                    })
+                    .collect();
+                seen.lock()
+                    .unwrap()
+                    .push((std::fs::read(&unscoped).ok(), scoped));
+            });
+        }
+        (live, seen)
+    }
+
+    /// Round 8: the unscoped item holds the login's grant beside `D`'s
+    /// `oauthAccount` (the active account) only until the capture. It is
+    /// back to its pre-login value before the store patch's liveness
+    /// checks, so an Orca coming up there never reads the new grant back
+    /// into the active account's stash (Orca's own order).
+    #[cfg(unix)]
+    #[test]
+    fn a_legacy_login_restores_the_unscoped_item_before_the_store_patch() {
+        let fake = crate::orca::testsupport::FakeSecurity::install();
+        let w = world();
+        let user = w.user.clone();
+        let pre = creds_json("at-a", "rt-a", 1);
+        keychain::write_runtime_scoped(&pre, None, &user).unwrap();
+        let grant = creds_json("at-c", "rt-c", 5);
+        let cli = LegacyMacClaude {
+            user: user.clone(),
+            grant: grant.clone(),
+        };
+        // 0 = the post-login check, 1-3 = the protocol's L0/L1/L2.
+        let (live, seen) =
+            record_keychain_at_marks(ScriptedLiveness::stopped(), &fake, &user.acct, 4);
+        let mut env = w.env(&live);
+        env.os = HostOs::MacOs;
+        let c = login_add(&env, &cli).unwrap();
+        assert!(c.leftover.is_none(), "{:?}", c.leftover);
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 4, "{} checks", live.checks());
+        for (unscoped, _) in seen.iter() {
+            assert_eq!(unscoped.as_deref(), Some(pre.as_bytes()));
+        }
+        let id = c.id.unwrap();
+        assert_eq!(
+            fake.get(keychain::STASH_SERVICE, &id).as_deref(),
+            Some(grant.as_bytes())
+        );
+        assert_eq!(
+            fake.get(keychain::RUNTIME_SERVICE, &user.acct).as_deref(),
+            Some(pre.as_bytes())
+        );
+        assert!(
+            Quarantine::new(HostOs::MacOs, w.tmp.path())
+                .list()
+                .is_empty()
+        );
+    }
+
+    /// Round 8: when Orca comes up during a legacy login, the unscoped item
+    /// is already back when csm asks Orca to import the dir, and the grant
+    /// waits in the login dir's scoped item, where Orca's
+    /// `addClaudeFromConfigDir` looks first.
+    #[cfg(unix)]
+    #[test]
+    fn a_legacy_login_redone_over_rpc_restores_first_and_seeds_the_dir_item() {
+        let fake = crate::orca::testsupport::FakeSecurity::install();
+        let w = world();
+        let user = w.user.clone();
+        let pre = creds_json("at-a", "rt-a", 1);
+        keychain::write_runtime_scoped(&pre, None, &user).unwrap();
+        let grant = creds_json("at-c", "rt-c", 5);
+        let cli = LegacyMacClaude {
+            user: user.clone(),
+            grant: grant.clone(),
+        };
+        let (live, seen) =
+            record_keychain_at_marks(ScriptedLiveness::appears_at(0), &fake, &user.acct, 1);
+        let mut env = w.env(&live);
+        env.os = HostOs::MacOs;
+        let c = login_add(&env, &cli).unwrap();
+        assert_eq!(c.route, Route::OfflineThenRpc);
+        let seen = seen.lock().unwrap();
+        let (unscoped, scoped) = &seen[0];
+        assert_eq!(unscoped.as_deref(), Some(pre.as_bytes()));
+        assert!(scoped.iter().any(|v| v == grant.as_bytes()), "{scoped:?}");
+        // Unconfirmed: the grant is filed, and the item keeps its value.
+        assert_eq!(
+            fake.get(keychain::RUNTIME_SERVICE, &user.acct).as_deref(),
+            Some(pre.as_bytes())
+        );
+        let q = Quarantine::new(HostOs::MacOs, w.tmp.path());
+        assert!(
+            q.list().iter().any(|m| m.reason == Reason::AddUnconfirmed),
+            "{:?}",
+            q.list()
+        );
+    }
+
+    /// A fake login that records what the quarantine holds while it runs.
+    #[cfg(unix)]
+    struct QuarantineProbe {
+        inner: MacClaude,
+        state: PathBuf,
+        seen: Mutex<Vec<(Reason, String)>>,
+    }
+
+    #[cfg(unix)]
+    impl ClaudeCli for QuarantineProbe {
+        fn run(&self, args: &[&str], dir: &Path, t: Duration, i: bool) -> io::Result<CliOutput> {
+            if args[..2] == ["auth", "login"] {
+                let q = Quarantine::new(HostOs::MacOs, &self.state);
+                *self.seen.lock().unwrap() = q
+                    .list()
+                    .into_iter()
+                    .map(|m| {
+                        let v = q.get(&m.fingerprint).unwrap().unwrap();
+                        (m.reason, v.expose().to_owned())
+                    })
+                    .collect();
+            }
+            self.inner.run(args, dir, t, i)
+        }
+    }
+
+    /// The unscoped item's pre-login value is on disk before the login
+    /// starts (a csm killed mid-login loses nothing), and the copy goes
+    /// once the finally block has put the item back.
+    #[cfg(unix)]
+    #[test]
+    fn the_pre_login_unscoped_value_is_filed_before_the_login_and_dropped_after() {
+        let fake = crate::orca::testsupport::FakeSecurity::install();
+        let w = world();
+        let user = w.user.clone();
+        let pre = creds_json("at-a", "rt-a", 1);
+        keychain::write_runtime_scoped(&pre, None, &user).unwrap();
+        let cli = QuarantineProbe {
+            inner: MacClaude {
+                user: user.clone(),
+                grant: creds_json("at-c", "rt-c", 5),
+            },
+            state: w.tmp.path().to_path_buf(),
+            seen: Mutex::new(Vec::new()),
+        };
+        let live = ScriptedLiveness::stopped();
+        let mut env = w.env(&live);
+        env.os = HostOs::MacOs;
+        let c = login_add(&env, &cli).unwrap();
+        assert!(c.leftover.is_none(), "{:?}", c.leftover);
+        assert_eq!(
+            *cli.seen.lock().unwrap(),
+            vec![(Reason::PreLogin, pre.clone())],
+            "filed before the login ran"
+        );
+        assert_eq!(
+            fake.get(keychain::RUNTIME_SERVICE, &user.acct).as_deref(),
+            Some(pre.as_bytes())
+        );
+        assert!(
+            Quarantine::new(HostOs::MacOs, w.tmp.path())
+                .list()
+                .is_empty()
+        );
+    }
+
     #[test]
     fn unscoped_restore_touches_only_what_the_login_changed() {
         use UnscopedRestore::*;
@@ -1834,6 +2432,67 @@ mod tests {
         assert_eq!(q.get(&list[0].fingerprint).unwrap().unwrap().expose(), pre);
     }
 
+    /// Orca comes up during the login and already lists the account: csm
+    /// wrote nothing, so this is a duplicate, as it is offline. The fresh
+    /// grant is filed, and the add is reported as refused, not "added".
+    #[cfg(unix)]
+    #[test]
+    fn a_login_orca_already_lists_is_a_duplicate_and_quarantines_the_grant() {
+        use crate::orca::testsupport::{FakeOrca, OrcaModel, model_handler};
+        use std::sync::Arc;
+        let model = Arc::new(Mutex::new(OrcaModel::default()));
+        let fake = FakeOrca::start(model_handler(model.clone()));
+        model.lock().unwrap().accounts = vec![record_json(
+            fake.user_data(),
+            "id-a",
+            "alice@example.com",
+            None,
+        )];
+        let tmp = tempfile::tempdir().unwrap();
+        let choice = crate::orca::userdata::data_file(fake.user_data());
+        let user = KeychainUser {
+            acct: "t".into(),
+            delete_accts: vec![],
+        };
+        let live = ScriptedLiveness::appears_at(0);
+        let env = AccountsEnv {
+            os: HostOs::Linux,
+            user_data: fake.user_data(),
+            data_file: &choice,
+            state: tmp.path(),
+            keychain_user: &user,
+            live: &live,
+            version_ok: true,
+            store_access_allowed: true,
+            lock_wait: Duration::from_secs(2),
+            redo: RedoOpts {
+                wait: Duration::from_millis(300),
+                poll: Duration::from_millis(20),
+            },
+            mutation_timeout: Duration::from_secs(2),
+        };
+        let grant = creds_json("at-a2", "rt-a2", 5);
+        let cli = FakeClaude {
+            creds: grant.clone(),
+            status: r#"{"email":"alice@example.com","organizationUuid":null}"#.into(),
+            calls: Mutex::new(Vec::new()),
+        };
+        let e = login_add(&env, &cli).unwrap_err().to_string();
+        let fp = crate::orca::quarantine::fingerprint(&grant);
+        assert!(e.contains("already added") && e.contains(&fp), "{e}");
+        let q = Quarantine::new(HostOs::Linux, tmp.path());
+        let list = q.list();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].reason, Reason::LoginNotAdded);
+        assert!(
+            fake.requests()
+                .iter()
+                .all(|r| r["method"] != "accounts.addClaudeFromConfigDir")
+        );
+        assert_eq!(model.lock().unwrap().accounts.len(), 1);
+        assert!(!cli.calls.lock().unwrap()[0].1.exists());
+    }
+
     #[cfg(unix)]
     #[test]
     fn remove_over_rpc_when_orca_runs() {
@@ -1865,7 +2524,7 @@ mod tests {
             store_access_allowed: true,
             lock_wait: Duration::from_secs(2),
             redo: RedoOpts::default(),
-            rpc_timeout: Duration::from_secs(2),
+            mutation_timeout: Duration::from_secs(2),
         };
         let c = remove(&env, "id-b").unwrap();
         assert_eq!(c.route, Route::Rpc);
@@ -1981,5 +2640,29 @@ mod tests {
         // id-b holds exactly this grant.
         purge_quarantine(&w.env(&live), &fp, "id-b").unwrap();
         assert!(q.list().is_empty());
+    }
+
+    /// Round 8: the fingerprint names only the Claude grant. An entry that
+    /// also holds MCP logins the stash lacks (a retired dir's copy) is not
+    /// superseded by the stash, so `--fix` keeps it.
+    #[test]
+    fn purge_quarantine_keeps_an_entry_with_logins_the_stash_lacks() {
+        let w = world();
+        let live = ScriptedLiveness::stopped();
+        let q = Quarantine::new(HostOs::Linux, w.tmp.path());
+        let mut v: serde_json::Value =
+            serde_json::from_str(&creds_json("id-b", "id-b", 1)).unwrap();
+        v["mcpOAuth"] = json!({"srv-a": {"accessToken": "mcp-tok"}});
+        let entry = v.to_string();
+        let fp = q
+            .file(&entry, Reason::ExtraLogins, "file", Some("id-b"), None, 1)
+            .unwrap()
+            .fingerprint()
+            .to_owned();
+        let err = purge_quarantine(&w.env(&live), &fp, "id-b").unwrap_err();
+        assert!(err.to_string().contains("mcpOAuth/srv-a"), "{err}");
+        assert!(!err.to_string().contains("mcp-tok"), "{err}");
+        assert_eq!(q.get(&fp).unwrap().unwrap().expose(), entry);
+        assert_eq!(q.list().len(), 1);
     }
 }

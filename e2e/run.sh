@@ -65,8 +65,12 @@ D="$HOME_DIR/.claude"
 STATE="$HOME_DIR/.local/state/csm"
 if [ "$HOST_OS" = mac ]; then
   UD="$HOME_DIR/Library/Application Support/orca"
+  # Case-insensitive: the late userData (see World.pm late_ud) is UD itself.
+  STASH_UD="$UD"
 else
   UD="$HOME_DIR/.config/orca"
+  # Orca keeps stashes under the late userData <appData>/Orca.
+  STASH_UD="$HOME_DIR/.config/Orca"
 fi
 FAKES="$REPO/e2e/fakes"
 BIN="$SANDBOX/bin"
@@ -146,7 +150,7 @@ if [ "$HOST_OS" = mac ]; then
   ORCA_EXE="$SANDBOX/Orca.app/Contents/MacOS/Orca"
 else
   mkdir -p "$SANDBOX/orca-app"
-  ORCA_EXE="$SANDBOX/orca-app/orca"
+  ORCA_EXE="$SANDBOX/orca-app/orca-ide"
 fi
 ln "$BIN/claude" "$ORCA_EXE" || exit 1
 

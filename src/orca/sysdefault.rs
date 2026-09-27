@@ -44,9 +44,15 @@ pub const FILE: &str = "system-default-auth.json";
 /// Cap on the snapshot and the runtime files it reads.
 const CAP: u64 = 64 * 1024 * 1024;
 
-/// `<userData>/claude-runtime-auth/system-default-auth.json`.
+/// `<late userData>/claude-runtime-auth/system-default-auth.json`. Orca
+/// resolves this dir per call after `app.setName('Orca')`
+/// (runtime-auth-file-storage.ts), so on a case-sensitive filesystem it
+/// sits under `<appData>/Orca`, not under the canonical userData `user_data`
+/// names (see [`super::userdata::late_user_data`]).
 pub fn snapshot_path(user_data: &Path) -> PathBuf {
-    user_data.join(DIR).join(FILE)
+    super::userdata::late_user_data(user_data)
+        .join(DIR)
+        .join(FILE)
 }
 
 // ─── shape ────────────────────────────────────────────────────────────────────
@@ -338,7 +344,12 @@ pub fn capture(
         OrcaError::Refused("cannot capture the current Claude Keychain credentials".into())
     })?;
     let text = jsjson::write_json_text(&v);
-    let dir = user_data.join(DIR);
+    // The snapshot's own parent: under the late userData, like the file
+    // (Orca's getRuntimeMetadataDir creates it there on every access).
+    let dir = path
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| super::userdata::late_user_data(user_data).join(DIR));
     super::fsx::guard(&dir).map_err(|e| OrcaError::io("refusing", &dir, e))?;
     std::fs::create_dir_all(&dir).map_err(|e| OrcaError::io("cannot create", &dir, e))?;
     if read_text(&path)?.is_some_and(|t| t.expose() == text) {
@@ -627,6 +638,71 @@ pub fn restore_after_crash(
     Ok(report)
 }
 
+// ─── preserve while Orca runs ─────────────────────────────────────────────────
+
+/// The snapshot's credential values worth keeping: every non-blank value
+/// the snapshot captured (file, scoped and legacy item) that is not
+/// `managed`, the grant the crashed switch materialized (its stash holds
+/// that one). Deduplicated, in the order file, scoped, legacy. Pure.
+pub fn snapshot_values(
+    snap: &Map<String, Value>,
+    managed: Option<&str>,
+) -> Vec<(&'static str, String)> {
+    let mut out: Vec<(&'static str, String)> = Vec::new();
+    let mut push = |name: &'static str, v: Option<String>| {
+        if let Some(v) = v
+            && !v.trim().is_empty()
+            && !managed.is_some_and(|m| same(m, &v))
+            && !out.iter().any(|(_, o)| same(o, &v))
+        {
+            out.push((name, v));
+        }
+    };
+    push("snapshot-file", str_of(snap.get("credentialsJson")));
+    for (name, kind) in [
+        ("snapshot-scoped-keychain", Kind::Scoped),
+        ("snapshot-legacy-keychain", Kind::Legacy),
+    ] {
+        if let KcValue::Captured(v) = read_keychain_value(Some(snap), kind) {
+            push(name, v);
+        }
+    }
+    out
+}
+
+/// File the system-default snapshot's grants in the quarantine without
+/// touching `D` or anything of Orca's. This is what csm does about a
+/// crashed switch from no account while Orca runs: csm never writes `D`
+/// behind a running Orca (Invariant 6), and Orca's next select would
+/// force-capture the half-written `D` over the snapshot, which may hold the
+/// only copy of the user's own login. Returns the fingerprints filed (or
+/// already there); nothing when there is no valid snapshot.
+pub fn preserve_snapshot(
+    user_data: &Path,
+    managed: Option<&str>,
+    quarantine: &super::quarantine::Quarantine,
+    now_ms: i64,
+) -> Result<Vec<String>, OrcaError> {
+    let Some(snap) = read_snapshot(user_data) else {
+        return Ok(Vec::new());
+    };
+    snapshot_values(&snap, managed)
+        .into_iter()
+        .map(|(source, v)| {
+            quarantine
+                .file(
+                    &v,
+                    super::quarantine::Reason::CrashRecovery,
+                    source,
+                    None,
+                    None,
+                    now_ms,
+                )
+                .map(|f| f.fingerprint().to_owned())
+        })
+        .collect()
+}
+
 // ─── tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -682,6 +758,41 @@ mod tests {
             surface_action(Some("C"), Some(None), None, false),
             KeepNewer
         );
+    }
+
+    #[test]
+    fn snapshot_values_skip_blank_managed_and_duplicate_values() {
+        let snap = json!({
+            "credentialsJson": "S",
+            "configOauthAccount": null,
+            "scopedKeychainCredentialsJson": "S\n",
+            "legacyKeychainCredentialsJson": "L",
+            "scopedKeychainCredentialsCaptured": true,
+            "legacyKeychainCredentialsCaptured": true,
+            "capturedAt": 1
+        });
+        let m = snap.as_object().unwrap();
+        assert_eq!(
+            snapshot_values(m, Some("B")),
+            vec![
+                ("snapshot-file", "S".to_owned()),
+                ("snapshot-legacy-keychain", "L".to_owned())
+            ]
+        );
+        // The crashed switch's own grant is in its stash already.
+        assert_eq!(
+            snapshot_values(m, Some("L")),
+            vec![("snapshot-file", "S".to_owned())]
+        );
+        // An uncaptured item is unknown, a blank value is nothing.
+        let snap = json!({
+            "credentialsJson": " ",
+            "configOauthAccount": null,
+            "legacyKeychainCredentialsJson": "L",
+            "legacyKeychainCredentialsCaptured": false,
+            "capturedAt": 1
+        });
+        assert!(snapshot_values(snap.as_object().unwrap(), None).is_empty());
     }
 
     #[test]
@@ -897,6 +1008,39 @@ mod tests {
         .unwrap();
         assert_eq!(r, Captured::Written);
         assert!(read_snapshot(&ud).is_some());
+    }
+
+    /// A userData named `orca` on a case-sensitive filesystem: the snapshot
+    /// goes under the late sibling `Orca`, and the capture creates that
+    /// dir itself (Orca may never have touched it, for example when csm
+    /// added every account offline). Nothing lands under the canonical dir.
+    /// On a case-insensitive filesystem both names are one dir and the
+    /// capture still writes the file.
+    #[cfg(unix)]
+    #[test]
+    fn capture_creates_the_late_snapshot_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ud = tmp.path().join("orca");
+        std::fs::create_dir_all(ud.join("profiles")).unwrap();
+        let d = tmp.path().join("D");
+        std::fs::create_dir_all(&d).unwrap();
+        let paths = runtime_paths(Some(d.to_str().unwrap()), tmp.path(), |p| p.exists());
+        std::fs::write(&paths.credentials_path, "SYS").unwrap();
+        let user = KeychainUser {
+            acct: "t".into(),
+            delete_accts: vec!["t".into()],
+        };
+        let late = crate::orca::userdata::late_user_data(&ud);
+        let r = capture_for_managed_entry(&ud, HostOs::Linux, &paths, &user, "SYS", 1).unwrap();
+        assert_eq!(r, Captured::Written);
+        assert_eq!(snapshot_path(&ud), late.join(DIR).join(FILE));
+        assert!(snapshot_path(&ud).is_file());
+        if late != ud {
+            assert!(
+                !ud.join(DIR).exists(),
+                "no stray snapshot dir under the canonical userData"
+            );
+        }
     }
 
     #[cfg(unix)]

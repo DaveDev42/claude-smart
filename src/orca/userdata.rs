@@ -27,6 +27,9 @@
 //!   `local-default`, Orca migrates a legacy `<userData>/orca-data.json` into
 //!   the profile dir at start when the profile file is missing (ESr); csm
 //!   reads that legacy file as a fallback view and never writes it.
+//! - The stash root and the system-default snapshot dir are NOT under this
+//!   canonical userData but under the late one Orca resolves after
+//!   `app.setName('Orca')`: [`late_user_data`] (Orca 1.4.214).
 
 use std::path::{Path, PathBuf};
 
@@ -437,10 +440,128 @@ pub fn data_file(user_data: &Path) -> DataFileChoice {
     choice
 }
 
-/// `<userData>/claude-accounts`, the stash root (per userData, not per Orca
-/// profile).
+// ─── the late userData ───────────────────────────────────────────────────────
+//
+// Orca pins `orca-data.json`, `orca-runtime.json` and the profile index to
+// the userData it captures at start (`initDataPath`,
+// `getCanonicalUserDataPath`). Two account roots are NOT pinned: the stash
+// root (`getClaudeManagedAccountsRoot`, managed-auth-path.ts) and the
+// system-default snapshot dir (`claude-runtime-auth`,
+// runtime-auth-file-storage.ts) call `app.getPath('userData')` on every use,
+// which runs after the post-ready `app.setName('Orca')`. Orca's own comment
+// (user-data-path.ts) says that call "flips path case", which would put the
+// account roots under `<appData>/Orca`, a second dir on a case-sensitive
+// filesystem.
+//
+// In practice the flip does not happen: Electron resolves userData once
+// (Chromium's PathService caches it, and Orca reads it before `setName`),
+// and a live macOS Orca 1.4.212 writes lowercase `.../orca/claude-accounts/`
+// record paths and `.../orca/daemon/` socket paths long after `setName`.
+// And if the flip were real, Orca's first start would create
+// `<appData>/Orca/daemon` (`getDaemonRuntimeDir` → `ensurePrivateDir`), so
+// "the canonical dir exists and the late one does not" can only mean the
+// canonical dir is where the stashes are. csm therefore uses the late
+// sibling only when the disk shows Orca put its account roots there: the
+// canonical dir is missing, or both exist and only the late one holds
+// `claude-accounts`, or both hold it (a flip Orca actually made).
+
+/// How the late sibling relates to the canonical userData on disk.
+// Only the unix probe builds the on-disk answers; Windows never asks.
+#[cfg_attr(not(unix), allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LateProbe {
+    /// Both names open the same dir: a case-insensitive filesystem.
+    SameDir,
+    /// Both exist and are different dirs.
+    OtherDir,
+    /// The canonical dir exists and the late one does not: the filesystem
+    /// tells the two names apart.
+    LateMissing,
+    /// Only the late dir exists.
+    CanonicalMissing,
+    /// Neither exists, or a probe failed: the filesystem cannot be asked.
+    Unknown,
+}
+
+/// Does Orca use the late sibling `<appData>/Orca` for its account roots?
+/// Pure. Windows never does: its filesystem is case-insensitive by default,
+/// and csm does not compare paths there by identity. Elsewhere only when
+/// the disk shows it (see the section note): `LateMissing` and `Unknown`
+/// keep the canonical dir, which is safe under either reading of `setName`
+/// (before Orca's first start there is no stash anywhere).
+pub fn use_late_sibling(os: HostOs, probe: LateProbe) -> bool {
+    match (os, probe) {
+        (HostOs::Windows, _) => false,
+        (_, LateProbe::OtherDir | LateProbe::CanonicalMissing) => true,
+        (_, LateProbe::SameDir | LateProbe::LateMissing | LateProbe::Unknown) => false,
+    }
+}
+
+/// Both dirs exist and differ: which one holds Orca's account roots? Pure.
+/// The late one, unless only the canonical one has `claude-accounts` (the
+/// late dir then exists for some other reason, and Orca never flipped).
+pub fn other_dir_uses_late(canonical_has_accounts: bool, late_has_accounts: bool) -> bool {
+    !(canonical_has_accounts && !late_has_accounts)
+}
+
+/// `<parent>/Orca` when `user_data`'s last component is exactly `orca`
+/// (Electron's name before `setName`), else `None`: a dev or sandbox
+/// userData is pinned with `setPath` and does not move. Pure.
+pub fn late_sibling(user_data: &Path) -> Option<PathBuf> {
+    (user_data.file_name()? == "orca").then(|| user_data.with_file_name("Orca"))
+}
+
+#[cfg(unix)]
+fn probe_late(canonical: &Path, late: &Path) -> LateProbe {
+    use std::os::unix::fs::MetadataExt;
+    let found = |p: &Path| match std::fs::metadata(p) {
+        Ok(m) => Ok(Some((m.dev(), m.ino()))),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e),
+    };
+    match (found(canonical), found(late)) {
+        (Ok(Some(a)), Ok(Some(b))) if a == b => LateProbe::SameDir,
+        (Ok(Some(_)), Ok(Some(_))) => LateProbe::OtherDir,
+        (Ok(Some(_)), Ok(None)) => LateProbe::LateMissing,
+        (Ok(None), Ok(Some(_))) => LateProbe::CanonicalMissing,
+        _ => LateProbe::Unknown,
+    }
+}
+
+#[cfg(not(unix))]
+fn probe_late(_canonical: &Path, _late: &Path) -> LateProbe {
+    LateProbe::Unknown
+}
+
+/// The userData Orca's account roots live under (see the section note).
+/// Equals `user_data` unless a case-sensitive filesystem shows Orca put its
+/// account roots under the sibling `Orca`.
+pub fn late_user_data(user_data: &Path) -> PathBuf {
+    late_user_data_for(HostOs::current(), user_data)
+}
+
+fn late_user_data_for(os: HostOs, user_data: &Path) -> PathBuf {
+    let Some(late) = late_sibling(user_data) else {
+        return user_data.to_path_buf();
+    };
+    let probe = probe_late(user_data, &late);
+    let use_late = use_late_sibling(os, probe)
+        && (probe != LateProbe::OtherDir
+            || other_dir_uses_late(
+                user_data.join("claude-accounts").is_dir(),
+                late.join("claude-accounts").is_dir(),
+            ));
+    if use_late {
+        late
+    } else {
+        user_data.to_path_buf()
+    }
+}
+
+/// `<late userData>/claude-accounts`, the stash root (per userData, not per
+/// Orca profile). `user_data` is the canonical dir; see [`late_user_data`].
 pub fn claude_accounts_root(user_data: &Path) -> PathBuf {
-    user_data.join("claude-accounts")
+    late_user_data(user_data).join("claude-accounts")
 }
 
 // ─── tests ────────────────────────────────────────────────────────────────────
@@ -717,5 +838,65 @@ mod tests {
             data_file(ud).path,
             ud.join("profiles/local-5/orca-data.json")
         );
+    }
+
+    #[test]
+    fn the_late_userdata_rule() {
+        assert_eq!(
+            late_sibling(Path::new("/home/example/.config/orca")),
+            Some(PathBuf::from("/home/example/.config/Orca"))
+        );
+        assert_eq!(late_sibling(Path::new("/tmp/sandbox-ud")), None);
+        assert_eq!(late_sibling(Path::new("/home/example/.config/Orca")), None);
+        for os in [HostOs::MacOs, HostOs::Linux] {
+            for p in [LateProbe::OtherDir, LateProbe::CanonicalMissing] {
+                assert!(use_late_sibling(os, p), "{os:?} {p:?}");
+            }
+            // The canonical dir exists and `Orca` does not: Orca's late
+            // userData is the canonical dir (it would have created
+            // `Orca/daemon` otherwise). Nothing on disk: no stash yet.
+            for p in [
+                LateProbe::SameDir,
+                LateProbe::LateMissing,
+                LateProbe::Unknown,
+            ] {
+                assert!(!use_late_sibling(os, p), "{os:?} {p:?}");
+            }
+        }
+        for p in [
+            LateProbe::SameDir,
+            LateProbe::OtherDir,
+            LateProbe::LateMissing,
+            LateProbe::CanonicalMissing,
+            LateProbe::Unknown,
+        ] {
+            assert!(!use_late_sibling(HostOs::Windows, p), "{p:?}");
+        }
+        assert!(other_dir_uses_late(false, true));
+        assert!(other_dir_uses_late(true, true));
+        assert!(other_dir_uses_late(false, false));
+        assert!(!other_dir_uses_late(true, false));
+        // A fresh host with neither dir keeps the canonical one.
+        let dir = tempfile::tempdir().unwrap();
+        let ud = dir.path().join("fresh").join("orca");
+        assert_eq!(late_user_data_for(HostOs::Linux, &ud), ud);
+        assert_eq!(late_user_data_for(HostOs::Windows, &ud), ud);
+    }
+
+    /// Round 8: a Linux host where Orca keeps its stashes under the
+    /// canonical `~/.config/orca` and no `~/.config/Orca` exists must look
+    /// for them there, and a stray `Orca` dir without `claude-accounts`
+    /// does not move the root either.
+    #[test]
+    fn stashes_under_the_canonical_dir_stay_there() {
+        let dir = tempfile::tempdir().unwrap();
+        let ud = dir.path().join(".config").join("orca");
+        std::fs::create_dir_all(ud.join("claude-accounts").join("id-1").join("auth")).unwrap();
+        std::fs::create_dir_all(ud.join("daemon")).unwrap();
+        assert_eq!(late_user_data_for(HostOs::Linux, &ud), ud);
+        assert_eq!(claude_accounts_root(&ud), ud.join("claude-accounts"));
+        let late = dir.path().join(".config").join("Orca");
+        std::fs::create_dir_all(late.join("logs")).unwrap();
+        assert_eq!(late_user_data_for(HostOs::Linux, &ud), ud);
     }
 }

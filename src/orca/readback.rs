@@ -654,7 +654,7 @@ fn record_inputs<'a>(rb: &ReadBack<'a>) -> Result<Vec<RecordInput<'a>>, OrcaErro
 }
 
 /// Where the profile veto sends a grant.
-enum Veto {
+pub(crate) enum Veto {
     /// The profile names the matched stash's account.
     Owner,
     /// Filed under this reason, with the answer.
@@ -663,7 +663,10 @@ enum Veto {
     Unauthorized,
 }
 
-fn profile_veto(
+/// The profile veto (design §3 step 3): does `grant`'s access token
+/// profile as `stash_uuid`? `Err` when the endpoint gave no usable answer
+/// ("network unavailable" is not "mismatch").
+pub(crate) fn profile_veto(
     http: &dyn OauthHttp,
     grant: &str,
     stash_uuid: Option<&str>,

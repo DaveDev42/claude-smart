@@ -100,6 +100,10 @@ pub(crate) fn snapshot() -> Vec<ProcInfo> {
     let sys = System::new_all();
     sys.processes()
         .iter()
+        // On Linux sysinfo also lists every userland thread as an entry of
+        // its own (pid = tid, same exe, parent = the process): a thread of
+        // csm itself would read as "another csm process".
+        .filter(|(_, proc_)| !matches!(proc_.thread_kind(), Some(sysinfo::ThreadKind::Userland)))
         .map(|(pid, proc_)| ProcInfo {
             pid: pid.as_u32(),
             ppid: proc_.parent().map(|p| p.as_u32()),
@@ -113,6 +117,29 @@ pub(crate) fn snapshot() -> Vec<ProcInfo> {
 
 #[cfg(test)]
 mod tests {
+    /// Round 8: this process's own threads are not processes in the table
+    /// (Linux, where sysinfo lists them), so the migrate gate's
+    /// `other_csm` never counts csm's own reader thread.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_snapshot_leaves_out_threads() {
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        let (tid_tx, tid_rx) = std::sync::mpsc::channel();
+        let t = std::thread::spawn(move || {
+            tid_tx.send(nix::unistd::gettid().as_raw() as u32).unwrap();
+            let _ = rx.recv();
+        });
+        let tid = tid_rx.recv().unwrap();
+        let me = std::process::id();
+        let table = super::snapshot();
+        let _ = tx.send(());
+        t.join().unwrap();
+        assert_ne!(tid, me);
+        assert!(table.iter().any(|p| p.pid == me), "this process is listed");
+        assert!(!table.iter().any(|p| p.pid == tid), "thread {tid} listed");
+        assert_eq!(crate::cmd::migrate::other_csm(&table, me), None);
+    }
+
     #[cfg(unix)]
     use super::{probe, snapshot};
 

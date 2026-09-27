@@ -220,6 +220,37 @@ pub fn stash_identities(
         .collect()
 }
 
+/// The stash identity of every stash under `<userData>/claude-accounts/`
+/// that no record in `records` names and that passes Q2i (its marker names
+/// its dir). On a SQLite-backed profile `orca-data.json` is an export Orca
+/// rewrites only when it quits, so an account added while Orca runs has a
+/// stash but no record there yet. Read-only; unreadable dirs are skipped.
+pub fn unlisted_stash_identities(
+    user_data: &Path,
+    records: &[AccountRecord],
+) -> Vec<(String, Option<OauthIdentity>)> {
+    let root = super::userdata::claude_accounts_root(user_data);
+    let Ok(rd) = std::fs::read_dir(&root) else {
+        return Vec::new();
+    };
+    let mut out: Vec<(String, Option<OauthIdentity>)> = rd
+        .flatten()
+        .filter_map(|e| e.file_name().to_str().map(str::to_owned))
+        .filter(|id| !records.iter().any(|r| &r.id == id))
+        .filter_map(|id| {
+            let s = Stash::open(user_data, &id, None).ok()?;
+            let ident = s
+                .oauth_account()
+                .ok()
+                .flatten()
+                .map(|v| OauthIdentity::from_value(&v));
+            Some((id, ident))
+        })
+        .collect();
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    out
+}
+
 /// `D`'s account: its identity mapped to a stash id.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimeAccount {

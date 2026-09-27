@@ -217,6 +217,15 @@ impl WriteOpts {
         tmp: TmpStyle::Uuid,
         durable: false,
     };
+
+    /// [`WriteOpts::PRIVATE`], fsynced (the file, then its dir): for a
+    /// file whose loss after a power cut loses a credential or a pending
+    /// repair (a quarantined grant whose source is removed right after, the
+    /// switch journal).
+    pub const PRIVATE_DURABLE: WriteOpts = WriteOpts {
+        durable: true,
+        ..WriteOpts::PRIVATE
+    };
 }
 
 /// A written, not yet renamed temp file. Dropping it removes the file.
@@ -479,6 +488,22 @@ mod tests {
         assert!(name.starts_with(&format!(".credentials.json.{}.", std::process::id())));
         assert!(name.ends_with(".tmp"));
         assert_eq!(name.matches('-').count(), 4, "a hyphenated uuid");
+    }
+
+    /// Quarantined grants and the switch journal are fsynced: their source
+    /// is overwritten or removed right after they are written.
+    #[test]
+    fn the_durable_private_write_is_private_and_fsynced() {
+        let d = WriteOpts::PRIVATE_DURABLE;
+        assert!(d.durable && !WriteOpts::PRIVATE.durable);
+        assert_eq!(d.mode, 0o600);
+        assert!(matches!(d.tmp, TmpStyle::Uuid));
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("q.json");
+        write_atomic(&p, b"x", d).unwrap();
+        assert_eq!(std::fs::read(&p).unwrap(), b"x");
+        #[cfg(unix)]
+        assert_eq!(mode_of(&p), Some(0o600));
     }
 
     #[test]

@@ -13,7 +13,9 @@
 //!   process named like Orca whose executable cannot be read).
 //!
 //! Orca's main executable: macOS `<bundle>.app/Contents/MacOS/Orca`, Linux
-//! `orca` (INFERRED from electron-builder's naming), Windows `Orca.exe`; in
+//! `orca-ide` (electron-builder's `linux.executableName`, chosen so the
+//! package does not claim GNOME Orca's `/usr/bin/orca`; `orca`/`Orca` still
+//! match, which only errs toward "running"), Windows `Orca.exe`; in
 //! every case without a `--type=` argument (renderer, GPU, utility and
 //! crashpad helpers carry one) and without a script argument (the PTY
 //! daemon runs `daemon-entry.js` under `ELECTRON_RUN_AS_NODE`, and Orca's CLI
@@ -122,7 +124,7 @@ fn is_helper_argv(cmd: &[std::ffi::OsString]) -> bool {
 fn name_is(os: HostOs, name: &str) -> bool {
     match os {
         HostOs::MacOs => name == "Orca",
-        HostOs::Linux => name == "orca" || name == "Orca",
+        HostOs::Linux => name == "orca-ide" || name == "orca" || name == "Orca",
         HostOs::Windows => name.eq_ignore_ascii_case("Orca.exe"),
     }
 }
@@ -544,9 +546,21 @@ mod tests {
         let p = proc_info(1, "zsh", None, &[]);
         assert_eq!(orca_main_match(HostOs::MacOs, &p), MainMatch::No);
 
-        let lin = proc_info(1, "orca", Some("/opt/Orca/orca"), &[]);
+        // Orca ships its Linux main as `orca-ide` (electron-builder
+        // `linux.executableName`), deb/rpm under /opt/Orca and AppImage
+        // under a /tmp/.mount_* dir.
+        let lin = proc_info(1, "orca-ide", Some("/opt/Orca/orca-ide"), &[]);
         assert_eq!(orca_main_match(HostOs::Linux, &lin), MainMatch::Yes);
-        let lin = proc_info(1, "orca", Some("/opt/Orca/orca"), &["--type=gpu-process"]);
+        let lin = proc_info(1, "orca-ide", Some("/tmp/.mount_OrcaAb/orca-ide"), &[]);
+        assert_eq!(orca_main_match(HostOs::Linux, &lin), MainMatch::Yes);
+        let lin = proc_info(1, "orca-ide", None, &[]);
+        assert_eq!(orca_main_match(HostOs::Linux, &lin), MainMatch::Unknown);
+        let lin = proc_info(
+            1,
+            "orca-ide",
+            Some("/opt/Orca/orca-ide"),
+            &["--type=gpu-process"],
+        );
         assert_eq!(orca_main_match(HostOs::Linux, &lin), MainMatch::No);
         let win = proc_info(1, "Orca.exe", Some("C:\\Programs\\Orca\\Orca.exe"), &[]);
         assert_eq!(orca_main_match(HostOs::Windows, &win), MainMatch::Yes);
@@ -649,6 +663,16 @@ mod tests {
         );
         assert!(!r.running);
         assert!(r.runtime.is_some(), "the metadata is still reported");
+
+        // Linux: the runtime pid's executable is `.../orca-ide`.
+        let lin = proc_info(900, "orca-ide", Some("/opt/Orca/orca-ide"), &[]);
+        let facts = FakeProcs::default().with_hidden(lin);
+        let mut i = inputs(SingletonProbe::Absent, RuntimeProbe::Present(meta(900)));
+        i.os = HostOs::Linux;
+        let r = classify(&i, &facts);
+        assert!(r.running, "{:?}", r.reasons);
+        assert_eq!(r.reasons[0], RunningReason::RuntimePid { pid: 900 });
+        assert_eq!(r.main_exe.as_deref(), Some(Path::new("/opt/Orca/orca-ide")));
 
         // An unreadable runtime file fails closed.
         let r = classify(

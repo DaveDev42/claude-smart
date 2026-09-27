@@ -16,8 +16,15 @@
 //!
 //! Filing a grant whose fingerprint is already quarantined keeps the
 //! fresher of the two (by `expiresAt`, Orca's readFreshness); an entry is
-//! never replaced by an older or equally fresh one.
+//! never replaced by an older or equally fresh one. The fingerprint names
+//! only the Claude grant, but the blob is Claude Code's whole secure-storage
+//! entry, which also holds MCP servers' OAuth logins (`mcpOAuth`): see
+//! [`side_state`]. A copy whose side state the entry lacks replaces it (the
+//! refresh token is the same, so only a derivable access token can be
+//! older); an entry whose side state the new copy lacks is kept; when each
+//! holds side state the other lacks, filing refuses, and nothing is lost.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -44,6 +51,49 @@ pub fn fingerprint(creds: &str) -> String {
             &hex_lower(&Sha256::digest(creds.as_bytes()))[..16]
         ),
     }
+}
+
+/// The Claude grant's key in Claude Code's credential blob.
+const GRANT_KEY: &str = "claudeAiOauth";
+
+/// What a credential blob holds beside its Claude grant: Claude Code keeps
+/// MCP servers' OAuth logins (`mcpOAuth`) in the same secure-storage entry.
+/// One short digest per entry, keyed `<key>` or, for an object's children
+/// (one per MCP server), `<key>/<child>`. Never holds a secret. Empty for a
+/// blob that is not a JSON object. Pure.
+pub fn side_state(creds: &str) -> BTreeMap<String, String> {
+    let digest = |v: &serde_json::Value| {
+        let text = serde_json::to_string(v).unwrap_or_default();
+        hex_lower(&Sha256::digest(text.as_bytes()))[..16].to_owned()
+    };
+    let mut out = BTreeMap::new();
+    let Ok(serde_json::Value::Object(map)) = serde_json::from_str::<serde_json::Value>(creds)
+    else {
+        return out;
+    };
+    for (k, v) in &map {
+        match v {
+            _ if k == GRANT_KEY => {}
+            serde_json::Value::Null => {}
+            serde_json::Value::Object(children) => {
+                for (c, cv) in children {
+                    out.insert(format!("{k}/{c}"), digest(cv));
+                }
+            }
+            other => {
+                out.insert(k.clone(), digest(other));
+            }
+        }
+    }
+    out
+}
+
+/// The entries of side state `a` that `b` lacks or holds differently. Pure.
+pub fn uncovered(a: &BTreeMap<String, String>, b: &BTreeMap<String, String>) -> Vec<String> {
+    a.iter()
+        .filter(|(k, v)| b.get(*k) != Some(*v))
+        .map(|(k, _)| k.clone())
+        .collect()
 }
 
 /// Why a grant was quarantined.
@@ -79,6 +129,22 @@ pub enum Reason {
     /// A runtime grant the recovery of a crashed switch from no account
     /// displaced while putting the system default back.
     CrashRecovery,
+    /// A fresh login's grant that Orca, started during `accounts add`, did
+    /// not confirm taking, filed before the login dir is cleaned up.
+    AddUnconfirmed,
+    /// A fresh login's grant whose add failed after the capture (the store
+    /// refused the record, or the account had no email), filed before the
+    /// login dir is cleaned up.
+    LoginNotAdded,
+    /// The unscoped runtime item's value from before an `accounts add`
+    /// login, filed before the login runs so a csm killed mid-login does
+    /// not lose it. Removed once the item is back; an entry that stays
+    /// means the login was interrupted before its cleanup ran.
+    PreLogin,
+    /// A retired config dir's copy of its account's grant that also holds
+    /// side state (MCP servers' OAuth logins) the account's stash lacks.
+    /// `accounts doctor --fix` keeps it until the stash holds that too.
+    ExtraLogins,
 }
 
 /// The secret-free index entry.
@@ -115,6 +181,20 @@ impl Filed {
         match self {
             Filed::New(f) | Filed::Replaced(f) | Filed::Kept(f) => f,
         }
+    }
+}
+
+/// Pure: whether a copy of an entry's grant replaces it (`Some(true)`),
+/// leaves it (`Some(false)`), or cannot be filed without losing side state
+/// (`None`). `new_extra` / `old_extra`: the copy / the entry holds side
+/// state the other lacks. The refresh token is the same, so side state
+/// outranks freshness, which only an access token can differ in.
+fn side_choice(fresher: bool, new_extra: bool, old_extra: bool) -> Option<bool> {
+    match (new_extra, old_extra) {
+        (true, true) => None,
+        (true, false) => Some(true),
+        (false, true) => Some(false),
+        (false, false) => Some(fresher),
     }
 }
 
@@ -160,7 +240,7 @@ impl Quarantine {
             HostOs::MacOs => Ok(keychain::add_password(SERVICE, fp, creds)?),
             HostOs::Linux | HostOs::Windows => {
                 let p = self.secret_path(fp);
-                fsx::write_atomic(&p, creds.as_bytes(), WriteOpts::PRIVATE)
+                fsx::write_atomic(&p, creds.as_bytes(), WriteOpts::PRIVATE_DURABLE)
                     .map_err(|e| OrcaError::io("cannot write", &p, e))
             }
         }
@@ -168,7 +248,9 @@ impl Quarantine {
 
     /// File `creds`. The secret is written (and, on macOS, read back) before
     /// the index entry, so a crash leaves at worst a secret without an index
-    /// line, never an index line without its secret.
+    /// line, never an index line without its secret. A later filing that
+    /// keeps the stored secret writes its missing (or unreadable) index
+    /// entry, so such a secret does not stay invisible to `accounts doctor`.
     pub fn file(
         &self,
         creds: &str,
@@ -182,25 +264,44 @@ impl Quarantine {
             .map_err(|e| OrcaError::io("cannot create", &self.dir, e))?;
         let fp = fingerprint(creds);
         let existing = self.get(&fp)?;
-        let outcome = match &existing {
-            Some(old) if old.expose() == creds => return Ok(Filed::Kept(fp)),
+        // `kept`: the stored secret stays; the index describes it.
+        let (outcome, kept) = match &existing {
+            Some(old) if old.expose() == creds => (Filed::Kept(fp.clone()), Some(old)),
             Some(old) => {
                 let fresher = match (read_freshness(creds), read_freshness(old.expose())) {
                     (Some(n), Some(o)) => n > o,
                     (Some(_), None) => true,
                     _ => false,
                 };
-                if !fresher {
-                    return Ok(Filed::Kept(fp));
+                let (new_side, old_side) = (side_state(creds), side_state(old.expose()));
+                match side_choice(
+                    fresher,
+                    !uncovered(&new_side, &old_side).is_empty(),
+                    !uncovered(&old_side, &new_side).is_empty(),
+                ) {
+                    Some(true) => (Filed::Replaced(fp.clone()), None),
+                    Some(false) => (Filed::Kept(fp.clone()), Some(old)),
+                    None => {
+                        return Err(OrcaError::Refused(format!(
+                            "quarantine entry {fp} and this copy of the same grant each hold MCP \
+                             logins the other lacks; nothing filed"
+                        )));
+                    }
                 }
-                Filed::Replaced(fp.clone())
             }
-            None => Filed::New(fp.clone()),
+            None => (Filed::New(fp.clone()), None),
         };
-        self.put_secret(&fp, creds)?;
+        let described = match kept {
+            Some(_) if self.meta_of(&fp).is_some() => return Ok(outcome),
+            Some(old) => old.expose(),
+            None => {
+                self.put_secret(&fp, creds)?;
+                creds
+            }
+        };
         let meta = Meta {
             fingerprint: fp.clone(),
-            expires_at: read_freshness(creds),
+            expires_at: read_freshness(described),
             reason,
             source: source.to_owned(),
             matched_account: matched_account.map(str::to_owned),
@@ -211,9 +312,16 @@ impl Quarantine {
         let text = serde_json::to_vec_pretty(&meta)
             .map_err(|e| OrcaError::Invalid(format!("quarantine index: {e}")))?;
         let mp = self.meta_path(&fp);
-        fsx::write_atomic(&mp, &text, WriteOpts::PRIVATE)
+        fsx::write_atomic(&mp, &text, WriteOpts::PRIVATE_DURABLE)
             .map_err(|e| OrcaError::io("cannot write", &mp, e))?;
         Ok(outcome)
+    }
+
+    /// The index entry for `fp`, when it exists and parses as that entry.
+    fn meta_of(&self, fp: &str) -> Option<Meta> {
+        let b = super::read_capped_bytes(&self.meta_path(fp), ENTRY_CAP).ok()??;
+        let m: Meta = serde_json::from_slice(&b).ok()?;
+        (m.fingerprint == fp).then_some(m)
     }
 
     /// Every index entry, sorted by fingerprint. Unreadable entries are
@@ -236,6 +344,21 @@ impl Quarantine {
             .collect();
         out.sort_by(|a, b| a.fingerprint.cmp(&b.fingerprint));
         out
+    }
+
+    /// Rewrite entry `fp`'s reason, keeping its secret and every other
+    /// index field. `Ok(false)` when there is no such entry.
+    pub fn set_reason(&self, fp: &str, reason: Reason) -> Result<bool, OrcaError> {
+        let Some(mut meta) = self.meta_of(fp) else {
+            return Ok(false);
+        };
+        meta.reason = reason;
+        let text = serde_json::to_vec_pretty(&meta)
+            .map_err(|e| OrcaError::Invalid(format!("quarantine index: {e}")))?;
+        let mp = self.meta_path(fp);
+        fsx::write_atomic(&mp, &text, WriteOpts::PRIVATE_DURABLE)
+            .map_err(|e| OrcaError::io("cannot write", &mp, e))?;
+        Ok(true)
     }
 
     /// Delete entry `fp` (after `accounts doctor` attributed it).
@@ -272,6 +395,48 @@ mod tests {
         let no_rt = r#"{"claudeAiOauth":{"accessToken":"at"}}"#;
         assert!(fingerprint(no_rt).starts_with("raw-"));
         assert!(!fingerprint(&a).contains("rt-1"));
+    }
+
+    /// A crash between the secret and its index line leaves a secret that
+    /// `list` cannot see. Filing the same grant again keeps the secret and
+    /// writes the missing line, and a line that no longer parses is
+    /// rewritten too.
+    #[test]
+    fn refiling_a_kept_grant_restores_its_missing_index_entry() {
+        let tmp = tempfile::tempdir().unwrap();
+        let q = Quarantine::new(HostOs::Linux, tmp.path());
+        let grant = creds_json("at-1", "rt-1", 1000);
+        let f = q
+            .file(&grant, Reason::NoMatch, "file", None, None, 5)
+            .unwrap();
+        let fp = f.fingerprint().to_owned();
+        std::fs::remove_file(q.meta_path(&fp)).unwrap();
+        assert!(q.list().is_empty());
+        assert_eq!(
+            q.file(&grant, Reason::LoginNotAdded, "login", None, None, 6)
+                .unwrap(),
+            Filed::Kept(fp.clone())
+        );
+        let list = q.list();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].fingerprint, fp);
+        assert_eq!(list[0].expires_at, Some(1000.0));
+        assert_eq!(list[0].reason, Reason::LoginNotAdded);
+        // An older grant with the same refresh token keeps the stored one,
+        // and the rewritten line describes the stored one.
+        std::fs::write(q.meta_path(&fp), "{").unwrap();
+        let older = creds_json("at-0", "rt-1", 500);
+        assert_eq!(
+            q.file(&older, Reason::NoMatch, "file", None, None, 7)
+                .unwrap(),
+            Filed::Kept(fp.clone())
+        );
+        assert_eq!(q.get(&fp).unwrap().unwrap().expose(), grant);
+        assert_eq!(q.list()[0].expires_at, Some(1000.0));
+        // A present line is left as it is.
+        q.file(&grant, Reason::Rotated, "refresh", None, None, 8)
+            .unwrap();
+        assert_eq!(q.list()[0].reason, Reason::NoMatch);
     }
 
     #[test]
@@ -321,6 +486,91 @@ mod tests {
         }
         q.remove(f.fingerprint()).unwrap();
         assert!(q.list().is_empty() && q.get(f.fingerprint()).unwrap().is_none());
+    }
+
+    /// A blob with MCP logins beside the grant: `creds_json` plus
+    /// `mcpOAuth` entries `server -> token`.
+    fn with_mcp(base: &str, servers: &[(&str, &str)]) -> String {
+        let mut v: serde_json::Value = serde_json::from_str(base).unwrap();
+        let m: serde_json::Map<String, serde_json::Value> = servers
+            .iter()
+            .map(|(k, t)| ((*k).to_owned(), serde_json::json!({"accessToken": t})))
+            .collect();
+        v["mcpOAuth"] = serde_json::Value::Object(m);
+        v.to_string()
+    }
+
+    #[test]
+    fn side_state_names_what_sits_beside_the_grant() {
+        let plain = creds_json("at", "rt", 1);
+        assert!(side_state(&plain).is_empty());
+        assert!(side_state("not json").is_empty());
+        let one = with_mcp(&plain, &[("srv-a", "mcp-tok-a")]);
+        let two = with_mcp(&plain, &[("srv-a", "mcp-tok-a"), ("srv-b", "mcp-tok-b")]);
+        let side = side_state(&two);
+        assert_eq!(
+            side.keys().cloned().collect::<Vec<_>>(),
+            vec!["mcpOAuth/srv-a", "mcpOAuth/srv-b"]
+        );
+        assert!(!format!("{side:?}").contains("mcp-tok"));
+        assert!(uncovered(&side_state(&one), &side_state(&two)).is_empty());
+        assert_eq!(
+            uncovered(&side_state(&two), &side_state(&one)),
+            vec!["mcpOAuth/srv-b"]
+        );
+        // The same server with another token is not covered.
+        let other = with_mcp(&plain, &[("srv-a", "mcp-tok-a2")]);
+        assert_eq!(
+            uncovered(&side_state(&one), &side_state(&other)),
+            vec!["mcpOAuth/srv-a"]
+        );
+    }
+
+    /// Round 8: the fingerprint names only the Claude grant, so a copy that
+    /// also holds MCP logins the entry lacks replaces it, whatever its
+    /// `expiresAt`; an entry holding logins the copy lacks is kept; and two
+    /// copies each holding logins the other lacks are refused rather than
+    /// one of them being dropped.
+    #[test]
+    fn filing_never_drops_side_state_of_the_same_grant() {
+        let tmp = tempfile::tempdir().unwrap();
+        let q = Quarantine::new(HostOs::Linux, tmp.path());
+        let plain = creds_json("at-1", "rt-1", 1000);
+        let fp = q
+            .file(
+                &plain,
+                Reason::Retired,
+                "scoped-keychain",
+                Some("a"),
+                None,
+                1,
+            )
+            .unwrap()
+            .fingerprint()
+            .to_owned();
+        let logins = with_mcp(&creds_json("at-0", "rt-1", 500), &[("srv-a", "t")]);
+        assert_eq!(
+            q.file(&logins, Reason::ExtraLogins, "file", Some("a"), None, 2)
+                .unwrap(),
+            Filed::Replaced(fp.clone())
+        );
+        assert_eq!(q.get(&fp).unwrap().unwrap().expose(), logins);
+        assert_eq!(q.list()[0].reason, Reason::ExtraLogins);
+        // A fresher copy without them keeps the entry.
+        let fresher = creds_json("at-2", "rt-1", 2000);
+        assert_eq!(
+            q.file(&fresher, Reason::Retired, "file", Some("a"), None, 3)
+                .unwrap(),
+            Filed::Kept(fp.clone())
+        );
+        assert_eq!(q.get(&fp).unwrap().unwrap().expose(), logins);
+        // Each holding a login the other lacks: refused, entry untouched.
+        let other = with_mcp(&creds_json("at-3", "rt-1", 3000), &[("srv-b", "u")]);
+        assert!(
+            q.file(&other, Reason::Retired, "file", Some("a"), None, 4)
+                .is_err()
+        );
+        assert_eq!(q.get(&fp).unwrap().unwrap().expose(), logins);
     }
 
     #[cfg(unix)]

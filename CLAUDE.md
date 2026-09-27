@@ -30,7 +30,9 @@ multi-machine fleet), but the crate itself ships **zero** private identifiers
   unless `HOME` (and any `XDG_*_HOME`) lies inside `CSM_E2E_SANDBOX`; the
   Keychain runner calls `/usr/bin/perl $CSM_E2E_SECURITY` instead of
   `/usr/bin/security`; the Orca process scan counts only executables under
-  the sandbox; `CSM_E2E_ORCA_VERSION` supplies the Orca version; and
+  the sandbox; `CSM_E2E_ORCA_VERSION` supplies the Orca version;
+  `CSM_E2E_SESSION_FLOOR` stands in for the login session's
+  `CLAUDE_CONFIG_DIR` that `csm migrate`'s write gate reads; and
   `point(name)` runs `/bin/sh $CSM_E2E_POINT_HOOK <name>` at the store
   writer's `store-L1`/`store-L2` points so a scenario can start the fake
   Orca mid-write. Never enable the feature in a release build.
@@ -90,7 +92,9 @@ multi-machine fleet), but the crate itself ships **zero** private identifiers
   `cfg(test)`, tests build one with `HostEnv::for_test`), `context.rs` (one
   command's resolved context: userData, data file, `D` paths, state dir,
   version gate), `userdata.rs` (userData location, the WSL rule, the
-  profile index), `store.rs` (`orca-data.json`: typed views, the pure
+  profile index, and the rule for the late userData `<appData>/Orca`, used
+  for the stash root and the system-default snapshot only when the disk
+  shows Orca put them there), `store.rs` (`orca-data.json`: typed views, the pure
   `patch_settings` with its round-trip gate, and the store-write protocol
   with its L0/L1/L2 liveness checks), `jsjson.rs` (`JSON.stringify` byte
   for byte), `record.rs` (the account record and Orca's identity/active-id
