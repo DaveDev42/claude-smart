@@ -2085,7 +2085,9 @@ mod tests {
         });
     }
 
-    /// An unreadable follow file is removed, never acted on.
+    /// An unreadable follow file is removed, never acted on. Windows has no
+    /// relaunch loop, so there `follow_decision` never opens a follow file
+    /// (no leader writes one): it skips and leaves the file alone.
     #[test]
     fn unreadable_follow_file_is_removed() {
         let home = tempfile::TempDir::new().unwrap();
@@ -2096,7 +2098,7 @@ mod tests {
             std::fs::write(&path, "not json").unwrap();
             let input = parse_input(r#"{"session_id": "s", "hook_event_name": "Stop"}"#).unwrap();
             assert!(matches!(follow_decision(sid, &input, "a"), Decision::Skip));
-            assert!(!path.exists());
+            assert_eq!(path.exists(), !follows_supported());
         });
     }
 

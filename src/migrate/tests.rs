@@ -1032,7 +1032,11 @@ fn a_sqlite_profile_defers_only_the_store_writes() {
 /// Round 8: an agent that runs `launchctl setenv CLAUDE_CONFIG_DIR` at
 /// every login is found (the cutover names it as the floor's writer),
 /// whether the plist or the script it runs says it; an agent that only
-/// sets the variable for its own job is not.
+/// sets the variable for its own job is not. LaunchAgents are macOS's, and
+/// a plist names the script it runs by a `/`-rooted path, which a temp dir
+/// on Windows is not, so this runs on unix only (the cutover calls
+/// `floor_agents` on macOS only).
+#[cfg(unix)]
 #[test]
 fn a_launch_agent_that_sets_the_floor_again_is_found() {
     let tmp = tempfile::tempdir().unwrap();
@@ -4543,21 +4547,20 @@ fn the_report_groups_rows_per_dir_and_lists_the_rest() {
     );
     // One heading per dir, its rows under it.
     assert_eq!(
-        out.matches("home  /Users/example/.claude.home\n").count(),
+        out.matches(&format!("home  {}\n", home.join(".claude.home").display()))
+            .count(),
         1
     );
     let h = out.find("home  ").unwrap();
     let w = out.find("work  ").unwrap();
     assert!(h < out.find("waits: a claude runs in it").unwrap());
     assert!(out.find("waits: a claude runs in it").unwrap() < w);
+    let scratch = format!("  {}", home.join(".claude.scratch").display());
     for (title, item) in [
         ("changed:", "  work: imported carol@example.com"),
         ("pending:", "  home: a claude runs in it"),
         ("errors:", "  cannot read profiles.json"),
-        (
-            "not registered, left alone:",
-            "  /Users/example/.claude.scratch",
-        ),
+        ("not registered, left alone:", scratch.as_str()),
     ] {
         let t = out.find(&format!("{title}\n")).expect(title);
         assert!(out[t..].contains(item), "{title}: {out}");

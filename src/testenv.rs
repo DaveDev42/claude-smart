@@ -160,3 +160,17 @@ pub(crate) fn with_test_home<T>(tmp: &std::path::Path, f: impl FnOnce() -> T) ->
         Err(e) => std::panic::resume_unwind(e),
     }
 }
+
+/// A fixture path written `/`-rooted, as an absolute path on this host:
+/// unchanged on unix; on Windows, where a path with no drive is not
+/// absolute, the same components under `C:\`. For pure path logic that
+/// tests `is_absolute()` and must see the same shape on every host.
+#[cfg(test)]
+pub(crate) fn abs(path: &str) -> std::path::PathBuf {
+    debug_assert!(path.starts_with('/'), "abs wants a /-rooted path: {path}");
+    if cfg!(windows) {
+        std::path::PathBuf::from(format!("C:{}", path.replace('/', "\\")))
+    } else {
+        std::path::PathBuf::from(path)
+    }
+}

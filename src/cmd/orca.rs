@@ -534,13 +534,14 @@ mod tests {
     /// `PATH` link, which survives `brew upgrade`, never the keg path.
     #[test]
     fn link_target_prefers_the_path_link_over_a_versioned_keg() {
-        let keg = Path::new("/opt/homebrew/Cellar/claude-smart/0.3.7/bin/csm");
-        let link = PathBuf::from("/opt/homebrew/bin/csm");
+        use crate::testenv::abs;
+        let keg = &abs("/opt/homebrew/Cellar/claude-smart/0.3.7/bin/csm");
+        let link = abs("/opt/homebrew/bin/csm");
         let other = (
-            PathBuf::from("/Users/example/.cargo/bin/csm"),
-            PathBuf::from("/Users/example/.cargo/bin/csm"),
+            abs("/Users/example/.cargo/bin/csm"),
+            abs("/Users/example/.cargo/bin/csm"),
         );
-        let on_path = vec![other.clone(), (link.clone(), keg.to_path_buf())];
+        let on_path = vec![other.clone(), (link.clone(), keg.clone())];
         // Linux reports the resolved path; macOS the invoked one.
         assert_eq!(link_target(keg, keg, &on_path), link);
         assert_eq!(link_target(&link, keg, &on_path), link);
@@ -549,10 +550,10 @@ mod tests {
         // Relative invocation and nothing on PATH: the resolved path.
         assert_eq!(
             link_target(Path::new("target/debug/csm"), keg, &[]),
-            keg.to_path_buf()
+            keg.clone()
         );
         // A relative PATH entry never wins.
-        let rel = vec![(PathBuf::from("bin/csm"), keg.to_path_buf())];
+        let rel = vec![(PathBuf::from("bin/csm"), keg.clone())];
         assert_eq!(link_target(&link, keg, &rel), link);
     }
 

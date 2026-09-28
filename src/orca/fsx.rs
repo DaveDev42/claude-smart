@@ -798,8 +798,9 @@ mod tests {
         let home = Path::new("/Users/example");
         let mut env = HostEnv::for_test(home, HostOs::MacOs);
         assert_eq!(state_dir(&env), home.join(".local/state/csm"));
-        env.xdg_state_home = Some("/var/state".into());
-        assert_eq!(state_dir(&env), Path::new("/var/state/csm"));
+        let xdg = crate::testenv::abs("/var/state");
+        env.xdg_state_home = Some(xdg.to_string_lossy().into_owned());
+        assert_eq!(state_dir(&env), xdg.join("csm"));
         env.xdg_state_home = Some("relative".into());
         assert_eq!(state_dir(&env), home.join(".local/state/csm"));
         let mut w = HostEnv::for_test(home, HostOs::Windows);

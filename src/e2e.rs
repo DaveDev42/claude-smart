@@ -188,8 +188,14 @@ pub fn point(_name: &str) {}
 mod tests {
     use super::*;
 
+    /// A `/`-rooted fixture path as this host writes an absolute one
+    /// ([`crate::testenv::abs`]); a relative one as given.
     fn os(s: &str) -> Option<OsString> {
-        Some(OsString::from(s))
+        Some(if s.starts_with('/') {
+            crate::testenv::abs(s).into_os_string()
+        } else {
+            OsString::from(s)
+        })
     }
 
     #[test]

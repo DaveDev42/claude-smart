@@ -695,14 +695,13 @@ mod tests {
             (default.clone(), HintUse::SameAsDefault)
         );
 
-        e.orca_user_data_path = Some("/sandbox/orca-dev".into());
+        // The hint must be absolute on this host to be used at all.
+        let dev = crate::testenv::abs("/sandbox/orca-dev");
+        e.orca_user_data_path = Some(dev.to_string_lossy().into_owned());
         let ud = resolve(&e, |_| false);
         assert_eq!((ud.dir, ud.hint), (default.clone(), HintUse::Ignored));
-        let ud = resolve(&e, |p| p == Path::new("/sandbox/orca-dev"));
-        assert_eq!(
-            (ud.dir, ud.hint),
-            (PathBuf::from("/sandbox/orca-dev"), HintUse::UsedLive)
-        );
+        let ud = resolve(&e, |p| p == dev);
+        assert_eq!((ud.dir, ud.hint), (dev.clone(), HintUse::UsedLive));
 
         // A relative hint is never used.
         e.orca_user_data_path = Some("orca-dev".into());

@@ -890,6 +890,7 @@ mod tests {
         assert!(has_password("svc-a", "alice").is_err());
     }
 
+    #[cfg(unix)]
     #[test]
     fn find_reads_trimmed_bytes_and_absent_items() {
         let fake = crate::orca::testsupport::FakeSecurity::install();

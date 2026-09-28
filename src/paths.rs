@@ -446,13 +446,19 @@ mod tests {
         crate::testenv::set_test_home(None);
         let home = home_dir().unwrap();
         assert!(home.starts_with(std::env::temp_dir()));
+        // Every path lands under that home in the temp dir. "Not under the
+        // real home" is not the test: Windows keeps the temp dir inside the
+        // user's profile.
+        for p in [smart_dir_no_create(), runtime_dir(), config_json()] {
+            assert!(
+                p.starts_with(&home),
+                "{} is outside {}",
+                p.display(),
+                home.display()
+            );
+        }
         if let Some(real) = dirs::home_dir() {
             assert_ne!(home, real);
-            assert!(
-                !smart_dir_no_create().starts_with(&real) || real.starts_with(std::env::temp_dir())
-            );
-            assert!(!runtime_dir().starts_with(&real) || real.starts_with(std::env::temp_dir()));
-            assert!(!config_json().starts_with(&real) || real.starts_with(std::env::temp_dir()));
         }
     }
 

@@ -1894,14 +1894,15 @@ mod tests {
                 PathBuf::from("/Applications/Orca.app"),
                 PathBuf::from("/Users/example/Applications/Orca.app"),
             ],
-            &[PathBuf::from("/usr/local/bin"), PathBuf::from("rel")],
+            // A PATH dir counts only when it is absolute on this host.
+            &[crate::testenv::abs("/usr/local/bin"), PathBuf::from("rel")],
         );
         assert_eq!(
             got,
             vec![
                 PathBuf::from("/Applications/Orca.app/Contents/Resources/bin/orca"),
                 PathBuf::from("/Users/example/Applications/Orca.app/Contents/Resources/bin/orca"),
-                PathBuf::from("/usr/local/bin/orca"),
+                crate::testenv::abs("/usr/local/bin/orca"),
             ]
         );
     }
@@ -1912,10 +1913,13 @@ mod tests {
             HostOs::Linux,
             Some(Path::new("/opt/Orca/orca-ide")),
             &LINUX_INSTALL_DIRS.map(PathBuf::from),
-            &[PathBuf::from("/usr/bin")],
+            &[crate::testenv::abs("/usr/bin")],
         );
         assert_eq!(got[0], PathBuf::from("/opt/Orca/resources/bin/orca-ide"));
-        assert_eq!(got.last().unwrap(), &PathBuf::from("/usr/bin/orca-ide"));
+        assert_eq!(
+            got.last().unwrap(),
+            &crate::testenv::abs("/usr/bin/orca-ide")
+        );
         assert!(got.iter().all(|p| p.ends_with("orca-ide")), "{got:?}");
         assert_eq!(got.len(), 4, "deduplicated: {got:?}");
     }

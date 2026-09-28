@@ -94,12 +94,14 @@ jobs:
       - name: Format check
         run: cargo fmt --check
 
-  # The limit-switch harness (e2e/): builds csm + a fake, sleeping `claude`,
-  # drives both through an isolated sandbox HOME with no network access. POSIX
-  # fork/SIGTERM semantics only, so macOS + Linux, no Windows row (see
-  # e2e/README.md's Portability section). run.sh prints the full report (and,
-  # on failure, every per-invocation log) to stdout, so CI logs are enough to
-  # debug a failure without a separate artifact upload.
+  # The end-to-end harness (e2e/): run.sh builds csm with the `e2e` cargo
+  # feature and a fake `claude`, then drives them against a fake Orca, a fake
+  # Keychain and a loopback OAuth stand-in inside a sandbox HOME under /tmp,
+  # with no network access. POSIX fork/SIGTERM semantics only, so macOS +
+  # Linux, no Windows row (see e2e/README.md). run.sh takes no binary path:
+  # it always builds its own. It prints the summary (and, on failure, every
+  # scenario's logs) to stdout, so CI logs are enough to debug a failure
+  # without a separate artifact upload.
   e2e:
     name: e2e (${{ matrix.os }})
     strategy:
@@ -114,7 +116,9 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: e2e-${{ matrix.os }}
-      - name: Build csm
-        run: cargo build --bin csm
-      - name: Run the limit-switch e2e harness
-        run: bash e2e/run.sh --csm target/debug/csm
+      # The same build run.sh does first, as its own step so a compile error
+      # is not mixed into the harness output; run.sh then finds it current.
+      - name: Build csm with the e2e feature
+        run: cargo build --features e2e --bin csm
+      - name: Run the e2e harness
+        run: bash e2e/run.sh

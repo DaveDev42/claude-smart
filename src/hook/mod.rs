@@ -568,20 +568,45 @@ mod tests {
         }
     }
 
-    /// Spawn a real, harmless `sleep` process and register it (via
-    /// `CLAUDE_SMART_CLAUDE_BIN=sleep`) as "managed" so `managed_session`'s
-    /// live-process check passes without needing an actual `claude`/`node`
-    /// binary on the test host. Writes `<sid>.pid` under `home`'s smart_dir
-    /// and stores the child on `fixture` so it is reaped on drop.
+    /// A harmless process that exits on its own after about 30 s, and the
+    /// basename a process check sees for it. Windows has no `sleep`
+    /// binary; `ping -n 31` on the loopback waits a second between echoes
+    /// and needs no console.
+    fn sleeper() -> (Command, &'static str) {
+        if cfg!(windows) {
+            let root = std::env::var_os("SystemRoot").unwrap_or_else(|| r"C:\Windows".into());
+            let mut cmd = Command::new(
+                std::path::Path::new(&root)
+                    .join("System32")
+                    .join("PING.EXE"),
+            );
+            cmd.args(["-n", "31", "127.0.0.1"])
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null());
+            (cmd, "ping")
+        } else {
+            let mut cmd = Command::new("/bin/sleep");
+            cmd.arg("30");
+            (cmd, "sleep")
+        }
+    }
+
+    /// Spawn a real, harmless sleeper ([`sleeper`]) and register it (via
+    /// `CLAUDE_SMART_CLAUDE_BIN=<its name>`) as "managed" so
+    /// `managed_session`'s live-process check passes without needing an
+    /// actual `claude`/`node` binary on the test host. Writes `<sid>.pid`
+    /// under `home`'s smart_dir and stores the child on `fixture` so it is
+    /// reaped on drop.
     fn spawn_fake_managed_process(fixture: &mut EnvFixture, sid: &str) {
-        crate::testenv::set_var("CLAUDE_SMART_CLAUDE_BIN", "sleep");
+        let (mut cmd, name) = sleeper();
+        crate::testenv::set_var("CLAUDE_SMART_CLAUDE_BIN", name);
         // A second call replaces the first child: stop (kill + reap) the old
         // one before starting the next, so none is ever orphaned.
         if let Some(mut old) = fixture.fake_proc.take() {
             old.stop();
         }
-        let child = ChildGuard::spawn(Command::new("/bin/sleep").arg("30"))
-            .expect("spawn fake managed process");
+        let child = ChildGuard::spawn(&mut cmd).expect("spawn fake managed process");
         let pid = child.id();
         // Owned by the fixture BEFORE any assertion can panic, so the child
         // is reaped on drop either way.
