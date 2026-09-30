@@ -514,7 +514,7 @@ fn display_name(r: &Row) -> String {
 /// `REFRESH NEEDED (stale 3d)`). `LoginRequired` renders as the bare label —
 /// its full message/age/action live in the footer (`attention_lines`) since
 /// `CLAUDE_CONFIG_DIR=<dir> claude auth login` is far too long for a column.
-fn status_cell(r: &Row, now: DateTime<Utc>) -> String {
+pub(crate) fn status_cell(r: &Row, now: DateTime<Utc>) -> String {
     match (&r.status, &r.error, &r.attention) {
         (Status::RefreshNeeded, _, Some(att)) => {
             format!(
@@ -590,7 +590,7 @@ pub fn attention_lines(rows: &[Row], now: DateTime<Utc>) -> Vec<String> {
 }
 
 /// Format an optional percent as `NN%` or the em-dash placeholder.
-fn pct(v: Option<i64>) -> String {
+pub(crate) fn pct(v: Option<i64>) -> String {
     match v {
         Some(p) => format!("{p}%"),
         None => "\u{2014}".to_owned(),
@@ -598,7 +598,7 @@ fn pct(v: Option<i64>) -> String {
 }
 
 /// Truncate `s` to `max` display chars (ASCII-safe; resets strings are ASCII).
-fn truncate(s: &str, max: usize) -> String {
+pub(crate) fn truncate(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
         s.to_owned()
     } else {
@@ -609,7 +609,7 @@ fn truncate(s: &str, max: usize) -> String {
 }
 
 /// Humanize an age in seconds → `"7m"`, `"3h"`, `"2d"`, `"45s"`.
-fn humanize_age(secs: u64) -> String {
+pub(crate) fn humanize_age(secs: u64) -> String {
     if secs >= 86_400 {
         format!("{}d", secs / 86_400)
     } else if secs >= 3_600 {

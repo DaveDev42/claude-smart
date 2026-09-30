@@ -63,6 +63,24 @@ pub(crate) fn cmd_usage(args: &[OsString]) -> anyhow::Result<()> {
 
     // Orca's live list when it runs (the store lags it on Orca 1.4.214+).
     let accounts = account::AccountSet::load_live();
+    let rpt = build_usage_report(&accounts, no_fetch, refresh);
+
+    if json {
+        println!("{}", report::render_json(&rpt)?);
+    } else {
+        print!("{}", report::render_table(&rpt, chrono::Utc::now()));
+    }
+    Ok(())
+}
+
+/// The joined usage report for `accounts`: the one pipeline behind both
+/// `csm usage` and `csm accounts list`. See [`cmd_usage`] for the flags.
+pub(crate) fn build_usage_report(
+    accounts: &account::AccountSet,
+    no_fetch: bool,
+    refresh: bool,
+) -> usage::report::Report {
+    use usage::report;
     // "Configured" means Orca lists at least one host account.
     let configured = !accounts.is_empty();
     let ids = accounts.ids_sorted();
@@ -121,13 +139,7 @@ pub(crate) fn cmd_usage(args: &[OsString]) -> anyhow::Result<()> {
 
     let mut rpt = report::build_report(&ids, data.as_ref(), configured, stale_secs);
     report::label_rows(&mut rpt, &accounts.accounts);
-
-    if json {
-        println!("{}", report::render_json(&rpt)?);
-    } else {
-        print!("{}", report::render_table(&rpt, chrono::Utc::now()));
-    }
-    Ok(())
+    rpt
 }
 
 /// Read the positive usage cache file directly (no network, no TTL gate). Used

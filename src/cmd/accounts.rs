@@ -36,7 +36,7 @@ use crate::orca::{OrcaView, SecretString, SnapshotOptions};
 /// A parsed `csm accounts` invocation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum AccountsCmd {
-    List,
+    List { usage: bool },
     Use(String),
     Add,
     Import(Vec<PathBuf>),
@@ -52,7 +52,7 @@ pub(crate) fn parse(args: &[OsString]) -> anyhow::Result<AccountsCmd> {
         .map(|a| a.to_string_lossy().into_owned())
         .collect();
     let (verb, rest) = match words.split_first() {
-        None => return Ok(AccountsCmd::List),
+        None => return Ok(AccountsCmd::List { usage: true }),
         Some((v, r)) => (v.as_str(), r),
     };
     let one = |what: &str| -> anyhow::Result<String> {
@@ -62,7 +62,16 @@ pub(crate) fn parse(args: &[OsString]) -> anyhow::Result<AccountsCmd> {
         }
     };
     Ok(match verb {
-        "list" | "ls" if rest.is_empty() => AccountsCmd::List,
+        "list" | "ls" => {
+            let mut usage = true;
+            for f in rest {
+                match f.as_str() {
+                    "--no-usage" => usage = false,
+                    other => bail!("csm accounts list: unknown flag {other:?}"),
+                }
+            }
+            AccountsCmd::List { usage }
+        }
         "use" => AccountsCmd::Use(one("account (id, id prefix or email)")?),
         "add" if rest.is_empty() => AccountsCmd::Add,
         "import" => {
@@ -94,7 +103,7 @@ pub(crate) fn parse(args: &[OsString]) -> anyhow::Result<AccountsCmd> {
 /// `csm accounts …`
 pub(crate) fn cmd_accounts(args: &[OsString]) -> anyhow::Result<()> {
     match parse(args)? {
-        AccountsCmd::List => list(),
+        AccountsCmd::List { usage } => list(usage),
         AccountsCmd::Use(q) => use_account(&q),
         AccountsCmd::Add => add_account(),
         AccountsCmd::Import(dirs) => import(&dirs),
@@ -109,7 +118,9 @@ pub(crate) fn cmd_accounts(args: &[OsString]) -> anyhow::Result<()> {
 
 fn print_help() {
     println!("csm accounts — Orca's Claude accounts\n");
-    println!("  csm accounts [list]                  list accounts (* active, D = D's account)");
+    println!("  csm accounts [list] [--no-usage]     list accounts with their usage");
+    println!("                                       (* active, D = D's account; --no-usage:");
+    println!("                                       identity only, no fetch)");
     println!("  csm accounts use <id|prefix|email>   switch the active account");
     println!("  csm accounts add                     log in a new account");
     println!("  csm accounts import <dir>...         import the login held by config dirs");
@@ -195,15 +206,200 @@ pub(crate) fn render_list(
     out
 }
 
-fn list() -> anyhow::Result<()> {
+/// `accounts list` with usage: one aligned row per account — markers, email,
+/// short id, session / weekly / per-model weekly percent, both reset times
+/// and the `csm usage` status. Pure; `color` adds ANSI (the caller decides:
+/// a TTY with `NO_COLOR` unset).
+pub(crate) fn render_list_usage(
+    accounts: &[AccountEntry],
+    active: Option<&str>,
+    in_d: Option<&str>,
+    report: &crate::usage::report::Report,
+    now: chrono::DateTime<chrono::Utc>,
+    color: bool,
+) -> String {
+    use crate::usage::report::{Row, Status, pct, status_cell, truncate};
+    if accounts.is_empty() {
+        return "(no Claude accounts in Orca — `csm accounts add`)\n".to_owned();
+    }
+    let paint = |s: String, code: &str| {
+        if color {
+            format!("\x1b[{code}m{s}\x1b[0m")
+        } else {
+            s
+        }
+    };
+    let pct_code = |v: Option<i64>| match v {
+        Some(p) if p >= crate::account::scoring::LIMIT_PCT => "31",
+        Some(p) if p >= crate::usage::report::WARN_PCT => "33",
+        Some(_) => "32",
+        None => "2",
+    };
+    let status_code = |st: Status| match st {
+        Status::Ok => "32",
+        Status::NearLimit => "33",
+        Status::Errored | Status::LoginRequired => "31",
+        Status::RefreshNeeded => "33",
+        Status::NoData => "2",
+    };
+    let tier = truncate(report.week_model_label.as_deref().unwrap_or("fable"), 14);
+    let tier_head = format!("WK({tier})");
+    let show_tier = report.rows.iter().any(|r| r.week_fable_pct.is_some());
+    let dash = "\u{2014}";
+    let rows: Vec<Vec<String>> = accounts
+        .iter()
+        .map(|a| {
+            let r: Option<&Row> = report.rows.iter().find(|r| r.name == a.id);
+            let mark = format!(
+                "{}{}",
+                if active == Some(a.id.as_str()) {
+                    '*'
+                } else {
+                    ' '
+                },
+                if in_d == Some(a.id.as_str()) {
+                    'D'
+                } else {
+                    ' '
+                }
+            );
+            let short: String = a.id.chars().take(8).collect();
+            let resets = |f: fn(&Row) -> Option<&str>| {
+                r.and_then(f)
+                    .map_or_else(|| dash.to_owned(), |s| truncate(s, 30))
+            };
+            vec![
+                mark,
+                a.email.clone().unwrap_or_else(|| "-".into()),
+                short,
+                r.map_or_else(|| dash.to_owned(), |r| pct(r.session_pct)),
+                r.map_or_else(|| dash.to_owned(), |r| pct(r.week_all_pct)),
+                r.map_or_else(|| dash.to_owned(), |r| pct(r.week_fable_pct)),
+                resets(|r| r.session_resets.as_deref()),
+                resets(|r| r.week_all_resets.as_deref()),
+                r.map_or_else(
+                    || Status::NoData.label().to_owned(),
+                    |r| status_cell(r, now),
+                ),
+            ]
+        })
+        .collect();
+    let heads = [
+        "",
+        "ACCOUNT",
+        "ID",
+        "SESSION",
+        "WEEK(all)",
+        tier_head.as_str(),
+        "RESETS(sess)",
+        "RESETS(week)",
+        "STATUS",
+    ];
+    let shown = |i: usize| show_tier || i != 5;
+    let widths: Vec<usize> = (0..heads.len())
+        .map(|i| {
+            rows.iter()
+                .map(|r| r[i].chars().count())
+                .chain(std::iter::once(heads[i].chars().count()))
+                .max()
+                .unwrap_or(0)
+        })
+        .collect();
+    // Columns 3..=5 are numbers: right-aligned.
+    let cell = |i: usize, text: &str, code: Option<&str>| {
+        let w = widths[i];
+        let padded = if (3..=5).contains(&i) {
+            format!("{text:>w$}")
+        } else {
+            format!("{text:<w$}")
+        };
+        match code {
+            Some(c) if color && !text.is_empty() => paint(padded, c),
+            _ => padded,
+        }
+    };
+    let mut out = String::new();
+    let mut head = Vec::new();
+    for (i, h) in heads.iter().enumerate().filter(|(i, _)| shown(*i)) {
+        head.push(cell(i, h, Some("1")));
+    }
+    out.push_str(head.join("  ").trim_end());
+    out.push('\n');
+    for (a, cells) in accounts.iter().zip(&rows) {
+        let st = report
+            .rows
+            .iter()
+            .find(|r| r.name == a.id)
+            .map_or(Status::NoData, |r| r.status);
+        let fields = [
+            report
+                .rows
+                .iter()
+                .find(|r| r.name == a.id)
+                .map(|r| r.session_pct),
+            report
+                .rows
+                .iter()
+                .find(|r| r.name == a.id)
+                .map(|r| r.week_all_pct),
+            report
+                .rows
+                .iter()
+                .find(|r| r.name == a.id)
+                .map(|r| r.week_fable_pct),
+        ];
+        let mut line = Vec::new();
+        for (i, text) in cells.iter().enumerate().filter(|(i, _)| shown(*i)) {
+            let code = match i {
+                3..=5 => Some(pct_code(fields[i - 3].flatten())),
+                8 => Some(status_code(st)),
+                _ => None,
+            };
+            line.push(cell(i, text, code));
+        }
+        let _ = a;
+        out.push_str(line.join("  ").trim_end());
+        out.push('\n');
+    }
+    if report.no_usage && report.configured {
+        out.push_str("usage data unavailable (no readable credentials, no cache)\n");
+    }
+    out
+}
+
+/// Stdout is a terminal and `NO_COLOR` is unset or empty (no-color.org).
+fn want_color() -> bool {
+    use std::io::IsTerminal as _;
+    std::io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none_or(|v| v.is_empty())
+}
+
+fn list(with_usage: bool) -> anyhow::Result<()> {
     let v = view()?;
     if let Some(e) = &v.store_error {
         eprintln!("csm: warning: Orca's store: {e}");
     }
     let accts = entries(&v.accounts);
+    if !with_usage || accts.is_empty() {
+        print!(
+            "{}",
+            render_list(&accts, v.active_id.as_deref(), d_account(&v))
+        );
+        return Ok(());
+    }
+    // The same pipeline as `csm usage`: Orca's live list, then the
+    // resilience ladder (cache, cooldown, offline degrade).
+    let set = crate::account::AccountSet::load_live();
+    let report = crate::cmd::usage::build_usage_report(&set, false, false);
     print!(
         "{}",
-        render_list(&accts, v.active_id.as_deref(), d_account(&v))
+        render_list_usage(
+            &accts,
+            v.active_id.as_deref(),
+            d_account(&v),
+            &report,
+            chrono::Utc::now(),
+            want_color(),
+        )
     );
     Ok(())
 }
@@ -1105,8 +1301,11 @@ mod tests {
 
     #[test]
     fn parse_every_verb() {
-        assert_eq!(parse(&[]).unwrap(), AccountsCmd::List);
-        assert_eq!(parse(&os(&["list"])).unwrap(), AccountsCmd::List);
+        assert_eq!(parse(&[]).unwrap(), AccountsCmd::List { usage: true });
+        assert_eq!(
+            parse(&os(&["list"])).unwrap(),
+            AccountsCmd::List { usage: true }
+        );
         assert_eq!(
             parse(&os(&["use", "alice@example.com"])).unwrap(),
             AccountsCmd::Use("alice@example.com".into())
@@ -1129,6 +1328,88 @@ mod tests {
                 fix: true,
                 offline: true
             }
+        );
+    }
+
+    #[test]
+    fn parse_list_no_usage() {
+        assert_eq!(
+            parse(&os(&["list", "--no-usage"])).unwrap(),
+            AccountsCmd::List { usage: false }
+        );
+        assert!(parse(&os(&["list", "--bogus"])).is_err());
+    }
+
+    fn usage_fixture() -> (Vec<AccountEntry>, crate::usage::report::Report) {
+        let data: crate::usage::UsageData = serde_json::from_str(
+            r#"{"profiles":{
+              "aaaa1111-0000":{"session":{"pct":12,"resets":"9pm (UTC)"},
+                "week_all":{"pct":34,"resets":"Jun 22 at 9pm (UTC)"},"week_fable":{"pct":8}},
+              "bbbb2222-0000":{"session":{"pct":97},"week_all":{"pct":60}}}}"#,
+        )
+        .unwrap();
+        let accts = vec![
+            entry("aaaa1111-0000", "alice@example.com"),
+            entry("bbbb2222-0000", "bob@example.com"),
+            entry("cccc3333-0000", "carol@example.com"),
+        ];
+        let ids: Vec<&str> = accts.iter().map(|a| a.id.as_str()).collect();
+        let rpt = crate::usage::report::build_report(&ids, Some(&data), true, None);
+        (accts, rpt)
+    }
+
+    #[test]
+    fn render_list_usage_aligns_columns_and_shows_status() {
+        let (accts, rpt) = usage_fixture();
+        let now = chrono::Utc::now();
+        let out = render_list_usage(
+            &accts,
+            Some("bbbb2222-0000"),
+            Some("aaaa1111-0000"),
+            &rpt,
+            now,
+            false,
+        );
+        println!("{out}");
+        assert!(!out.contains('\x1b'));
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines.len(), 4, "{out}");
+        assert!(
+            lines[0].contains("ACCOUNT") && lines[0].contains("WK("),
+            "{out}"
+        );
+        assert!(
+            lines[1].starts_with(" D  alice@example.com  aaaa1111"),
+            "{out}"
+        );
+        assert!(lines[1].contains("12%") && lines[1].contains("34%") && lines[1].contains("8%"));
+        assert!(lines[1].contains("Jun 22 at 9pm (UTC)"));
+        assert!(lines[2].starts_with("*   bob@example.com"), "{out}");
+        assert!(lines[2].contains("97%") && lines[2].contains("near-limit"));
+        assert!(lines[3].contains("carol@example.com") && lines[3].contains("no data"));
+        assert!(!out.contains("cccc3333-0000"), "id is shortened");
+        // The status column starts at the same offset on every account line.
+        let col = |l: &str| {
+            l.find("ok")
+                .or_else(|| l.find('\u{26a0}'))
+                .or_else(|| l.find('\u{00b7}'))
+        };
+        assert!(col(lines[1]).is_some() && col(lines[2]).is_some());
+    }
+
+    #[test]
+    fn render_list_usage_color_only_when_asked_and_hides_empty_tier() {
+        let (accts, mut rpt) = usage_fixture();
+        let now = chrono::Utc::now();
+        let colored = render_list_usage(&accts, None, None, &rpt, now, true);
+        assert!(colored.contains("\x1b[33m"), "97% is yellow: {colored:?}");
+        for r in &mut rpt.rows {
+            r.week_fable_pct = None;
+        }
+        let plain = render_list_usage(&accts, None, None, &rpt, now, false);
+        assert!(!plain.contains("WK("), "{plain}");
+        assert!(
+            render_list_usage(&[], None, None, &rpt, now, false).contains("no Claude accounts")
         );
     }
 

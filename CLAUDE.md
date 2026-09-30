@@ -165,7 +165,7 @@ dependency/MSRV checks).
 
 ## CLI surface (collision-safe)
 
-`run, hook, accounts {list|use|add|import|rm|doctor [--fix] [--offline]},
+`run, hook, accounts {list [--no-usage]|use|add|import|rm|doctor [--fix] [--offline]},
 orca {status|setup}, migrate [--dry-run],
 config {show|get|set|unset launch-command|min-claude-version|idle-compact},
 usage [--json] [--no-fetch] [--refresh] | usage capture,

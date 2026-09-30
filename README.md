@@ -67,7 +67,7 @@ Add them in Orca, or with `csm accounts add` / `csm accounts import`.
 ## Quick start
 
 ```sh
-csm accounts                    # Orca's accounts, the active one marked
+csm accounts                    # Orca's accounts with their usage, the active one marked
 csm                             # start claude in D (a fresh session)
 csm -c                          # continue the newest session in this directory
 csm -i                          # pick a session
@@ -84,7 +84,7 @@ csm [claude-args...]                     bare = launch (implicit `csm run`)
 csm run [run-flags] [-- claude-args...]  launch with session handling and the limit switch
 csm claude <args...>                     run claude in D, arguments verbatim
 
-csm accounts [list]                      Orca's accounts (* active, D = the account D holds)
+csm accounts [list] [--no-usage]         Orca's accounts with usage (* active, D = the account D holds)
 csm accounts use <id|prefix|email>       make that account active
 csm accounts add                         log in a new account
 csm accounts import <dir>...             import the logins held by Claude config dirs
@@ -586,6 +586,13 @@ Manual compaction itself took 21 to 226 seconds in those 15 runs, median
 
 ## Accounts from the terminal
 
+- `csm accounts list` prints one aligned row per account: markers, email,
+  the first 8 characters of the id, session, weekly and model-weekly
+  percent, both reset times and the same status `csm usage` shows. It reads
+  usage through the same path as `csm usage` (cache, cooldown, offline
+  fallback), so it stays quick with the network down. Colors appear only on
+  a terminal with `NO_COLOR` unset. `--no-usage` prints identity only (full
+  id and organization) and does no fetch.
 - `csm accounts use <account>` makes that account active. It does not stop
   running sessions; they pick up the new account from `D`, as after a
   switch in Orca's GUI.

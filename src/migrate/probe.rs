@@ -66,7 +66,7 @@ pub(crate) fn trigger_class(
                     | AccountsCmd::Rm(_)
                     | AccountsCmd::Doctor { fix: true, .. },
                 ) => TriggerClass::Full,
-                Ok(AccountsCmd::List | AccountsCmd::Doctor { fix: false, .. }) => {
+                Ok(AccountsCmd::List { .. } | AccountsCmd::Doctor { fix: false, .. }) => {
                     TriggerClass::Note
                 }
                 Ok(AccountsCmd::Help) | Err(_) => TriggerClass::None,

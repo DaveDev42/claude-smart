@@ -215,7 +215,11 @@ pub enum UsageVerb {
 pub enum AccountsVerb {
     /// List Orca's host accounts (active and D's account marked).
     #[command(name = "list")]
-    List,
+    List {
+        /// Identity only: skip the usage fetch.
+        #[arg(long = "no-usage")]
+        no_usage: bool,
+    },
     /// Switch the active account (Orca RPC when Orca runs, else offline).
     #[command(name = "use")]
     Use {
