@@ -21,186 +21,23 @@ multi-machine fleet), but the crate itself ships **zero** private identifiers
 
 ## Layout
 
-- `src/main.rs`: `GLOBAL` (the process-wide allocator), `e2e::guard()` (the
-  first call in `main()`), `main()`'s argv[0]/`args[1]` dispatch, and
-  `print_help()`. Every `cmd_*` handler now lives under `src/cmd/`.
-- `src/e2e.rs`: the seams `e2e/run.sh` needs, compiled in only with the
-  `e2e` cargo feature (`[features] e2e = []`; `ENABLED` is `false`
-  otherwise and every function is inert). With it: `guard()` exits 97
-  unless `HOME` (and any `XDG_*_HOME`) lies inside `CSM_E2E_SANDBOX`; the
-  Keychain runner calls `/usr/bin/perl $CSM_E2E_SECURITY` instead of
-  `/usr/bin/security`; the Orca process scan counts only executables under
-  the sandbox; `CSM_E2E_ORCA_VERSION` supplies the Orca version; the file
-  named by `CSM_E2E_SESSION_FLOOR_FILE` stands in for the login session's
-  `CLAUDE_CONFIG_DIR` (the migration's floor: read by `session_floor`,
-  emptied by `unset_floor_env`, so no `launchctl` or registry call);
-  `CSM_E2E_BOOT_ID` stands in for the boot id the retire gate compares;
-  and `point(name)` runs `/bin/sh $CSM_E2E_POINT_HOOK <name>` at named
-  points (the store writer's `store-L1`/`store-L2`, and the migration's
-  `migrate-b1-moved`, `migrate-b1-unlinked`, `migrate-b2-write`,
-  `migrate-cutover-cleared` and `migrate-retire-quarantined`) so a
-  scenario can start the fake Orca mid-write or kill csm there. Never
-  enable the feature in a release build.
-- `src/cmd/`: one module per subcommand, namely `run.rs`, `hook.rs`, `cas.rs` (a
-  compat stub: `--print-default-dir` prints Orca's live `D` while that is a
-  legacy profile dir and nothing otherwise, `--eval` is a quiet no-op),
-  `config.rs`, `usage.rs`, `accounts.rs` (`csm accounts`: pure arg parser,
-  list render and doctor `findings` core over `orca::`), `orca.rs` (`csm orca
-  status|setup`), `migrate.rs` (`csm migrate [--dry-run]`: the parser, the
-  retired `plan`/`import`/`retire` pointer and the pure `exit_code`
-  0/75/1 over `migrate::Report`), `scan.rs`,
-  `sidecar.rs`, `completions.rs`, `claude.rs` (the `csm claude <args…>`
-  passthrough: pure `plan` + a thin unix-`exec` / windows-spawn shell; it runs
-  in `D` and sets `CLAUDE_CONFIG_DIR` only when `launch_context::runtime_dir_pin`
-  finds the inherited value differs from `D`), plus `support.rs` (uuid / stdin / tty helpers). Three
-  reserved words dispatch outside `src/cmd/` instead: `reap` → `reaper::cmd`
-  (`src/reaper/mod.rs`), `statusline` → `statusline::run`
-  (`src/statusline.rs`), and `newuuid` → inline in `main()` (see the match in
-  `src/main.rs`).
-- `src/launch_context.rs`: how this launch was started (`Print`, `OrcaPane`,
-  `OrcaStructured`, `Interactive`, with the `CSM_ORCA` override), the argv[0]
-  `claude` alias check, the `CLAUDE_CONFIG_DIR` pin rule, `launch_dir` /
-  pure `resolve_launch_dir` (R1: while Orca runs every launch uses Orca's
-  live `D`; pure `stale_pin` drops an inherited value naming a recorded
-  legacy dir or `~/.claude`), and the managed-account auth-env strip list.
-- `src/migrate/`: the automatic migration off the legacy per-profile
-  layout (`~/.config/claude-as/profiles.json`, `~/.claude.<name>`,
-  `~/.claude.shared`, the machine-wide `CLAUDE_CONFIG_DIR` floor). `mod.rs`
-  (`Trigger`, `run_with`, `at_dispatch`, `prespawn` with the 3 s
-  `PRESPAWN_BUDGET`, the post-spawn run, `pane_prespawn`, the report and
-  its `render`, the terminal/log lines), `probe.rs` (pure `probe` and
-  `trigger_class`: FULL, NOTE, PANE, NONE; NONE words never probe),
-  `state.rs` (`<state>/migration.json`: phase
-  `adopt|carry|cutover|retire|done`, the legacy snapshot, `cutover
-  {at, boot_id}`, notes with `note_due`; `migrate.lock`, a flock try-lock),
-  `legacy.rs` (the registry reader), `adopt.rs` (A1 import, A2 active, A3
-  read-back; pure `import_action`), `carry.rs` (B1 shared dirs with compat
-  links, pure `shared_step` over the crash states, B2 `~/.claude.json`
-  under Claude Code's config lock, B3 file copies, B4 old state, B5 plugin
-  paths), `cutover.rs` (pure `cutover_gate` and `floor_gate`, the steps,
-  `session_floor`/`unset_floor_env`), `retire.rs` (pure
-  `retire_gate` and `retire_verdict`, settle, `retire_dir`), `plan.rs`
-  (the dry-run view), `tests.rs`. Credentials are never deleted (the
-  quarantine files them), legacy dirs are renamed `<dir>.retired`,
-  unregistered `~/.claude.*` dirs are only listed.
-- `src/cli/`: `parser.rs` (hand-rolled `csm run` flag loop, NOT clap, so
-  claude flags forward verbatim; it stops at the first positional, using
-  `carry::arity` so a claude flag's value is not taken for one; `-h`/`--help`
-  and `-n`/`--new` are the two claude-shaped flags it reads), `carry.rs` (pure
-  `carry_passthru`: the arity-aware allow-list picking which remembered
-  passthru flags a limit-switch hop replays on `claude --resume`, and which it
-  drops; also `arity`), `completions.rs` (clap tree used ONLY for
-  `csm completions`, never to parse real argv), `reserved.rs` (the reserved
-  subcommand consts, `invocation` (argv[0] `csm` / `csm-hook` / `claude`) and
-  `dispatch_subcommand` → `Dispatch {subcommand, rest_len}`, read by dispatch,
-  completions, and the disjointness test).
-- `src/account/`: `accounts.rs` (`AccountSet`: Orca's host accounts, the
-  active id, `D`'s account and `D`, all read-only: `load` / `load_with`
-  read Orca's store (`orca::store::load_choice`) plus `D`'s runtime
-  identity and are the only loads the hook and the statusline use (design
-  decision 8); `load_pinned` is `load` with a launch's `CLAUDE_CONFIG_DIR`
-  pin applied; `load_live` / `load_live_with` take Orca's own list over RPC
-  (`accounts.list`, 3 s `LIVE_LIST_TIMEOUT`) while Orca runs, because its
-  store lags its memory, and fall back to the store otherwise (`from_orca`
-  says which), for `csm usage`, usage collection and the limit leader;
-  `find` resolves an id, id prefix or email), `limit_switch.rs` (the
-  supervisor's side of a limit switch: lead or follow, the follow files for
-  peers, the unsupervised-session `min-claude-version` gate), `scoring.rs` (pick-best
-  thresholds: `LIMIT_PCT=99`, `SATURATION_PCT=95`;
-  `is_viable_pcts` is the ONE viability predicate over session and week_all
-  (`week_fable` no longer feeds it: a model-scoped-only cap leaves the
-  account itself viable, and the hook's `fable_fallback_model` in
-  `src/hook/detect.rs` handles that case with a same-account model swap
-  instead); `pick_best_at` and the hook's account-switch target pick route
-  through it; never add a second inline threshold check; also the shared
-  `effective_reset_epoch`), `reset.rs` (compat parser for `resets`-only
-  payloads), `mod.rs` (`pick_account_gated`, which the hook's target pick
-  calls (see `src/hook/detect.rs`), and `current_usage`).
-- `src/orca/`: csm as a second client of Orca's account service. `mod.rs`
-  (`HostEnv`, `OrcaError`; `HostEnv::current()` refuses the real home under
-  `cfg(test)`, tests build one with `HostEnv::for_test`), `context.rs` (one
-  command's resolved context: userData, data file, `D` paths, state dir,
-  version gate), `userdata.rs` (userData location, the WSL rule, the
-  profile index, and the rule for the late userData `<appData>/Orca`, used
-  for the stash root and the system-default snapshot only when the disk
-  shows Orca put them there), `store.rs` (`orca-data.json`: typed views, the pure
-  `patch_settings` with its round-trip gate, and the store-write protocol
-  with its L0/L1/L2 liveness checks), `jsjson.rs` (`JSON.stringify` byte
-  for byte), `record.rs` (the account record and Orca's identity/active-id
-  helpers), `stash.rs` (per-account stashes, exact bytes), `keychain.rs`
-  (pure `-i`/argv `-X` builders plus the one `run_security` shell; refuses
-  the real `/usr/bin/security` under `cfg(test)`), `runtime.rs` (`D`: paths,
-  identity, the credential surfaces, the `D/sessions` registry scan),
-  `readback.rs` (attribute the grant in `D` before overwriting it),
-  `quarantine.rs`, `http.rs` (the profile and token calls), `refresh.rs`
-  (the stash refresh), `sysdefault.rs` (the system-default snapshot),
-  `rpc.rs` (NDJSON client over the socket or pipe named in
-  `orca-runtime.json`), `live.rs` (is Orca running, fail closed; `dir_users`: which live
-  claude processes use a dir, over their environment),
-  `procenv.rs` (Orca main's own `CLAUDE_CONFIG_DIR`), `version.rs` (installed
-  version and `TESTED`), `snapshot.rs` (one read-only view), `switch.rs`
-  (pure `plan_switch` plus the executor and its journal), `add.rs`
-  (add/import/remove), `forward.rs` (the statusLine forward to Orca), `fsx.rs`
-  (guarded file primitives, the state dir, `switch.lock`, Claude Code's
-  `<config>.lock` as `ClaudeConfigLock`, `link_compat`, `boot_id`), and
-  `testsupport.rs` (fixtures: a fake `security`, a fake store and socket).
-- `src/usage/`: `model.rs` (`UsageData` serde), `transport.rs` (`fetch()`:
-  positive TTL cache → `CSM_USAGE_CMD` → negative cooldown → `local::collect`),
-  `report.rs` (`csm usage`: pure `build_report` + `render_table`/`render_json`),
-  `local/` (the collector: `mod.rs` orchestrates per-account fresh/stale/probe
-  resolution over Orca's host accounts, `creds.rs` reads the runtime or
-  stashed grant read-only, `api.rs` calls Anthropic's `/api/oauth/usage` and owns the one
-  `http_client` builder, `store.rs` persists `<state>/usage/<account-id>.json`,
-  `statusline.rs` merges the statusLine stdin capture, `display.rs` formats
-  reset times).
-- `src/hook/`: `mod.rs` (`run` / `run_from_statusline`), `detect.rs`,
-  `stop.rs`, `notify.rs`. Two live tiers remain: tier-0 `StopFailure` with
-  `error: "rate_limit"` fires when a 429 ends the turn, and tier-2 usage-%
-  catches caps crossed during a successful turn. A subscription cap fires NO
-  hook at all (Claude Code parks the turn in an auto-retry wait), so
-  `hook::run_from_statusline` runs the same classification off the statusLine
-  tick (`csm usage capture` / `csm statusline`), which is the operative switch
-  path for the weekly and model-scoped caps. The former tier-1
-  (transcript-text) and tier-3 (malformed-in-tail) checks have been deleted.
-  A `week_fable`-only cap does not switch accounts: `detect::classify_with`
-  relaunches the same session on the same account with a `--model` override
-  instead (`fable_fallback_model`, gated by `CLAUDE_FABLE_FALLBACK` and a
-  one-shot `<sid>.model-fallback` marker), since the account itself still has
-  headroom on every other model.
-- `src/picker/`: `engine.rs` and `session.rs`, the in-process fuzzy session picker
-  (nucleo + crossterm). There is no account picker.
-- `src/reaper/`: `mod.rs`, `scan.rs`, `kill.rs`: the `csm reap` orphan killer.
-- `src/config.rs`: csm's own `config.json` behind `csm config`.
-- `src/envvar.rs`, `src/epoch.rs`, `src/testenv.rs`: one small helper each.
-- `src/session/`, `src/sidecar/`, `src/platform/`, `src/statusline.rs`,
-  `src/paths.rs`: session scan/index, sidecar store (with `account_id` and
-  `born`), OS launch/relaunch/proc checks (`platform/child.rs` holds every
-  bounded run-with-timeout helper), statusline, canonical state paths (state
-  dir `$XDG_STATE_HOME/csm` or `~/.local/state/csm`, `%LOCALAPPDATA%\csm` on
-  Windows).
-- `tests/no_private_names.rs`: the leak guard. `src/**/*.rs` is scanned by all
-  three rules (the `forbidden()` substring list, the `Dave-` host-prefix rule,
-  and the quoted-profile-literal rule); `README.md`, `CLAUDE.md`, `Cargo.toml`,
-  and `examples/*.sh` are scanned by the `forbidden()` substring rule only.
-- `.github/workflows/ci.yml`: the push/PR gate (fmt, per-target check/clippy
-  (4 targets: linux-gnu, aarch64-darwin, x86_64-darwin, windows-msvc) with
-  native `cargo test` where the runner can execute the target, and an msrv
-  (1.95) job).
-- `.github/workflows/release-please.yml`: release automation (conventional
-  commits → release PR → tag → build matrix + Homebrew bump; see Releases).
-- `e2e/`: the end-to-end harness. `run.sh` builds `csm --features e2e`
-  and the fake `claude` (`fake-claude/claude.c`, which also plays Orca's main
-  process) once, lays out a sandbox under `/tmp`, and runs the 40 scenarios
-  in `scenarios.sh` (helpers in `lib.sh`), each in a subshell with a time
-  limit and a sweep for leftover processes. `fakes/` holds the fake Orca
-  (`orca.pl` + `World.pm`: store, stashes, NDJSON socket), the fake Keychain
-  (`security.pl`), the loopback OAuth stand-in (`http.pl`) and small
-  helpers, all run through `/usr/bin/perl` or `/bin/sh`. Excluded from the
-  packaged crate. See `e2e/README.md`.
-- `tools/orca-drift.sh`: `bash tools/orca-drift.sh <old-tag> <new-tag>`
-  diffs the Orca files csm mirrors between two Orca releases (blobless clone
-  cached under `${XDG_CACHE_HOME:-~/.cache}/csm/orca-src`, or `--repo`).
-  Excluded from the packaged crate.
+The module tree is discoverable from `src/`; this lists only what is not obvious from it.
+
+- `src/main.rs`: `e2e::guard()` is the first call in `main()`, then argv[0]/`args[1]` dispatch. Every `cmd_*` handler lives under `src/cmd/`. Three reserved words dispatch outside it: `reap` (`src/reaper/`), `statusline` (`src/statusline.rs`), `newuuid` (inline in `main()`).
+- `src/e2e.rs`: seams for `e2e/run.sh`, compiled in only with the `e2e` cargo feature (inert otherwise). `guard()` exits 97 unless `HOME` (and any `XDG_*_HOME`) lies inside `CSM_E2E_SANDBOX`. The feature also fakes the Keychain runner, Orca process scan, Orca version, session floor, boot id, and named `point(name)` hooks. Never enable the feature in a release build.
+- `src/cmd/`: one module per subcommand. `cas.rs` is a compat stub, `claude.rs` is the `csm claude <args…>` passthrough. `accounts.rs` and `migrate.rs` keep a pure parser/decision core over `orca::` / `migrate::Report`.
+- `src/launch_context.rs`: how a launch started (`Print`, `OrcaPane`, `OrcaStructured`, `Interactive`, `CSM_ORCA` override), the `CLAUDE_CONFIG_DIR` pin rule (while Orca runs every launch uses Orca's live `D`; `stale_pin` drops an inherited value naming a recorded legacy dir or `~/.claude`), and the managed-account auth-env strip list.
+- `src/migrate/`: the automatic migration off the legacy per-profile layout (`~/.config/claude-as/profiles.json`, `~/.claude.<name>`, `~/.claude.shared`, the machine-wide `CLAUDE_CONFIG_DIR` floor). Phases `adopt|carry|cutover|retire|done` are persisted in `<state>/migration.json`; the 3 s `PRESPAWN_BUDGET` bounds the pre-spawn run. Credentials are never deleted (quarantine files them), legacy dirs are renamed `<dir>.retired`, unregistered `~/.claude.*` dirs are only listed.
+- `src/cli/`: `parser.rs` is a hand-rolled `csm run` flag loop, NOT clap, so claude flags forward verbatim (it stops at the first positional, using `carry::arity`). `completions.rs` holds a clap tree used ONLY for `csm completions`, never to parse real argv. `reserved.rs` owns the reserved subcommand consts and `dispatch_subcommand`.
+- `src/account/`: `accounts.rs` reads Orca's host accounts read-only. `load` (store) is the only load the hook and statusline use; `load_live` asks Orca over RPC (3 s timeout) because its store lags its memory. `scoring.rs` has `LIMIT_PCT=99`, `SATURATION_PCT=95` and `is_viable_pcts`, the one viability predicate over session and week_all. `pick_best_at` and the hook's target pick route through it; never add a second inline threshold check. `week_fable` does not feed viability.
+- `src/orca/`: csm as a second client of Orca's account service. `HostEnv::current()` refuses the real home under `cfg(test)`; tests use `HostEnv::for_test`. `store.rs` holds the store-write protocol (L0/L1/L2 liveness checks, `patch_settings` round-trip gate, `sqlite_gate`). `keychain.rs` refuses the real `/usr/bin/security` under `cfg(test)`. `switch.rs` is a pure `plan_switch` plus executor and journal.
+- `src/usage/`: `transport.rs` `fetch()` order is positive TTL cache, `CSM_USAGE_CMD`, negative cooldown, `local::collect`. `local/api.rs` owns the one `http_client` builder.
+- `src/hook/`: two live tiers. Tier-0 `StopFailure` with `error: "rate_limit"` fires when a 429 ends the turn; tier-2 usage-% catches caps crossed during a successful turn. A subscription cap fires no hook (Claude Code parks the turn in an auto-retry wait), so `hook::run_from_statusline` runs the same classification off the statusLine tick; that is the operative path for weekly and model-scoped caps. A `week_fable`-only cap does not switch accounts: `detect::classify_with` relaunches the same session with a `--model` override (`fable_fallback_model`, gated by `CLAUDE_FABLE_FALLBACK` and a one-shot `<sid>.model-fallback` marker).
+- `src/platform/child.rs` holds every bounded run-with-timeout helper. State dir is `$XDG_STATE_HOME/csm` or `~/.local/state/csm` (`%LOCALAPPDATA%\csm` on Windows).
+- `tests/no_private_names.rs`: the leak guard. `src/**/*.rs` is scanned by all three rules (the `forbidden()` substring list, the `Dave-` host-prefix rule, the quoted-profile-literal rule); `README.md`, `CLAUDE.md`, `Cargo.toml`, `examples/*.sh` by the `forbidden()` rule only.
+- `.github/workflows/ci.yml`: fmt, per-target check/clippy (linux-gnu, aarch64-darwin, x86_64-darwin, windows-msvc), native `cargo test` where the runner can run the target, and an msrv (1.95) job. `release-please.yml` drives releases (see Releases).
+- `e2e/`: end-to-end harness (`run.sh`, `scenarios.sh`, `lib.sh`, fakes for Orca, Keychain and OAuth run via `/usr/bin/perl` or `/bin/sh`). Excluded from the packaged crate. See `e2e/README.md`.
+- `tools/orca-drift.sh`: diffs the Orca files csm mirrors between two Orca releases. Excluded from the packaged crate.
 
 ## Commands
 
@@ -245,7 +82,7 @@ dependency/MSRV checks).
    `https://platform.claude.com/v1/oauth/token` (overridable via
    `CSM_OAUTH_TOKEN_URL`), used only by the offline stash refresh
    (`csm usage --refresh` and a limit-switch pick while Orca is stopped;
-   the former `CSM_OAUTH_REFRESH` opt-in is removed); any host-naming convention is injected via
+   any host-naming convention is injected via
    `CSM_HOST_REPLACE`, never compiled in. Account ids come from Orca's account
    list, never literals. `cargo test` runs `tests/no_private_names.rs`,
    which scans every line of `src/` and fails on any leak (its forbidden list is
@@ -346,7 +183,7 @@ Branches/PRs are optional and usually unnecessary for this single-owner repo.
 
 Never merge-commit into main; rebase. release-please walks history by date
 and stops at the previous release commit, so commits behind a merge commit
-fall out of the changelog (this happened on 2026-09-17 for 0.3.3).
+fall out of the changelog.
 
 ## Releases
 
@@ -412,14 +249,6 @@ is needed.
   switch the session `.jsonl` is complete, not truncated. Until both pass on a
   real Windows console the relaunch loop stays gated off and Windows falls back
   to launch-without-relaunch. See `src/platform/windows.rs`'s module doc.
-- **`csm statusline` render-side latency, measured.** A measurement of a
-  release build on an Apple-silicon laptop (macOS, no host name; n=200 after
-  a 10-run warmup): `csm statusline` with a real statusLine payload on stdin
-  ran p50 11.48 ms / p95 22.64 ms, only ~1.3 ms above the bare process-spawn
-  floor (`csm --version` p50 10.18 ms) and faster than a naive shell statusline
-  (`zsh -c 'echo "..."'` p50 18.87 ms). These numbers are macOS-only; Linux,
-  WSL and Windows are unmeasured, and the numbers predate the Orca forward
-  and the statusLine switch check (both run after the segment is printed).
 
 ## Don't touch / out of scope
 
