@@ -102,6 +102,7 @@ csm usage capture                        read a statusLine payload on stdin, rec
 csm config [show]                        csm's own config
 csm config get|set|unset launch-command  what `csm run` starts instead of `claude`
 csm config get|set|unset min-claude-version   lowest claude a limit switch accepts next to unsupervised sessions
+csm config get|set|unset idle-compact    off|dry-run|on, default off: send /compact before an idle session's prompt cache expires
 
 csm hook                                 the Claude Code hook (Stop, StopFailure, SubagentStop, SessionEnd)
 csm statusline                           Claude Code statusLine segment: <account>@<host>
@@ -358,6 +359,231 @@ The hook (`csm hook`, every event) reads only csm's own files. It makes no
 network call, no RPC call and no Keychain access, so a `SessionEnd` hook
 returns well inside Claude Code's 1.5 s budget even with stale usage.
 
+## Idle compact
+
+`csm usage capture` and `csm statusline` both see the statusLine payload
+Claude Code sends on every refresh. When that payload carries prompt cache
+information, csm can use the gap while a session sits idle to keep the
+cache from going cold: it sends `/compact` to that session's terminal
+shortly before the cache expires, so the request after the gap re-writes a
+compacted context instead of the full one.
+
+This is opt-in: `csm config set idle-compact off|dry-run|on`, default
+`off`. `dry-run` and `on` decide identically; only the relay's own
+delivery (below) treats them differently.
+
+csm's own part is a hand-off, not a delivery. On each statusLine tick it
+acts on a session when all of this holds: the mode is not off, the prompt
+cache is reported warm with 300 seconds or fewer left before it expires,
+the re-write the payload predicts is at least 100000 tokens, the turn has
+actually ended, and it has not already acted for this idle period. The
+turn-ended check starts cheap (the transcript's mtime at or before the
+last `Stop`) and only reads further when that mtime moved past the stop:
+Claude Code keeps appending rows to the transcript well after a turn ends
+(`turn_duration`, `away_summary`, and other bookkeeping), so csm reads the
+transcript's tail and looks at the last real `user`/`assistant` row's own
+timestamp rather than treating every later write as a new turn. A `[Request
+interrupted by user` row newer than the `Stop` stamp also ends the turn, at
+that row's own timestamp, even with no fresh `Stop` event at all.
+
+When every condition holds, csm checks whether a pty-relay supervisor is
+alive (`CSM_SUPERVISOR_PID` names a running process) and, if so, writes a
+hand-off request file under `<state>/idle-compact-requests/<supervisor
+pid>.json` (session id, mode, remaining seconds, recache estimate, a
+deadline, and the statusLine payload's vim mode when it has one) and logs
+`outcome=handed-off`. With no live supervisor it logs
+`outcome=no-delivery-path` instead and still claims the idle period, so
+either outcome is logged at most once per idle period. The tick itself never
+types into a terminal, checks a screen, or reads session status.
+
+### The relay
+
+`csm run` puts itself between the real terminal and claude when the mode is
+not `off`, stdin and stdout are both terminals, csm is in the terminal's
+foreground group and `CSM_RELAY` is not `0`. Bytes pass both ways unchanged;
+csm also feeds claude's output into a screen model (the `vt100` crate) and
+watches the clock of the last real keystroke. `CSM_RELAY=0` forces the
+direct launcher (claude gets the terminal itself, no relay, no delivery).
+A relay that cannot be set up falls back to the direct launcher for that
+run and says so in the limit-switch log. The supervisor sets
+`CSM_SUPERVISOR_PID` in claude's environment; the direct launcher removes it.
+
+When a request arrives the supervisor looks about once a second and types
+`/compact` only if every one of these holds:
+
+- The request's deadline has not passed.
+- Claude Code's own session record (`sessions/<pid>.json` under the config
+  dir csm launched claude with) does not say the session is busy or waiting.
+  A missing file vetoes nothing.
+- No real keystroke in the last 60 seconds and no output in the last 2
+  seconds. Terminal replies, focus and mouse reports do not count as
+  keystrokes.
+- The screen shows the main input box, empty (a dim placeholder still counts
+  as empty). A draft, including a multi-line or wrapped one and a `[Pasted
+  text ...]` placeholder, is never typed over: csm notifies once and gives
+  up on that request. A dialog, menu or picker (no box) is retried until the
+  deadline.
+- The screen is not busy. The input box looks empty while a reply generates,
+  so csm also refuses when the window title carries Claude Code's spinner
+  glyph or an activity line such as `(3s · thinking)` is on screen. Refused
+  requests log `vetoed-screen-busy`.
+- The vim mode agrees with the request. The statusLine payload's vim mode is
+  the reference: no vim reported means the box is treated as plain and `i` is
+  never sent; INSERT requires the `-- INSERT --` marker on screen; NORMAL
+  requires it absent, and csm then sends `i` and waits for the marker before
+  typing. Any disagreement is treated as no box and retried.
+
+It then holds the user's input back, types `/compact`, waits for the output
+to settle and checks that the box holds exactly `/compact`. If the slash
+menu is open, its highlighted entry must be `/compact` too, otherwise Enter
+would run something else. Only then does it press Enter. Otherwise it erases
+what it typed (one DEL per character, plus Esc if it entered insert mode
+itself), tells the user and logs `verify-failed`. Held input is flushed in
+order afterwards, on every exit path. Within 10 seconds of Enter, the
+compaction line on screen (or a busy session record) makes it `delivered`;
+without either it is `sent-unconfirmed`.
+
+Notifications (`draft`, `verify-failed`, a request that ran out of time
+after typing) are an OSC 777 sequence csm writes into claude's output only
+at a sequence boundary after 500 ms of quiet, and dropped if that does not
+happen within a few seconds. `dry-run` mode runs the same checks but types
+and notifies nothing.
+
+Every finished request appends one line to `<state>/idle-compact.log`. The
+`outcome=` words are `handed-off` and `no-delivery-path` (the tick),
+`delivered`, `sent-unconfirmed`, `draft`, `verify-failed`, `expired`,
+`vetoed-<reason>` (the deadline passed while the session record or the
+screen kept saying no; `<reason>` is claude's status word or
+`screen-busy`), and the dry-run words `dry-run-would-type`, `dry-run-draft`
+and `dry-run-expired`. Delivery lines also carry `box=`, `vim=` and
+`status=` when known.
+
+The screen checks were written against real captures of Claude Code
+2.1.283 (`tests/fixtures/screens/`, see its README); a Claude Code release
+that redraws the box, the mode line or the window title differently would
+make the supervisor refuse (it never types on a screen it does not
+recognise), not misfire.
+
+### Limits on switching
+
+- One switch per session chain. A second cap after a switch only notifies.
+  The limit is fixed at 1: `CLAUDE_MAX_HOPS=0` stops the hook from
+  switching at all, but a larger value changes nothing, because the
+  session's `.switched` marker and the relaunch loop's own cap both stay
+  at one switch.
+- A switch triggered by the `Stop` usage figures waits out a machine-wide
+  cooldown (`CLAUDE_SWITCH_COOLDOWN`, default 300 s). A statusLine tick or a
+  429 is the session's own evidence and is not held back.
+- When every other account is capped too, csm notifies and changes nothing.
+- `CLAUDE_AUTO_SWITCH=0` turns the switch off. `CLAUDE_AUTO_SWITCH_RELAUNCH=0`
+  keeps detection and notifies instead of relaunching.
+
+### What counts as capped
+
+| Window | Not usable at |
+|---|---|
+| 5-hour session | `CLAUDE_LIMIT_PCT`, default 99% |
+| weekly, all models | `CLAUDE_PICK_SATURATION_PCT`, default 95% |
+| weekly, one model tier (`week_fable`) | never on its own; see below |
+
+A cap on the model-scoped weekly window alone does not switch accounts.
+The session resumes on the same account with `--model` set to
+`CLAUDE_FABLE_FALLBACK_MODEL` (default `opus`), once per weekly window. This
+spends no switch. `CLAUDE_FABLE_FALLBACK=0` turns it off, and the cap is
+then handled like any other.
+
+## Usage metering
+
+`csm usage` prints one row per Orca account: email, organization, the three
+usage windows and when they reset. `--json` prints the same data as JSON.
+Usage comes from Anthropic's OAuth usage API (`GET /api/oauth/usage`),
+called with each account's own grant:
+
+- The active account: the statusLine captures first, else the grant in `D`.
+  csm never refreshes that grant; Claude Code and Orca do.
+- Other accounts with Orca running: Orca's own cached figures
+  (`accounts.list`). csm does not touch their stashes.
+- Other accounts with Orca stopped: the stashed grant. `csm usage --refresh`
+  and the pick before a limit switch refresh a stashed grant that expires
+  within five minutes, the way Orca does. Nothing else refreshes a grant.
+
+Results are cached: the whole snapshot for `CSM_USAGE_TTL_SECS` (60 s), each
+account's record for `CSM_USAGE_PROFILE_TTL` (300 s), with a back-off after
+a 429 or a total failure. A window whose reset time has passed is shown as
+0%. `--no-fetch` reads only the cache; `--refresh` skips the caches and asks
+a running Orca to re-probe (up to 30 s).
+
+`CSM_USAGE_CMD` replaces collection with your own command that prints the
+usage JSON. See [`examples/usage-collector.sh`](examples/usage-collector.sh)
+for the format.
+
+`csm statusline` prints `<account>@<host>`: the local part of the account's
+email and the short host name (`CSM_HOST_REPLACE=Acme-/` strips a prefix).
+Inside an Orca pane it also forwards the payload to Orca's own statusLine
+receiver, so Orca's usage display stays current even though your statusLine
+command is csm's. The forward runs in a detached child after the segment
+is printed, so it adds no render latency.
+
+The hook (`csm hook`, every event) reads only csm's own files. It makes no
+network call, no RPC call and no Keychain access, so a `SessionEnd` hook
+returns well inside Claude Code's 1.5 s budget even with stale usage.
+
+## Idle compact
+
+`csm usage capture` and `csm statusline` both see the statusLine payload
+Claude Code sends on every refresh. When that payload carries prompt cache
+information, csm can use the gap while a session sits idle to keep the
+cache from going cold: it sends `/compact` to that session's terminal
+shortly before the cache expires, so the request after the gap re-writes a
+compacted context instead of the full one.
+
+This is opt-in: `csm config set idle-compact off|dry-run|on`, default
+`off`. `dry-run` and `on` decide identically; only the relay's own
+delivery (below) treats them differently.
+
+csm's own part is a hand-off, not a delivery. On each statusLine tick it
+acts on a session when all of this holds: the mode is not off, the prompt
+cache is reported warm with 300 seconds or fewer left before it expires,
+the re-write the payload predicts is at least 100000 tokens, the turn has
+actually ended, and it has not already acted for this idle period. The
+turn-ended check starts cheap (the transcript's mtime at or before the
+last `Stop`) and only reads further when that mtime moved past the stop:
+Claude Code keeps appending rows to the transcript well after a turn ends
+(`turn_duration`, `away_summary`, and other bookkeeping), so csm reads the
+transcript's tail and looks at the last real `user`/`assistant` row's own
+timestamp rather than treating every later write as a new turn. A `[Request
+interrupted by user` row newer than the `Stop` stamp also ends the turn, at
+that row's own timestamp, even with no fresh `Stop` event at all.
+
+When every condition holds, csm checks whether its own future pty-relay
+supervisor is alive (`CSM_SUPERVISOR_PID` names a running process) and, if
+so, writes a hand-off request file under
+`<state>/idle-compact-requests/<supervisor pid>.json` (session id, mode,
+remaining seconds, recache estimate, a deadline) and logs
+`outcome=handed-off`. With no live supervisor it logs
+`outcome=no-delivery-path` instead and still claims the idle period, so
+either outcome is logged at most once per idle period. csm itself never
+types into a terminal, checks a screen, or reads session status; that is
+the supervisor's job once it picks up the request, using the typing
+protocol in `src/idle_compact/deliver.rs` (screen classification, a vim
+NORMAL/INSERT distinction, a session-status veto, retry until the request's
+deadline, and rollback on a failed verify).
+
+### Limits
+
+A request file past its deadline, unparseable, or of an unknown schema
+version is dropped rather than acted on late; pruning piggybacks on the
+existing marker sweep, so a supervisor that never picks one up (crashed,
+or was never really alive despite a live-looking pid) does not leave it
+behind forever.
+
+`/compact` raises no `Stop` event, so the idle marker from before the
+compaction outlives it and only clears once the next real turn ends
+(checked on 15 manual compactions).
+
+Manual compaction itself took 21 to 226 seconds in those 15 runs, median
+85, across contexts of 54000 to 268000 tokens.
+
 ## Accounts from the terminal
 
 - `csm accounts use <account>` makes that account active. It does not stop
@@ -583,6 +809,9 @@ csm config unset launch-command
 
 The other setting, `min-claude-version`, is the floor described under
 *Who switches*: `csm config set min-claude-version 2.1.300`.
+
+`idle-compact` turns on the feature described under *Idle compact*:
+`csm config set idle-compact off|dry-run|on` (default `off`).
 
 `CLAUDE_SMART_CLAUDE_BIN` overrides the launch command for one run. csm skips any candidate
 that turns out to be csm itself (the `claude` alias, for instance) and uses

@@ -167,11 +167,38 @@ dependency/MSRV checks).
 
 `run, hook, accounts {list|use|add|import|rm|doctor [--fix] [--offline]},
 orca {status|setup}, migrate [--dry-run],
-config {show|get|set|unset launch-command|min-claude-version},
+config {show|get|set|unset launch-command|min-claude-version|idle-compact},
 usage [--json] [--no-fetch] [--refresh] | usage capture,
 scan, sidecar, statusline, completions, reap, newuuid, claude <args…>` + the
 hidden compat `cas`. There is no csm-global flag. The collision analysis
 against claude's own subcommands is Invariant 2 above.
+
+`idle-compact` (off by default; `dry-run`/`on`) compacts an idle session
+shortly before its prompt cache expires. The statusLine tick only hands off a
+request file; the typing is done by csm's own pty relay, never by an
+external terminal tool.
+`csm run` relays the terminal when the mode is not `off`, stdin and stdout
+are terminals and `CSM_RELAY` is not `0` (`CSM_RELAY=0` = the direct
+launcher, no delivery). Layout: `platform/relay/` (pty, leader, byte
+classification, `RelayObserver`/`RelayIo`), `screen_check.rs` (pure
+functions over a `vt100::Screen`: input box, vim state, busy, slash-menu
+highlight, compaction), `idle_compact/tick.rs` (fire conditions, hand-off),
+`idle_compact/deliver.rs` (pure typing state machine),
+`idle_compact/supervisor.rs` (the observer: screen model, watcher thread,
+executes the machine's actions), `request.rs`/`status.rs`/`log.rs`.
+Safety rules the supervisor enforces before typing: deadline, session-status
+veto, 60 s without a keystroke and 2 s without output, main box found and
+empty, not busy (window-title spinner or `(3s · thinking)` activity line),
+vim state agrees with the request's `vim_mode`, and before Enter the box
+holds exactly `/compact` with `/compact` the highlighted menu entry;
+otherwise it rolls back (DEL per char, Esc). Screen rules come from real
+captures in `tests/fixtures/screens/`; add a capture and an `index.json`
+row before changing a rule. Log outcomes (`<state>/idle-compact.log`):
+`handed-off`, `no-delivery-path`, `delivered`, `sent-unconfirmed`, `draft`,
+`verify-failed`, `expired`, `vetoed-<reason>`, `dry-run-would-type`,
+`dry-run-draft`, `dry-run-expired`. E2E through the real relay:
+`tests/idle_compact_relay.rs` (fake claude `tests/bin/fake_claude_ui.rs`
+replays the fixtures). See the README's "Idle compact" section.
 
 ## Git workflow
 

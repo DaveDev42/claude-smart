@@ -62,6 +62,23 @@ summary.
 | `fakes/usage-cmd.sh` | `CSM_USAGE_CMD`: prints the scenario's usage fixture and counts its calls. |
 | `fakes/point-hook.sh` | At one named point: starts the fake Orca (`E2E_POINT_AT`), or kills the csm process once (`E2E_POINT_KILL`) so a scenario can check the next run recovers. |
 
+idle-compact needs no fake of its own in this harness: the tick only hands
+off a request, so its scenarios exercise `lib.sh`'s
+`idle_compact_stand_in_supervisor`/`idle_compact_dead_pid` (any real
+process satisfies `crate::platform::proc::is_running`, so a bare
+`/bin/sleep` stands in for the pty-relay supervisor) and check the
+request file `tick` writes under `<state>/idle-compact-requests/<pid>.json`.
+The supervisor's own behaviour (the relay, the screen checks, what gets
+typed) is not driven from here: `tests/idle_compact_relay.rs` runs it
+through the real relay under a pty, against a fake claude that replays the
+captured screens in `tests/fixtures/screens/`. Its scenarios: happy path
+(`delivered`, `/compact` then Enter), vim NORMAL (`i` first), a draft screen
+(nothing typed, `draft`, notification), multi-line/wrapped/pasted drafts, a
+dialog (nothing typed, `expired`), a recent keystroke (nothing typed), a busy
+screen (`vetoed-screen-busy`), a request/screen vim mismatch, dry-run
+(`dry-run-would-type`, nothing typed) and a failed verify (rollback DELs,
+`verify-failed`). `CSM_RELAY=0` is covered by `tests/pty_relay.rs`.
+
 The accounts are alice (`aaaaaaaa-…-00000000000a`, active) and bob
 (`bbbbbbbb-…-00000000000b`). Tokens are fixture strings such as `rt-bob-1`.
 Every scenario starts from that state with Orca stopped and csm's state dir
@@ -136,6 +153,37 @@ Launch contexts:
   running finishes in under 1 s without touching the network, the RPC
   socket, the Keychain or the usage command, and one with no turn finishes
   in under 0.5 s.
+
+idle-compact (no supervised claude needed — `csm hook` and
+`csm usage capture` are stateless one-shot calls). csm itself only ever
+hands off a request to a live `CSM_SUPERVISOR_PID`; it never types into a
+terminal. The typing protocol the relay supervisor runs against the request
+these scenarios produce is in `src/idle_compact/deliver.rs` (unit and
+property tests) and `tests/idle_compact_relay.rs`:
+
+- `idle_compact_no_supervisor`: mode `on`, an idle session, a cache about
+  to expire, and no `CSM_SUPERVISOR_PID` set logs `outcome=no-delivery-path`
+  once for the idle period; a second tick against the same idle period does
+  not re-log.
+- `idle_compact_supervisor_hands_off`: the same conditions with
+  `CSM_SUPERVISOR_PID` naming a live process (a stand-in, not a real
+  supervisor) log `outcome=handed-off` and write a request file under
+  `<state>/idle-compact-requests/<pid>.json` carrying the session id, mode,
+  remaining seconds and recache estimate.
+- `idle_compact_dead_supervisor`: `CSM_SUPERVISOR_PID` naming a pid that is
+  not running is treated exactly like no supervisor at all:
+  `outcome=no-delivery-path`, no request file.
+- `idle_compact_interrupted_turn_hands_off`: a `[Request interrupted by
+  user` row newer than the `Stop` stamp, with no fresh `Stop` event at all,
+  still hands off, since the busy check ends the turn at that row's own
+  timestamp.
+- `idle_compact_metadata_after_stamp_still_hands_off`: post-Stop metadata
+  rows (`turn_duration`, `away_summary`, `mode`) land after the idle stamp
+  and move the transcript's mtime past it, but the last real `assistant`
+  row is still before it, so the busy check's tail read must see through
+  the metadata and hand off anyway (no supervisor needed: `no-delivery-path`
+  is just as good proof the busy check concluded not-busy, since a silent
+  Skip would log nothing at all).
 
 Migration off the legacy profile layout. Except for `auto_fresh`, each
 starts from two registered profiles, work (carol, the floor) and home
