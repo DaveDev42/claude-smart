@@ -1,5 +1,23 @@
 # Changelog
 
+## [0.4.0](https://github.com/DaveDev42/claude-smart/compare/v0.3.8...v0.4.0) (2026-09-30)
+
+
+### ⚠ BREAKING CHANGES
+
+* **accounts:** csm profiles, the cas registry verbs, pick-account, current-usage, --profile, -A and --no-pick are removed. csm cas --print-default-dir prints D and csm cas --eval is a silent no-op so old shell shims keep loading. The first run of the new csm moves existing ~/.claude.<name> logins into Orca by itself; csm migrate shows or finishes that work.
+
+### Features
+
+* **accounts:** switch accounts through Orca's account store ([0fd39b5](https://github.com/DaveDev42/claude-smart/commit/0fd39b593e507bc58fa4c0b8484e04fe8aff80e8))
+* **migrate:** move a machine onto Orca's account store automatically ([ea46f37](https://github.com/DaveDev42/claude-smart/commit/ea46f374f0815edd89936a8df4a9c23422c4e00a))
+
+
+### Bug Fixes
+
+* **orca:** close crash, liveness and migration gaps found in review ([0d2665c](https://github.com/DaveDev42/claude-smart/commit/0d2665ca93453c99975520ef9258e0f96f54a1ad))
+* **test:** make the suite pass on native Windows and the CI e2e runners ([0ab727f](https://github.com/DaveDev42/claude-smart/commit/0ab727f310e4656f05ae8af99a54e9cb303130fc))
+
 ## [0.3.8](https://github.com/DaveDev42/claude-smart/compare/v0.3.7...v0.3.8) (2026-09-26)
 
 
