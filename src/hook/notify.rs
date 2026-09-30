@@ -107,7 +107,10 @@ pub fn append_log(sid: &str, message: &str) -> anyhow::Result<()> {
 // ─── hostname helper ─────────────────────────────────────────────────────────
 
 /// Return the short hostname (like `hostname -s`).
-fn get_hostname() -> String {
+///
+/// `pub(crate)`: `idle_compact`'s own log writer reuses this rather than
+/// duplicating the unix/Windows hostname lookup.
+pub(crate) fn get_hostname() -> String {
     // Shell: `hostname -s 2>/dev/null || hostname`
     // On unix, use gethostname via nix; fall back to std::process or "unknown".
     #[cfg(unix)]

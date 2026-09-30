@@ -43,6 +43,32 @@ pub struct StatuslinePayload {
     pub session_id: Option<serde_json::Value>,
     #[serde(default)]
     pub cost: Option<serde_json::Value>,
+    /// Claude Code's own prompt-cache state, read by `idle_compact`. Kept
+    /// loose (`Value`), exactly like `cost` above, so a shape this crate
+    /// does not expect (a future engine change, a non-object value) never
+    /// fails the parse of the rest of the payload; the typed sub-fields
+    /// (`warm`/`expires_at`/`recache_tokens_if_cold`) are read back through
+    /// the `prompt_cache_*` accessors below, each individually optional.
+    #[serde(default)]
+    pub prompt_cache: Option<serde_json::Value>,
+    /// The context window size `idle_compact`'s log line reports alongside
+    /// the re-write estimate. Kept as a loose `Value` (undocumented
+    /// shape/unit) — never interpreted here beyond the bare-number case
+    /// (see `idle_compact::context_window_summary`), only carried through.
+    #[serde(default)]
+    pub context_window: Option<serde_json::Value>,
+    /// The `.jsonl` transcript path for this session, read by
+    /// `idle_compact`'s busy check (its mtime vs. the `<sid>.idle` marker).
+    /// Kept loose for the same reason as `session_id` above.
+    #[serde(default)]
+    pub transcript_path: Option<serde_json::Value>,
+    /// Claude Code's vim-mode indicator, read by `idle_compact::request` so
+    /// a hand-off request can tell the supervisor whether it will need to
+    /// leave NORMAL mode before typing. Kept loose for the same reason as
+    /// `prompt_cache` above; the typed value is read back through
+    /// [`Self::vim_mode`].
+    #[serde(default)]
+    pub vim: Option<serde_json::Value>,
 }
 
 impl StatuslinePayload {
@@ -60,6 +86,49 @@ impl StatuslinePayload {
     pub fn duration_secs(&self) -> Option<i64> {
         let ms = self.cost.as_ref()?.get("total_duration_ms")?.as_f64()?;
         (ms.is_finite() && ms >= 0.0).then(|| (ms / 1000.0) as i64)
+    }
+
+    /// `prompt_cache.warm`, when present and a boolean.
+    pub fn prompt_cache_warm(&self) -> Option<bool> {
+        self.prompt_cache.as_ref()?.get("warm")?.as_bool()
+    }
+
+    /// `prompt_cache.expires_at` (unix epoch seconds), when present and a
+    /// sane integer.
+    pub fn prompt_cache_expires_at(&self) -> Option<i64> {
+        self.prompt_cache.as_ref()?.get("expires_at")?.as_i64()
+    }
+
+    /// `prompt_cache.recache_tokens_if_cold`, when present and a sane
+    /// integer.
+    pub fn prompt_cache_recache_tokens_if_cold(&self) -> Option<i64> {
+        self.prompt_cache
+            .as_ref()?
+            .get("recache_tokens_if_cold")?
+            .as_i64()
+    }
+
+    /// The payload's `transcript_path`, when it is a non-empty string.
+    pub fn transcript_path(&self) -> Option<String> {
+        self.transcript_path
+            .as_ref()
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+    }
+
+    /// `vim.mode`, when present and a non-empty string (for example
+    /// `"insert"`/`"normal"`). `None` when the payload carries no `vim`
+    /// section at all (vim mode is off, or claude has not reported one yet).
+    pub fn vim_mode(&self) -> Option<String> {
+        self.vim
+            .as_ref()?
+            .get("mode")?
+            .as_str()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
     }
 }
 
@@ -327,5 +396,126 @@ mod tests {
         }"#;
         let payload: StatuslinePayload = serde_json::from_str(json).expect("must tolerate extras");
         assert!(to_profile_usage(&payload, None, now()).is_some());
+    }
+
+    // ── prompt_cache / context_window (idle_compact's inputs) ────────────────
+
+    #[test]
+    fn prompt_cache_parses_full_shape() {
+        let json = r#"{
+          "prompt_cache": {"warm": true, "expires_at": 1788339599, "recache_tokens_if_cold": 213000},
+          "context_window": 200000
+        }"#;
+        let payload: StatuslinePayload = serde_json::from_str(json).unwrap();
+        assert_eq!(payload.prompt_cache_warm(), Some(true));
+        assert_eq!(payload.prompt_cache_expires_at(), Some(1_788_339_599));
+        assert_eq!(payload.prompt_cache_recache_tokens_if_cold(), Some(213_000));
+        assert_eq!(payload.context_window, Some(serde_json::json!(200000)));
+    }
+
+    #[test]
+    fn prompt_cache_absent_is_none() {
+        let payload: StatuslinePayload = serde_json::from_str(r#"{}"#).unwrap();
+        assert!(payload.prompt_cache_warm().is_none());
+        assert!(payload.prompt_cache_expires_at().is_none());
+        assert!(payload.prompt_cache_recache_tokens_if_cold().is_none());
+        assert!(payload.context_window.is_none());
+    }
+
+    #[test]
+    fn prompt_cache_partial_fields_are_individually_optional() {
+        let payload: StatuslinePayload =
+            serde_json::from_str(r#"{"prompt_cache": {"warm": true}}"#).unwrap();
+        assert_eq!(payload.prompt_cache_warm(), Some(true));
+        assert!(payload.prompt_cache_expires_at().is_none());
+        assert!(payload.prompt_cache_recache_tokens_if_cold().is_none());
+    }
+
+    #[test]
+    fn prompt_cache_unexpected_shape_never_fails_the_whole_parse() {
+        // A future engine change reshapes prompt_cache (e.g. a string instead
+        // of an object) — the rest of the payload must still parse, with
+        // every prompt_cache accessor coming back None rather than an error.
+        let json = r#"{
+          "prompt_cache": "unexpected",
+          "rate_limits": {"five_hour": {"used_percentage": 5.0, "resets_at": 1}}
+        }"#;
+        let payload: StatuslinePayload =
+            serde_json::from_str(json).expect("must tolerate a reshaped prompt_cache");
+        assert!(payload.prompt_cache_warm().is_none());
+        assert!(payload.prompt_cache_expires_at().is_none());
+        assert!(payload.prompt_cache_recache_tokens_if_cold().is_none());
+        assert!(to_profile_usage(&payload, None, now()).is_some());
+    }
+
+    #[test]
+    fn context_window_tolerates_any_shape() {
+        let payload: StatuslinePayload =
+            serde_json::from_str(r#"{"context_window": {"used": 1, "max": 2}}"#).unwrap();
+        assert!(payload.context_window.is_some());
+    }
+
+    // ── transcript_path (idle_compact's busy check) ──────────────────────────
+
+    #[test]
+    fn transcript_path_parses_a_string() {
+        let json = r#"{"transcript_path": "/home/example/.claude/projects/foo/sid.jsonl"}"#;
+        let payload: StatuslinePayload = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            payload.transcript_path().as_deref(),
+            Some("/home/example/.claude/projects/foo/sid.jsonl")
+        );
+    }
+
+    #[test]
+    fn transcript_path_absent_is_none() {
+        let payload: StatuslinePayload = serde_json::from_str(r#"{}"#).unwrap();
+        assert!(payload.transcript_path().is_none());
+    }
+
+    #[test]
+    fn transcript_path_blank_or_wrong_shape_is_none() {
+        let blank: StatuslinePayload =
+            serde_json::from_str(r#"{"transcript_path": "  "}"#).unwrap();
+        assert!(blank.transcript_path().is_none());
+        let wrong_shape: StatuslinePayload = serde_json::from_str(
+            r#"{"transcript_path": 42, "rate_limits": {"five_hour": {"used_percentage": 5.0, "resets_at": 1}}}"#,
+        )
+        .unwrap();
+        assert!(wrong_shape.transcript_path().is_none());
+        assert!(
+            to_profile_usage(&wrong_shape, None, now()).is_some(),
+            "a wrong-shaped transcript_path must not fail the rest of the parse"
+        );
+    }
+
+    // ── vim (idle_compact's request hand-off) ─────────────────────────────────
+
+    #[test]
+    fn vim_mode_parses_a_string() {
+        let payload: StatuslinePayload =
+            serde_json::from_str(r#"{"vim": {"mode": "insert"}}"#).unwrap();
+        assert_eq!(payload.vim_mode().as_deref(), Some("insert"));
+    }
+
+    #[test]
+    fn vim_mode_absent_is_none() {
+        let payload: StatuslinePayload = serde_json::from_str(r#"{}"#).unwrap();
+        assert!(payload.vim_mode().is_none());
+    }
+
+    #[test]
+    fn vim_mode_blank_or_wrong_shape_is_none() {
+        let blank: StatuslinePayload = serde_json::from_str(r#"{"vim": {"mode": "  "}}"#).unwrap();
+        assert!(blank.vim_mode().is_none());
+        let wrong_shape: StatuslinePayload = serde_json::from_str(
+            r#"{"vim": "unexpected", "rate_limits": {"five_hour": {"used_percentage": 5.0, "resets_at": 1}}}"#,
+        )
+        .unwrap();
+        assert!(wrong_shape.vim_mode().is_none());
+        assert!(
+            to_profile_usage(&wrong_shape, None, now()).is_some(),
+            "a wrong-shaped vim must not fail the rest of the parse"
+        );
     }
 }

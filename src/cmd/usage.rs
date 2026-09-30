@@ -155,6 +155,10 @@ fn cmd_usage_capture() -> anyhow::Result<()> {
     if let Ok(Some(capture)) = usage::local::record_statusline_payload(&raw) {
         hook::run_from_statusline(&raw, &capture);
     }
+    // idle_compact reads the payload's own session_id/prompt_cache/
+    // transcript_path directly — it runs regardless of whether this
+    // session's usage capture could be attributed to an account above.
+    crate::idle_compact::run_from_raw(&raw);
     Ok(())
 }
 

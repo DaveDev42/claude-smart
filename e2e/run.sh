@@ -192,6 +192,7 @@ run_scenario() {
     "sc_$name"
     wait 2>/dev/null
     cp "$STATE/limit-switch.log" "$LOGS/limit-switch.log" 2>/dev/null
+    cp "$STATE/idle-compact.log" "$LOGS/idle-compact.log" 2>/dev/null
     echo "$FAILED" >"$LOGS/failed"
   ) >"$LOGS/scenario.log" 2>&1 &
   sp=$!
@@ -235,7 +236,7 @@ for name in "${FAILED_NAMES[@]:-}"; do
   cat "$SANDBOX/logs/$name/scenario.log"
   for f in "$SANDBOX/logs/$name"/transcript "$SANDBOX/logs/$name"/*.sup.log "$SANDBOX/logs/$name"/*.claude.log \
     "$SANDBOX/logs/$name"/claude.log "$SANDBOX/logs/$name"/orca-requests.log "$SANDBOX/logs/$name"/orca-requests.log.stderr \
-    "$SANDBOX/logs/$name"/limit-switch.log; do
+    "$SANDBOX/logs/$name"/limit-switch.log "$SANDBOX/logs/$name"/idle-compact.log; do
     [ -f "$f" ] || continue
     echo "---- $f"
     cat "$f"

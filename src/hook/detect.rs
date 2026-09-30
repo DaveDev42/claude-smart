@@ -1654,9 +1654,22 @@ fn write_noclobber_epoch(path: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Prune `.detected` markers older than 7 days across the smart dir.
-/// Best-effort: any error is silently ignored.
-/// Shell: `find "$SMART_DIR" -maxdepth 1 -name '*.detected' -mtime +7 -delete`
+/// Suffixes [`prune_detected_markers`] sweeps: the one-shot notify dedup
+/// marker, plus `idle_compact`'s two per-session markers (`<sid>.idle`, the
+/// last-Stop stamp, and `<sid>.idle-compacted`, the one-shot fire marker) —
+/// the same per-session state files this sweep already prunes by age, so a
+/// session that stops running is not left with stale idle-compact markers
+/// any more than it is with a stale `.detected` one.
+const PRUNED_MARKER_SUFFIXES: [&str; 3] = [".detected", ".idle", ".idle-compacted"];
+
+/// Prune `.detected`/`.idle`/`.idle-compacted` markers older than 7 days
+/// across the smart dir, then [`idle_compact::request::prune_stale_requests`]
+/// over the same dir's `idle-compact-requests/` subdirectory (a supervisor
+/// that never claimed a hand-off request — crashed, or was never actually
+/// alive despite a live-looking pid check at write time — must not leave it
+/// behind forever either). Best-effort: any error is silently ignored.
+/// Shell (the `.detected` case this ported from):
+/// `find "$SMART_DIR" -maxdepth 1 -name '*.detected' -mtime +7 -delete`
 fn prune_detected_markers() {
     use crate::paths;
     let smart_dir = paths::smart_dir_no_create();
@@ -1668,7 +1681,10 @@ fn prune_detected_markers() {
     for entry in entries.flatten() {
         let name = entry.file_name();
         let name_str = name.to_string_lossy();
-        if !name_str.ends_with(".detected") {
+        if !PRUNED_MARKER_SUFFIXES
+            .iter()
+            .any(|suffix| name_str.ends_with(suffix))
+        {
             continue;
         }
         if let Ok(meta) = entry.metadata()
@@ -1679,6 +1695,10 @@ fn prune_detected_markers() {
             let _ = std::fs::remove_file(entry.path());
         }
     }
+    crate::idle_compact::request::prune_stale_requests(
+        &paths::idle_compact_requests_dir(),
+        crate::epoch::now_secs() as i64,
+    );
 }
 
 /// Check the machine-wide cooldown and atomically claim the slot.
@@ -3049,5 +3069,84 @@ mod tests {
                 crate::usage::FetchError::NegativeCacheActive,
             ));
         assert!(resolve_target_from_pick(result).is_none());
+    }
+
+    // ── prune_detected_markers (also sweeps idle_compact's two markers) ──────
+
+    /// A marker older than 7 days is pruned for all three suffixes
+    /// (`.detected`, `.idle`, `.idle-compacted`); one still within the
+    /// window is left alone, for every suffix.
+    #[test]
+    fn prune_detected_markers_sweeps_idle_compact_markers_too() {
+        let home = tempfile::TempDir::new().unwrap();
+        crate::testenv::with_test_home(home.path(), || {
+            let dir = crate::paths::smart_dir().unwrap();
+            let old = std::time::SystemTime::now() - std::time::Duration::from_secs(8 * 24 * 3600);
+            let fresh_sid = "sid-fresh-0001";
+            let stale_sid = "sid-stale-0001";
+            for sid in [fresh_sid, stale_sid] {
+                std::fs::write(crate::paths::detected(sid), "1").unwrap();
+                std::fs::write(crate::paths::idle(sid), "1").unwrap();
+                std::fs::write(crate::paths::idle_compacted(sid), "1").unwrap();
+            }
+            for sid in [stale_sid] {
+                for p in [
+                    crate::paths::detected(sid),
+                    crate::paths::idle(sid),
+                    crate::paths::idle_compacted(sid),
+                ] {
+                    let f = std::fs::File::open(&p).unwrap();
+                    f.set_modified(old).unwrap();
+                }
+            }
+            // Also drop an unrelated file to prove the sweep does not touch
+            // anything outside the three tracked suffixes.
+            std::fs::write(dir.join("sidecar-unrelated.json"), "{}").unwrap();
+            let unrelated = std::fs::File::open(dir.join("sidecar-unrelated.json")).unwrap();
+            unrelated.set_modified(old).unwrap();
+
+            prune_detected_markers();
+
+            assert!(crate::paths::detected(fresh_sid).exists());
+            assert!(crate::paths::idle(fresh_sid).exists());
+            assert!(crate::paths::idle_compacted(fresh_sid).exists());
+            assert!(!crate::paths::detected(stale_sid).exists());
+            assert!(!crate::paths::idle(stale_sid).exists());
+            assert!(!crate::paths::idle_compacted(stale_sid).exists());
+            assert!(
+                dir.join("sidecar-unrelated.json").exists(),
+                "the sweep must only touch the tracked marker suffixes"
+            );
+        });
+    }
+
+    /// [`prune_detected_markers`] also sweeps
+    /// `idle-compact-requests/<pid>.json` hand-off files: an expired one
+    /// (past its own `deadline`, regardless of the 7-day marker-age window
+    /// above) is pruned, a live one is left alone.
+    #[test]
+    fn prune_detected_markers_sweeps_stale_idle_compact_requests_too() {
+        let home = tempfile::TempDir::new().unwrap();
+        crate::testenv::with_test_home(home.path(), || {
+            let dir = crate::paths::idle_compact_requests_dir();
+            let now = crate::epoch::now_secs() as i64;
+            let sample = |deadline: i64| crate::idle_compact::request::Request {
+                v: crate::idle_compact::request::REQUEST_V,
+                mode: "on".to_owned(),
+                sid: "sid-1".to_owned(),
+                written_at: now,
+                deadline,
+                recache_tokens: 150_000,
+                remaining_secs: 200,
+                vim_mode: None,
+            };
+            crate::idle_compact::request::write_request(&dir, 111, &sample(now - 1_000)).unwrap(); // expired
+            crate::idle_compact::request::write_request(&dir, 222, &sample(now + 1_000)).unwrap(); // live
+
+            prune_detected_markers();
+
+            assert!(!crate::paths::idle_compact_request(111).exists());
+            assert!(crate::paths::idle_compact_request(222).exists());
+        });
     }
 }

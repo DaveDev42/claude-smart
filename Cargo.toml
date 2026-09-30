@@ -37,8 +37,38 @@ e2e = []
 name = "csm"
 path = "src/main.rs"
 
+# Test-only stand-in for `claude`, driven by the pty relay integration tests
+# (tests/pty_relay.rs) through CLAUDE_SMART_CLAUDE_BIN, the same override csm's
+# own launch-command resolver reads. A no-op on non-unix so `cargo build --all-targets`
+# / clippy stay green on windows-gnu even though the relay itself is unix-only.
+[[bin]]
+name = "fake_claude_relay"
+path = "tests/bin/fake_claude_relay.rs"
+
+# Test-only stand-in for claude's screen, driven by tests/idle_compact_relay.rs:
+# replays the captured fixtures in tests/fixtures/screens/ and records what the
+# idle-compact supervisor types at it. A no-op on non-unix.
+[[bin]]
+name = "fake_claude_ui"
+path = "tests/bin/fake_claude_ui.rs"
+
+# Test-only "shell" process for the same integration tests: becomes the
+# session leader of a pty slave, then hands it to the real program as a
+# genuine job-control child (own process group, this harness staying alive as
+# its "shell" — a real, non-orphaned job, unlike an exec-in-place hop).
+# See tests/bin/pty_harness.rs for why this has to be a separate OS process
+# rather than something a #[test] function does to itself, and for why it
+# forks a real child instead of exec'ing in place.
+[[bin]]
+name = "pty_harness"
+path = "tests/bin/pty_harness.rs"
+
 # ─── core, always present ────────────────────────────────────────────────────
 [dependencies]
+# relay screen model: parses claude's pty output so src/screen_check.rs can
+# read the input box, vim mode indicator and compaction state (tracks the dim
+# attribute through Cell::dim()); pure, no I/O of its own.
+vt100 = "0.16"
 # serde model: sidecar/<sid>.json, .relaunch sentinel, .usage-cache.json,
 # profiles.json, hook stdin contract, scan index storage
 serde      = { version = "1", features = ["derive"] }
@@ -113,8 +143,17 @@ features         = ["blocking", "rustls-no-provider"]
 
 # ─── POSIX-only ──────────────────────────────────────────────────────────────
 # tcsetpgrp/setpgid (foreground supervisor), kill() (hook SIGTERM), isatty (TTY gate)
+# "term" also covers nix's pty (openpty/posix_openpt/ptsname) and termios modules,
+# used by the pty relay launcher (platform/relay/); no separate "pty" feature exists
+# in this nix version. "poll" adds nix::poll for the relay's self-pipe shutdown
+# (input/output threads block in poll() so run_foreground can wake and join them
+# between relaunch hops, instead of leaving a stale thread racing the next hop's
+# reader on the same stdin/master fd).
 [target.'cfg(unix)'.dependencies]
-nix = { version = "0.31", features = ["hostname", "process", "signal", "term", "fs", "user"] }
+nix = { version = "0.31", features = ["hostname", "process", "signal", "term", "fs", "user", "poll"] }
+# TIOCSCTTY/TIOCGWINSZ/TIOCSWINSZ: "bad" (hardcoded, non-composable) ioctls with no
+# nix wrapper, called directly the same way nix's own pty.rs calls libc (platform/relay/).
+libc = "0.2"
 
 # ─── Windows-only ────────────────────────────────────────────────────────────
 # GenerateConsoleCtrlEvent, SetConsoleCtrlHandler, WaitFor*Object, CreateProcess

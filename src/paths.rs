@@ -168,6 +168,45 @@ pub fn model_fallback(sid: &str) -> PathBuf {
     smart_dir_no_create().join(format!("{sid}.model-fallback"))
 }
 
+/// `<smart_dir>/<sid>.idle` — the epoch `csm hook` last saw a turn end
+/// (`Stop`) for this session. `idle_compact`'s busy check compares this
+/// against the transcript file's mtime: a later mtime means a new turn
+/// started after this Stop, so the session is busy.
+pub fn idle(sid: &str) -> PathBuf {
+    smart_dir_no_create().join(format!("{sid}.idle"))
+}
+
+/// `<smart_dir>/<sid>.idle-compacted` — one-shot-per-idle-period marker:
+/// `idle_compact` already evaluated (or fired, or dry-ran) for this
+/// session's current idle period. Written before delivery, and in
+/// `dry-run` too, so a failed delivery is not retried every statusline
+/// tick; the next `Stop` clears it (`csm hook` removes it when it writes a
+/// fresh [`idle`] marker).
+pub fn idle_compacted(sid: &str) -> PathBuf {
+    smart_dir_no_create().join(format!("{sid}.idle-compacted"))
+}
+
+/// `<state>/idle-compact-requests/` — one hand-off request file per live
+/// supervisor pid, written by the `idle_compact` tick and consumed by csm's
+/// pty-relay supervisor. See `idle_compact::request`.
+pub fn idle_compact_requests_dir() -> PathBuf {
+    smart_dir_no_create().join("idle-compact-requests")
+}
+
+/// `<state>/idle-compact-requests/<supervisor_pid>.json` — the request a
+/// tick hands to the supervisor running as `supervisor_pid`. Mirrors
+/// [`follow`]'s dir-then-file split; `idle_compact::request`'s functions
+/// also accept an explicit `dir: &Path` seam for tests, which joins this
+/// same `<pid>.json` filename itself rather than calling this constructor,
+/// so a test can point at a temp dir without going through [`smart_dir_no_create`].
+/// A convenience for the supervisor to compute its own request path from
+/// just its own pid; not yet called by any production code in this crate
+/// (the supervisor is a separate module, not yet built here).
+#[allow(dead_code)]
+pub fn idle_compact_request(supervisor_pid: u32) -> PathBuf {
+    idle_compact_requests_dir().join(format!("{supervisor_pid}.json"))
+}
+
 // ─── global state paths ───────────────────────────────────────────────────────
 
 /// `<smart_dir>/.usage-cache.json` — positive TTL usage cache (60 s by mtime).
@@ -184,6 +223,15 @@ pub fn fetch_failed() -> PathBuf {
 /// is authoritative — NOT an mtime lock).
 pub fn last_switch() -> PathBuf {
     smart_dir_no_create().join(".last-switch")
+}
+
+/// `<smart_dir>/idle-compact.log` — one line per idle period `idle_compact`
+/// evaluates past the "would fire" threshold (outcome, remaining TTL,
+/// re-write size, target, and the reason when it did not fire). Mirrors
+/// `limit-switch.log`'s line format but is a separate file/writer
+/// (`hook::notify::append_log` is hardcoded to `limit-switch.log`).
+pub fn idle_compact_log() -> PathBuf {
+    smart_dir_no_create().join("idle-compact.log")
 }
 
 /// `<state>/last-identity` — the last `oauthAccount.accountUuid` csm saw in
@@ -517,5 +565,46 @@ mod tests {
         assert!(switched(sid).to_string_lossy().contains(sid));
         assert!(detected(sid).to_string_lossy().contains(sid));
         assert!(model_fallback(sid).to_string_lossy().contains(sid));
+        assert!(idle(sid).to_string_lossy().contains(sid));
+        assert!(idle_compacted(sid).to_string_lossy().contains(sid));
+    }
+
+    #[test]
+    fn idle_compact_log_is_a_global_path_under_smart_dir() {
+        let p = idle_compact_log();
+        assert!(p.starts_with(smart_dir_no_create()));
+        assert!(p.to_string_lossy().ends_with("idle-compact.log"));
+        assert_ne!(p, idle("some-sid"), "must not collide with a per-sid path");
+    }
+
+    #[test]
+    fn idle_compact_requests_dir_is_under_smart_dir() {
+        let d = idle_compact_requests_dir();
+        assert!(d.starts_with(smart_dir_no_create()));
+        assert!(d.to_string_lossy().ends_with("idle-compact-requests"));
+    }
+
+    #[test]
+    fn idle_compact_request_path_includes_pid_and_dir() {
+        let p = idle_compact_request(4242);
+        let s = p.to_string_lossy();
+        assert!(s.ends_with("4242.json"), "got: {s}");
+        assert!(p.starts_with(idle_compact_requests_dir()));
+    }
+
+    #[test]
+    fn idle_compact_paths_are_distinct_and_under_smart_dir() {
+        let sid = "01234567-89ab-cdef-0123-456789abcdef";
+        let idle_p = idle(sid);
+        let compacted_p = idle_compacted(sid);
+        assert_ne!(idle_p, compacted_p);
+        assert!(idle_p.to_string_lossy().ends_with(".idle"));
+        assert!(compacted_p.to_string_lossy().ends_with(".idle-compacted"));
+        for p in [&idle_p, &compacted_p] {
+            assert!(
+                p.starts_with(smart_dir_no_create()),
+                "{p:?} should live under smart_dir"
+            );
+        }
     }
 }

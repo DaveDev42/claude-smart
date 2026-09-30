@@ -48,6 +48,20 @@ pub struct Config {
     )]
     pub min_claude_version: Option<String>,
 
+    /// The idle-compact delivery mode: `"off"` | `"dry-run"` | `"on"` (design
+    /// `docs/superpowers/specs/`-companion issue 36). Absent →
+    /// [`DEFAULT_IDLE_COMPACT_MODE`] (`"off"`). Stored as the raw string
+    /// (not the enum) so a value an older binary wrote round-trips even if
+    /// this binary does not recognise it — [`Config::idle_compact_mode`] is
+    /// the only place that interprets it, and falls back to `Off` rather
+    /// than erroring on an unrecognised value.
+    #[serde(
+        default,
+        rename = "idleCompact",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub idle_compact: Option<String>,
+
     /// Absorb any unknown keys written by future binary versions so a rollback
     /// to an older binary does not destroy unrecognised fields (mirrors
     /// `Sidecar.extra`).
@@ -117,6 +131,60 @@ impl Config {
             .map(str::trim)
             .filter(|v| !v.is_empty())
             .unwrap_or(DEFAULT_MIN_CLAUDE_VERSION)
+    }
+}
+
+/// The idle-compact feature's delivery mode (`csm config set idle-compact
+/// off|dry-run|on`). `Off` (the default) never evaluates the trigger
+/// conditions at all; `DryRun` evaluates and logs every idle period but
+/// never sends `/compact` or claims the fire marker before delivery; `On`
+/// delivers. See `idle_compact` for the decision function this drives.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IdleCompactMode {
+    Off,
+    DryRun,
+    On,
+}
+
+impl IdleCompactMode {
+    /// Parse the on-disk/CLI string form. `None` for anything else — the
+    /// caller decides whether that means "reject the input" (`csm config
+    /// set`) or "fall back to the default" (`Config::idle_compact_mode`).
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim() {
+            "off" => Some(Self::Off),
+            "dry-run" => Some(Self::DryRun),
+            "on" => Some(Self::On),
+            _ => None,
+        }
+    }
+
+    /// The canonical string form — round-trips through [`Self::parse`].
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::DryRun => "dry-run",
+            Self::On => "on",
+        }
+    }
+}
+
+/// [`Config::idle_compact`]'s default when unset.
+pub const DEFAULT_IDLE_COMPACT_MODE: &str = "off";
+
+impl Config {
+    /// The effective idle-compact mode: the configured string, parsed —
+    /// unset, blank, or an unrecognised value all fall back to
+    /// [`DEFAULT_IDLE_COMPACT_MODE`] rather than erroring, matching
+    /// [`Config::min_claude_version`]'s leniency.
+    pub fn idle_compact_mode(&self) -> IdleCompactMode {
+        let raw = self
+            .idle_compact
+            .as_deref()
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .unwrap_or(DEFAULT_IDLE_COMPACT_MODE);
+        IdleCompactMode::parse(raw).unwrap_or(IdleCompactMode::Off)
     }
 }
 
@@ -343,6 +411,64 @@ mod tests {
 
     fn parse(json: &str) -> Config {
         serde_json::from_str(json).expect("valid json")
+    }
+
+    // ── idle_compact mode ─────────────────────────────────────────────────────
+
+    #[test]
+    fn idle_compact_mode_defaults_to_off() {
+        assert_eq!(Config::default().idle_compact_mode(), IdleCompactMode::Off);
+    }
+
+    #[test]
+    fn idle_compact_mode_parses_every_valid_value() {
+        for (raw, want) in [
+            ("off", IdleCompactMode::Off),
+            ("dry-run", IdleCompactMode::DryRun),
+            ("on", IdleCompactMode::On),
+        ] {
+            let cfg = Config {
+                idle_compact: Some(raw.to_owned()),
+                ..Default::default()
+            };
+            assert_eq!(cfg.idle_compact_mode(), want, "raw={raw}");
+            assert_eq!(want.as_str(), raw);
+        }
+    }
+
+    #[test]
+    fn idle_compact_mode_unrecognised_value_falls_back_to_off() {
+        let cfg = Config {
+            idle_compact: Some("banana".to_owned()),
+            ..Default::default()
+        };
+        assert_eq!(cfg.idle_compact_mode(), IdleCompactMode::Off);
+    }
+
+    #[test]
+    fn idle_compact_mode_blank_value_falls_back_to_off() {
+        let cfg = Config {
+            idle_compact: Some("   ".to_owned()),
+            ..Default::default()
+        };
+        assert_eq!(cfg.idle_compact_mode(), IdleCompactMode::Off);
+    }
+
+    #[test]
+    fn idle_compact_mode_serializes_only_when_set() {
+        assert_eq!(serde_json::to_string(&Config::default()).unwrap(), "{}");
+        let cfg = Config {
+            idle_compact: Some("dry-run".to_owned()),
+            ..Default::default()
+        };
+        let s = serde_json::to_string(&cfg).unwrap();
+        assert!(s.contains(r#""idleCompact":"dry-run""#), "got {s}");
+    }
+
+    #[test]
+    fn idle_compact_json_key_is_camel_case() {
+        let cfg = parse(r#"{"idleCompact": "on"}"#);
+        assert_eq!(cfg.idle_compact_mode(), IdleCompactMode::On);
     }
 
     #[test]

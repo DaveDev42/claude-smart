@@ -39,6 +39,11 @@ SCENARIOS=(
   orca_pane_resume
   alias_dispatch
   sessionend_budget
+  idle_compact_no_supervisor
+  idle_compact_supervisor_hands_off
+  idle_compact_dead_supervisor
+  idle_compact_interrupted_turn_hands_off
+  idle_compact_metadata_after_stamp_still_hands_off
   migrate
   auto_fresh
   auto_adopt_live
@@ -635,6 +640,123 @@ sc_sessionend_budget() {
   check "a SessionEnd with no turn returns at once ($((t1 - t0)) ms)" lt $((t1 - t0)) 500
   stop_sup "$SUP_PID" "$FLOG"
   stop_orca
+}
+
+# ─── idle-compact ───────────────────────────────────────────────────────────
+# No supervised claude is needed: idle_compact's two entry points, `csm hook`
+# (mark_turn_ended) and `csm usage capture`, are stateless one-shot calls —
+# sc_auto_untouched already established that pattern for a bare `hook` call.
+# Every scenario starts from fresh_world + usage_healthy (so the Stop
+# event's own usage-% check never trips) and sets the mode via `csm config
+# set idle-compact <mode>`. csm itself no longer types into anything: these
+# scenarios only prove the hand-off to CSM_SUPERVISOR_PID (or the lack of
+# one), never a terminal delivery — see idle_compact/deliver.rs's own unit
+# tests (including a property test) for the typing protocol that the future
+# pty-relay supervisor runs on the request these scenarios produce.
+
+IC_SID=idle-compact-sid-1
+
+# No CSM_SUPERVISOR_PID at all: every gate passes but there is nothing to
+# hand off to, so the tick logs no-delivery-path exactly once for the idle
+# period (a second tick against the same idle period must not re-log).
+sc_idle_compact_no_supervisor() {
+  fresh_world
+  usage_healthy
+  csm config set idle-compact on
+  idle_compact_turn_ended "$IC_SID"
+  tick "$(idle_compact_json "$IC_SID" 120 150000)"
+  check "the tick prints nothing" test ! -s "$LOGS/stdout"
+  check "no-delivery-path is logged" has_fixed "$(idle_compact_log)" "outcome=no-delivery-path"
+  check "the idle period is claimed" test -f "$STATE/$IC_SID.idle-compacted"
+  check "no request dir was created" test ! -d "$STATE/idle-compact-requests"
+
+  tick "$(idle_compact_json "$IC_SID" 120 150000)"
+  check "the second tick does not re-log" eq "$(lines "$(idle_compact_log)")" 1
+}
+
+# CSM_SUPERVISOR_PID names a live process: the tick writes a request file
+# under that pid, claims the idle period, and logs handed-off.
+sc_idle_compact_supervisor_hands_off() {
+  fresh_world
+  usage_healthy
+  csm config set idle-compact on
+  idle_compact_turn_ended "$IC_SID"
+  local sup_pid
+  sup_pid=$(idle_compact_stand_in_supervisor)
+  EXTRA=("CSM_SUPERVISOR_PID=$sup_pid")
+  tick "$(idle_compact_json "$IC_SID" 120 150000)"
+  EXTRA=()
+  idle_compact_stop_stand_in_supervisor "$sup_pid"
+
+  check "handed-off is logged" has_fixed "$(idle_compact_log)" "outcome=handed-off"
+  check "the idle period is claimed" test -f "$STATE/$IC_SID.idle-compacted"
+  local req
+  req=$(idle_compact_request_file "$sup_pid")
+  check "a request file was written for that pid" test -f "$req"
+  check "the request names this session" has_fixed "$req" "\"sid\":\"$IC_SID\""
+  check "the request carries the mode" has_fixed "$req" "\"mode\":\"on\""
+  check "the request carries the remaining seconds" has_fixed "$req" "\"remaining_secs\":120"
+  check "the request carries the recache estimate" has_fixed "$req" "\"recache_tokens\":150000"
+}
+
+# CSM_SUPERVISOR_PID names a pid that is not running: treated exactly like
+# no supervisor at all — logged no-delivery-path, no request file.
+sc_idle_compact_dead_supervisor() {
+  fresh_world
+  usage_healthy
+  csm config set idle-compact on
+  idle_compact_turn_ended "$IC_SID"
+  local dead_pid
+  dead_pid=$(idle_compact_dead_pid)
+  EXTRA=("CSM_SUPERVISOR_PID=$dead_pid")
+  tick "$(idle_compact_json "$IC_SID" 120 150000)"
+  EXTRA=()
+
+  check "no-delivery-path is logged" has_fixed "$(idle_compact_log)" "outcome=no-delivery-path"
+  check "no request file was written" test ! -f "$(idle_compact_request_file "$dead_pid")"
+}
+
+# A `[Request interrupted by user` row newer than the <sid>.idle Stop stamp
+# ends the turn at its own timestamp, with no fresh Stop hook at all: the
+# busy check must see this and still hand off.
+sc_idle_compact_interrupted_turn_hands_off() {
+  fresh_world
+  usage_healthy
+  csm config set idle-compact on
+  idle_compact_turn_ended "$IC_SID"
+  /bin/sleep 1.1
+  idle_compact_append_metadata_rows "$IC_SID" \
+    "$(printf '{"type":"user","timestamp":"%s","message":{"role":"user","content":"[Request interrupted by user]"}}' "$(idle_compact_iso_now)")"
+  local sup_pid
+  sup_pid=$(idle_compact_stand_in_supervisor)
+  EXTRA=("CSM_SUPERVISOR_PID=$sup_pid")
+  tick "$(idle_compact_json "$IC_SID" 120 150000)"
+  EXTRA=()
+  idle_compact_stop_stand_in_supervisor "$sup_pid"
+
+  check "handed-off is logged despite no fresh Stop" has_fixed "$(idle_compact_log)" "outcome=handed-off"
+}
+
+# metadata rows Claude Code keeps writing after a Stop (turn_duration,
+# away_summary, mode) land after the <sid>.idle stamp and bump the
+# transcript's mtime past it, but the last real assistant row is still
+# before the stamp: the busy check's tail read must see through the
+# metadata and hand off anyway (Fix 1 for the "false busy forever" bug). No
+# supervisor is needed to observe this — no-delivery-path is just as good
+# proof the busy check concluded not-busy, since Skip is silent.
+sc_idle_compact_metadata_after_stamp_still_hands_off() {
+  fresh_world
+  usage_healthy
+  csm config set idle-compact on
+  idle_compact_turn_ended "$IC_SID"
+  /bin/sleep 1.1
+  idle_compact_append_metadata_rows "$IC_SID" \
+    '{"type":"system","subtype":"turn_duration"}' \
+    '{"type":"system","subtype":"away_summary"}' \
+    '{"type":"mode"}'
+  tick "$(idle_compact_json "$IC_SID" 120 150000)"
+  check "no-delivery-path is logged (not silently skipped as busy)" has_fixed "$(idle_compact_log)" "outcome=no-delivery-path"
+  check "the idle period is claimed" test -f "$STATE/$IC_SID.idle-compacted"
 }
 
 # ─── the automatic migration ───────────────────────────────────────────────────

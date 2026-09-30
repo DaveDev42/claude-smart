@@ -403,6 +403,96 @@ statusline_json() {
 # tick <json>: one statusLine tick (`csm usage capture`).
 tick() { csm_stdin "$1" usage capture; }
 
+# ─── idle-compact fixtures ─────────────────────────────────────────────────────
+
+# idle_compact_json <sid> <remaining_secs> <recache_tokens> [context_window]:
+# a minimal statusLine payload carrying only what idle_compact reads
+# (session_id, transcript_path, prompt_cache, context_window) — deliberately
+# not statusline_json's shape, since a Stop/usage-capture-side interest in
+# rate_limits would be a distraction here and cmd_usage_capture's own
+# attribution failing on a payload this small is fine (idle_compact runs
+# regardless, see cmd/usage.rs).
+idle_compact_json() {
+  local sid="$1" remaining="$2" recache="$3" cw="${4:-200000}"
+  local exp=$(($(date +%s) + remaining))
+  printf '{"session_id":"%s","transcript_path":"%s","prompt_cache":{"warm":true,"expires_at":%s,"recache_tokens_if_cold":%s},"context_window":%s}' \
+    "$sid" "$SANDBOX/transcripts/$sid.jsonl" "$exp" "$recache" "$cw"
+}
+
+# idle_compact_iso_now: the current time as the UTC ISO 8601 shape csm's
+# busy check parses (transcript rows carry milliseconds; this omits them,
+# which RFC 3339 allows and csm's parser still accepts).
+idle_compact_iso_now() { date -u +%Y-%m-%dT%H:%M:%SZ; }
+
+# idle_compact_turn_ended <sid>: write the transcript's last real turn row
+# (a timestamped `assistant` row), then a Stop hook event, so the
+# transcript's mtime lands at or before the <sid>.idle marker `csm hook`
+# stamps (busy_state's cheap path: mtime > idle_marker is "still busy";
+# landing at or before it is "idle" with no tail read at all).
+idle_compact_turn_ended() {
+  local sid="$1"
+  mkdir -p "$SANDBOX/transcripts"
+  printf '{"type":"assistant","timestamp":"%s"}\n' "$(idle_compact_iso_now)" \
+    >"$SANDBOX/transcripts/$sid.jsonl"
+  hook "$(stop_json "$sid")"
+}
+
+# idle_compact_append_metadata_rows <sid> <row_json...>: append rows to the
+# transcript after idle_compact_turn_ended already ran, the way Claude
+# Code's own post-Stop bookkeeping (turn_duration, away_summary, mode, and
+# more) keeps writing well after a turn ends. This bumps the transcript's
+# mtime past the <sid>.idle stamp, so busy_state's cheap path no longer
+# applies and it must read the tail instead.
+idle_compact_append_metadata_rows() {
+  local sid="$1"
+  shift
+  printf '%s\n' "$@" >>"$SANDBOX/transcripts/$sid.jsonl"
+}
+
+# idle_compact_log: the shared idle-compact.log's path under this
+# scenario's STATE (mirrors switch_log's pattern for limit-switch.log).
+idle_compact_log() { printf '%s\n' "$STATE/idle-compact.log"; }
+
+# idle_compact_request_file <pid>: the hand-off request file idle_compact's
+# tick would write for a supervisor running as <pid>.
+idle_compact_request_file() { printf '%s\n' "$STATE/idle-compact-requests/$1.json"; }
+
+# idle_compact_stand_in_supervisor: start a bare `/bin/sleep` in the
+# background and echo its pid. idle_compact's tick only checks
+# CSM_SUPERVISOR_PID's liveness (crate::platform::proc::is_running scans the
+# real process table, unsandboxed) — it never execs or talks to the pid in
+# any way, so any real process stands in for the future pty-relay
+# supervisor. The caller stops it with idle_compact_stop_stand_in_supervisor.
+# stdout/stderr are redirected away from /dev/null explicitly: left
+# inherited, the backgrounded sleep would hold this function's own stdout
+# pipe open (it is called as `sup_pid=$(idle_compact_stand_in_supervisor)`),
+# so the command substitution would not return until sleep itself exited 60
+# seconds later.
+idle_compact_stand_in_supervisor() {
+  /bin/sleep 60 >/dev/null 2>&1 &
+  echo $!
+}
+
+# idle_compact_stop_stand_in_supervisor <pid>: terminate and reap a pid
+# idle_compact_stand_in_supervisor started, mirroring stop_sup's shape.
+idle_compact_stop_stand_in_supervisor() {
+  kill -TERM "$1" 2>/dev/null
+  wait "$1" 2>/dev/null
+  return 0
+}
+
+# idle_compact_dead_pid: a pid guaranteed not to be running right now — a
+# trivial subshell, started and reaped in place, so
+# crate::platform::proc::is_running sees no such process. Deliberately a
+# real (recently) exited pid rather than a fixed literal, so this exercises
+# the same process-table scan a genuinely dead supervisor pid would.
+idle_compact_dead_pid() {
+  (: ) &
+  local p=$!
+  wait "$p" 2>/dev/null
+  echo "$p"
+}
+
 # ─── the legacy layout ─────────────────────────────────────────────────────────
 
 LEGACY_SID=0f0f0f0f-1111-4222-8333-444444444444

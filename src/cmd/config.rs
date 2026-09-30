@@ -18,6 +18,9 @@ use crate::config;
 ///   set   min-claude-version <v> the lowest claude version a limit switch
 ///                                accepts while an unsupervised claude is live
 ///   unset min-claude-version     back to the default (2.1.283)
+///   get   idle-compact           print the effective mode (off/dry-run/on)
+///   set   idle-compact <mode>    off|dry-run|on — see `idle_compact`
+///   unset idle-compact           back to the default (off)
 pub(crate) fn cmd_config(args: &[OsString]) -> anyhow::Result<()> {
     let verb = args.first().map(|a| a.to_string_lossy().into_owned());
     let key = args.get(1).map(|a| a.to_string_lossy().into_owned());
@@ -28,19 +31,20 @@ pub(crate) fn cmd_config(args: &[OsString]) -> anyhow::Result<()> {
         .map(|a| a.to_string_lossy().into_owned())
         .collect();
 
-    /// Reject any key but the two exposed ones.
+    /// Reject any key but the three exposed ones.
     fn require_key(key: Option<&str>, verb: &str) -> anyhow::Result<()> {
         match key {
-            Some("launch-command" | "min-claude-version") => Ok(()),
+            Some("launch-command" | "min-claude-version" | "idle-compact") => Ok(()),
             Some(other) => anyhow::bail!(
-                "csm config {verb}: unknown key '{other}' (expected launch-command or min-claude-version)"
+                "csm config {verb}: unknown key '{other}' (expected launch-command, min-claude-version or idle-compact)"
             ),
             None => anyhow::bail!(
-                "csm config {verb}: missing key (expected launch-command or min-claude-version)"
+                "csm config {verb}: missing key (expected launch-command, min-claude-version or idle-compact)"
             ),
         }
     }
     let floor = key.as_deref() == Some("min-claude-version");
+    let idle_compact = key.as_deref() == Some("idle-compact");
 
     match verb.as_deref() {
         None | Some("show") => {
@@ -66,6 +70,30 @@ pub(crate) fn cmd_config(args: &[OsString]) -> anyhow::Result<()> {
         Some("unset") if floor => {
             let mut cfg = config::Config::load().unwrap_or_default();
             cfg.min_claude_version = None;
+            cfg.save()
+                .context("csm config: failed to write config.json")?;
+        }
+        Some("get") if idle_compact => {
+            let cfg = config::Config::load().unwrap_or_default();
+            println!("{}", cfg.idle_compact_mode().as_str());
+        }
+        Some("set") if idle_compact => {
+            let Some(v) = rest.first() else {
+                anyhow::bail!("csm config set idle-compact: missing mode (off|dry-run|on)");
+            };
+            if config::IdleCompactMode::parse(v).is_none() {
+                anyhow::bail!(
+                    "csm config set idle-compact: '{v}' is not a mode (expected off, dry-run or on)"
+                );
+            }
+            let mut cfg = config::Config::load().unwrap_or_default();
+            cfg.idle_compact = Some(v.clone());
+            cfg.save()
+                .context("csm config: failed to write config.json")?;
+        }
+        Some("unset") if idle_compact => {
+            let mut cfg = config::Config::load().unwrap_or_default();
+            cfg.idle_compact = None;
             cfg.save()
                 .context("csm config: failed to write config.json")?;
         }

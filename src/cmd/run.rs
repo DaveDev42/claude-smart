@@ -261,16 +261,21 @@ pub(crate) fn run(args: &[OsString]) -> anyhow::Result<()> {
         cli,
     };
 
-    // PlatformLauncher is a type alias to PosixLauncher (unix) or WindowsLauncher
-    // (Windows). Construct via Default so platform-specific changes are isolated.
-    // The migration's run after the spawn counts this child as a live
-    // claude in its D: it starts before it registers in D/sessions.
+    // `pick_launcher` picks the pty relay or the direct (PosixLauncher /
+    // WindowsLauncher) launcher once, per idle-compact's activation predicate
+    // (unix: `platform::relay::should_activate`; Windows relay is a later
+    // phase, always direct for now). The migration's run after the spawn
+    // counts this child as a live claude in its D: it starts before it
+    // registers in D/sessions.
     crate::migrate::note_child(
         dir.as_ref().map(|d| d.d.clone()),
         Some(spec.session_id.clone()),
     );
-    let launcher = <platform::PlatformLauncher as std::default::Default>::default();
-    platform::relaunch::run_relaunch_loop(&launcher, &spec)
+    let mode = crate::config::Config::load()
+        .unwrap_or_default()
+        .idle_compact_mode();
+    let launcher = platform::pick_launcher(mode);
+    platform::relaunch::run_relaunch_loop(launcher.as_ref(), &spec)
 }
 
 /// The accounts as the child will see them. Only a pinned launch reads `D`

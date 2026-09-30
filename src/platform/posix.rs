@@ -67,6 +67,10 @@ impl Launcher for PosixLauncher {
         cmd.args(prefix);
         cmd.args(cli);
         env.apply(&mut cmd);
+        // Direct mode is never a relay leader: strip any CSM_SUPERVISOR_PID this
+        // process itself inherited (e.g. a relay hop earlier in the same shell)
+        // so a plain claude launch never looks like it is running under relay.
+        cmd.env_remove(crate::idle_compact::SUPERVISOR_PID_ENV);
         // stdin/stdout/stderr inherited by default (never piped) — the child must
         // own the real tty for a usable interactive session.
 

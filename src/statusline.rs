@@ -121,6 +121,10 @@ pub(crate) fn run_with_capture(
     if let Some(capture) = capture {
         crate::hook::run_from_statusline(&raw, &capture);
     }
+    // idle_compact reads the payload's own fields directly, independent of
+    // the capture/attribution above. Writes no stdout of its own — the
+    // segment above is already printed and this must never corrupt it.
+    crate::idle_compact::run_from_raw(&raw);
     Ok(())
 }
 

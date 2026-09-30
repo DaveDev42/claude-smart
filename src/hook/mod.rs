@@ -133,6 +133,12 @@ pub(crate) fn run_with_input(input: detect::HookInput) -> anyhow::Result<()> {
         Some(s) if !s.is_empty() => s.clone(),
         _ => return Ok(()),
     };
+    // idle_compact's turn-ended marker: file I/O only (Invariant 6 allows it
+    // from every hook event), independent of the limit-switch classification
+    // below, so it runs whether or not this Stop also happens to be a limit.
+    if detect::is_turn_boundary(&input) {
+        crate::idle_compact::mark_turn_ended(&sid);
+    }
     // A SessionEnd with no turn behind it (`claude upgrade`, a session that
     // never wrote a transcript) has nothing to act on. Claude Code gives all
     // SessionEnd hooks together about 1.5 s, so return before any other read.

@@ -9,14 +9,18 @@
 //! alike). This file — the guard's own forbidden list — is the only thing that
 //! names the identifiers, and it lives under `tests/`, which is not scanned.
 //!
-//! Two scopes:
+//! Three scopes:
 //! - `src/**/*.rs`: all three rules — `forbidden()`, the `Dave-` host-prefix
 //!   rule, and the quoted-profile-literal rule.
 //! - `README.md`, `CLAUDE.md`, `Cargo.toml`, `examples/*.sh`: the `forbidden()`
 //!   substring scan only (the other two rules are `src/`-specific: host-prefix
 //!   literals and quoted profile literals are meaningful only in code).
+//! - `tests/fixtures/**`: the `forbidden()` substring scan only, at the byte
+//!   level (fixtures are captured terminal byte streams, not necessarily
+//!   valid UTF-8, so this scan cannot use `fs::read_to_string`).
 //!
-//! `tests/` itself stays excluded from every scope.
+//! `tests/` itself is otherwise excluded from every scope (this file would
+//! trivially fail its own scan).
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -92,6 +96,48 @@ fn scan_forbidden_only(file: &Path, forbidden: &[String], violations: &mut Vec<S
                     needle
                 ));
             }
+        }
+    }
+}
+
+/// Byte-level `forbidden()` substring scan for `tests/fixtures/**`: fixture
+/// files are captured terminal byte streams (raw `.bin`, plus `.json`/`.md`),
+/// not guaranteed to be valid UTF-8, so this cannot use `fs::read_to_string`.
+/// Reports a byte offset instead of a line number.
+fn scan_forbidden_bytes(file: &Path, forbidden: &[String], violations: &mut Vec<String>) {
+    let Ok(data) = fs::read(file) else {
+        return;
+    };
+    for needle in forbidden {
+        let needle_bytes = needle.as_bytes();
+        let mut start = 0usize;
+        while let Some(pos) = data[start..]
+            .windows(needle_bytes.len())
+            .position(|w| w == needle_bytes)
+        {
+            let offset = start + pos;
+            violations.push(format!(
+                "{}:byte {}: forbidden identifier {:?}",
+                file.display(),
+                offset,
+                needle
+            ));
+            start = offset + 1;
+        }
+    }
+}
+
+fn collect_files(dir: &Path, out: &mut Vec<PathBuf>) {
+    let entries = match fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+    for entry in entries.flatten() {
+        let p = entry.path();
+        if p.is_dir() {
+            collect_files(&p, out);
+        } else {
+            out.push(p);
         }
     }
 }
@@ -175,6 +221,15 @@ fn no_private_identifiers_in_shipped_source() {
     }
     for file in &doc_files {
         scan_forbidden_only(file, &forbidden, &mut violations);
+    }
+
+    // Fixture scope: byte-level scan, since captured terminal streams are not
+    // guaranteed to be valid UTF-8. Missing directory (no fixtures yet) is not
+    // a failure here.
+    let mut fixture_files = Vec::new();
+    collect_files(&root.join("tests").join("fixtures"), &mut fixture_files);
+    for file in &fixture_files {
+        scan_forbidden_bytes(file, &forbidden, &mut violations);
     }
 
     assert!(
