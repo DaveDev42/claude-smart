@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.4.4](https://github.com/DaveDev42/claude-smart/compare/v0.4.3...v0.4.4) (2026-10-01)
+
+
+### Bug Fixes
+
+* **relay:** resync pty size after installing the SIGWINCH handler ([#44](https://github.com/DaveDev42/claude-smart/issues/44)) ([80d26ce](https://github.com/DaveDev42/claude-smart/commit/80d26cec2bbcaa989fa900de5ef3c5d3d0736442))
+
 ## [0.4.3](https://github.com/DaveDev42/claude-smart/compare/v0.4.2...v0.4.3) (2026-10-01)
 
 
