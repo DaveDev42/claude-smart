@@ -408,6 +408,21 @@ A relay that cannot be set up falls back to the direct launcher for that
 run and says so in the limit-switch log. The supervisor sets
 `CSM_SUPERVISOR_PID` in claude's environment; the direct launcher removes it.
 
+Windows: the relay is a ConPTY. When the mode is not `off`, stdin and stdout
+are both consoles and `CSM_RELAY` is not `0`, csm creates a pseudoconsole at
+the console's size and starts claude inside it (through a small hidden
+`csm __conpty-leader` helper that runs in the pseudoconsole, starts claude
+and reports its pid back). The outer console goes into raw VT mode for the
+session and gets its original modes back on every exit path, a panic
+included. Keys go to the pseudoconsole as VT input, held back while csm
+types; Ctrl-C reaches claude as the `0x03` key, the same as on a pty.
+Resizing the window resizes the pseudoconsole (polled about ten times a
+second; the smallest size passed on is 5 rows by 20 columns). Closing the
+window ends claude and csm. csm exits with claude's exit code. The same
+screen checks, delivery rules, log lines and OSC 777 notifications apply.
+`CSM_RELAY=0`, a redirected stdin or stdout, and any ConPTY setup failure
+use the direct launcher as before.
+
 When a request arrives the supervisor looks about once a second and types
 `/compact` only if every one of these holds:
 
@@ -894,7 +909,8 @@ and Linux, and `%LOCALAPPDATA%\csm` on Windows.
   installed Orca version on Linux, so with Orca stopped it will not write
   Orca's store: switch with Orca running. Under WSL, a Windows Orca's
   userData is never written.
-- Windows: the binary builds and its unit tests pass, but Orca detection
+- Windows: idle-compact's relay runs claude in a ConPTY (see *The
+  relay*), and its end-to-end tests pass on a Windows machine. Orca detection
   (no `SingletonLock` there, the named pipe, telling `Orca.exe` from its
   helpers) follows Orca's source and has not been checked on a real
   machine. The relaunch loop is off until two checks pass on a real

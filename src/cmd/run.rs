@@ -261,10 +261,11 @@ pub(crate) fn run(args: &[OsString]) -> anyhow::Result<()> {
         cli,
     };
 
-    // `pick_launcher` picks the pty relay or the direct (PosixLauncher /
-    // WindowsLauncher) launcher once, per idle-compact's activation predicate
-    // (unix: `platform::relay::should_activate`; Windows relay is a later
-    // phase, always direct for now). The migration's run after the spawn
+    // `pick_launcher` picks the relay (a pty on unix, a ConPTY on Windows)
+    // or the direct (PosixLauncher / WindowsLauncher) launcher once, per
+    // idle-compact's activation predicate (`platform::relay::should_activate`
+    // through each platform's `platform_should_activate`). The migration's
+    // run after the spawn
     // counts this child as a live claude in its D: it starts before it
     // registers in D/sessions.
     crate::migrate::note_child(

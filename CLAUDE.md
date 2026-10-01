@@ -179,8 +179,12 @@ request file; the typing is done by csm's own pty relay, never by an
 external terminal tool.
 `csm run` relays the terminal when the mode is not `off`, stdin and stdout
 are terminals and `CSM_RELAY` is not `0` (`CSM_RELAY=0` = the direct
-launcher, no delivery). Layout: `platform/relay/` (pty, leader, byte
-classification, `RelayObserver`/`RelayIo`), `screen_check.rs` (pure
+launcher, no delivery). On Windows the same rule holds with consoles in
+place of terminals, and the relay is a ConPTY. Layout: `platform/relay/`
+(`mod.rs` shared API: `RelayObserver`/`RelayIo`/`InputHold`; `pty.rs` +
+`leader.rs` unix; `conpty.rs` Windows, with the hidden `__conpty-leader`
+helper; `conpty_logic.rs` its pure, Mac-testable parts; byte
+classification), `screen_check.rs` (pure
 functions over a `vt100::Screen`: input box, vim state, busy, slash-menu
 highlight, compaction), `idle_compact/tick.rs` (fire conditions, hand-off),
 `idle_compact/deliver.rs` (pure typing state machine),
@@ -198,7 +202,10 @@ row before changing a rule. Log outcomes (`<state>/idle-compact.log`):
 `verify-failed`, `expired`, `vetoed-<reason>`, `dry-run-would-type`,
 `dry-run-draft`, `dry-run-expired`. E2E through the real relay:
 `tests/idle_compact_relay.rs` (fake claude `tests/bin/fake_claude_ui.rs`
-replays the fixtures). See the README's "Idle compact" section.
+replays the fixtures); on Windows `tests/idle_compact_conpty.rs`
+(`tests/bin/conpty_harness.rs` plays the terminal), run with
+`cargo test --features e2e --test idle_compact_conpty`: only an `e2e` build
+takes its home from `HOME`, since `dirs::home_dir` ignores it on Windows. See the README's "Idle compact" section.
 
 ## Git workflow
 
