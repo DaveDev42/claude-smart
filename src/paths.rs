@@ -32,9 +32,20 @@ use std::path::{Path, PathBuf};
 /// `HOME`/`USERPROFILE`, so a fixture that sets those env vars gets zero
 /// isolation there. Tests instead override this function's return value
 /// directly via a thread-local set with [`crate::testenv::set_test_home`].
-#[cfg(not(test))]
+#[cfg(not(any(test, feature = "e2e")))]
 pub(crate) fn home_dir() -> Option<PathBuf> {
     dirs::home_dir()
+}
+
+/// e2e sandbox build: `HOME`, which [`crate::e2e::guard`] has already checked
+/// lies inside the sandbox. On unix this is what `dirs::home_dir()` returns
+/// anyway; on Windows `dirs` would ignore `HOME` and resolve the real
+/// profile, so a sandbox binary there could not be kept off it otherwise.
+#[cfg(all(feature = "e2e", not(test)))]
+pub(crate) fn home_dir() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .filter(|h| !h.is_empty())
+        .map(PathBuf::from)
 }
 
 /// Test build: the thread's test home, else [`no_test_home`]. Never the real
