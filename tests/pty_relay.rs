@@ -619,6 +619,27 @@ fn resize_propagates_to_inner_pty() {
     session.kill_if_alive();
 }
 
+/// The inner pty must start at the outer terminal's size, not 0x0. Claude
+/// reads its size once at start; with 0x0 it falls back to 80x24 and only a
+/// later SIGWINCH could correct it.
+#[test]
+fn inner_pty_starts_at_the_outer_size() {
+    let home = TestHome::new();
+    let mut session = spawn_via_harness(&home, &["-n"], &[("PTY_HARNESS_SIZE", "50x160")]);
+    let mut buf = wait_for(session.master.as_fd(), b"SIZE ", Duration::from_secs(10));
+    buf.extend(read_available(
+        session.master.as_fd(),
+        Duration::from_millis(300),
+    ));
+    let lines = lines_of(&buf);
+    let size = lines
+        .iter()
+        .find(|l| l.starts_with("SIZE "))
+        .unwrap_or_else(|| panic!("no SIZE line in {lines:?}"));
+    assert_eq!(size, "SIZE 50 160");
+    session.kill_if_alive();
+}
+
 /// `claude`'s exit code propagates through the leader → relay → csm's own
 /// process exit (`exit_with`'s plain-code path).
 #[test]
