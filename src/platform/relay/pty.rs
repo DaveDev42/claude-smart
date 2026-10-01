@@ -176,12 +176,27 @@ fn write_all(fd: BorrowedFd<'_>, mut buf: &[u8]) -> io::Result<()> {
 /// Resync the master's window size from the outer terminal's current size.
 /// Returns `Ok(true)` if the size actually changed.
 fn sync_size(io: &RelayIo) -> io::Result<bool> {
-    let ws = get_winsize(io::stdin())?;
+    sync_size_from(io::stdin(), io)
+}
+
+fn sync_size_from(outer: impl AsFd, io: &RelayIo) -> io::Result<bool> {
+    let ws = get_winsize(outer)?;
     set_winsize(io.master.as_fd(), &ws)?;
     let (rows, cols) = (ws.ws_row, ws.ws_col);
     let changed = io.size() != (rows, cols);
     io.set_size(rows, cols);
     Ok(changed)
+}
+
+/// One more resync from `outer`, run once the SIGWINCH handler exists and
+/// `io` has been handed to the observer. The size read at startup predates
+/// the handler, so a resize (or a 0x0 outer that gets its real size) in
+/// between would otherwise never reach the inner pty or the observer.
+fn resync_after_install(outer: impl AsFd, io: &RelayIo, observer: &Arc<dyn RelayObserver>) {
+    if let Ok(true) = sync_size_from(outer, io) {
+        let (rows, cols) = io.size();
+        observer.on_resize(rows, cols);
+    }
 }
 
 fn shutdown_requested(fds: &[PollFd<'_>], idx: usize) -> bool {
@@ -663,6 +678,7 @@ impl RelayLauncher {
         // From here on claude is real and running: no more setup fallback.
         let io = Arc::new(RelayIo::new(master, (initial_ws.ws_row, initial_ws.ws_col)));
         self.observer.on_start(Arc::clone(&io), pid, env);
+        resync_after_install(io::stdin(), &io, &self.observer);
 
         let (shutdown_r, shutdown_w) = pipe()?;
         let shutdown_r = Arc::new(shutdown_r);
@@ -774,5 +790,66 @@ mod tests {
             }
         }
         assert_eq!(got, want, "got {:?}", String::from_utf8_lossy(&got));
+    }
+
+    struct ResizeLog(Mutex<Vec<(u16, u16)>>);
+    impl RelayObserver for ResizeLog {
+        fn on_resize(&self, rows: u16, cols: u16) {
+            self.0.lock().unwrap().push((rows, cols));
+        }
+    }
+
+    fn open_pty_pair() -> (PtyMaster, OwnedFd) {
+        let master = posix_openpt(OFlag::O_RDWR | OFlag::O_NOCTTY).expect("posix_openpt");
+        grantpt(&master).expect("grantpt");
+        unlockpt(&master).expect("unlockpt");
+        let slave_path = unsafe { nix::pty::ptsname(&master) }.expect("ptsname");
+        let slave = nix::fcntl::open(
+            slave_path.as_str(),
+            OFlag::O_RDWR | OFlag::O_NOCTTY,
+            nix::sys::stat::Mode::empty(),
+        )
+        .expect("open slave");
+        (master, slave)
+    }
+
+    /// The size is read before the SIGWINCH handler exists. When the outer
+    /// terminal was 0x0 then (or resized in that gap) no signal arrives, so
+    /// the post-install resync must carry the current size to the inner pty
+    /// and tell the observer, once, and stay quiet when nothing changed.
+    #[test]
+    fn resync_after_install_applies_a_size_missed_before_the_handler() {
+        let (_outer_master, outer) = open_pty_pair();
+        let (inner_master, inner_slave) = open_pty_pair();
+        let zero = Winsize {
+            ws_row: 0,
+            ws_col: 0,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
+        set_winsize(&outer, &zero).unwrap();
+        let startup = get_winsize(&outer).unwrap();
+        set_winsize(inner_master.as_fd(), &startup).unwrap();
+        let io = RelayIo::new(inner_master, (startup.ws_row, startup.ws_col));
+        let log = Arc::new(ResizeLog(Mutex::new(Vec::new())));
+        let observer: Arc<dyn RelayObserver> = log.clone();
+
+        // The outer terminal gets its real size after the startup read.
+        let real = Winsize {
+            ws_row: 41,
+            ws_col: 137,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
+        set_winsize(&outer, &real).unwrap();
+
+        resync_after_install(&outer, &io, &observer);
+        let inner = get_winsize(&inner_slave).unwrap();
+        assert_eq!((inner.ws_row, inner.ws_col), (41, 137));
+        assert_eq!(io.size(), (41, 137));
+        assert_eq!(*log.0.lock().unwrap(), vec![(41, 137)]);
+
+        resync_after_install(&outer, &io, &observer);
+        assert_eq!(log.0.lock().unwrap().len(), 1, "no change, no callback");
     }
 }

@@ -5,7 +5,7 @@
 //! a no-op on non-unix so `cargo build --all-targets` / clippy stay green on
 //! every target even though the relay itself is unix-only.
 //!
-//! On start, prints three lines to its own stdout:
+//! On start, prints these lines to its own stdout:
 //!
 //!   - `READY <pid>\n` — so a test can confirm it is alive and cross-check
 //!     the pid csm records (pidfile, `ChildHandle`) against the real one.
@@ -16,6 +16,9 @@
 //!   - `SUPERVISOR <value>\n` or `SUPERVISOR -\n` — `CSM_SUPERVISOR_PID` from
 //!     its own environment, or `-` if unset (relay mode sets it, direct mode
 //!     removes it; see `crate::platform::posix::PosixLauncher`).
+//!
+//!   - `SIZE <rows> <cols>\n` — the window size of its own controlling
+//!     terminal at start, so a test can check the size csm gave the inner pty.
 //!
 //! It then echoes every line read from its stdin back to stdout prefixed
 //! with `ECHO `, except for a small set of control lines a test can send it:
@@ -82,6 +85,12 @@ fn main() {
     match std::env::var("CSM_SUPERVISOR_PID") {
         Ok(v) => println!("SUPERVISOR {v}"),
         Err(_) => println!("SUPERVISOR -"),
+    }
+    unsafe {
+        let mut ws: libc::winsize = std::mem::zeroed();
+        if libc::ioctl(0, libc::TIOCGWINSZ as _, &mut ws as *mut libc::winsize) == 0 {
+            println!("SIZE {} {}", ws.ws_row, ws.ws_col);
+        }
     }
     let _ = std::io::stdout().flush();
 
