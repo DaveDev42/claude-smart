@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.4.1](https://github.com/DaveDev42/claude-smart/compare/v0.4.0...v0.4.1) (2026-10-01)
+
+
+### Features
+
+* **idle-compact:** compact an idle session before its prompt cache expires ([affdf4b](https://github.com/DaveDev42/claude-smart/commit/affdf4b98ea99296d5ee25b5895e4b8382b6501a)), closes [#36](https://github.com/DaveDev42/claude-smart/issues/36)
+
+
+### Bug Fixes
+
+* **relay:** take the foreground in the child before exec ([2918bc4](https://github.com/DaveDev42/claude-smart/commit/2918bc4c825bf38b8ff7d3c318fcbb7e87c0cda8))
+
 ## [0.4.0](https://github.com/DaveDev42/claude-smart/compare/v0.3.8...v0.4.0) (2026-09-30)
 
 
