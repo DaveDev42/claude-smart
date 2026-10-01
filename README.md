@@ -543,48 +543,7 @@ The hook (`csm hook`, every event) reads only csm's own files. It makes no
 network call, no RPC call and no Keychain access, so a `SessionEnd` hook
 returns well inside Claude Code's 1.5 s budget even with stale usage.
 
-## Idle compact
-
-`csm usage capture` and `csm statusline` both see the statusLine payload
-Claude Code sends on every refresh. When that payload carries prompt cache
-information, csm can use the gap while a session sits idle to keep the
-cache from going cold: it sends `/compact` to that session's terminal
-shortly before the cache expires, so the request after the gap re-writes a
-compacted context instead of the full one.
-
-This is opt-in: `csm config set idle-compact off|dry-run|on`, default
-`off`. `dry-run` and `on` decide identically; only the relay's own
-delivery (below) treats them differently.
-
-csm's own part is a hand-off, not a delivery. On each statusLine tick it
-acts on a session when all of this holds: the mode is not off, the prompt
-cache is reported warm with 300 seconds or fewer left before it expires,
-the re-write the payload predicts is at least 100000 tokens, the turn has
-actually ended, and it has not already acted for this idle period. The
-turn-ended check starts cheap (the transcript's mtime at or before the
-last `Stop`) and only reads further when that mtime moved past the stop:
-Claude Code keeps appending rows to the transcript well after a turn ends
-(`turn_duration`, `away_summary`, and other bookkeeping), so csm reads the
-transcript's tail and looks at the last real `user`/`assistant` row's own
-timestamp rather than treating every later write as a new turn. A `[Request
-interrupted by user` row newer than the `Stop` stamp also ends the turn, at
-that row's own timestamp, even with no fresh `Stop` event at all.
-
-When every condition holds, csm checks whether its own future pty-relay
-supervisor is alive (`CSM_SUPERVISOR_PID` names a running process) and, if
-so, writes a hand-off request file under
-`<state>/idle-compact-requests/<supervisor pid>.json` (session id, mode,
-remaining seconds, recache estimate, a deadline) and logs
-`outcome=handed-off`. With no live supervisor it logs
-`outcome=no-delivery-path` instead and still claims the idle period, so
-either outcome is logged at most once per idle period. csm itself never
-types into a terminal, checks a screen, or reads session status; that is
-the supervisor's job once it picks up the request, using the typing
-protocol in `src/idle_compact/deliver.rs` (screen classification, a vim
-NORMAL/INSERT distinction, a session-status veto, retry until the request's
-deadline, and rollback on a failed verify).
-
-### Limits
+## Idle compact: request files and timing
 
 A request file past its deadline, unparseable, or of an unknown schema
 version is dropped rather than acted on late; pruning piggybacks on the
