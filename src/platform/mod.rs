@@ -8,7 +8,6 @@ pub mod relaunch;
 #[cfg(unix)]
 pub mod posix;
 
-#[cfg(unix)]
 pub mod relay;
 
 #[cfg(windows)]
@@ -41,7 +40,16 @@ pub fn pick_launcher(mode: crate::config::IdleCompactMode) -> Box<dyn launcher::
     }
 }
 
+/// Windows: the ConPTY relay under the same activation rule (consoles
+/// instead of terminals, no foreground-group check), the direct launcher
+/// otherwise. See `relay::conpty`.
 #[cfg(windows)]
-pub fn pick_launcher(_mode: crate::config::IdleCompactMode) -> Box<dyn launcher::Launcher> {
-    Box::new(windows::WindowsLauncher)
+pub fn pick_launcher(mode: crate::config::IdleCompactMode) -> Box<dyn launcher::Launcher> {
+    if relay::platform_should_activate(mode) {
+        Box::new(relay::ConptyLauncher::with_observer(std::sync::Arc::new(
+            crate::idle_compact::supervisor::Supervisor::new(),
+        )))
+    } else {
+        Box::new(windows::WindowsLauncher)
+    }
 }

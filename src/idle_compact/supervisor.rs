@@ -231,8 +231,8 @@ impl Default for Supervisor {
 /// row or a column or two, and an outer terminal that has not reported a size
 /// yet reads as 0x0; a screen this small cannot show the input box anyway, so
 /// the supervisor just sees no box.
-const MIN_ROWS: u16 = 5;
-const MIN_COLS: u16 = 20;
+pub(crate) const MIN_ROWS: u16 = 5;
+pub(crate) const MIN_COLS: u16 = 20;
 
 fn new_parser(rows: u16, cols: u16) -> vt100::Parser<TitleTracker> {
     vt100::Parser::new_with_callbacks(

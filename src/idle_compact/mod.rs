@@ -51,7 +51,6 @@ pub mod deliver;
 mod log;
 pub mod request;
 pub mod status;
-#[cfg(unix)]
 pub mod supervisor;
 mod tick;
 

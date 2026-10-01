@@ -110,6 +110,9 @@ impl Launcher for WindowsLauncher {
         cmd.args(prefix);
         cmd.args(cli);
         env.apply(&mut cmd);
+        // Direct mode is never a relay supervisor: strip any CSM_SUPERVISOR_PID
+        // this process inherited, as the POSIX direct launcher does.
+        cmd.env_remove(crate::idle_compact::SUPERVISOR_PID_ENV);
         // Own process group so GenerateConsoleCtrlEvent can target claude alone.
         cmd.creation_flags(CREATE_NEW_PROCESS_GROUP);
         // stdio inherited by default (shares the console) — never piped.
@@ -117,13 +120,7 @@ impl Launcher for WindowsLauncher {
         let child = cmd.spawn()?;
         let pid = child.id();
 
-        // Publish the child group id, THEN install the forwarding handler. With
-        // CREATE_NEW_PROCESS_GROUP the OS will otherwise drop keyboard Ctrl-C.
-        CHILD_PGID.store(pid, Ordering::SeqCst);
-        // SAFETY: registering a process-wide console control handler.
-        unsafe {
-            SetConsoleCtrlHandler(Some(console_ctrl_handler), TRUE);
-        }
+        forward_console_ctrl(pid);
 
         // Write the pidfile NOW (born-timing): the hook reads it mid-session.
         let _ = crate::platform::pid::write_pid_file(&crate::paths::pid_file(sid), pid, born);
@@ -134,20 +131,37 @@ impl Launcher for WindowsLauncher {
 
         let status = supervise(child, &stop_flag, pid, grace)?;
 
-        // Tear down the handler + clear the shared pgid so a stray late Ctrl-C
-        // after exit is a no-op.
-        unsafe {
-            SetConsoleCtrlHandler(Some(console_ctrl_handler), FALSE);
-        }
-        CHILD_PGID.store(0, Ordering::SeqCst);
+        stop_forwarding_console_ctrl();
 
         Ok((status, ChildHandle { pid, born }))
     }
 }
 
+/// Publish claude's group id, then install the forwarding console control
+/// handler. With `CREATE_NEW_PROCESS_GROUP` the OS would otherwise drop
+/// keyboard Ctrl-C. Also used by the ConPTY relay's `__conpty-leader` helper,
+/// which shares the pseudoconsole with claude.
+pub(crate) fn forward_console_ctrl(pid: u32) {
+    CHILD_PGID.store(pid, Ordering::SeqCst);
+    // SAFETY: registering a process-wide console control handler.
+    unsafe {
+        SetConsoleCtrlHandler(Some(console_ctrl_handler), TRUE);
+    }
+}
+
+/// Tear down the handler and clear the shared pgid so a stray late Ctrl-C
+/// after exit is a no-op.
+pub(crate) fn stop_forwarding_console_ctrl() {
+    // SAFETY: unregisters the handler `forward_console_ctrl` registered.
+    unsafe {
+        SetConsoleCtrlHandler(Some(console_ctrl_handler), FALSE);
+    }
+    CHILD_PGID.store(0, Ordering::SeqCst);
+}
+
 /// Block on `child`, polling `stop_flag`. On stop: CTRL_BREAK → grace →
 /// TerminateProcess. Returns when the child has exited.
-fn supervise(
+pub(crate) fn supervise(
     mut child: std::process::Child,
     stop_flag: &std::path::Path,
     pgid: u32,

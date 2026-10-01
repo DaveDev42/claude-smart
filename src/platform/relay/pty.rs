@@ -38,7 +38,6 @@ pub(super) fn write_stdout(bytes: &[u8]) -> io::Result<()> {
     write_all(io::stdout().as_fd(), bytes)
 }
 
-
 /// I/O shell around [`should_activate`]: reads the real stdin/stdout tty
 /// status, csm's own foreground-pgrp status on stdin, and `CSM_RELAY`.
 pub(crate) fn platform_should_activate(mode: IdleCompactMode) -> bool {

@@ -45,6 +45,12 @@ fn main() -> anyhow::Result<()> {
     if args.len() >= 2 && args[1] == "__pty-leader" {
         std::process::exit(platform::relay::leader::main(&args[2..]));
     }
+    // Windows counterpart: the helper `ConptyLauncher` starts inside its
+    // pseudoconsole to run claude there.
+    #[cfg(windows)]
+    if args.len() >= 2 && args[1] == platform::relay::conpty_logic::LEADER_WORD {
+        std::process::exit(platform::relay::conpty::leader_main(&args[2..]));
+    }
 
     // Top-level `--version`/`-V` and `--help`/`-h` belong to csm itself, not to
     // claude — but only under the name `csm`. `csm-hook --version` must reach

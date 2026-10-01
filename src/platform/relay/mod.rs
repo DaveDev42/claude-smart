@@ -95,7 +95,6 @@ pub fn should_activate(
     stdin_is_tty && stdout_is_tty && is_foreground
 }
 
-
 // ─── public API: RelayObserver / RelayIo / InputHold ─────────────────────────
 
 /// Hooks other code (idle-compact's tick/typing glue) registers to be told
