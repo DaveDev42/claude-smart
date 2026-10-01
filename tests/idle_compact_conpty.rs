@@ -77,6 +77,7 @@ struct Session {
 struct Opts {
     idle: &'static str,
     rules: &'static str,
+    vim: &'static str,
     mode: &'static str,
     exit_rule: Option<&'static str>,
     extra_env: Vec<(&'static str, &'static str)>,
@@ -87,6 +88,7 @@ impl Opts {
         Opts {
             idle,
             rules: COMPACT_RULES,
+            vim: "insert",
             mode: "on",
             exit_rule: None,
             extra_env: Vec::new(),
@@ -206,6 +208,13 @@ impl Session {
         self.out.lock().unwrap().clone()
     }
 
+    /// Whether csm sent its OSC 777 notification, which reaches the outer
+    /// console through ConPTY.
+    fn notified(&self) -> bool {
+        let needle = b"\x1b]777;notify;idle-compact;";
+        self.output().windows(needle.len()).any(|w| w == needle)
+    }
+
     fn wait_output(&self, needle: &[u8], timeout: Duration) -> bool {
         let start = Instant::now();
         while start.elapsed() < timeout {
@@ -231,7 +240,7 @@ impl Session {
         self.home.join("AppData").join("Local").join("csm")
     }
 
-    fn write_request(&self, mode: &str, deadline_secs: i64) {
+    fn write_request(&self, mode: &str, vim: &str, deadline_secs: i64) {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -244,7 +253,7 @@ impl Session {
             "deadline": now + deadline_secs,
             "recache_tokens": 150_000,
             "remaining_secs": 120,
-            "vim_mode": "insert",
+            "vim_mode": vim,
         });
         let dir = self.state_dir().join("idle-compact-requests");
         fs::create_dir_all(&dir).unwrap();
@@ -275,17 +284,23 @@ impl Session {
         );
     }
 
+    /// The keys the fake received, minus the outer console's answers to the
+    /// `CSI c` queries the captured screens carry. On a pty the test's
+    /// drain answers nothing; here the harness's conhost answers every
+    /// query, and csm rightly passes the answer on to the app that asked.
     fn typed(&self) -> Vec<u8> {
         let Ok(text) = fs::read_to_string(&self.typed_log) else {
             return Vec::new();
         };
-        text.lines()
+        let raw: Vec<u8> = text
+            .lines()
             .flat_map(|l| {
                 (0..l.len() / 2)
                     .map(|i| u8::from_str_radix(&l[i * 2..i * 2 + 2], 16).unwrap())
                     .collect::<Vec<_>>()
             })
-            .collect()
+            .collect();
+        strip_da_replies(&raw)
     }
 
     fn wait_exit(&mut self, timeout: Duration) -> Option<i32> {
@@ -326,10 +341,10 @@ fn outcome_word(line: &str) -> String {
 }
 
 fn run_request(o: Opts, deadline_secs: i64, wait: Duration) -> (Session, String) {
-    let mode = o.mode;
+    let (mode, vim) = (o.mode, o.vim);
     let s = Session::start(o);
     s.wait_ready();
-    s.write_request(mode, deadline_secs);
+    s.write_request(mode, vim, deadline_secs);
     let line = s.outcome_line(wait);
     // Let anything still in flight land before the assertions read it.
     std::thread::sleep(Duration::from_millis(1500));
@@ -352,12 +367,14 @@ fn happy_path_types_compact_and_presses_enter() {
     assert_eq!(s.typed(), b"/compact\r");
     assert!(s.marker.exists(), "Enter must have reached the fake");
     assert!(line.contains("box="), "{line}");
+    assert!(!s.notified(), "a clean delivery notifies nobody");
 }
 
 #[test]
 fn draft_is_never_typed_over() {
     let (s, line) = run_request(Opts::new("draft-hello-120x40"), 60, Duration::from_secs(40));
     assert_eq!(outcome_word(&line), "draft", "{line}");
+    assert!(s.notified(), "the user is told the draft blocked it");
     assert!(s.typed().is_empty(), "typed {:?}", s.typed());
     assert!(!s.marker.exists());
 }
@@ -442,7 +459,7 @@ fn csm_relay_zero_keeps_the_direct_launcher() {
     o.extra_env.push(("CSM_RELAY", "0"));
     let s = Session::start(o);
     s.wait_ready();
-    s.write_request("on", 5);
+    s.write_request("on", "insert", 5);
     // No relay means no supervisor: the request is never picked up.
     std::thread::sleep(Duration::from_secs(8));
     assert!(
@@ -450,4 +467,65 @@ fn csm_relay_zero_keeps_the_direct_launcher() {
         "a direct launch has no supervisor to log an outcome"
     );
     assert!(s.typed().is_empty());
+}
+
+/// Drop `ESC [ ? <digits;...> c` (a primary device attributes reply).
+fn strip_da_replies(bytes: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i..].starts_with(b"\x1b[?") {
+            let mut j = i + 3;
+            while j < bytes.len() && (bytes[j].is_ascii_digit() || bytes[j] == b';') {
+                j += 1;
+            }
+            if j < bytes.len() && bytes[j] == b'c' {
+                i = j + 1;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    out
+}
+
+#[test]
+fn vim_normal_gets_i_then_compact_then_enter() {
+    let mut o = Opts::new("vim-normal-120x40");
+    o.rules = "i=vim-insert-120x40|/compact=compact-menu-typed-120x40|\\r=compact-started-120x40";
+    o.vim = "normal";
+    let (s, line) = run_request(o, 60, Duration::from_secs(40));
+    assert_eq!(
+        outcome_word(&line),
+        "delivered",
+        "{line} typed={:?}",
+        s.typed()
+    );
+    assert_eq!(s.typed(), b"i/compact\r");
+    assert!(s.marker.exists());
+}
+
+#[test]
+fn verify_failure_rolls_back_the_typed_text() {
+    let mut o = Opts::new("idle-after-turn-120x40");
+    o.rules = "/compact=draft-hello-120x40";
+    let (s, line) = run_request(o, 60, Duration::from_secs(40));
+    assert_eq!(outcome_word(&line), "verify-failed", "{line}");
+    let mut want = b"/compact".to_vec();
+    want.extend(std::iter::repeat_n(0x7f, 8));
+    assert_eq!(s.typed(), want, "typed text erased with one DEL per char");
+    assert!(!s.marker.exists(), "Enter must not be pressed");
+    assert!(s.notified());
+}
+
+#[test]
+fn closing_the_window_ends_the_session() {
+    let mut s = Session::start(Opts::new("idle-after-turn-120x40"));
+    s.wait_ready();
+    s.command("Q");
+    assert!(
+        s.wait_exit(Duration::from_secs(15)).is_some(),
+        "csm (and so the harness) must exit once its console is gone"
+    );
 }
