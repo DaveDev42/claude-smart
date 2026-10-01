@@ -3095,14 +3095,18 @@ mod tests {
                     crate::paths::idle(sid),
                     crate::paths::idle_compacted(sid),
                 ] {
-                    let f = std::fs::File::open(&p).unwrap();
+                    // Write access: Windows refuses set_modified on a read-only handle.
+                    let f = std::fs::OpenOptions::new().write(true).open(&p).unwrap();
                     f.set_modified(old).unwrap();
                 }
             }
             // Also drop an unrelated file to prove the sweep does not touch
             // anything outside the three tracked suffixes.
             std::fs::write(dir.join("sidecar-unrelated.json"), "{}").unwrap();
-            let unrelated = std::fs::File::open(dir.join("sidecar-unrelated.json")).unwrap();
+            let unrelated = std::fs::OpenOptions::new()
+                .write(true)
+                .open(dir.join("sidecar-unrelated.json"))
+                .unwrap();
             unrelated.set_modified(old).unwrap();
 
             prune_detected_markers();
