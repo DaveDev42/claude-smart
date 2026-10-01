@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.4.2](https://github.com/DaveDev42/claude-smart/compare/v0.4.1...v0.4.2) (2026-10-01)
+
+
+### Features
+
+* **accounts:** show each account's usage in accounts list ([20b6d84](https://github.com/DaveDev42/claude-smart/commit/20b6d8401c965d90a6aec514db51b87ac71bca8c))
+* **orca:** flag an Orca that still runs the old D ([7fcff12](https://github.com/DaveDev42/claude-smart/commit/7fcff120f2c66ecf1fc3c2eb2b8228586860b38e))
+
+
+### Bug Fixes
+
+* **orca:** read a headless Orca's D when its environ is retitled ([8ebfc42](https://github.com/DaveDev42/claude-smart/commit/8ebfc42357910e8ce447fdcbb41c3776864509f7))
+* **switch:** leave a capped account when no usage is known ([3f21f4b](https://github.com/DaveDev42/claude-smart/commit/3f21f4b2e54e7e291bd1fe8c5e819ddb017d74ca))
+* **usage:** track the statusLine identity per config dir ([26eef6c](https://github.com/DaveDev42/claude-smart/commit/26eef6cdf35d41093cf9052e170e39fae114d8bd))
+
 ## [0.4.1](https://github.com/DaveDev42/claude-smart/compare/v0.4.0...v0.4.1) (2026-10-01)
 
 
