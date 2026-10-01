@@ -133,14 +133,23 @@ pub fn choose_target(
     if known(hook_target) && data.and_then(|d| viable_in(d, hook_target)) != Some(false) {
         return Ok(hook_target.to_owned());
     }
-    let Some(data) = data else {
-        return Err("no usage data to pick another account".into());
-    };
-    match scoring::pick_best_gated(data, from.unwrap_or(""), false, false) {
-        Ok(Some(id)) if known(&id) => Ok(id),
-        Ok(_) => Err("no other account with headroom".into()),
-        Err(e) => Err(e.to_string()),
+    // A hop only follows a definitive limit on `from`, so staying on it is
+    // the worst answer. When usage names no other account with headroom
+    // (nothing read, or only `from`'s own reading), leave for the next one in
+    // Orca's order that no reading rules out; Stay only when there is none.
+    let picked = data.map(|d| scoring::pick_best_gated(d, from.unwrap_or(""), false, false));
+    if let Some(Ok(Some(id))) = &picked
+        && known(id)
+    {
+        return Ok(id.clone());
     }
+    let ids: Vec<&str> = accounts.accounts.iter().map(|a| a.id.as_str()).collect();
+    let capped = |id: &str| data.and_then(|d| viable_in(d, id)) == Some(false);
+    scoring::next_after(&ids, from, capped).ok_or_else(|| match picked {
+        Some(Err(e)) => e.to_string(),
+        Some(_) => "no other account with headroom".into(),
+        None => "no usage data to pick another account".into(),
+    })
 }
 
 /// Pure: the live claude pids in `D` that no csm supervisor owns.
@@ -264,7 +273,7 @@ pub fn run_hop(
             crate::usage::capture_warnings(|| crate::usage::fetch_for_limit_pick(lock, env));
         (fresh.ok(), warnings)
     };
-    run_hop_in(
+    let outcome = run_hop_in(
         &ctx,
         &procs,
         &http,
@@ -272,7 +281,26 @@ pub fn run_hop(
         sentinel,
         own_sid,
         notice,
-    )
+    );
+    // The terminal line is gone with the terminal (an Orca pane, a closed
+    // window): the log keeps why the hop switched or stayed.
+    let _ = crate::hook::notify::append_log(own_sid, &hop_log_message(own_sid, &outcome));
+    outcome
+}
+
+/// The `limit-switch.log` message for a hop's decision, in the hook's
+/// `kind sid=… detail` shape. Pure.
+pub fn hop_log_message(own_sid: &str, outcome: &HopOutcome) -> String {
+    let sid = crate::hook::sid_short(own_sid);
+    match outcome {
+        HopOutcome::Switched { from, to, .. } => format!(
+            "hop sid={sid} outcome=switched from={} to={to}",
+            from.as_deref().unwrap_or("-")
+        ),
+        HopOutcome::Followed { to } => format!("hop sid={sid} outcome=followed to={to}"),
+        HopOutcome::Stay { reason } => format!("hop sid={sid} outcome=stay reason={reason}"),
+        HopOutcome::LockBusy => format!("hop sid={sid} outcome=lock-busy reason=switch.lock held"),
+    }
 }
 
 /// The leader's fresh usage read for its pick: the data (`None` when the
@@ -667,11 +695,56 @@ mod tests {
         let set = accounts(&["a", "b"]);
         let d = data(&[("a", 100, 20), ("b", 100, 20)]);
         assert!(choose_target(&set, Some(&d), "b", Some("a")).is_err());
-        assert!(choose_target(&set, None, "gone", Some("a")).is_err());
         // A pick that is not one of Orca's accounts never comes back.
         let only_a = accounts(&["a"]);
         let d = data(&[("a", 100, 20), ("x", 10, 10)]);
         assert!(choose_target(&only_a, Some(&d), "x", Some("a")).is_err());
+    }
+
+    /// No usage at all after a definitive limit: leave the capped account for
+    /// the next one in Orca's order instead of staying on it.
+    #[test]
+    fn choose_target_leaves_a_capped_account_when_no_usage_is_known() {
+        let set = accounts(&["a", "b", "c"]);
+        assert_eq!(choose_target(&set, None, "gone", Some("b")), Ok("c".into()));
+        assert_eq!(choose_target(&set, None, "gone", Some("c")), Ok("a".into()));
+        // Only `from` has a reading (and it is capped): the others are unknown.
+        let d = data(&[("a", 100, 20)]);
+        assert_eq!(
+            choose_target(&set, Some(&d), "gone", Some("a")),
+            Ok("b".into())
+        );
+        // An account a reading rules out is skipped.
+        let d = data(&[("a", 100, 20), ("b", 100, 20)]);
+        assert_eq!(
+            choose_target(&set, Some(&d), "gone", Some("a")),
+            Ok("c".into())
+        );
+        // The capped account alone: still nowhere to go.
+        let only_a = accounts(&["a"]);
+        assert!(choose_target(&only_a, None, "gone", Some("a")).is_err());
+    }
+
+    #[test]
+    fn hop_log_message_carries_the_decision_and_its_reason() {
+        let sid = "0017654e-0152-421f-9c32-291d889c4603";
+        let short = crate::hook::sid_short(sid);
+        let stay = HopOutcome::Stay {
+            reason: "no other account with headroom".into(),
+        };
+        assert_eq!(
+            hop_log_message(sid, &stay),
+            format!("hop sid={short} outcome=stay reason=no other account with headroom")
+        );
+        let sw = HopOutcome::Switched {
+            from: Some("a".into()),
+            to: "b".into(),
+            generation: 2,
+        };
+        assert_eq!(
+            hop_log_message(sid, &sw),
+            format!("hop sid={short} outcome=switched from=a to=b")
+        );
     }
 
     #[test]

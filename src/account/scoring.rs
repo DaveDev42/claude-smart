@@ -454,6 +454,28 @@ pub fn pick_best_at(
     }
 }
 
+/// The account to leave a known-capped `from` for when no usage reading picks
+/// one (the store is empty or holds only `from`'s own). Orca's list order
+/// starting after `from` and wrapping, the first account `known_capped` does
+/// not rule out; `None` when `from` is the only candidate. Pure. The viability
+/// judgement stays with the caller's `known_capped` (built on
+/// [`is_viable_pcts`]); this holds no threshold of its own.
+pub fn next_after(
+    ids: &[&str],
+    from: Option<&str>,
+    known_capped: impl Fn(&str) -> bool,
+) -> Option<String> {
+    let start = from
+        .and_then(|f| ids.iter().position(|i| *i == f))
+        .map_or(0, |p| p + 1);
+    ids.iter()
+        .cycle()
+        .skip(start)
+        .take(ids.len())
+        .find(|i| Some(**i) != from && !known_capped(i))
+        .map(|i| (*i).to_owned())
+}
+
 // ─── tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -535,6 +557,21 @@ mod tests {
             )
         };
         const { assert!(ABSENT_SESSION_PCT < 0, "absent sentinel must be negative") };
+    }
+
+    #[test]
+    fn next_after_follows_orcas_order_and_wraps() {
+        let ids = ["a", "b", "c"];
+        let none = |_: &str| false;
+        assert_eq!(next_after(&ids, Some("a"), none).as_deref(), Some("b"));
+        assert_eq!(next_after(&ids, Some("c"), none).as_deref(), Some("a"));
+        assert_eq!(next_after(&ids, None, none).as_deref(), Some("a"));
+        assert_eq!(
+            next_after(&ids, Some("a"), |i| i == "b").as_deref(),
+            Some("c")
+        );
+        assert_eq!(next_after(&ids, Some("a"), |i| i != "a"), None);
+        assert_eq!(next_after(&["a"], Some("a"), none), None);
     }
 
     // ─── basic pick ──────────────────────────────────────────────────────────
