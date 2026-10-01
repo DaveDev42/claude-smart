@@ -126,6 +126,19 @@ fn main() {
     unsafe {
         cmd.pre_exec(|| {
             let _ = setpgid(Pid::from_raw(0), Pid::from_raw(0));
+            // Take the foreground ourselves, before exec, like a real shell's
+            // forked child does. Waiting for the parent's `tcsetpgrp` below
+            // races csm: if csm touches the terminal (tcsetattr, a write
+            // under TOSTOP) first, it is a background job and SIGTTOU stops
+            // it for good (the harness only reports STOPPED). Linux runners
+            // with few CPUs lose that race; an idle macOS box rarely does.
+            // SIGTTOU is ignored only across this call, and reset to the
+            // default so it is not inherited through exec.
+            let ign_ttou = SigAction::new(SigHandler::SigIgn, SaFlags::empty(), SigSet::empty());
+            let dfl_ttou = SigAction::new(SigHandler::SigDfl, SaFlags::empty(), SigSet::empty());
+            let _ = sigaction(Signal::SIGTTOU, &ign_ttou);
+            let _ = libc::tcsetpgrp(0, libc::getpgrp());
+            let _ = sigaction(Signal::SIGTTOU, &dfl_ttou);
             let dfl = SigAction::new(SigHandler::SigDfl, SaFlags::empty(), SigSet::empty());
             let _ = sigaction(Signal::SIGHUP, &dfl);
             Ok(())

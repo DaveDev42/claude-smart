@@ -198,6 +198,20 @@ fn run(args: &[OsString]) -> io::Result<()> {
     unsafe {
         cmd.pre_exec(|| {
             let _ = setpgid(Pid::from_raw(0), Pid::from_raw(0));
+            // Take the foreground before exec instead of waiting for the
+            // parent's `tcsetpgrp` below. Until that lands claude is a
+            // background job, and a `tcsetattr` (or a write under TOSTOP)
+            // in its first milliseconds raises SIGTTOU/SIGTTIN and stops it
+            // for good, which left the session hung on loaded CI runners.
+            // SIGTTOU is ignored only for this call and the previous
+            // disposition restored so nothing leaks through exec.
+            // `libc` calls only: this runs between fork and exec.
+            let mut ign: libc::sigaction = std::mem::zeroed();
+            ign.sa_sigaction = libc::SIG_IGN;
+            let mut old: libc::sigaction = std::mem::zeroed();
+            libc::sigaction(libc::SIGTTOU, &ign, &mut old);
+            let _ = libc::tcsetpgrp(0, libc::getpgrp());
+            libc::sigaction(libc::SIGTTOU, &old, std::ptr::null_mut());
             Ok(())
         });
     }

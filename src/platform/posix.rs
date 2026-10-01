@@ -78,9 +78,31 @@ impl Launcher for PosixLauncher {
         // process-group leader so the kernel delivers Ctrl-C/Ctrl-Z to its pgrp
         // (not the supervisor). setpgid(0,0) — NOT setsid (which would drop the
         // controlling tty we need for the tcsetpgrp grant-back).
+        //
+        // With a tty the child also takes the foreground itself, before exec.
+        // Leaving that to the parent's `tcsetpgrp` below races claude: until
+        // it lands claude is a background job, and an early `tcsetattr` raises
+        // SIGTTOU and stops it for good. SIGTTOU is ignored only across the
+        // call and the old disposition restored. `libc` only (post-fork).
+        let has_tty = tty.is_some();
+        // The foreground group to give the terminal back to, read before the
+        // child can change it.
+        let parent_pgid = tty.as_ref().and_then(|t| tcgetpgrp(t.as_fd()).ok());
         unsafe {
-            cmd.pre_exec(|| {
+            cmd.pre_exec(move || {
                 let _ = setpgid(Pid::from_raw(0), Pid::from_raw(0));
+                if has_tty {
+                    let fd = libc::open(c"/dev/tty".as_ptr(), libc::O_RDWR);
+                    if fd >= 0 {
+                        let mut ign: libc::sigaction = std::mem::zeroed();
+                        ign.sa_sigaction = libc::SIG_IGN;
+                        let mut old: libc::sigaction = std::mem::zeroed();
+                        libc::sigaction(libc::SIGTTOU, &ign, &mut old);
+                        let _ = libc::tcsetpgrp(fd, libc::getpgrp());
+                        libc::sigaction(libc::SIGTTOU, &old, std::ptr::null_mut());
+                        libc::close(fd);
+                    }
+                }
                 Ok(())
             });
         }
@@ -110,12 +132,9 @@ impl Launcher for PosixLauncher {
             None
         };
 
-        let parent_pgid = tty.as_ref().and_then(|t| {
-            let fd = t.as_fd();
-            let prev = tcgetpgrp(fd).ok();
-            let _ = tcsetpgrp(fd, child_pgid);
-            prev
-        });
+        if let Some(t) = tty.as_ref() {
+            let _ = tcsetpgrp(t.as_fd(), child_pgid);
+        }
 
         // The supervisor installs NO SIGINT/SIGTERM handler: with the child in the
         // foreground pgrp, the kernel routes keyboard signals straight to claude.
