@@ -52,6 +52,10 @@ pub struct ObsInfo {
     pub box_state: &'static str,
     pub vim: &'static str,
     pub status: Option<String>,
+    /// The input box's text (None when no box was found).
+    pub box_text: Option<String>,
+    /// `none` (no menu) or `<entries>:<highlighted|none>`.
+    pub menu: String,
 }
 
 /// Map one screen (plus the window title, the request's `vim_mode`, and the
@@ -99,6 +103,21 @@ pub fn observe(
             BoxState::NotFound => "unknown",
         },
         status: status_veto.clone(),
+        box_text: screen_check::box_text(screen).map(|t| {
+            t.split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+                .chars()
+                .take(80)
+                .collect()
+        }),
+        menu: match screen_check::command_menu(screen) {
+            screen_check::Menu::Absent => "none".to_owned(),
+            screen_check::Menu::Open {
+                highlighted,
+                entries,
+            } => format!("{entries}:{}", highlighted.as_deref().unwrap_or("none")),
+        },
     };
     let obs = Observation {
         now_ms,
@@ -428,6 +447,10 @@ fn run_request(ctx: &Ctx, stop: &Stop, req: Request) {
     // The screen that justified Enter. The log reports it rather than the
     // last screen, which shows claude already busy with the compaction.
     let mut at_enter: Option<ObsInfo> = None;
+    // The screen that made the machine give up (verify-failed/expired): the
+    // observation behind the first rollback action, before the rollback
+    // changes the screen.
+    let mut at_verify: Option<ObsInfo> = None;
 
     let outcome = loop {
         if stop.stopped() {
@@ -459,13 +482,17 @@ fn run_request(ctx: &Ctx, stop: &Stop, req: Request) {
                 }
                 inject_and_settle(io, stop, &bytes);
             }
-            Action::Rollback(bytes) => inject_and_settle(io, stop, &bytes),
+            Action::Rollback(bytes) => {
+                at_verify.get_or_insert_with(|| info.clone());
+                inject_and_settle(io, stop, &bytes);
+            }
             Action::PressEnter => {
                 at_enter = Some(info.clone());
                 inject_and_settle(io, stop, b"\r");
             }
             Action::ReleaseInput => drop(hold.take()),
             Action::Notify { title, body } => {
+                at_verify.get_or_insert_with(|| info.clone());
                 notify = Some(PendingNotify {
                     bytes: osc777(&title, &body),
                     since: Instant::now(),
@@ -475,7 +502,15 @@ fn run_request(ctx: &Ctx, stop: &Stop, req: Request) {
         }
     };
     drop(hold);
-    let info = at_enter.unwrap_or(info);
+    let failed = matches!(outcome, super::deliver::Outcome::VerifyFailed);
+    let info = at_enter
+        .or_else(|| at_verify.filter(|_| failed))
+        .unwrap_or(info);
+    let (box_text, menu) = if failed {
+        (info.box_text.as_deref(), Some(info.menu.as_str()))
+    } else {
+        (None, None)
+    };
 
     log_outcome(
         &req.sid,
@@ -486,6 +521,8 @@ fn run_request(ctx: &Ctx, stop: &Stop, req: Request) {
             box_state: Some(info.box_state),
             vim: Some(info.vim),
             status: info.status.as_deref(),
+            box_text,
+            menu,
             ..Default::default()
         },
     );
@@ -530,6 +567,16 @@ mod tests {
     fn obs_of(name: &str, req_vim: Option<&str>, entered: bool) -> (Observation, ObsInfo) {
         let (screen, title) = replay(name);
         observe(&screen, &title, req_vim, entered, None, 10_000, None, None)
+    }
+
+    #[test]
+    fn obs_info_carries_box_text_and_menu_for_the_verify_log() {
+        let (_, info) = obs_of("compact-menu-typed-120x40", Some("insert"), false);
+        assert!(info.box_text.as_deref().is_some_and(|t| t.starts_with('/')));
+        assert!(info.menu != "none", "menu: {}", info.menu);
+        let (_, idle) = obs_of("idle-after-turn-120x40", Some("insert"), false);
+        assert_eq!(idle.menu, "none");
+        assert_eq!(idle.box_text.as_deref(), Some(""));
     }
 
     #[test]

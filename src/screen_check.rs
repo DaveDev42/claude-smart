@@ -101,22 +101,43 @@ fn first_visible(screen: &vt100::Screen, row: u16, cols: u16) -> Option<&str> {
 /// rounded dialog corners, `╌`-style separators and the `/model` picker's
 /// `▔` border all fail this even though they visually resemble a rule.
 fn is_rule_row(screen: &vt100::Screen, row: u16, cols: u16) -> bool {
-    let mut any_rule = false;
+    // Claude Code draws a session name into the top rule, right-aligned:
+    // `──────── name ─`. Accept one such title: a long leading run of `─`,
+    // a blank, text, a blank, and a single closing `─`. Anything else that
+    // is not `─` or blank still fails (zero tolerance for dialog borders).
+    let mut cells: Vec<&str> = Vec::with_capacity(cols as usize);
     for col in 0..cols {
-        let Some(cell) = screen.cell(row, col) else {
-            continue;
-        };
-        let c = cell.contents();
-        if c.is_empty() || c == " " {
-            continue;
-        }
-        if c != RULE {
-            return false;
-        }
-        any_rule = true;
+        let c = screen.cell(row, col).map_or("", |cell| cell.contents());
+        cells.push(if c.is_empty() { " " } else { c });
     }
-    any_rule
+    let Some(first) = cells.iter().position(|c| *c != " ") else {
+        return false;
+    };
+    let Some(last) = cells.iter().rposition(|c| *c != " ") else {
+        return false;
+    };
+    if cells[first] != RULE {
+        return false;
+    }
+    let lead = cells[first..=last]
+        .iter()
+        .take_while(|c| **c == RULE)
+        .count();
+    let tail = &cells[first + lead..=last];
+    if tail.is_empty() || tail.iter().all(|c| *c == RULE || *c == " ") {
+        return true;
+    }
+    // Titled: the run, one blank, the title, one blank, a final `─`.
+    lead >= TITLED_RULE_MIN_RUN
+        && tail.len() >= 4
+        && tail[0] == " "
+        && tail[tail.len() - 1] == RULE
+        && tail[tail.len() - 2] == " "
 }
+
+/// Shortest `─` run that may lead a titled rule (a title never takes most of
+/// the row's width, and a short run is more likely prose).
+const TITLED_RULE_MIN_RUN: usize = 8;
 
 /// Non-dim text of the box's content rows (`content_start..content_end`),
 /// with the leading `❯` marker dropped, joined across continuation rows and
@@ -186,15 +207,19 @@ fn row_plain_text(screen: &vt100::Screen, row: u16, cols: u16) -> String {
 
 /// Vim mode from the screen's last row (see [`VimState`] for the Normal/Off
 /// caveat).
-fn vim_state(screen: &vt100::Screen) -> VimState {
+fn vim_state(screen: &vt100::Screen, below: u16) -> VimState {
     let (rows, cols) = screen.size();
     if rows == 0 {
         return VimState::Off;
     }
-    let text = row_plain_text(screen, rows - 1, cols);
-    if text.contains("-- INSERT --") {
+    let last = row_plain_text(screen, rows - 1, cols);
+    // Rows may be drawn under the mode line (a background-agent panel), so
+    // the marker is looked for in every row below the box's closing rule.
+    let marker =
+        ((below + 1)..rows).any(|r| row_plain_text(screen, r, cols).contains("-- INSERT --"));
+    if marker {
         VimState::Insert
-    } else if text.trim().is_empty() {
+    } else if last.trim().is_empty() {
         VimState::Off
     } else {
         VimState::Normal
@@ -207,7 +232,7 @@ pub fn input_box(screen: &vt100::Screen) -> BoxState {
     match locate(screen) {
         None => BoxState::NotFound,
         Some((start, end)) => {
-            let vim = vim_state(screen);
+            let vim = vim_state(screen, end);
             if extract_text(screen, start, end).is_empty() {
                 BoxState::Empty { vim }
             } else {
@@ -335,8 +360,12 @@ pub enum Menu {
     /// No command menu is drawn above the box.
     Absent,
     /// A menu is drawn; `highlighted` is the entry Enter would run (`None`
-    /// when zero or several entries look highlighted).
-    Open { highlighted: Option<String> },
+    /// when zero or several entries look highlighted); `entries` is how many
+    /// command rows were found (logged on verify-failed).
+    Open {
+        highlighted: Option<String>,
+        entries: usize,
+    },
 }
 
 /// Inspect the slash-command menu Claude Code draws directly above the box's
@@ -403,7 +432,10 @@ pub fn command_menu(screen: &vt100::Screen) -> Menu {
     } else {
         None
     };
-    Menu::Open { highlighted }
+    Menu::Open {
+        highlighted,
+        entries: entries.len(),
+    }
 }
 
 /// `true` when pressing Enter would run exactly `command`: either no menu is
@@ -412,7 +444,7 @@ pub fn command_menu(screen: &vt100::Screen) -> Menu {
 pub fn enter_runs(screen: &vt100::Screen, command: &str) -> bool {
     match command_menu(screen) {
         Menu::Absent => true,
-        Menu::Open { highlighted } => highlighted.as_deref() == Some(command),
+        Menu::Open { highlighted, .. } => highlighted.as_deref() == Some(command),
     }
 }
 
@@ -613,7 +645,8 @@ mod tests {
         assert_eq!(
             command_menu(&screen),
             Menu::Open {
-                highlighted: Some("/compact".to_owned())
+                highlighted: Some("/compact".to_owned()),
+                entries: 3
             }
         );
         assert!(enter_runs(&screen, "/compact"));
@@ -650,7 +683,8 @@ mod tests {
         assert_eq!(
             command_menu(screen),
             Menu::Open {
-                highlighted: Some("/autocompact".to_owned())
+                highlighted: Some("/autocompact".to_owned()),
+                entries: 3
             }
         );
         assert!(!enter_runs(screen, "/compact"));
@@ -840,6 +874,91 @@ mod tests {
         assert_eq!(input_box(&screen), BoxState::NotFound);
         assert_eq!(box_text(&screen), None);
         assert!(!compaction_started(&screen));
+    }
+
+    // --- diagnosis repros (idle-compact real-session failures, 2026-10-01) ---
+
+    /// Orca/Claude draw the session name right-aligned in the rule above the
+    /// box: `──── reduce-token-usage ─`. A named session is NotFound today.
+    #[test]
+    fn titled_rule_above_the_box_still_finds_it() {
+        let titled = format!("{} reduce-token-usage \u{2500}", rule(60));
+        let screen = synth(
+            12,
+            82,
+            &[
+                (5, 0, titled.as_str(), false),
+                (6, 0, "\u{276f}", false),
+                (7, 0, rule(82).as_str(), false),
+                (8, 0, "  dave@MBP16 ~/x [Opus 5.5]", false),
+                (9, 0, "  -- INSERT -- bypass permissions on", false),
+            ],
+        );
+        assert_eq!(
+            input_box(&screen),
+            BoxState::Empty {
+                vim: VimState::Insert
+            }
+        );
+    }
+
+    #[test]
+    fn titled_rule_with_wide_title_still_finds_it() {
+        let titled = format!(
+            "{} \u{d074}\u{b85c}\u{b4dc} \u{c815}\u{b9ac} \u{2500}",
+            rule(50)
+        );
+        let screen = synth(
+            12,
+            82,
+            &[
+                (5, 0, titled.as_str(), false),
+                (6, 0, "\u{276f}", false),
+                (7, 0, rule(82).as_str(), false),
+            ],
+        );
+        assert!(matches!(input_box(&screen), BoxState::Empty { .. }));
+    }
+
+    #[test]
+    fn prose_after_a_dash_run_is_not_a_rule() {
+        // No closing `─` after the text: an ordinary line, not a rule.
+        let line = format!("{} see below", rule(30));
+        let screen = synth(
+            12,
+            82,
+            &[
+                (5, 0, line.as_str(), false),
+                (6, 0, "\u{276f}", false),
+                (7, 0, rule(82).as_str(), false),
+            ],
+        );
+        assert_eq!(input_box(&screen), BoxState::NotFound);
+    }
+
+    /// With a background-agent panel drawn under the vim line, the
+    /// `-- INSERT --` row is not the terminal's last row.
+    #[test]
+    fn insert_marker_above_an_agent_panel_still_reads_as_insert() {
+        let screen = synth(
+            12,
+            82,
+            &[
+                (5, 0, rule(82).as_str(), false),
+                (6, 0, "\u{276f}", false),
+                (7, 0, rule(82).as_str(), false),
+                (8, 0, "  dave@MBP16 ~/x [Opus 5.5]", false),
+                (9, 0, "  -- INSERT -- bypass permissions on", false),
+                (10, 0, "  \u{23fa} main", false),
+                (11, 0, "  \u{25ef} general-purpose  Listing files", false),
+            ],
+        );
+        assert_eq!(
+            input_box(&screen),
+            BoxState::Empty {
+                vim: VimState::Insert
+            }
+        );
     }
 
     // --- content_fingerprint ---
