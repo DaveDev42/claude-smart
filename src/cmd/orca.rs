@@ -669,8 +669,11 @@ mod tests {
             (old, Path::new("/example/.claude"))
         );
         let n = restart_note(&o, &t);
-        assert!(n.contains("restart Orca to adopt /example/.claude:"), "{n}");
-        assert!(n.contains("/example/.claude.old"), "{n}");
+        assert!(
+            n.contains(&format!("restart Orca to adopt {}:", t.display())),
+            "{n}"
+        );
+        assert!(n.contains(&o.display().to_string()), "{n}");
         // Orca already on the target, on an unrecorded dir, unreadable, or
         // before the cutover: nothing to restart.
         let none = |d: Option<&str>, cut| old_orca_d(d.map(Path::new), &stale, home, cut);

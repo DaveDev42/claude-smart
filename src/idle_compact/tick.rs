@@ -1242,7 +1242,13 @@ mod tests {
                 let req: Request = serde_json::from_slice(&bytes).unwrap();
                 assert_eq!(req.sid, sid);
                 assert_eq!(req.mode, "on");
-                assert_eq!(req.remaining_secs, 200);
+                // run_from_raw reads the clock again; a slow runner can
+                // cross a second boundary after `now` was taken.
+                assert!(
+                    (199..=200).contains(&req.remaining_secs),
+                    "remaining_secs: {}",
+                    req.remaining_secs
+                );
                 assert_eq!(req.recache_tokens, 150_000);
                 assert_eq!(req.deadline, now + 200 - DEADLINE_MARGIN_SECS);
                 assert_eq!(req.vim_mode.as_deref(), Some("insert"));
