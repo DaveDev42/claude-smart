@@ -30,6 +30,12 @@ pub struct LogFields<'a> {
     /// The session-status veto reason, when a status file was read and
     /// vetoed (`busy`/`waiting`/`shell`/...).
     pub status: Option<&'a str>,
+    /// The input box's text at verify time (verify-failed only), with
+    /// whitespace collapsed and quoted by `{:?}`.
+    pub box_text: Option<&'a str>,
+    /// The slash menu at verify time: `none` or `<entries>:<highlighted|none>`
+    /// (verify-failed only).
+    pub menu: Option<&'a str>,
 }
 
 /// Append one `outcome=<outcome> ...` line to [`paths::idle_compact_log`].
@@ -54,6 +60,12 @@ pub fn log_outcome(sid: &str, outcome: &str, fields: &LogFields) {
     }
     if let Some(v) = fields.status {
         message.push_str(&format!(" status={v}"));
+    }
+    if let Some(v) = fields.box_text {
+        message.push_str(&format!(" box_text={v:?}"));
+    }
+    if let Some(v) = fields.menu {
+        message.push_str(&format!(" menu={v}"));
     }
     append_line(sid, &message);
 }

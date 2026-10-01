@@ -436,7 +436,9 @@ When a request arrives the supervisor looks about once a second and types
   redraws every second, are ignored. Terminal replies, focus and mouse
   reports do not count as keystrokes.
 - The screen shows the main input box, empty (a dim placeholder still counts
-  as empty). A draft, including a multi-line or wrapped one and a `[Pasted
+  as empty). The rule above the box may carry a right-aligned session name
+  (`──── name ─`); the vim marker is looked for in every row under the box,
+  so a background-agent panel below the mode line does not hide it. A draft, including a multi-line or wrapped one and a `[Pasted
   text ...]` placeholder, is never typed over: csm notifies once and gives
   up on that request. A dialog, menu or picker (no box) is retried until the
   deadline.
@@ -473,7 +475,10 @@ Every finished request appends one line to `<state>/idle-compact.log`. The
 screen kept saying no; `<reason>` is claude's status word or
 `screen-busy`), and the dry-run words `dry-run-would-type`, `dry-run-draft`
 and `dry-run-expired`. Delivery lines also carry `box=`, `vim=` and
-`status=` when known.
+`status=` when known. A `verify-failed` line also carries `box_text=` (the
+box content at verify time, whitespace collapsed, at most 80 characters) and
+`menu=` (`none`, or `<entries>:<highlighted entry or none>`), taken before
+the rollback.
 
 The screen checks were written against real captures of Claude Code
 2.1.283 (`tests/fixtures/screens/`, see its README); a Claude Code release
