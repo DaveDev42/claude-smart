@@ -172,7 +172,18 @@ fn open_pty() -> (PtyMaster, String) {
         posix_openpt(OFlag::O_RDWR | OFlag::O_NOCTTY | OFlag::O_CLOEXEC).expect("posix_openpt");
     grantpt(&master).expect("grantpt");
     unlockpt(&master).expect("unlockpt");
-    let slave_path = unsafe { nix::pty::ptsname(&master) }.expect("ptsname");
+    // `ptsname` returns a pointer into a process-wide static buffer, so two
+    // tests opening a pty at the same moment can be handed each other's
+    // slave path. Linux has the reentrant `ptsname_r`; elsewhere the call is
+    // serialised.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    let slave_path = nix::pty::ptsname_r(&master).expect("ptsname_r");
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    let slave_path = {
+        static PTSNAME: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = PTSNAME.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe { nix::pty::ptsname(&master) }.expect("ptsname")
+    };
     (master, slave_path)
 }
 

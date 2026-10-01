@@ -123,7 +123,18 @@ fn open_pty() -> (PtyMaster, String) {
         posix_openpt(OFlag::O_RDWR | OFlag::O_NOCTTY | OFlag::O_CLOEXEC).expect("posix_openpt");
     grantpt(&master).expect("grantpt");
     unlockpt(&master).expect("unlockpt");
-    let slave_path = unsafe { nix::pty::ptsname(&master) }.expect("ptsname");
+    // `ptsname` returns a pointer into a process-wide static buffer, so two
+    // tests opening a pty at the same moment can be handed each other's
+    // slave path. Linux has the reentrant `ptsname_r`; elsewhere the call is
+    // serialised.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    let slave_path = nix::pty::ptsname_r(&master).expect("ptsname_r");
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    let slave_path = {
+        static PTSNAME: Mutex<()> = Mutex::new(());
+        let _guard = PTSNAME.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe { nix::pty::ptsname(&master) }.expect("ptsname")
+    };
     (master, slave_path)
 }
 
@@ -142,6 +153,11 @@ impl Drain {
         let (b, s) = (Arc::clone(&buf), Arc::clone(&stop));
         let handle = std::thread::spawn(move || {
             let mut tmp = [0u8; 4096];
+            // The drain starts before pty_harness has opened the slave. On
+            // Linux a master with no slave open polls as POLLHUP and reads
+            // as EIO (macOS just blocks), so a hangup is not the end here:
+            // csm's output may still be coming once the slave is opened.
+            // Keep polling until the test drops the drain.
             while !s.load(Ordering::SeqCst) {
                 let mut fds = [PollFd::new(fd.as_fd(), PollFlags::POLLIN)];
                 match poll(&mut fds, PollTimeout::from(100u16)) {
@@ -152,13 +168,16 @@ impl Drain {
                 let revents = fds[0].revents().unwrap_or(PollFlags::empty());
                 if revents.contains(PollFlags::POLLIN) {
                     match nix::unistd::read(fd.as_fd(), &mut tmp) {
-                        Ok(0) => break,
+                        Ok(0) => std::thread::sleep(Duration::from_millis(20)),
                         Ok(n) => b.lock().unwrap().extend_from_slice(&tmp[..n]),
                         Err(nix::errno::Errno::EINTR) => {}
+                        Err(nix::errno::Errno::EIO) => {
+                            std::thread::sleep(Duration::from_millis(20))
+                        }
                         Err(_) => break,
                     }
                 } else if revents.intersects(PollFlags::POLLHUP | PollFlags::POLLERR) {
-                    break;
+                    std::thread::sleep(Duration::from_millis(20));
                 }
             }
         });
