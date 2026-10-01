@@ -52,7 +52,7 @@ use nix::sys::stat::Mode;
 use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
 use nix::unistd::{Pid, setpgid, setsid};
 
-use super::set_controlling_tty;
+use super::pty::set_controlling_tty;
 
 /// One report line the leader writes to its stdout.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
