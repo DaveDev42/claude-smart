@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.4.5](https://github.com/DaveDev42/claude-smart/compare/v0.4.4...v0.4.5) (2026-10-01)
+
+
+### Bug Fixes
+
+* **idle-compact:** titled input-box rule, vim marker above agent panels, verify-failed logging ([#46](https://github.com/DaveDev42/claude-smart/issues/46)) ([4cccd6c](https://github.com/DaveDev42/claude-smart/commit/4cccd6ccf611fe93b4be506703e129f702bbcfdd))
+
 ## [0.4.4](https://github.com/DaveDev42/claude-smart/compare/v0.4.3...v0.4.4) (2026-10-01)
 
 
