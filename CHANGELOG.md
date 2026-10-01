@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.4.3](https://github.com/DaveDev42/claude-smart/compare/v0.4.2...v0.4.3) (2026-10-01)
+
+
+### Features
+
+* **relay:** run claude in a ConPTY on Windows ([059c457](https://github.com/DaveDev42/claude-smart/commit/059c45760898af820465e41e915ecf812b3bb10e))
+
+
+### Bug Fixes
+
+* **idle-compact:** judge output quiet on screen content above the input box — a statusline countdown no longer blocks delivery ([0388f57](https://github.com/DaveDev42/claude-smart/commit/0388f576ba69187a9fa1daa0be5f6b981c12d973))
+* **orca:** resolve status D like a launch and list every legacy-dir user ([236eb0b](https://github.com/DaveDev42/claude-smart/commit/236eb0b8a53d3afab32f80ea5a3ee7b3f5e9dc8d))
+
 ## [0.4.2](https://github.com/DaveDev42/claude-smart/compare/v0.4.1...v0.4.2) (2026-10-01)
 
 
