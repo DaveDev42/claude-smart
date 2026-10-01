@@ -76,8 +76,16 @@ pub(crate) fn render_status(v: &OrcaView) -> String {
     line(
         "orca D",
         match (&v.orca_runtime_dir, v.runtime_dir_agrees) {
-            (Some(d), Some(false)) => format!("{} (differs from csm's)", d.display()),
-            (Some(d), _) => d.display().to_string(),
+            (Some(d), agrees) => {
+                let mut out = d.display().to_string();
+                if let Some(n) = &v.orca_dir_note {
+                    out.push_str(&format!(" ({n})"));
+                }
+                if agrees == Some(false) {
+                    out.push_str(" (differs from csm's)");
+                }
+                out
+            }
             (None, _) if v.running => "unknown".to_owned(),
             (None, _) => "-".to_owned(),
         },

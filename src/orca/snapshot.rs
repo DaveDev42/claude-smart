@@ -66,6 +66,8 @@ pub struct OrcaView {
     pub runtime: RuntimePaths,
     /// Orca main's `D`, when Orca runs and its environment was read.
     pub orca_runtime_dir: Option<PathBuf>,
+    /// How that `D` was found, when not from Orca main's own environment.
+    pub orca_dir_note: Option<String>,
     /// `Some(true)` when both `D`s are known and equal.
     pub runtime_dir_agrees: Option<bool>,
     /// The effective host active id (n6i-normalized, as `accounts.list`
@@ -141,13 +143,14 @@ pub fn snapshot_with(env: &HostEnv, opts: &SnapshotOptions, facts: &dyn ProcFact
         runtime::runtime_paths(env.claude_config_dir.as_deref(), &env.home, |p| p.exists());
 
     // Orca main's D, when Orca runs.
-    let orca_runtime_dir = if running && opts.orca_env {
-        live.main_pid
-            .or(live.runtime.as_ref().map(|m| m.pid))
-            .and_then(|pid| super::procenv::orca_runtime_dir(pid, Some(&env.home)))
+    let orca_pid = live.main_pid.or(live.runtime.as_ref().map(|m| m.pid));
+    let orca_found = if running && opts.orca_env {
+        orca_pid.and_then(|pid| super::procenv::orca_dir_sourced(pid, Some(&env.home)))
     } else {
         None
     };
+    let orca_dir_note = orca_found.as_ref().and_then(|(_, src)| src.note());
+    let orca_runtime_dir = orca_found.map(|(d, _)| d.dir);
     let runtime_dir_agrees = orca_runtime_dir
         .as_deref()
         .map(|d| super::procenv::same_runtime_dir(&runtime, d));
@@ -204,6 +207,7 @@ pub fn snapshot_with(env: &HostEnv, opts: &SnapshotOptions, facts: &dyn ProcFact
         running,
         runtime,
         orca_runtime_dir,
+        orca_dir_note,
         runtime_dir_agrees,
         active_id,
         accounts,

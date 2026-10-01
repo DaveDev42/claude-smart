@@ -10,15 +10,21 @@
 //! same-user, non-platform process, Linux `/proc/<pid>/environ`, Windows the PEB). An
 //! unreadable block is `None`, which callers read as "refuse the switch".
 //!
+//! A headless Orca (`orca-ide --serve`, Electron) retitles its process, which
+//! leaves `/proc/<pid>/environ` readable but blank. On Linux that case reads
+//! the nearest same-uid ancestor's environment (the `serve` launcher, the
+//! `xvfb-run` shell), then the owner's home. macOS and Windows keep the
+//! single-block read: their APIs do not tell a blank block from a denied one.
+//!
 //! The block may hold secrets (Orca exports hook tokens to its panes and may
 //! carry API keys). Only `CLAUDE_CONFIG_DIR` and `HOME` are looked at; the
 //! block is dropped right after and never printed. Salvaged from the
 //! reverted commit de91859.
 
-use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 use super::runtime::RuntimePaths;
+use crate::platform::proc::{EnvRead, environ_read};
 
 /// Orca main's runtime dir and whether its own environment named it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -72,10 +78,95 @@ pub fn orca_dir_from_environ<S: AsRef<std::ffi::OsStr>>(
     }
 }
 
-/// The environment block of `pid`. A seam so tests read a child they
-/// spawned; nothing here prints it.
-fn environ_of(pid: u32) -> Option<Vec<OsString>> {
-    crate::platform::proc::environ(pid)
+/// Where Orca's `D` was read from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DirSource {
+    /// Orca main's own environment.
+    Own,
+    /// Orca main's environment is blank (retitled process); this ancestor's
+    /// environment named it.
+    Ancestor(u32),
+    /// Blank and no ancestor named it: the main process owner's home.
+    OwnerHome,
+}
+
+impl DirSource {
+    /// Short note for `csm orca status`; `None` for the ordinary case.
+    pub fn note(self) -> Option<String> {
+        match self {
+            DirSource::Own => None,
+            DirSource::Ancestor(pid) => Some(format!("from parent pid {pid}'s environment")),
+            DirSource::OwnerHome => Some("from the Orca owner's home".to_owned()),
+        }
+    }
+}
+
+/// The decision over what was read: Orca main's block, its same-uid
+/// ancestors nearest first, and the owner's home. Pure.
+///
+/// An unreadable main block stays `None` (fail closed). A blank one is a
+/// retitled Electron process: the nearest ancestor whose environment names
+/// `D` (via `CLAUDE_CONFIG_DIR` or `HOME`) answers, else the owner's home.
+pub(crate) fn resolve_environ(
+    main: &EnvRead,
+    ancestors: &[(u32, EnvRead)],
+    owner_home: Option<&Path>,
+    fallback_home: Option<&Path>,
+) -> Option<(OrcaDir, DirSource)> {
+    match main {
+        EnvRead::Unreadable => None,
+        EnvRead::Entries(env) => {
+            orca_dir_from_environ(env, fallback_home).map(|d| (d, DirSource::Own))
+        }
+        EnvRead::Empty => ancestors
+            .iter()
+            .find_map(|(pid, read)| match read {
+                EnvRead::Entries(env) => {
+                    orca_dir_from_environ(env, None).map(|d| (d, DirSource::Ancestor(*pid)))
+                }
+                _ => None,
+            })
+            .or_else(|| {
+                owner_home.map(|h| {
+                    (
+                        OrcaDir {
+                            dir: h.join(".claude"),
+                            explicit: false,
+                        },
+                        DirSource::OwnerHome,
+                    )
+                })
+            }),
+    }
+}
+
+/// Same-uid ancestors of `pid`, nearest first, at most [`MAX_ANCESTORS`],
+/// each with its environment. Linux only; empty elsewhere.
+#[cfg(target_os = "linux")]
+fn ancestry(pid: u32) -> (Vec<(u32, EnvRead)>, Option<PathBuf>) {
+    use crate::platform::proc;
+    /// How far up the parent chain a blank-environ Orca is followed.
+    const MAX_ANCESTORS: usize = 4;
+    let Some((mut next, uid)) = proc::parent_and_uid(pid) else {
+        return (Vec::new(), None);
+    };
+    let mut out = Vec::new();
+    while out.len() < MAX_ANCESTORS && next > 1 {
+        let Some((ppid, puid)) = proc::parent_and_uid(next) else {
+            break;
+        };
+        if puid != uid {
+            break;
+        }
+        out.push((next, proc::environ_read(next)));
+        next = ppid;
+    }
+    (out, proc::home_of_uid(uid))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn ancestry(_pid: u32) -> (Vec<(u32, EnvRead)>, Option<PathBuf>) {
+    (Vec::new(), None)
 }
 
 /// The `D` the running Orca main process `pid` materializes into. `None`
@@ -87,11 +178,21 @@ pub fn orca_runtime_dir(pid: u32, fallback_home: Option<&Path>) -> Option<PathBu
 /// [`orca_runtime_dir`] plus whether Orca main's environment set
 /// `CLAUDE_CONFIG_DIR`.
 pub fn orca_dir(pid: u32, fallback_home: Option<&Path>) -> Option<OrcaDir> {
+    orca_dir_sourced(pid, fallback_home).map(|(d, _)| d)
+}
+
+/// [`orca_dir`] plus where the answer came from.
+pub fn orca_dir_sourced(pid: u32, fallback_home: Option<&Path>) -> Option<(OrcaDir, DirSource)> {
     if pid == 0 {
         return None;
     }
-    let env = environ_of(pid)?;
-    orca_dir_from_environ(&env, fallback_home)
+    let main = environ_read(pid);
+    let (ancestors, owner_home) = if main == EnvRead::Empty {
+        ancestry(pid)
+    } else {
+        (Vec::new(), None)
+    };
+    resolve_environ(&main, &ancestors, owner_home.as_deref(), fallback_home)
 }
 
 /// Does csm's `D` agree with Orca's? Compares canonical paths when both
@@ -107,6 +208,7 @@ pub fn same_runtime_dir(csm: &RuntimePaths, orca_dir: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::OsString;
 
     #[test]
     fn claude_config_dir_wins_trimmed() {
@@ -186,6 +288,75 @@ mod tests {
             &dir.path().join("x").join("..").join("claude")
         ));
         assert!(!same_runtime_dir(&paths, &dir.path().join("other")));
+    }
+
+    fn ent(v: &[&str]) -> EnvRead {
+        EnvRead::Entries(v.iter().map(OsString::from).collect())
+    }
+
+    #[test]
+    fn blank_environ_takes_the_nearest_ancestor_with_home() {
+        let anc = [
+            (20, EnvRead::Empty),
+            (10, ent(&["PATH=/bin", "HOME=/home/example"])),
+            (5, ent(&["HOME=/elsewhere"])),
+        ];
+        let (d, src) =
+            resolve_environ(&EnvRead::Empty, &anc, Some(Path::new("/home/owner")), None).unwrap();
+        assert_eq!(d.dir, PathBuf::from("/home/example/.claude"));
+        assert!(!d.explicit);
+        assert_eq!(src, DirSource::Ancestor(10));
+    }
+
+    #[test]
+    fn blank_environ_takes_an_ancestors_claude_config_dir() {
+        let anc = [(
+            10,
+            ent(&["HOME=/home/example", "CLAUDE_CONFIG_DIR=/home/example/.cc"]),
+        )];
+        let (d, src) = resolve_environ(&EnvRead::Empty, &anc, None, None).unwrap();
+        assert_eq!(d.dir, PathBuf::from("/home/example/.cc"));
+        assert!(d.explicit);
+        assert_eq!(src, DirSource::Ancestor(10));
+    }
+
+    #[test]
+    fn blank_environ_without_a_useful_ancestor_uses_the_owner_home() {
+        let anc = [(10, EnvRead::Unreadable), (9, ent(&["PATH=/bin"]))];
+        let (d, src) =
+            resolve_environ(&EnvRead::Empty, &anc, Some(Path::new("/home/owner")), None).unwrap();
+        assert_eq!(d.dir, PathBuf::from("/home/owner/.claude"));
+        assert_eq!(src, DirSource::OwnerHome);
+        assert_eq!(resolve_environ(&EnvRead::Empty, &anc, None, None), None);
+    }
+
+    #[test]
+    fn unreadable_environ_never_falls_back() {
+        let anc = [(10, ent(&["HOME=/home/example"]))];
+        assert_eq!(
+            resolve_environ(
+                &EnvRead::Unreadable,
+                &anc,
+                Some(Path::new("/home/owner")),
+                Some(Path::new("/h"))
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn readable_environ_ignores_ancestors() {
+        let anc = [(10, ent(&["HOME=/home/other"]))];
+        let own = ent(&["HOME=/home/example"]);
+        let (d, src) = resolve_environ(&own, &anc, Some(Path::new("/home/owner")), None).unwrap();
+        assert_eq!(d.dir, PathBuf::from("/home/example/.claude"));
+        assert_eq!(src, DirSource::Own);
+    }
+
+    #[test]
+    fn source_note_only_for_the_fallbacks() {
+        assert_eq!(DirSource::Own.note(), None);
+        assert!(DirSource::Ancestor(7).note().unwrap().contains("pid 7"));
     }
 
     #[test]

@@ -81,6 +81,8 @@ pub(crate) fn is_running(pid: u32) -> bool {
 /// empty block counts as unreadable: every real process carries at least
 /// `PATH`, and sysinfo returns an empty list on a permission failure.
 /// Off the hot path: only the Orca runtime-dir check calls this.
+// Linux tests stub the one other caller (orca::live), so it is unused there.
+#[cfg_attr(all(test, target_os = "linux"), allow(dead_code))]
 pub(crate) fn environ(pid: u32) -> Option<Vec<OsString>> {
     use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
 
@@ -90,6 +92,68 @@ pub(crate) fn environ(pid: u32) -> Option<Vec<OsString>> {
     sys.refresh_processes_specifics(ProcessesToUpdate::Some(&[sys_pid]), true, kind);
     let env = sys.process(sys_pid)?.environ().to_vec();
     if env.is_empty() { None } else { Some(env) }
+}
+
+/// What reading one process's environment block found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum EnvRead {
+    /// The block could not be read (process gone, permission denied).
+    Unreadable,
+    /// The block was read but holds no `KEY=value` entry at all. Electron
+    /// and Chromium overwrite the argv/environ area to set the process
+    /// title, which leaves `/proc/<pid>/environ` readable and blank.
+    Empty,
+    Entries(Vec<OsString>),
+}
+
+/// [`environ`] that tells an unreadable block from a blank one. Linux reads
+/// `/proc/<pid>/environ` itself (sysinfo folds both cases into an empty
+/// list); other platforms cannot tell and keep reporting `Unreadable`.
+pub(crate) fn environ_read(pid: u32) -> EnvRead {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::ffi::OsStringExt;
+        let Ok(raw) = std::fs::read(format!("/proc/{pid}/environ")) else {
+            return EnvRead::Unreadable;
+        };
+        let entries: Vec<OsString> = raw
+            .split(|b| *b == 0)
+            .filter(|kv| kv.contains(&b'='))
+            .map(|kv| OsString::from_vec(kv.to_vec()))
+            .collect();
+        if entries.is_empty() {
+            EnvRead::Empty
+        } else {
+            EnvRead::Entries(entries)
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        environ(pid).map_or(EnvRead::Unreadable, EnvRead::Entries)
+    }
+}
+
+/// `pid`'s parent and owning uid (Linux `/proc`; `None` elsewhere or when
+/// the process is gone).
+#[cfg(target_os = "linux")]
+pub(crate) fn parent_and_uid(pid: u32) -> Option<(u32, u32)> {
+    use std::os::unix::fs::MetadataExt;
+    let uid = std::fs::metadata(format!("/proc/{pid}")).ok()?.uid();
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    // The comm field may hold spaces and parens: parse after the last ')'.
+    let rest = stat.rsplit_once(')')?.1;
+    let ppid = rest.split_whitespace().nth(1)?.parse().ok()?;
+    Some((ppid, uid))
+}
+
+/// Home directory of `uid` from the passwd database.
+#[cfg(target_os = "linux")]
+pub(crate) fn home_of_uid(uid: u32) -> Option<PathBuf> {
+    nix::unistd::User::from_uid(nix::unistd::Uid::from_raw(uid))
+        .ok()
+        .flatten()
+        .map(|u| u.dir)
+        .filter(|d| !d.as_os_str().is_empty())
 }
 
 /// Full process-table sweep: `System::new_all()`. Off the hot path — never
