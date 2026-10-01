@@ -876,7 +876,7 @@ pub(crate) fn findings(f: &DoctorFacts) -> Vec<Finding> {
     if f.dir_agrees == Some(false) {
         push(
             &mut out,
-            "Orca's D differs from csm's (CLAUDE_CONFIG_DIR)".into(),
+            "Orca's D differs from csm's (CLAUDE_CONFIG_DIR); after the cutover, restart Orca to adopt csm's D (`csm orca status`)".into(),
             None,
         );
     }
@@ -1148,7 +1148,13 @@ fn doctor(fix: bool, offline: bool) -> anyhow::Result<()> {
     let v = view()?;
     let http = SystemHttp::from_env();
     let facts = gather(&ctx, &v, &http, offline);
-    let found = findings(&facts);
+    let mut found = findings(&facts);
+    // The doctor already says Orca's D differs; it adds the legacy-dir user.
+    found.extend(
+        crate::cmd::orca::migration_notes(None, &ctx.env, &v.runtime.config_dir, false)
+            .into_iter()
+            .map(|text| Finding { text, fix: None }),
+    );
     println!(
         "Orca: {}; accounts: {} ({})",
         if v.running { "running" } else { "stopped" },

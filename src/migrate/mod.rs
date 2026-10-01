@@ -804,6 +804,28 @@ pub(crate) fn stale_dirs(env: &HostEnv) -> (Vec<PathBuf>, bool, Option<PathBuf>)
     (dirs, marker.is_some_and(|m| m.cutover.is_some()), floor)
 }
 
+/// The recorded legacy dirs that still exist and that a live claude uses,
+/// with what names the user (a pid and the dir it runs in, or the registered
+/// session). `~/.claude` is left out: it is not a legacy profile dir. A dir
+/// whose users cannot be read is not listed (this is a hint, not the
+/// cutover's gate). Reads the marker and the process table.
+pub(crate) fn legacy_dirs_in_use(
+    env: &HostEnv,
+    procs: &dyn crate::orca::live::ProcFacts,
+) -> Vec<(PathBuf, String)> {
+    let (dirs, _, _) = stale_dirs(env);
+    let claude = env.home.join(".claude");
+    dirs.into_iter()
+        .filter(|d| *d != claude && d.is_dir())
+        .filter_map(
+            |d| match crate::orca::live::dir_users(env.os, &d, &env.home, procs) {
+                crate::orca::live::DirUsers::Live(who) => Some((d, who)),
+                _ => None,
+            },
+        )
+        .collect()
+}
+
 /// The daily hint for a stale pin a launch replaced.
 pub(crate) fn stale_pin_hint() {
     const KEY: &str = "note:stale-pin";

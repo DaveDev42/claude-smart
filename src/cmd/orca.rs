@@ -160,6 +160,51 @@ pub(crate) fn render_status(v: &OrcaView) -> String {
     out
 }
 
+/// After the cutover, an Orca whose `D` is not csm's still runs the old one:
+/// its panes and sessions keep reading it. Pure.
+pub(crate) fn restart_note(agrees: Option<bool>, d: &Path, cutover_done: bool) -> Option<String> {
+    (cutover_done && agrees == Some(false)).then(|| {
+        format!(
+            "restart Orca to adopt {}: it still runs the old D, so its panes and csm disagree on the account",
+            d.display()
+        )
+    })
+}
+
+/// A live claude on a recorded legacy dir blocks the migration's retire step
+/// and keeps reporting that dir's account. Pure; `users` is
+/// [`crate::migrate::legacy_dirs_in_use`].
+pub(crate) fn legacy_use_notes(users: &[(PathBuf, String)]) -> Vec<String> {
+    users
+        .iter()
+        .map(|(dir, who)| {
+            format!(
+                "a claude still runs on the legacy dir {} ({who}); it blocks the migration's retire step, close it",
+                dir.display()
+            )
+        })
+        .collect()
+}
+
+/// The loud lines `status` and `accounts doctor` add about a half-finished
+/// migration. Reads the marker and the process table.
+pub(crate) fn migration_notes(
+    agrees: Option<bool>,
+    env: &HostEnv,
+    d: &Path,
+    include_restart: bool,
+) -> Vec<String> {
+    let (_, cutover_done, _) = crate::migrate::stale_dirs(env);
+    let users = crate::migrate::legacy_dirs_in_use(env, &crate::orca::live::SystemProcs);
+    let restart = include_restart
+        .then(|| restart_note(agrees, d, cutover_done))
+        .flatten();
+    restart
+        .into_iter()
+        .chain(legacy_use_notes(&users))
+        .collect()
+}
+
 fn status() -> anyhow::Result<()> {
     let v = crate::orca::snapshot(&SnapshotOptions::default()).context("csm orca status")?;
     print!("{}", render_status(&v));
@@ -170,6 +215,11 @@ fn status() -> anyhow::Result<()> {
     println!("{:<13} {}", "migration", crate::migrate::status_line());
     if let Some(w) = override_warning_now(&v) {
         println!("{:<13} {w}", "warning");
+    }
+    if let Ok(env) = HostEnv::current() {
+        for n in migration_notes(v.runtime_dir_agrees, &env, &v.runtime.config_dir, true) {
+            println!("{:<13} {n}", "WARNING");
+        }
     }
     Ok(())
 }
@@ -573,6 +623,33 @@ mod tests {
         let st = alias_state(&alias);
         assert_eq!(st, AliasState::Dangling(exe.clone()));
         assert!(alias_line(&st).contains("csm orca setup"));
+    }
+
+    #[test]
+    fn restart_note_only_after_the_cutover_and_a_differing_d() {
+        let d = Path::new("/example/d");
+        let n = restart_note(Some(false), d, true).unwrap();
+        assert!(n.contains("restart Orca to adopt /example/d"), "{n}");
+        assert_eq!(restart_note(Some(false), d, false), None);
+        assert_eq!(restart_note(Some(true), d, true), None);
+        assert_eq!(restart_note(None, d, true), None);
+    }
+
+    #[test]
+    fn legacy_use_names_the_dir_and_the_process() {
+        assert!(legacy_use_notes(&[]).is_empty());
+        let n = legacy_use_notes(&[(
+            PathBuf::from("/example/.claude.old"),
+            "pid 42 (claude) runs with CLAUDE_CONFIG_DIR=/example/.claude.old".into(),
+        )]);
+        assert_eq!(n.len(), 1);
+        assert!(n[0].contains("/example/.claude.old"), "{}", n[0]);
+        assert!(n[0].contains("pid 42"), "{}", n[0]);
+        assert!(
+            n[0].contains("blocks the migration's retire step"),
+            "{}",
+            n[0]
+        );
     }
 
     #[test]
