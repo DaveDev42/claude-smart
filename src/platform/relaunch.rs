@@ -480,11 +480,8 @@ fn relaunch_loop_with(
         // and the follow check key on them. `D`'s identity is noted first
         // (a follow or a Stay may find `D` moved by another supervisor, and
         // no tick has seen it yet), so this incarnation's captures count.
-        let born = crate::usage::local::launch_born(
-            crate::account::AccountSet::load_pinned(&spec.pin)
-                .current_uuid
-                .as_deref(),
-        );
+        let born =
+            crate::usage::local::launch_born(&crate::account::AccountSet::load_pinned(&spec.pin));
         let _ = crate::sidecar::merge_sidecar(
             &paths::sidecar(&sid),
             &crate::sidecar::Sidecar {

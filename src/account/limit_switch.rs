@@ -392,7 +392,8 @@ fn run_hop_in(
     }
     let _ = crate::hook::stop::stamp_last_switch();
     let after = AccountSet::load_with(&ctx.env);
-    let _ = crate::usage::local::note_identity(after.current_uuid.as_deref(), now);
+    let _ =
+        crate::usage::local::note_identity(&after.runtime_dir, after.current_uuid.as_deref(), now);
     drop(lock);
     HopOutcome::Switched {
         from,

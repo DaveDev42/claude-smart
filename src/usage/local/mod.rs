@@ -1179,7 +1179,11 @@ pub fn record_statusline_payload_in(
     let payload: statusline::StatuslinePayload = serde_json::from_str(raw)?;
     let now = Utc::now();
 
-    let last_switch = note_identity(accounts.current_uuid.as_deref(), now.timestamp());
+    let last_switch = note_identity(
+        &accounts.runtime_dir,
+        accounts.current_uuid.as_deref(),
+        now.timestamp(),
+    );
     let sidecar = payload
         .session_id()
         .filter(|sid| crate::session::alias::looks_like_uuid(sid))
@@ -1270,13 +1274,15 @@ pub(crate) fn attribute_capture(f: &CaptureFacts<'_>) -> Option<String> {
     }
 }
 
-/// Record `D`'s `accountUuid` in `<state>/last-identity`; a change is a
-/// switch event and re-stamps `.last-switch` (the cooldown) and
-/// `.last-identity-switch` (attribution). Returns the last identity switch
-/// event (epoch), if any. The first sighting records the identity without
-/// counting as a switch.
-pub(crate) fn note_identity(uuid: Option<&str>, now: i64) -> Option<i64> {
-    let path = crate::paths::last_identity();
+/// Record config dir `dir`'s `accountUuid` in its own
+/// `<state>/last-identity-<tag>`; a change in that dir is a switch event and
+/// re-stamps `.last-switch` (the cooldown) and `.last-identity-switch-<tag>`
+/// (attribution). Returns that dir's last identity switch event (epoch), if
+/// any. The first sighting of a dir records the identity without counting as
+/// a switch. Keyed per dir so ticks from a straggler on a legacy dir and
+/// sessions on `D` never look like a switch to each other.
+pub(crate) fn note_identity(dir: &Path, uuid: Option<&str>, now: i64) -> Option<i64> {
+    let path = crate::paths::last_identity(dir);
     let seen = std::fs::read_to_string(&path).ok();
     if let Some(uuid) = uuid.filter(|u| !u.is_empty())
         && seen.as_deref().map(str::trim) != Some(uuid)
@@ -1288,10 +1294,10 @@ pub(crate) fn note_identity(uuid: Option<&str>, now: i64) -> Option<i64> {
         );
         if seen.is_some() {
             let _ = std::fs::write(crate::paths::last_switch(), now.to_string());
-            let _ = std::fs::write(crate::paths::last_identity_switch(), now.to_string());
+            let _ = std::fs::write(crate::paths::last_identity_switch(dir), now.to_string());
         }
     }
-    std::fs::read_to_string(crate::paths::last_identity_switch())
+    std::fs::read_to_string(crate::paths::last_identity_switch(dir))
         .ok()
         .and_then(|s| s.trim().parse().ok())
 }
@@ -1302,9 +1308,9 @@ pub(crate) fn note_identity(uuid: Option<&str>, now: i64) -> Option<i64> {
 /// at or before this launch, not one the session's own first tick stamps
 /// after its `born` (which would drop every capture it makes). Returns the
 /// epoch to record as `born`.
-pub fn launch_born(uuid: Option<&str>) -> i64 {
+pub fn launch_born(accounts: &AccountSet) -> i64 {
     let now = crate::epoch::now_secs() as i64;
-    let _ = note_identity(uuid, now);
+    let _ = note_identity(&accounts.runtime_dir, accounts.current_uuid.as_deref(), now);
     now
 }
 
@@ -1966,27 +1972,70 @@ mod tests {
         assert_eq!(attribute_capture(&no_d), None);
     }
 
+    fn set(dir: &Path, uuid: &str, id: &str) -> AccountSet {
+        AccountSet {
+            current: Some(id.into()),
+            current_uuid: Some(uuid.into()),
+            runtime_dir: dir.to_path_buf(),
+            ..Default::default()
+        }
+    }
+
+    const TICK: &str = r#"{"rate_limits":{"five_hour":{"used_percentage":42.0,"resets_at":1788339599},"seven_day":{"used_percentage":31.0,"resets_at":1788339599}}}"#;
+
+    /// A straggler on a legacy dir ticks next to a session on `D`, each on
+    /// its own identity: neither tick is a switch, so nothing stamps the
+    /// cooldown and both captures count.
     #[test]
-    fn an_identity_change_stamps_a_switch_event() {
+    fn interleaved_ticks_from_two_dirs_are_not_a_switch() {
         let home = tempfile::tempdir().unwrap();
         crate::testenv::with_test_home(home.path(), || {
             std::fs::create_dir_all(crate::paths::smart_dir_no_create()).unwrap();
-            assert_eq!(note_identity(Some("uuid-a"), 100), None, "first sighting");
-            assert_eq!(note_identity(Some("uuid-a"), 150), None, "unchanged");
-            assert_eq!(note_identity(Some("uuid-b"), 200), Some(200), "changed");
+            let a = set(&home.path().join("legacy"), "uuid-a", "id-a");
+            let b = set(&home.path().join("orca-d"), "uuid-b", "id-b");
+            for _ in 0..3 {
+                let ca = record_statusline_payload_in(TICK, &a).unwrap();
+                let cb = record_statusline_payload_in(TICK, &b).unwrap();
+                assert_eq!(ca.unwrap().account_id, "id-a");
+                assert_eq!(cb.unwrap().account_id, "id-b");
+            }
+            assert!(!crate::paths::last_switch().exists(), "no switch stamped");
+            assert!(store::load("id-a").is_some_and(|r| r.usage.is_some()));
+            assert!(store::load("id-b").is_some_and(|r| r.usage.is_some()));
+            // A real change inside one dir still stamps, and only for it.
+            let a2 = set(&home.path().join("legacy"), "uuid-c", "id-c");
+            record_statusline_payload_in(TICK, &a2).unwrap();
+            assert!(crate::paths::last_switch().exists());
+            assert!(!crate::paths::last_identity_switch(&b.runtime_dir).exists());
+        });
+    }
+
+    #[test]
+    fn an_identity_change_stamps_a_switch_event() {
+        let home = tempfile::tempdir().unwrap();
+        let d = home.path().join("d");
+        crate::testenv::with_test_home(home.path(), || {
+            std::fs::create_dir_all(crate::paths::smart_dir_no_create()).unwrap();
             assert_eq!(
-                note_identity(None, 300),
+                note_identity(&d, Some("uuid-a"), 100),
+                None,
+                "first sighting"
+            );
+            assert_eq!(note_identity(&d, Some("uuid-a"), 150), None, "unchanged");
+            assert_eq!(note_identity(&d, Some("uuid-b"), 200), Some(200), "changed");
+            assert_eq!(
+                note_identity(&d, None, 300),
                 Some(200),
                 "unknown keeps the last"
             );
             assert_eq!(
-                std::fs::read_to_string(crate::paths::last_identity()).unwrap(),
+                std::fs::read_to_string(crate::paths::last_identity(&d)).unwrap(),
                 "uuid-b"
             );
             // A cooldown claim re-stamps `.last-switch` without a switch:
             // attribution does not move.
             std::fs::write(crate::paths::last_switch(), "400").unwrap();
-            assert_eq!(note_identity(Some("uuid-b"), 450), Some(200));
+            assert_eq!(note_identity(&d, Some("uuid-b"), 450), Some(200));
         });
     }
 
@@ -1997,14 +2046,15 @@ mod tests {
     #[test]
     fn a_launch_after_an_unseen_switch_keeps_its_captures() {
         let home = tempfile::tempdir().unwrap();
+        let d = home.path().join("d");
         crate::testenv::with_test_home(home.path(), || {
             std::fs::create_dir_all(crate::paths::smart_dir_no_create()).unwrap();
             // An earlier session ticked on a.
-            assert_eq!(note_identity(Some("uuid-a"), 100), None);
+            assert_eq!(note_identity(&d, Some("uuid-a"), 100), None);
             // D moved to b with no tick in between; the new session launches.
-            let born = launch_born(Some("uuid-b"));
+            let born = launch_born(&set(&d, "uuid-b", "id-b"));
             // Its first tick, at or after born, sees b.
-            let last_switch = note_identity(Some("uuid-b"), born + 5);
+            let last_switch = note_identity(&d, Some("uuid-b"), born + 5);
             assert!(last_switch.is_some_and(|s| s <= born), "{last_switch:?}");
             let f = CaptureFacts {
                 sidecar_account: Some("id-b"),

@@ -234,20 +234,35 @@ pub fn idle_compact_log() -> PathBuf {
     smart_dir_no_create().join("idle-compact.log")
 }
 
-/// `<state>/last-identity` — the last `oauthAccount.accountUuid` csm saw in
-/// `D`. A change is a switch event (whoever made it) and re-stamps
-/// [`last_switch`] and [`last_identity_switch`].
-pub fn last_identity() -> PathBuf {
-    smart_dir_no_create().join("last-identity")
+/// A short stable tag for one config dir: FNV-1a (64 bit) of its canonical
+/// path (the path as given when it cannot be canonicalized). `DefaultHasher`
+/// is not stable across Rust releases, and these names must survive an upgrade.
+fn dir_tag(dir: &Path) -> String {
+    let canon = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in canon.to_string_lossy().as_bytes() {
+        h = (h ^ u64::from(*b)).wrapping_mul(0x0100_0000_01b3);
+    }
+    format!("{h:016x}")
 }
 
-/// `<state>/.last-identity-switch` — when `D`'s identity last changed (bare
-/// epoch). Usage-capture attribution keys on it, not on [`last_switch`]: the
-/// cooldown claim re-stamps that one when a switch is only about to be
-/// asked for, and a claim that ends in no switch must not orphan the
-/// captures of every session already running.
-pub fn last_identity_switch() -> PathBuf {
-    smart_dir_no_create().join(".last-identity-switch")
+/// `<state>/last-identity-<dir tag>` — the last `oauthAccount.accountUuid`
+/// csm saw in config dir `dir`. Tracked per dir: two live claude processes on
+/// different dirs (a session on a legacy dir next to sessions on `D`) each
+/// show their own identity, and one shared file would flip on every tick. A
+/// change within one dir is a switch event (whoever made it) and re-stamps
+/// [`last_switch`] and [`last_identity_switch`].
+pub fn last_identity(dir: &Path) -> PathBuf {
+    smart_dir_no_create().join(format!("last-identity-{}", dir_tag(dir)))
+}
+
+/// `<state>/.last-identity-switch-<dir tag>` — when `dir`'s identity last
+/// changed (bare epoch). Usage-capture attribution keys on it, not on
+/// [`last_switch`]: the cooldown claim re-stamps that one when a switch is
+/// only about to be asked for, and a claim that ends in no switch must not
+/// orphan the captures of every session already running.
+pub fn last_identity_switch(dir: &Path) -> PathBuf {
+    smart_dir_no_create().join(format!(".last-identity-switch-{}", dir_tag(dir)))
 }
 
 /// `<smart_dir>/titles.tsv` — session-name alias index (`title \t sid \t mtime`).

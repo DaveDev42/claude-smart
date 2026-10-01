@@ -302,7 +302,7 @@ fn launch_accounts(dir: Option<&launch_context::LaunchDir>) -> account::AccountS
 /// (and with them the statusLine limit trigger).
 fn launch_stamp(dir: Option<&launch_context::LaunchDir>) -> (Option<String>, i64) {
     let now = launch_accounts(dir);
-    let born = crate::usage::local::launch_born(now.current_uuid.as_deref());
+    let born = crate::usage::local::launch_born(&now);
     (now.current, born)
 }
 
@@ -684,21 +684,21 @@ mod tests {
             set_d("u-a");
             let before = launch_accounts(Some(&dir));
             assert_eq!(before.current.as_deref(), Some("id-a"));
-            crate::usage::local::note_identity(Some("u-a"), 100);
+            crate::usage::local::note_identity(&d, Some("u-a"), 100);
             // While the picker is open, a peer's hop moves D to b and notes it.
             set_d("u-b");
-            crate::usage::local::note_identity(Some("u-b"), 200);
+            crate::usage::local::note_identity(&d, Some("u-b"), 200);
             // The user picks a session; the stamp reads D now.
             let (account, born) = launch_stamp(Some(&dir));
             assert_eq!(account.as_deref(), Some("id-b"));
             assert!(born >= 200);
             assert_eq!(
-                std::fs::read_to_string(crate::paths::last_identity()).unwrap(),
+                std::fs::read_to_string(crate::paths::last_identity(&d)).unwrap(),
                 "u-b",
                 "no switch back to the pre-picker identity"
             );
             assert_eq!(
-                std::fs::read_to_string(crate::paths::last_identity_switch())
+                std::fs::read_to_string(crate::paths::last_identity_switch(&d))
                     .unwrap()
                     .trim(),
                 "200",
