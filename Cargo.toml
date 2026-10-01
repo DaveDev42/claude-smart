@@ -47,7 +47,8 @@ path = "tests/bin/fake_claude_relay.rs"
 
 # Test-only stand-in for claude's screen, driven by tests/idle_compact_relay.rs:
 # replays the captured fixtures in tests/fixtures/screens/ and records what the
-# idle-compact supervisor types at it. A no-op on non-unix.
+# idle-compact supervisor types at it. Also drives tests/idle_compact_conpty.rs
+# on Windows.
 [[bin]]
 name = "fake_claude_ui"
 path = "tests/bin/fake_claude_ui.rs"
@@ -62,6 +63,12 @@ path = "tests/bin/fake_claude_ui.rs"
 [[bin]]
 name = "pty_harness"
 path = "tests/bin/pty_harness.rs"
+
+# Test-only Windows counterpart of pty_harness: hosts csm in a pseudoconsole
+# the test drives (tests/idle_compact_conpty.rs). A no-op off Windows.
+[[bin]]
+name = "conpty_harness"
+path = "tests/bin/conpty_harness.rs"
 
 # ─── core, always present ────────────────────────────────────────────────────
 [dependencies]
