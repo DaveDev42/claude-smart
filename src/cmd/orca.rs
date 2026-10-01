@@ -24,6 +24,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context as _, bail};
 
 use crate::orca::AccountSource;
+use crate::orca::live::SystemProcs;
 use crate::orca::runtime::UuidMatch;
 use crate::orca::{HostEnv, HostOs, OrcaView, SnapshotOptions, fsx, version};
 
@@ -168,15 +169,46 @@ pub(crate) fn render_status(v: &OrcaView) -> String {
     out
 }
 
-/// After the cutover, an Orca whose `D` is not csm's still runs the old one:
-/// its panes and sessions keep reading it. Pure.
-pub(crate) fn restart_note(agrees: Option<bool>, d: &Path, cutover_done: bool) -> Option<String> {
-    (cutover_done && agrees == Some(false)).then(|| {
-        format!(
-            "restart Orca to adopt {}: it still runs the old D, so its panes and csm disagree on the account",
-            d.display()
-        )
-    })
+/// After the cutover, an Orca whose live `D` is still a recorded legacy
+/// dir keeps its panes and sessions on the old account. Returns that dir
+/// and the dir to adopt (`~/.claude`). It looks at Orca's `D` only, never at
+/// the caller's shell pin. Pure over `stale` (the recorded legacy dirs plus
+/// `~/.claude`, [`crate::migrate::stale_dirs`]).
+pub(crate) fn old_orca_d(
+    orca_d: Option<&Path>,
+    stale: &[PathBuf],
+    home: &Path,
+    cutover_done: bool,
+) -> Option<(PathBuf, PathBuf)> {
+    let trim = |p: &Path| PathBuf::from(p.to_string_lossy().trim_end_matches(['/', '\\']));
+    let target = home.join(".claude");
+    let d = trim(orca_d?);
+    (cutover_done && d != trim(&target) && stale.iter().any(|s| trim(s) == d))
+        .then_some((d, target))
+}
+
+/// The restart warning for [`old_orca_d`]. Pure.
+pub(crate) fn restart_note(old: &Path, target: &Path) -> String {
+    format!(
+        "restart Orca to adopt {}: it still runs the old D {}, so its panes and csm disagree on the account",
+        target.display(),
+        old.display()
+    )
+}
+
+/// The note for an inherited `CLAUDE_CONFIG_DIR` that status and doctor
+/// ignored, as a launch would. Pure.
+pub(crate) fn pin_note(pin: &str) -> String {
+    format!(
+        "CLAUDE_CONFIG_DIR={} in this shell is a retired profile dir and is ignored; open a new shell",
+        pin.trim()
+    )
+}
+
+/// [`old_orca_d`] over the migration marker. Reads files.
+pub(crate) fn old_orca_d_now(env: &HostEnv, orca_d: Option<&Path>) -> Option<(PathBuf, PathBuf)> {
+    let (stale, cutover_done, _) = crate::migrate::stale_dirs(env);
+    old_orca_d(orca_d, &stale, &env.home, cutover_done)
 }
 
 /// A live claude on a recorded legacy dir blocks the migration's retire step
@@ -194,40 +226,30 @@ pub(crate) fn legacy_use_notes(users: &[(PathBuf, String)]) -> Vec<String> {
         .collect()
 }
 
-/// The loud lines `status` and `accounts doctor` add about a half-finished
-/// migration. Reads the marker and the process table.
-pub(crate) fn migration_notes(
-    agrees: Option<bool>,
-    env: &HostEnv,
-    d: &Path,
-    include_restart: bool,
-) -> Vec<String> {
-    let (_, cutover_done, _) = crate::migrate::stale_dirs(env);
+/// The lines about live users of legacy dirs. Reads the marker and the
+/// process table.
+pub(crate) fn legacy_use_notes_now(env: &HostEnv) -> Vec<String> {
     let users = crate::migrate::legacy_dirs_in_use(env, &crate::orca::live::SystemProcs);
-    let restart = include_restart
-        .then(|| restart_note(agrees, d, cutover_done))
-        .flatten();
-    restart
-        .into_iter()
-        .chain(legacy_use_notes(&users))
-        .collect()
+    legacy_use_notes(&users)
 }
 
 fn status() -> anyhow::Result<()> {
-    let v = crate::orca::snapshot(&SnapshotOptions::default()).context("csm orca status")?;
+    let (env, ignored) = crate::launch_context::status_env().context("csm orca status")?;
+    let v = crate::orca::snapshot_with(&env, &SnapshotOptions::default(), &SystemProcs);
     print!("{}", render_status(&v));
-    if let Ok(env) = HostEnv::current() {
-        let alias = alias_path(&fsx::state_dir(&env), env.os);
-        println!("{:<13} {}", "alias", alias_line(&alias_state(&alias)));
+    if let Some(pin) = &ignored {
+        println!("{:<13} {}", "note", pin_note(pin));
     }
+    let alias = alias_path(&fsx::state_dir(&env), env.os);
+    println!("{:<13} {}", "alias", alias_line(&alias_state(&alias)));
     println!("{:<13} {}", "migration", crate::migrate::status_line());
     if let Some(w) = override_warning_now(&v) {
         println!("{:<13} {w}", "warning");
     }
-    if let Ok(env) = HostEnv::current() {
-        for n in migration_notes(v.runtime_dir_agrees, &env, &v.runtime.config_dir, true) {
-            println!("{:<13} {n}", "WARNING");
-        }
+    let old = old_orca_d_now(&env, v.orca_runtime_dir.as_deref());
+    let restart = old.map(|(o, t)| restart_note(&o, &t));
+    for n in restart.into_iter().chain(legacy_use_notes_now(&env)) {
+        println!("{:<13} {n}", "WARNING");
     }
     Ok(())
 }
@@ -634,13 +656,36 @@ mod tests {
     }
 
     #[test]
-    fn restart_note_only_after_the_cutover_and_a_differing_d() {
-        let d = Path::new("/example/d");
-        let n = restart_note(Some(false), d, true).unwrap();
-        assert!(n.contains("restart Orca to adopt /example/d"), "{n}");
-        assert_eq!(restart_note(Some(false), d, false), None);
-        assert_eq!(restart_note(Some(true), d, true), None);
-        assert_eq!(restart_note(None, d, true), None);
+    fn restart_only_when_orcas_own_d_is_a_recorded_legacy_dir() {
+        let home = Path::new("/example");
+        let stale = vec![
+            PathBuf::from("/example/.claude.old"),
+            PathBuf::from("/example/.claude"),
+        ];
+        let old = Path::new("/example/.claude.old");
+        let (o, t) = old_orca_d(Some(old), &stale, home, true).unwrap();
+        assert_eq!(
+            (o.as_path(), t.as_path()),
+            (old, Path::new("/example/.claude"))
+        );
+        let n = restart_note(&o, &t);
+        assert!(n.contains("restart Orca to adopt /example/.claude:"), "{n}");
+        assert!(n.contains("/example/.claude.old"), "{n}");
+        // Orca already on the target, on an unrecorded dir, unreadable, or
+        // before the cutover: nothing to restart.
+        let none = |d: Option<&str>, cut| old_orca_d(d.map(Path::new), &stale, home, cut);
+        assert_eq!(none(Some("/example/.claude"), true), None);
+        assert_eq!(none(Some("/example/.claude/"), true), None);
+        assert_eq!(none(Some("/elsewhere/claude"), true), None);
+        assert_eq!(none(None, true), None);
+        assert_eq!(none(Some("/example/.claude.old"), false), None);
+    }
+
+    #[test]
+    fn an_ignored_pin_is_named_as_a_note() {
+        let n = pin_note("/example/.claude.old");
+        assert!(n.contains("CLAUDE_CONFIG_DIR=/example/.claude.old"), "{n}");
+        assert!(n.contains("is ignored; open a new shell"), "{n}");
     }
 
     #[test]

@@ -99,9 +99,7 @@ pub mod version;
 pub(crate) mod testsupport;
 
 mod snapshot;
-#[cfg(test)]
-pub use snapshot::snapshot_with;
-pub use snapshot::{AccountSource, OrcaView, SnapshotOptions, snapshot};
+pub use snapshot::{AccountSource, OrcaView, SnapshotOptions, snapshot, snapshot_with};
 
 use std::io;
 use std::path::{Path, PathBuf};

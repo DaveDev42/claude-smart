@@ -395,6 +395,19 @@ pub fn launch_dir(orca: bool) -> Option<LaunchDir> {
     ))
 }
 
+/// The environment `csm orca status` and `csm accounts doctor` resolve `D`
+/// over: this process's, with a stale pin dropped exactly as a launch
+/// would drop it ([`launch_dir`]). The second value is the ignored pin.
+pub fn status_env() -> Result<(crate::orca::HostEnv, Option<String>), crate::orca::OrcaError> {
+    let mut env = crate::orca::HostEnv::current()?;
+    let mut ignored = None;
+    if let Some(ld) = launch_dir(false).filter(|l| l.stale) {
+        ignored = env.claude_config_dir.clone();
+        ld.pin.apply_to(&mut env);
+    }
+    Ok((env, ignored))
+}
+
 /// Orca main's `CLAUDE_CONFIG_DIR` (else its `~/.claude`), from its
 /// runtime metadata's pid and that process's environment.
 pub(crate) fn orca_main_dir(env: &crate::orca::HostEnv) -> OrcaMain {

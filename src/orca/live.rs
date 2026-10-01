@@ -693,10 +693,55 @@ fn environ_names(env: &[OsString], dir: &Path) -> bool {
     })
 }
 
+/// One live process that uses a config dir, for the report.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DirUser {
+    pub pid: u32,
+    pub name: String,
+    /// Start time, already formatted for display (empty when unknown).
+    pub started: String,
+    /// The parent's process name when the table has it (a launcher such as
+    /// a browser or an Orca helper).
+    pub parent: Option<String>,
+}
+
+/// Most users a report lists before it says "and N more".
+pub const MAX_LISTED_USERS: usize = 10;
+
+/// What names the users of `dir`: one process reads "pid 4 (claude, ...)
+/// runs with CLAUDE_CONFIG_DIR=dir", several read "N processes run with
+/// CLAUDE_CONFIG_DIR=dir: ...", listing at most [`MAX_LISTED_USERS`]. Pure.
+pub fn format_dir_users(dir: &Path, users: &[DirUser]) -> String {
+    let one = |u: &DirUser| {
+        let mut bits = vec![u.name.clone()];
+        if !u.started.is_empty() {
+            bits.push(format!("started {}", u.started));
+        }
+        if let Some(p) = &u.parent {
+            bits.push(format!("parent {p}"));
+        }
+        format!("pid {} ({})", u.pid, bits.join(", "))
+    };
+    if let [u] = users {
+        return format!("{} runs with CLAUDE_CONFIG_DIR={}", one(u), dir.display());
+    }
+    let mut list: Vec<String> = users.iter().take(MAX_LISTED_USERS).map(one).collect();
+    if users.len() > MAX_LISTED_USERS {
+        list.push(format!("and {} more", users.len() - MAX_LISTED_USERS));
+    }
+    format!(
+        "{} processes run with CLAUDE_CONFIG_DIR={}: {}",
+        users.len(),
+        dir.display(),
+        list.join("; ")
+    )
+}
+
 /// [`dir_users`]'s core over its facts: `registered` is
 /// [`super::context::live_claude_in`]'s answer (a scan error already counts
 /// as live), `table` the process table, `this` csm's own pid (it and its
-/// ancestors never count), `environ` one process's environment.
+/// ancestors never count), `environ` one process's environment. Every live
+/// user is listed, not the first one found.
 pub fn dir_users_in(
     dir: &Path,
     registered: bool,
@@ -704,30 +749,34 @@ pub fn dir_users_in(
     this: u32,
     environ: &dyn Fn(u32) -> Option<Vec<OsString>>,
 ) -> DirUsers {
-    if registered {
-        return DirUsers::Live(format!(
-            "a claude session is registered in {}",
-            dir.join("sessions").display()
-        ));
-    }
+    let reg = format!(
+        "a claude session is registered in {}",
+        dir.join("sessions").display()
+    );
     let Some(table) = table else {
-        return DirUsers::Unknown("the process table cannot be read".into());
+        return if registered {
+            DirUsers::Live(reg)
+        } else {
+            DirUsers::Unknown("the process table cannot be read".into())
+        };
     };
     let mine = self_and_ancestors(table, this);
     let mut unknown = None;
+    let mut users = Vec::new();
     for p in table
         .iter()
         .filter(|p| !mine.contains(&p.pid) && claude_like(p))
     {
         match environ(p.pid) {
-            Some(env) if environ_names(&env, dir) => {
-                return DirUsers::Live(format!(
-                    "pid {} ({}) runs with CLAUDE_CONFIG_DIR={}",
-                    p.pid,
-                    p.name,
-                    dir.display()
-                ));
-            }
+            Some(env) if environ_names(&env, dir) => users.push(DirUser {
+                pid: p.pid,
+                name: p.name.clone(),
+                started: started_text(p.start_time),
+                parent: p
+                    .ppid
+                    .and_then(|pp| table.iter().find(|q| q.pid == pp))
+                    .map(|q| q.name.clone()),
+            }),
             Some(_) => {}
             None => {
                 // Gone since the sweep, or unreadable: only a process still
@@ -736,6 +785,17 @@ pub fn dir_users_in(
             }
         }
     }
+    if !users.is_empty() {
+        let list = format_dir_users(dir, &users);
+        return DirUsers::Live(if registered {
+            format!("{reg}; {list}")
+        } else {
+            list
+        });
+    }
+    if registered {
+        return DirUsers::Live(reg);
+    }
     match unknown {
         Some(pid) => DirUsers::Unknown(format!(
             "the environment of pid {pid} cannot be read, so it may use {}",
@@ -743,6 +803,20 @@ pub fn dir_users_in(
         )),
         None => DirUsers::Free,
     }
+}
+
+/// A process start time (epoch seconds) as local `MM-DD HH:MM`; empty for 0.
+fn started_text(epoch: u64) -> String {
+    i64::try_from(epoch)
+        .ok()
+        .filter(|e| *e > 0)
+        .and_then(|e| chrono::DateTime::from_timestamp(e, 0))
+        .map(|t| {
+            t.with_timezone(&chrono::Local)
+                .format("%m-%d %H:%M")
+                .to_string()
+        })
+        .unwrap_or_default()
 }
 
 /// Who uses `dir` right now (design section 2, C): a live claude
@@ -1118,6 +1192,61 @@ mod tests {
             dir_users_in(&dir, true, Some(&t), 7, &|_| None),
             DirUsers::Live(_)
         ));
+    }
+
+    #[test]
+    fn every_live_user_is_listed_with_its_parent_and_capped() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join(".claude.work");
+        std::fs::create_dir(&dir).unwrap();
+        let set = format!("CLAUDE_CONFIG_DIR={}", dir.display());
+        let mut f = FakeProcs::default().with(ProcInfo {
+            pid: 5,
+            ppid: Some(1),
+            ..proc_info(5, "Google Chrome", Some("/Applications/Chrome"), &[])
+        });
+        for pid in 100..112u32 {
+            let p = ProcInfo {
+                ppid: Some(5),
+                start_time: 1_790_000_000,
+                ..proc_info(pid, "claude", Some("/opt/bin/claude"), &[])
+            };
+            f = f.with(p).with_env(pid, &[&set]);
+        }
+        let t = f.table();
+        let DirUsers::Live(w) = dir_users_in(&dir, false, t.as_deref(), 7, &|p| f.environ(p))
+        else {
+            panic!("expected live");
+        };
+        assert!(
+            w.starts_with("12 processes run with CLAUDE_CONFIG_DIR="),
+            "{w}"
+        );
+        assert!(w.contains("pid 100 (claude, started "), "{w}");
+        assert!(w.contains("parent Google Chrome"), "{w}");
+        assert!(w.contains("pid 109 ") && !w.contains("pid 110 "), "{w}");
+        assert!(w.ends_with("and 2 more"), "{w}");
+    }
+
+    #[test]
+    fn format_dir_users_single_and_unknown_parent() {
+        let d = Path::new("/example/.claude.old");
+        let u = |pid, parent: Option<&str>| DirUser {
+            pid,
+            name: "claude".into(),
+            started: String::new(),
+            parent: parent.map(str::to_owned),
+        };
+        assert_eq!(
+            format_dir_users(d, &[u(9, None)]),
+            "pid 9 (claude) runs with CLAUDE_CONFIG_DIR=/example/.claude.old"
+        );
+        let w = format_dir_users(d, &[u(9, Some("Orca Helper")), u(10, None)]);
+        assert_eq!(
+            w,
+            "2 processes run with CLAUDE_CONFIG_DIR=/example/.claude.old: \
+             pid 9 (claude, parent Orca Helper); pid 10 (claude)"
+        );
     }
 
     /// The legacy registry is one machine-wide dir every profile's

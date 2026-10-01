@@ -685,10 +685,12 @@ print the same lines: `csm accounts use`, `add`, `import` and `rm`,
 `csm accounts doctor --fix` and `csm orca setup`. `csm accounts list`,
 `csm accounts doctor`, `csm usage` and `csm orca status` only mention,
 once a day, that the machine still has the old layout, and
-`csm orca status` shows a `migration` row. After the cutover it also warns
-when Orca still runs the old `D` (restart Orca to adopt csm's), and both it and
-`csm accounts doctor` name a live claude on a recorded legacy dir, which blocks
-the retire step until it is closed. The hook, the status line,
+`csm orca status` shows a `migration` row. Both resolve `D` the way a launch
+does, so an inherited `CLAUDE_CONFIG_DIR` naming a retired profile dir is shown
+as an ignored pin (open a new shell). After the cutover they warn when Orca's
+own `D` is still a legacy dir (restart Orca), and list every live process on a
+recorded legacy dir (pid, start time, parent; the first 10), which blocks the
+retire step until they are closed. The hook, the status line,
 `-p` and piped runs, `csm claude` and `csm cas` never start a migration.
 
 When claude exits before a run it started is done, csm waits at most a

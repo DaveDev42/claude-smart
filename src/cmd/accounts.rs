@@ -718,6 +718,11 @@ pub(crate) struct DoctorFacts {
     pub active: Option<String>,
     /// Orca main's `D` vs csm's.
     pub dir_agrees: Option<bool>,
+    /// After the cutover, Orca's live `D` is a recorded legacy dir: (that
+    /// dir, the dir to adopt).
+    pub orca_old_d: Option<(PathBuf, PathBuf)>,
+    /// The inherited `CLAUDE_CONFIG_DIR` this run ignored as a stale pin.
+    pub ignored_pin: Option<String>,
     /// The `claude` alias (`csm orca setup`) points at a file that is gone.
     pub alias_dangling: Option<PathBuf>,
 }
@@ -876,9 +881,15 @@ pub(crate) fn findings(f: &DoctorFacts) -> Vec<Finding> {
     if f.dir_agrees == Some(false) {
         push(
             &mut out,
-            "Orca's D differs from csm's (CLAUDE_CONFIG_DIR); after the cutover, restart Orca to adopt csm's D (`csm orca status`)".into(),
+            "Orca's D differs from csm's (CLAUDE_CONFIG_DIR)".into(),
             None,
         );
+    }
+    if let Some((old, target)) = &f.orca_old_d {
+        push(&mut out, crate::cmd::orca::restart_note(old, target), None);
+    }
+    if let Some(pin) = &f.ignored_pin {
+        push(&mut out, crate::cmd::orca::pin_note(pin), None);
     }
     if let Some(t) = &f.alias_dangling {
         push(
@@ -1144,14 +1155,17 @@ fn apply(ctx: &Context, facts: &dyn ProcFacts, fix: &Fix) -> anyhow::Result<(Ver
 
 fn doctor(fix: bool, offline: bool) -> anyhow::Result<()> {
     let procs = SystemProcs;
-    let ctx = Context::current(&procs)?;
-    let v = view()?;
+    // D as a launch would resolve it: a stale inherited pin is dropped.
+    let (env, ignored_pin) = crate::launch_context::status_env().context("csm accounts")?;
+    let ctx = Context::from_env(env, &procs);
+    let v = crate::orca::snapshot_with(&ctx.env, &SnapshotOptions::default(), &procs);
     let http = SystemHttp::from_env();
-    let facts = gather(&ctx, &v, &http, offline);
+    let mut facts = gather(&ctx, &v, &http, offline);
+    facts.ignored_pin = ignored_pin;
+    facts.orca_old_d = crate::cmd::orca::old_orca_d_now(&ctx.env, v.orca_runtime_dir.as_deref());
     let mut found = findings(&facts);
-    // The doctor already says Orca's D differs; it adds the legacy-dir user.
     found.extend(
-        crate::cmd::orca::migration_notes(None, &ctx.env, &v.runtime.config_dir, false)
+        crate::cmd::orca::legacy_use_notes_now(&ctx.env)
             .into_iter()
             .map(|text| Finding { text, fix: None }),
     );
@@ -1504,6 +1518,31 @@ mod tests {
             .text;
         assert!(!line.contains("already holds it"), "{line}");
         assert!(line.contains("MCP logins"), "{line}");
+    }
+
+    #[test]
+    fn restart_warning_follows_orcas_d_not_the_shell_pin() {
+        let has =
+            |f: &DoctorFacts, needle: &str| findings(f).iter().any(|x| x.text.contains(needle));
+        // A stale pin in the shell is a note; Orca on the target needs no restart.
+        let pinned = DoctorFacts {
+            dir_agrees: Some(true),
+            ignored_pin: Some("/example/.claude.old".into()),
+            ..Default::default()
+        };
+        assert!(has(&pinned, "is a retired profile dir and is ignored"));
+        assert!(!has(&pinned, "restart Orca"));
+        assert!(!has(&pinned, "differs"));
+        // Orca still on a recorded legacy dir: restart, whatever the shell has.
+        let old = DoctorFacts {
+            dir_agrees: Some(true),
+            orca_old_d: Some(("/example/.claude.old".into(), "/example/.claude".into())),
+            ..Default::default()
+        };
+        assert!(has(&old, "restart Orca to adopt /example/.claude:"));
+        assert!(!has(&old, "retired profile dir"));
+        // Nothing found: quiet.
+        assert!(findings(&DoctorFacts::default()).is_empty());
     }
 
     #[test]
