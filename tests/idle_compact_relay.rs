@@ -84,6 +84,8 @@ struct Scenario {
     keystroke: bool,
     /// How long to wait for an outcome line.
     wait: Duration,
+    /// `FAKE_UI_TICK`: redraw a countdown on this 1-based row every N ms.
+    tick: Option<&'static str>,
 }
 
 impl Scenario {
@@ -96,6 +98,7 @@ impl Scenario {
             deadline_secs: 60,
             keystroke: false,
             wait: Duration::from_secs(40),
+            tick: None,
         }
     }
 }
@@ -314,6 +317,9 @@ fn run(sc: Scenario) -> Result {
         .env("FAKE_UI_RULES", sc.rules)
         .env("FAKE_UI_LOG", &log)
         .env("FAKE_UI_MARKER", &marker);
+    if let Some(tick) = sc.tick {
+        cmd.env("FAKE_UI_TICK", tick);
+    }
     cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
@@ -497,4 +503,23 @@ fn verify_failure_rolls_back_the_typed_text() {
     assert_eq!(r.typed, want, "typed text erased with one DEL per char");
     assert!(!r.enter_marker, "Enter must not be pressed");
     assert!(r.notified());
+}
+
+#[test]
+fn statusline_countdown_below_the_box_does_not_block_delivery() {
+    // The live failure: a statusline countdown redrawing under the input box
+    // kept the pty from ever being quiet for 2 s, so the request expired.
+    // Row 39 is the fixture's statusline, below the box's closing rule.
+    let mut sc = Scenario::new("idle-after-turn-120x40");
+    sc.rules = COMPACT_RULES;
+    sc.tick = Some("300:39");
+    sc.deadline_secs = 25;
+    let r = run(sc);
+    assert_eq!(
+        r.outcome, "delivered",
+        "{} typed={:?} marker={}",
+        r.line, r.typed, r.enter_marker
+    );
+    assert_eq!(r.typed, b"/compact\r");
+    assert!(r.enter_marker, "Enter must have reached the fake");
 }

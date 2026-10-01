@@ -19,6 +19,9 @@
 //! - `FAKE_UI_MARKER`: see above.
 //! - `FAKE_UI_EXIT`: `trigger=code`; when the bytes received end with
 //!   `trigger`, exit with `code` (Windows tests check exit code propagation).
+//! - `FAKE_UI_TICK`: `<ms>:<row>`; every `ms` the fake rewrites the 1-based
+//!   screen `row` with a changing `[⏱ Ns]` countdown, as a statusline that
+//!   redraws on a timer does (the cursor is saved and restored around it).
 //! - `FAKE_UI_SIZE_LOG` (Windows only): every console size seen, polled every
 //!   50 ms, appended as `<rows> <cols>` lines.
 //!
@@ -131,6 +134,28 @@ fn run() {
     println!("READY {}", std::process::id());
     let _ = std::io::stdout().flush();
     render(&idle);
+
+    if let Some((ms, row)) = std::env::var("FAKE_UI_TICK")
+        .ok()
+        .and_then(|v| v.split_once(':').map(|(a, b)| (a.to_owned(), b.to_owned())))
+        .and_then(|(a, b)| Some((a.parse::<u64>().ok()?, b.parse::<u32>().ok()?)))
+    {
+        std::thread::spawn(move || {
+            let mut n = 3600u32;
+            loop {
+                std::thread::sleep(std::time::Duration::from_millis(ms));
+                n = n.saturating_sub(1);
+                let frame = format!(
+                    "\x1b7\x1b[{row};3H\x1b[2K[\u{23f1} {}m{:02}s]\x1b8",
+                    n / 60,
+                    n % 60
+                );
+                let mut out = std::io::stdout().lock();
+                let _ = out.write_all(frame.as_bytes());
+                let _ = out.flush();
+            }
+        });
+    }
 
     let mut pending: Vec<u8> = Vec::new();
     let mut buf = [0u8; 256];

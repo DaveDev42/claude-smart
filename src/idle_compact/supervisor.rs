@@ -9,7 +9,7 @@
 //!   outlives the launch.
 //! - The watcher takes the hand-off request ([`super::request`]) about once a
 //!   second. For an active request it builds an [`Observation`] from the
-//!   screen, the relay's keystroke/output clocks and the session-status veto,
+//!   screen, the relay's keystroke and screen-content clocks and the session-status veto,
 //!   steps the [`Delivery`] machine and carries out each [`Action`]. It
 //!   types nothing that the machine did not ask for, and the input hold is a
 //!   guard dropped on every exit path, panics included.
@@ -36,7 +36,7 @@ use crate::screen_check::{self, BoxState, TitleTracker, VimState};
 const COMPACT: &str = "/compact";
 /// How often the watcher looks for a new request while none is active.
 const POLL: Duration = Duration::from_secs(1);
-/// The output must have been quiet this long before an OSC notification is
+/// The screen content must have been quiet this long before an OSC notification is
 /// written into the stream.
 const NOTIFY_QUIET: Duration = Duration::from_millis(500);
 /// A notification not delivered within this long is dropped.
@@ -210,6 +210,11 @@ struct Watcher {
 pub struct Supervisor {
     parser: Arc<Mutex<vt100::Parser<TitleTracker>>>,
     watcher: Mutex<Option<Watcher>>,
+    /// The relay handle (set in `on_start`) and the last content fingerprint,
+    /// so `on_output` can stamp [`RelayIo::note_content_change`] only when the
+    /// screen content above the input box really changed.
+    io: Mutex<Option<Arc<RelayIo>>>,
+    fingerprint: Mutex<u64>,
 }
 
 impl Supervisor {
@@ -217,6 +222,8 @@ impl Supervisor {
         Supervisor {
             parser: Arc::new(Mutex::new(new_parser(24, 80))),
             watcher: Mutex::new(None),
+            io: Mutex::new(None),
+            fingerprint: Mutex::new(0),
         }
     }
 }
@@ -257,6 +264,7 @@ impl RelayObserver for Supervisor {
         let own_pid = std::process::id();
         request::clear_own_request(&dir, own_pid);
 
+        *lock(&self.io) = Some(Arc::clone(&io));
         let ctx = Ctx {
             io,
             parser: Arc::clone(&self.parser),
@@ -288,6 +296,18 @@ impl RelayObserver for Supervisor {
             let (rows, cols) = parser.screen().size();
             *parser = new_parser(rows, cols);
             crate::platform::relay::reassert_raw();
+        }
+        // Output only counts as activity when the content above the input
+        // box (or the title) changed; a statusline redrawing below it does
+        // not. Hashed once per chunk, not per byte.
+        let fp = screen_check::content_fingerprint(parser.screen(), parser.callbacks().title());
+        drop(parser);
+        let mut last = lock(&self.fingerprint);
+        if *last != fp {
+            *last = fp;
+            if let Some(io) = lock(&self.io).as_ref() {
+                io.note_content_change();
+            }
         }
     }
 
@@ -360,7 +380,9 @@ fn flush_notify(io: &RelayIo, pending: &mut Option<PendingNotify>) {
         *pending = None;
         return;
     }
-    let quiet = io.last_output().is_none_or(|t| t.elapsed() >= NOTIFY_QUIET);
+    let quiet = io
+        .last_content_change()
+        .is_none_or(|t| t.elapsed() >= NOTIFY_QUIET);
     if !quiet {
         return;
     }
@@ -373,12 +395,12 @@ fn flush_notify(io: &RelayIo, pending: &mut Option<PendingNotify>) {
 /// Type `bytes` and give claude a moment to echo before the next look at the
 /// screen, so the following observation sees the effect of this write.
 fn inject_and_settle(io: &RelayIo, stop: &Stop, bytes: &[u8]) {
-    let before = io.last_output();
+    let before = io.last_content_change();
     if io.inject(bytes).is_err() {
         return;
     }
     let start = Instant::now();
-    while start.elapsed() < ECHO_WAIT && io.last_output() == before && !stop.stopped() {
+    while start.elapsed() < ECHO_WAIT && io.last_content_change() == before && !stop.stopped() {
         stop.sleep(Duration::from_millis(20));
     }
     stop.sleep(Duration::from_millis(50));
@@ -424,7 +446,7 @@ fn run_request(ctx: &Ctx, stop: &Stop, req: Request) {
                 session_veto,
                 ctx.now_ms(),
                 io.last_keystroke().map(|t| ctx.ms_of(t)),
-                io.last_output().map(|t| ctx.ms_of(t)),
+                io.last_content_change().map(|t| ctx.ms_of(t)),
             )
         };
         info = seen;

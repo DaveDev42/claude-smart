@@ -430,9 +430,11 @@ When a request arrives the supervisor looks about once a second and types
 - Claude Code's own session record (`sessions/<pid>.json` under the config
   dir csm launched claude with) does not say the session is busy or waiting.
   A missing file vetoes nothing.
-- No real keystroke in the last 60 seconds and no output in the last 2
-  seconds. Terminal replies, focus and mouse reports do not count as
-  keystrokes.
+- No real keystroke in the last 60 seconds and no screen change in the last
+  2 seconds. Quiet is judged on screen content above the input box (and the
+  window title); status lines below it, such as a clock or countdown that
+  redraws every second, are ignored. Terminal replies, focus and mouse
+  reports do not count as keystrokes.
 - The screen shows the main input box, empty (a dim placeholder still counts
   as empty). A draft, including a multi-line or wrapped one and a `[Pasted
   text ...]` placeholder, is never typed over: csm notifies once and gives
@@ -460,7 +462,7 @@ without either it is `sent-unconfirmed`.
 
 Notifications (`draft`, `verify-failed`, a request that ran out of time
 after typing) are an OSC 777 sequence csm writes into claude's output only
-at a sequence boundary after 500 ms of quiet, and dropped if that does not
+at a sequence boundary after 500 ms without a screen change, and dropped if that does not
 happen within a few seconds. `dry-run` mode runs the same checks but types
 and notifies nothing.
 

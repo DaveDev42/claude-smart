@@ -231,6 +231,28 @@ pub fn box_text_is(screen: &vt100::Screen, text: &str) -> bool {
     box_text(screen).is_some_and(|t| t == text)
 }
 
+/// A hash of the screen content that matters for "has anything changed":
+/// every row from the top through the input box's closing rule (formatted
+/// rows, so colours and attributes count), plus the window `title`. Rows
+/// below the closing rule (the statusline, mode and footer lines) and the
+/// cursor position are left out, so a clock or countdown that redraws below
+/// the box does not look like activity. When no box is found the whole
+/// screen is hashed, the same as treating every byte as a change.
+pub fn content_fingerprint(screen: &vt100::Screen, title: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let (rows, cols) = screen.size();
+    let upto = match locate(screen) {
+        Some((_, end)) => end + 1,
+        None => rows,
+    };
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    title.hash(&mut h);
+    for row in screen.rows_formatted(0, cols).take(upto as usize) {
+        row.hash(&mut h);
+    }
+    h.finish()
+}
+
 /// `true` while a `/compact` run is in progress. Detected independently of
 /// [`input_box`] because the box is `Empty` both while idle and while
 /// compacting — the only on-screen signal is the "Compacting…" status line
@@ -818,5 +840,64 @@ mod tests {
         assert_eq!(input_box(&screen), BoxState::NotFound);
         assert_eq!(box_text(&screen), None);
         assert!(!compaction_started(&screen));
+    }
+
+    // --- content_fingerprint ---
+
+    fn boxed(status: &str, above: &str) -> vt100::Screen {
+        let r = rule(40);
+        synth(
+            12,
+            60,
+            &[
+                (0, 0, above, false),
+                (5, 0, &r, false),
+                (6, 0, "\u{276f}", false),
+                (7, 0, &r, false),
+                (8, 0, status, false),
+                (9, 0, "-- INSERT --", false),
+            ],
+        )
+    }
+
+    #[test]
+    fn fingerprint_ignores_rows_below_the_box() {
+        let a = content_fingerprint(&boxed("[⏱ 4m29s]", "hello"), "t");
+        let b = content_fingerprint(&boxed("[⏱ 4m28s]", "hello"), "t");
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn fingerprint_sees_changes_above_the_box_and_in_the_title() {
+        let a = content_fingerprint(&boxed("x", "hello"), "t");
+        assert_ne!(a, content_fingerprint(&boxed("x", "hellp"), "t"));
+        assert_ne!(a, content_fingerprint(&boxed("x", "hello"), "u"));
+    }
+
+    #[test]
+    fn fingerprint_sees_typing_in_the_box() {
+        let r = rule(40);
+        let with = |t: &str| {
+            synth(
+                12,
+                60,
+                &[
+                    (5, 0, &r, false),
+                    (6, 0, &format!("\u{276f} {t}"), false),
+                    (7, 0, &r, false),
+                ],
+            )
+        };
+        assert_ne!(
+            content_fingerprint(&with(""), ""),
+            content_fingerprint(&with("/compact"), "")
+        );
+    }
+
+    #[test]
+    fn fingerprint_hashes_the_whole_screen_without_a_box() {
+        let a = synth(12, 60, &[(0, 0, "menu", false), (9, 0, "clock 1", false)]);
+        let b = synth(12, 60, &[(0, 0, "menu", false), (9, 0, "clock 2", false)]);
+        assert_ne!(content_fingerprint(&a, ""), content_fingerprint(&b, ""));
     }
 }

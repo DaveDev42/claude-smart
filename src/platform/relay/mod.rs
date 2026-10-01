@@ -132,6 +132,7 @@ pub struct RelayIo {
     master_write_lock: Mutex<()>,
     last_keystroke: Mutex<Option<Instant>>,
     last_output: Mutex<Option<Instant>>,
+    last_content: Mutex<Option<Instant>>,
     hold_depth: Mutex<u32>,
     held_buffer: Mutex<Vec<u8>>,
     output: Mutex<OutputState>,
@@ -145,6 +146,7 @@ impl RelayIo {
             master_write_lock: Mutex::new(()),
             last_keystroke: Mutex::new(None),
             last_output: Mutex::new(None),
+            last_content: Mutex::new(None),
             hold_depth: Mutex::new(0),
             held_buffer: Mutex::new(Vec::new()),
             output: Mutex::new(OutputState {
@@ -159,9 +161,25 @@ impl RelayIo {
         *self.last_keystroke.lock().unwrap()
     }
 
-    /// When claude last produced output, if any.
+    /// When claude last produced any output byte, if ever. A statusline
+    /// clock keeps this fresh forever; idle detection wants
+    /// [`last_content_change`](Self::last_content_change) instead.
+    #[cfg_attr(not(windows), allow(dead_code))]
     pub fn last_output(&self) -> Option<Instant> {
         *self.last_output.lock().unwrap()
+    }
+
+    /// When the screen content last changed (as judged by the observer that
+    /// owns the screen model and calls [`note_content_change`](Self::note_content_change)),
+    /// if ever. Redraws that leave the meaningful content alone do not move it.
+    pub fn last_content_change(&self) -> Option<Instant> {
+        *self.last_content.lock().unwrap()
+    }
+
+    /// Record that the screen content just changed. Called by the observer
+    /// that owns the screen model, from `on_output`.
+    pub fn note_content_change(&self) {
+        *self.last_content.lock().unwrap() = Some(Instant::now());
     }
 
     /// The current window size (rows, cols).
