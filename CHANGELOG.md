@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.4.6](https://github.com/DaveDev42/claude-smart/compare/v0.4.5...v0.4.6) (2026-10-02)
+
+
+### Bug Fixes
+
+* **idle-compact:** name the highlighted row of a two-entry slash menu from the box command's accent colour ([#48](https://github.com/DaveDev42/claude-smart/issues/48)) ([39d2b62](https://github.com/DaveDev42/claude-smart/commit/39d2b6263bdcf9b75e4b7228751887f22209a763))
+
 ## [0.4.5](https://github.com/DaveDev42/claude-smart/compare/v0.4.4...v0.4.5) (2026-10-01)
 
 
