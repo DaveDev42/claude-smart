@@ -415,9 +415,14 @@ pub fn command_menu(screen: &vt100::Screen) -> Menu {
     // The selected row is drawn in the accent colour (name and description),
     // every other row in grey. Bold is not the marker: it only emphasises the
     // substring the user typed, in every entry that contains it. A lone entry
-    // is the selected one by construction. With several, the selected one is
-    // the single row whose colour differs from all the others; two rows of
-    // different colours cannot say which is the accent, so that is `None`.
+    // is the selected one by construction. With three or more, the selected
+    // one is the single row whose colour differs from all the others. With
+    // two, "the one that differs" is symmetric, so the accent is taken from
+    // the typed command in the box, which Claude Code draws in the same accent
+    // colour whichever row is selected (real captures `compact-menu-two-*`):
+    // the selected entry is the one drawn in that colour while the other is
+    // not. Anything unclear (no box command, default colour, both or neither
+    // row in the accent) stays `None`, so the caller rolls back.
     let highlighted = if let [(name, _)] = entries.as_slice() {
         Some(name.clone())
     } else if entries.len() >= 3 {
@@ -430,7 +435,23 @@ pub fn command_menu(screen: &vt100::Screen) -> Menu {
             _ => None,
         }
     } else {
-        None
+        let accent = (1..cols)
+            .find(|&c| {
+                screen
+                    .cell(start, c)
+                    .is_some_and(|cell| cell.contents() == "/")
+            })
+            .and_then(|c| screen.cell(start, c))
+            .map(|cell| cell.fgcolor())
+            .filter(|c| *c != vt100::Color::Default);
+        accent.and_then(|accent| {
+            let matching: Vec<&(String, Option<vt100::Color>)> =
+                entries.iter().filter(|(_, c)| *c == Some(accent)).collect();
+            match matching.as_slice() {
+                [(name, _)] => Some(name.clone()),
+                _ => None,
+            }
+        })
     };
     Menu::Open {
         highlighted,
@@ -653,10 +674,91 @@ mod tests {
         assert!(!enter_runs(&screen, "/autocompact"));
     }
 
+    fn menu_of(name: &str) -> Menu {
+        let fx = load_index().into_iter().find(|f| f.name == name).unwrap();
+        command_menu(&replay(&fx))
+    }
+
+    #[test]
+    fn two_entry_menu_highlight_follows_the_accent_of_the_box_command() {
+        // Real capture, `/compact` typed: `/compact` is drawn in the accent
+        // (b1b9f9), `/autocompact` in grey (999999); the box command is accent.
+        let fx = load_index()
+            .into_iter()
+            .find(|f| f.name == "compact-menu-two-typed-160x50")
+            .unwrap();
+        let screen = replay(&fx);
+        assert_eq!(
+            command_menu(&screen),
+            Menu::Open {
+                highlighted: Some("/compact".to_owned()),
+                entries: 2
+            }
+        );
+        assert!(enter_runs(&screen, "/compact"));
+        // After Down the accent moves to `/autocompact`; the box stays accent.
+        let fx = load_index()
+            .into_iter()
+            .find(|f| f.name == "compact-menu-two-down-160x50")
+            .unwrap();
+        let screen = replay(&fx);
+        assert_eq!(
+            command_menu(&screen),
+            Menu::Open {
+                highlighted: Some("/autocompact".to_owned()),
+                entries: 2
+            }
+        );
+        assert!(!enter_runs(&screen, "/compact"));
+    }
+
+    #[test]
+    fn three_entry_menu_highlight_from_real_captures() {
+        assert_eq!(
+            menu_of("compact-menu-three-typed-160x50"),
+            Menu::Open {
+                highlighted: Some("/compact".to_owned()),
+                entries: 3
+            }
+        );
+        assert_eq!(
+            menu_of("compact-menu-three-down-160x50"),
+            Menu::Open {
+                highlighted: Some("/autocompact".to_owned()),
+                entries: 3
+            }
+        );
+    }
+
+    #[test]
+    fn two_entry_menu_without_a_decidable_accent_is_refused() {
+        let fx = load_index()
+            .into_iter()
+            .find(|f| f.name == "compact-menu-two-typed-160x50")
+            .unwrap();
+        let path = fixtures_dir().join(format!("{}.bin", fx.name));
+        let base = std::fs::read(path).unwrap();
+        let check = |extra: &[u8]| {
+            let mut raw = base.clone();
+            raw.extend_from_slice(extra);
+            let mut parser = vt100::Parser::new(fx.rows, fx.cols, 0);
+            parser.process(&raw);
+            enter_runs(parser.screen(), "/compact")
+        };
+        // Sanity: the unmodified capture passes.
+        assert!(check(b""));
+        // Box command in the default colour: no accent to compare against.
+        assert!(!check(b"\x1b[48;3H\x1b[39m/compact"));
+        // Both rows in the accent: ambiguous.
+        assert!(!check(b"\x1b[46;3H\x1b[38;2;177;185;249m/autocompact"));
+        // Neither row in the accent.
+        assert!(!check(b"\x1b[45;3H\x1b[38;2;153;153;153m/compact"));
+    }
+
     #[test]
     fn no_menu_on_screens_without_one() {
         for fx in &load_index() {
-            if fx.name == "compact-menu-typed-120x40" {
+            if fx.name.starts_with("compact-menu-") {
                 continue;
             }
             let screen = replay(fx);
