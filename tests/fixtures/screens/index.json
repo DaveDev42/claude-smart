@@ -362,5 +362,57 @@
     "description": "Same screen after Esc: vim NORMAL (no INSERT marker), box Empty.",
     "source_session": "compactvim",
     "source_mark": "finished_normal"
+  },
+  {
+    "name": "compact-menu-two-typed-160x50",
+    "rows": 50,
+    "cols": 160,
+    "expect": "Draft",
+    "vim": "Normal",
+    "box_text": "/compact",
+    "compaction_started": false,
+    "description": "Real Claude Code 2.1.287 capture: two-entry slash menu, /compact highlighted (Enter runs /compact).",
+    "source_session": "menu-exp",
+    "source_mark": "two-typed",
+    "busy": false
+  },
+  {
+    "name": "compact-menu-two-down-160x50",
+    "rows": 50,
+    "cols": 160,
+    "expect": "Draft",
+    "vim": "Normal",
+    "box_text": "/compact",
+    "compaction_started": false,
+    "description": "Real Claude Code 2.1.287 capture: two-entry slash menu after Down, /autocompact highlighted.",
+    "source_session": "menu-exp",
+    "source_mark": "two-down",
+    "busy": false
+  },
+  {
+    "name": "compact-menu-three-typed-160x50",
+    "rows": 50,
+    "cols": 160,
+    "expect": "Draft",
+    "vim": "Insert",
+    "box_text": "/compact",
+    "compaction_started": false,
+    "description": "Real Claude Code 2.1.287 capture: three-entry slash menu (computer-use skill), /compact highlighted.",
+    "source_session": "menu-exp",
+    "source_mark": "three-typed",
+    "busy": false
+  },
+  {
+    "name": "compact-menu-three-down-160x50",
+    "rows": 50,
+    "cols": 160,
+    "expect": "Draft",
+    "vim": "Insert",
+    "box_text": "/compact",
+    "compaction_started": false,
+    "description": "Real Claude Code 2.1.287 capture: three-entry slash menu after Down, /autocompact highlighted.",
+    "source_session": "menu-exp",
+    "source_mark": "three-down",
+    "busy": false
   }
 ]
