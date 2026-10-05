@@ -95,31 +95,79 @@ pub fn plist_short_version(text: &str) -> Option<String> {
     (!v.is_empty()).then(|| v.to_owned())
 }
 
-/// The fixed file version (`a.b.c.d`) from a PE image's `VS_FIXEDFILEINFO`.
-/// Pure over the bytes.
+/// The UTF-16LE key `VS_VERSION_INFO` that heads a `VS_VERSIONINFO`
+/// resource.
+const VS_VERSION_INFO_KEY: &[u8] = b"V\0S\0_\0V\0E\0R\0S\0I\0O\0N\0_\0I\0N\0F\0O\0\0\0";
+
+/// The fixed file version (`a.b.c.d`) of a `VS_VERSIONINFO` resource in
+/// `bytes` (a PE image's resource section). Only a `VS_FIXEDFILEINFO` that
+/// sits where the structure puts it counts: after the `VS_VERSION_INFO`
+/// key, 32-bit aligned (`wLength`, `wValueLength`, `wType`, the 16-WCHAR
+/// key, one padding WORD: 40 bytes from the structure's start). A bare
+/// `0xFEEF04BD` is not enough: Chromium's code carries that constant, and a
+/// scan for it alone read a version out of Orca.exe's `.text`. Pure.
 pub fn fixed_file_version(bytes: &[u8]) -> Option<String> {
     const SIG: [u8; 4] = 0xFEEF_04BDu32.to_le_bytes();
     const STRUC: [u8; 4] = 0x0001_0000u32.to_le_bytes();
-    let mut i = 0;
-    while i + 16 <= bytes.len() {
-        let hit = bytes[i..].windows(4).position(|w| w == SIG)?;
-        let at = i + hit;
-        if at + 16 <= bytes.len() && bytes[at + 4..at + 8] == STRUC {
-            let word =
-                |o: usize| u32::from_le_bytes([bytes[o], bytes[o + 1], bytes[o + 2], bytes[o + 3]]);
-            let ms = word(at + 8);
-            let ls = word(at + 12);
-            return Some(format!(
-                "{}.{}.{}.{}",
-                ms >> 16,
-                ms & 0xffff,
-                ls >> 16,
-                ls & 0xffff
-            ));
+    let word = |o: usize| u32::from_le_bytes([bytes[o], bytes[o + 1], bytes[o + 2], bytes[o + 3]]);
+    let mut from = 0;
+    while let Some(hit) = bytes[from..]
+        .windows(VS_VERSION_INFO_KEY.len())
+        .position(|w| w == VS_VERSION_INFO_KEY)
+    {
+        let key = from + hit;
+        from = key + 1;
+        // The structure starts 6 bytes before its key; its value at +40.
+        let Some(start) = key.checked_sub(6) else {
+            continue;
+        };
+        let at = start + 40;
+        if at + 16 > bytes.len() || bytes[at..at + 4] != SIG || bytes[at + 4..at + 8] != STRUC {
+            continue;
         }
-        i = at + 1;
+        let (ms, ls) = (word(at + 8), word(at + 12));
+        return Some(format!(
+            "{}.{}.{}.{}",
+            ms >> 16,
+            ms & 0xffff,
+            ls >> 16,
+            ls & 0xffff
+        ));
     }
     None
+}
+
+/// The file range (offset, length) of a PE image's `.rsrc` section, from
+/// its headers: the DOS header's `e_lfanew`, the `PE\0\0` signature, the
+/// COFF header's section count and optional-header size, then the section
+/// table. `head` must hold the headers (the first 4 KiB do). Pure.
+pub fn rsrc_section(head: &[u8]) -> Option<(u64, u64)> {
+    let u16_at = |o: usize| -> Option<u16> {
+        Some(u16::from_le_bytes(head.get(o..o + 2)?.try_into().ok()?))
+    };
+    let u32_at = |o: usize| -> Option<u32> {
+        Some(u32::from_le_bytes(head.get(o..o + 4)?.try_into().ok()?))
+    };
+    if head.get(0..2)? != b"MZ" {
+        return None;
+    }
+    let pe = u32_at(0x3c)? as usize;
+    if head.get(pe..pe + 4)? != b"PE\0\0" {
+        return None;
+    }
+    let sections = usize::from(u16_at(pe + 6)?);
+    let optional = usize::from(u16_at(pe + 20)?);
+    let table = pe + 24 + optional;
+    (0..sections).find_map(|i| {
+        let e = table + i * 40;
+        let name = head.get(e..e + 8)?;
+        if !name.starts_with(b".rsrc\0") {
+            return None;
+        }
+        let size = u64::from(u32_at(e + 16)?);
+        let offset = u64::from(u32_at(e + 20)?);
+        (size > 0).then_some((offset, size))
+    })
 }
 
 /// Where the archive's header JSON lies and where file data starts, from
@@ -208,25 +256,25 @@ pub fn read_bundle_version(bundle: &Path) -> Option<String> {
     plist_short_version(&text)
 }
 
-/// Read the fixed file version of a Windows executable, streaming it.
+/// Cap on the `.rsrc` section csm reads (Orca's is a few hundred KiB:
+/// icons and the version resource).
+const RSRC_CAP: u64 = 64 * 1024 * 1024;
+
+/// Read the fixed file version of a Windows executable from its `.rsrc`
+/// section (the PE headers say where it lies; nothing else is read).
 pub fn read_exe_version(exe: &Path) -> Option<String> {
+    use std::io::{Seek, SeekFrom};
     let mut f = std::fs::File::open(exe).ok()?;
-    let mut buf = vec![0u8; 4 * 1024 * 1024];
-    let mut carry: Vec<u8> = Vec::new();
-    loop {
-        let n = f.read(&mut buf).ok()?;
-        if n == 0 {
-            return None;
-        }
-        let mut window = std::mem::take(&mut carry);
-        window.extend_from_slice(&buf[..n]);
-        if let Some(v) = fixed_file_version(&window) {
-            return Some(v);
-        }
-        // Keep a tail so a structure split across reads is still found.
-        let keep = window.len().min(15);
-        carry = window[window.len() - keep..].to_vec();
+    let mut head = Vec::with_capacity(4096);
+    (&mut f).take(4096).read_to_end(&mut head).ok()?;
+    let (offset, size) = rsrc_section(&head)?;
+    if size > RSRC_CAP {
+        return None;
     }
+    f.seek(SeekFrom::Start(offset)).ok()?;
+    let mut rsrc = Vec::with_capacity(size as usize);
+    f.take(size).read_to_end(&mut rsrc).ok()?;
+    fixed_file_version(&rsrc)
 }
 
 /// Where Orca is installed, most specific first: the running main's
@@ -366,37 +414,89 @@ mod tests {
         assert!(!OrcaVersion::unknown().in_tested_range());
     }
 
-    fn pe_with_version(prefix: usize, ms: u32, ls: u32) -> Vec<u8> {
-        let mut b = vec![0u8; prefix];
-        // A lone signature without the struct version is skipped.
-        b.extend(0xFEEF_04BDu32.to_le_bytes());
-        b.extend(0x0000_0000u32.to_le_bytes());
+    /// A `VS_VERSIONINFO` structure (header, key, padding, fixed info).
+    fn version_info(ms: u32, ls: u32) -> Vec<u8> {
+        let mut b = Vec::new();
+        b.extend(0x0100u16.to_le_bytes()); // wLength (not checked)
+        b.extend(52u16.to_le_bytes()); // wValueLength
+        b.extend(0u16.to_le_bytes()); // wType
+        b.extend(VS_VERSION_INFO_KEY);
+        b.extend([0u8; 2]); // padding to 32 bits
         b.extend(0xFEEF_04BDu32.to_le_bytes());
         b.extend(0x0001_0000u32.to_le_bytes());
         b.extend(ms.to_le_bytes());
         b.extend(ls.to_le_bytes());
-        b.extend([0u8; 32]);
+        b.extend([0u8; 36]);
+        b
+    }
+
+    /// A PE image: headers, a `.text` section carrying a decoy fixed-info
+    /// signature (as Chromium's code does), and a `.rsrc` section at
+    /// `rsrc_at` holding the version resource.
+    fn pe_image(rsrc_at: usize, ms: u32, ls: u32) -> Vec<u8> {
+        let mut rsrc = vec![0u8; 64];
+        rsrc.extend(version_info(ms, ls));
+        let mut b = vec![0u8; rsrc_at + rsrc.len()];
+        b[0..2].copy_from_slice(b"MZ");
+        let pe = 0x80usize;
+        b[0x3c..0x40].copy_from_slice(&(pe as u32).to_le_bytes());
+        b[pe..pe + 4].copy_from_slice(b"PE\0\0");
+        b[pe + 6..pe + 8].copy_from_slice(&2u16.to_le_bytes());
+        let optional = 0xF0usize;
+        b[pe + 20..pe + 22].copy_from_slice(&(optional as u16).to_le_bytes());
+        let table = pe + 24 + optional;
+        for (i, (name, offset, size)) in [
+            (&b".text"[..], 0x400usize, 0x100usize),
+            (&b".rsrc"[..], rsrc_at, rsrc.len()),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let e = table + i * 40;
+            b[e..e + name.len()].copy_from_slice(name);
+            b[e + 16..e + 20].copy_from_slice(&(size as u32).to_le_bytes());
+            b[e + 20..e + 24].copy_from_slice(&(offset as u32).to_le_bytes());
+        }
+        // The decoy: a bare signature and struct version in `.text`.
+        let d = 0x410;
+        b[d..d + 4].copy_from_slice(&0xFEEF_04BDu32.to_le_bytes());
+        b[d + 4..d + 8].copy_from_slice(&0x0001_0000u32.to_le_bytes());
+        b[d + 8..d + 12].copy_from_slice(&0x247C_8D48u32.to_le_bytes());
+        b[rsrc_at..].copy_from_slice(&rsrc);
         b
     }
 
     #[test]
-    fn fixed_file_version_scan() {
-        let b = pe_with_version(100, (1 << 16) | 4, 209 << 16);
+    fn fixed_file_version_needs_the_version_info_key() {
+        let mut b = vec![0u8; 100];
+        b.extend(version_info((1 << 16) | 4, 209 << 16));
         assert_eq!(fixed_file_version(&b).as_deref(), Some("1.4.209.0"));
+        // A bare signature (Chromium's code carries the constant) is not a
+        // version resource.
+        let mut decoy = vec![0u8; 16];
+        decoy.extend(0xFEEF_04BDu32.to_le_bytes());
+        decoy.extend(0x0001_0000u32.to_le_bytes());
+        decoy.extend(0x247C_8D48u32.to_le_bytes());
+        decoy.extend([0u8; 32]);
+        assert_eq!(fixed_file_version(&decoy), None);
         assert_eq!(fixed_file_version(&[0u8; 64]), None);
+        // The key at the very start (no room for the header) is skipped.
+        assert_eq!(fixed_file_version(VS_VERSION_INFO_KEY), None);
     }
 
     #[test]
-    fn exe_version_found_across_read_boundaries() {
+    fn exe_version_comes_from_the_rsrc_section_only() {
         let dir = tempfile::tempdir().unwrap();
         let exe = dir.path().join("Orca.exe");
-        // Straddle the 4 MiB read boundary.
-        std::fs::write(
-            &exe,
-            pe_with_version(4 * 1024 * 1024 - 18, (1 << 16) | 4, 7 << 16),
-        )
-        .unwrap();
-        assert_eq!(read_exe_version(&exe).as_deref(), Some("1.4.7.0"));
+        std::fs::write(&exe, pe_image(0x2000, (1 << 16) | 4, 220 << 16)).unwrap();
+        assert_eq!(read_exe_version(&exe).as_deref(), Some("1.4.220.0"));
+        assert_eq!(
+            rsrc_section(&pe_image(0x2000, 0, 0)).map(|(o, _)| o),
+            Some(0x2000)
+        );
+        // Not a PE image: nothing.
+        std::fs::write(&exe, version_info((1 << 16) | 4, 220 << 16)).unwrap();
+        assert_eq!(read_exe_version(&exe), None);
     }
 
     #[test]
