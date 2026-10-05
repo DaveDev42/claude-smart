@@ -1281,15 +1281,49 @@ fn load_view(env: &AccountsEnv<'_>) -> Result<Option<StoreView>, OrcaError> {
 /// re-checked under `switch.lock`, which every offline add and import holds
 /// from stash creation to store patch: Orca must still be stopped, the
 /// offline gates must pass, and the store, read again now, must still name
-/// no record `id`. Returns a Keychain cleanup that failed (no secrets).
+/// no record `id`. On a SQLite-backed profile the record list is read from
+/// `profile-state.db` (never its export, which lags) with every check of
+/// the offline write, and the database's write lock is held from that read
+/// to the removal, with Orca's liveness checked again inside it: a starting
+/// Orca cannot add a record naming the stash in between. Returns a
+/// Keychain cleanup that failed (no secrets).
 pub fn remove_orphan(env: &AccountsEnv<'_>, id: &str) -> Result<Option<String>, OrcaError> {
     let _lock = lock(env)?;
-    if env.live.mark().running {
+    let base = env.live.mark();
+    if base.running {
         return Err(OrcaError::Refused(format!(
             "Orca started; orphan stash {id} left in place"
         )));
     }
     offline_gate(env)?;
+    if env.data_file.has_state_db() {
+        let db = env
+            .data_file
+            .state_db_files()
+            .into_iter()
+            .next()
+            .ok_or_else(|| OrcaError::Refused("no profile-state.db path".into()))?;
+        let json = store::load(&env.data_file.path)?.map(|f| f.bytes);
+        return super::statedb::with_locked_view(
+            &db,
+            &env.data_file.profile_id,
+            json.as_deref(),
+            &mut |view| {
+                if view.account(id).is_some() {
+                    return Err(OrcaError::Refused(format!(
+                        "an Orca account names stash {id} now; left in place"
+                    )));
+                }
+                crate::e2e::point("orphan-L1");
+                if !env.live.mark().still_clear_of(&base) {
+                    return Err(OrcaError::Refused(format!(
+                        "Orca started; orphan stash {id} left in place"
+                    )));
+                }
+                drop_orphan(env, id)
+            },
+        );
+    }
     let view = load_view(env)?.ok_or_else(|| {
         OrcaError::Refused(format!(
             "no Orca store to confirm stash {id} is an orphan; left in place"
@@ -1300,6 +1334,12 @@ pub fn remove_orphan(env: &AccountsEnv<'_>, id: &str) -> Result<Option<String>, 
             "an Orca account names stash {id} now; left in place"
         )));
     }
+    drop_orphan(env, id)
+}
+
+/// [`remove_orphan`]'s removal, once the stash is known to be an orphan:
+/// the grant goes to the quarantine first, then the stash.
+fn drop_orphan(env: &AccountsEnv<'_>, id: &str) -> Result<Option<String>, OrcaError> {
     let stash = Stash::open(env.user_data, id, None)?;
     // Never lose a grant: it goes to the quarantine first.
     if let Some(creds) = stash.credentials(env.os)? {
@@ -2650,6 +2690,74 @@ mod tests {
             q[0].fingerprint,
             crate::orca::quarantine::fingerprint(&creds_json("id-z", "id-z", 1))
         );
+        assert_eq!(q[0].reason, Reason::Orphaned);
+    }
+
+    /// A SQLite-backed profile: the record list comes from the database
+    /// (with the offline write's checks), under its write lock, and Orca
+    /// appearing inside that lock leaves the stash in place.
+    #[test]
+    fn remove_orphan_on_a_sqlite_profile_reads_the_database_under_its_lock() {
+        let w = world();
+        let root = crate::orca::userdata::claude_accounts_root(&w.ud);
+        for id in ["id-c", "id-z"] {
+            let s = stash::create(&w.ud, id).unwrap();
+            s.write_auth(
+                &w.ud,
+                HostOs::Linux,
+                &creds_json(id, id, 1),
+                &oauth_json(id, "carol@example.com", None),
+            )
+            .unwrap();
+        }
+        let recs: Vec<Value> = ["id-a", "id-b", "id-c"]
+            .iter()
+            .map(|id| record_json(&w.ud, id, &format!("{id}@example.com"), None))
+            .collect();
+        write_store(&w.ud, &recs, Some("id-a"));
+        let db = crate::orca::testsupport::sqlite_profile(&w.choice, false);
+        let rev = db.meta("revision");
+        let live = ScriptedLiveness::stopped();
+
+        // The database names id-c: it stays.
+        let e = remove_orphan(&w.env(&live), "id-c")
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("names stash id-c"), "{e}");
+        assert!(root.join("id-c").exists());
+
+        // Orca appears between the first check and the one inside the lock.
+        let late = ScriptedLiveness::appears_at(1);
+        let e = remove_orphan(&w.env(&late), "id-z")
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("Orca started"), "{e}");
+        assert!(root.join("id-z").exists());
+
+        // A database the offline write would refuse: nothing happens.
+        db.exec("UPDATE profile_state_documents SET content_hash = 'x' WHERE domain = 'settings'");
+        assert!(remove_orphan(&w.env(&live), "id-z").is_err());
+        assert!(root.join("id-z").exists());
+        let good = crate::orca::statedb::sha256_hex(
+            db.rows()
+                .iter()
+                .find(|(d, _)| d == "settings")
+                .unwrap()
+                .1
+                .payload
+                .as_bytes(),
+        );
+        db.exec(&format!(
+            "UPDATE profile_state_documents SET content_hash = '{good}' WHERE domain = 'settings'"
+        ));
+
+        // A true orphan: quarantined, then removed; the database unchanged.
+        assert_eq!(remove_orphan(&w.env(&live), "id-z").unwrap(), None);
+        assert!(!root.join("id-z").exists());
+        assert!(root.join("id-c").exists());
+        assert_eq!(db.meta("revision"), rev);
+        let q = Quarantine::new(HostOs::Linux, w.tmp.path()).list();
+        assert_eq!(q.len(), 1);
         assert_eq!(q[0].reason, Reason::Orphaned);
     }
 

@@ -696,9 +696,14 @@ pub(crate) struct DoctorFacts {
     /// The profile keeps its state in SQLite (Orca 1.4.214+). csm reads the
     /// database, but falls back to Orca's export (which lags accounts added
     /// since Orca's last clean quit) when the database has no readable
-    /// settings, so an orphan found offline is not proof enough to delete a
-    /// stash; the removal waits for Orca.
+    /// settings, so an orphan found offline is proof enough to delete a
+    /// stash only while the database passes the offline write's checks
+    /// (`db_error` is `None`); the removal then reads the database again
+    /// under its write lock.
     pub sqlite_state: bool,
+    /// Why the offline write would refuse the SQLite database
+    /// (`store::preflight`), if it would.
+    pub db_error: Option<String>,
     /// `switch.json` names an unfinished switch.
     pub pending_journal: bool,
     pub quarantine: Vec<QEntry>,
@@ -817,14 +822,18 @@ pub(crate) fn findings(f: &DoctorFacts) -> Vec<Finding> {
         push(&mut out, text, fix);
     }
     for id in &f.orphans {
-        let stale = f.from_store && f.sqlite_state;
+        let stale = f.from_store && f.sqlite_state && f.db_error.is_some();
         let fix = (!f.running && f.from_store && !stale).then(|| Fix::RemoveOrphan(id.clone()));
         let why = if fix.is_some() {
-            ""
+            String::new()
         } else if stale {
-            " (Orca keeps its state in SQLite; start Orca to check and remove it)"
+            format!(
+                " (Orca keeps its state in SQLite and csm cannot check its database now: {}; \
+                 start Orca to check and remove it)",
+                f.db_error.as_deref().unwrap_or_default()
+            )
         } else {
-            " (repair only with Orca stopped)"
+            " (repair only with Orca stopped)".into()
         };
         push(
             &mut out,
@@ -991,6 +1000,7 @@ pub(crate) fn gather(
         running: view.running,
         from_store: view.source == AccountSource::Store,
         sqlite_state: view.sqlite_state,
+        db_error: view.db_write_error.clone(),
         pending_journal: switch::read_journal(&ctx.state).is_some_and(|j| j.pending()),
         active: view.active_id.clone(),
         dir_agrees: view.runtime_dir_agrees,
@@ -1698,12 +1708,35 @@ mod tests {
             running: false,
             from_store: true,
             sqlite_state: true,
+            db_error: Some("has no settings document; start Orca once".into()),
             ..Default::default()
         };
         let got = findings(&f);
         assert_eq!(got.len(), 1);
         assert!(got[0].fix.is_none());
         assert!(got[0].text.contains("start Orca"), "{}", got[0].text);
+        assert!(
+            got[0].text.contains("no settings document"),
+            "{}",
+            got[0].text
+        );
+    }
+
+    /// A SQLite database that passes the offline write's checks is the
+    /// store of record: its orphan is fixable with Orca stopped.
+    #[test]
+    fn orphans_of_a_checked_sqlite_database_are_fixable_offline() {
+        let f = DoctorFacts {
+            orphans: vec!["zz".into()],
+            running: false,
+            from_store: true,
+            sqlite_state: true,
+            db_error: None,
+            ..Default::default()
+        };
+        let got = findings(&f);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].fix, Some(Fix::RemoveOrphan("zz".into())));
     }
 
     #[test]

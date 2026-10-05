@@ -402,6 +402,30 @@ pub fn preflight(db: &Path, profile_id: &str, json: Option<&[u8]>) -> Result<(),
     inspect(&conn, profile_id, json).map(|_| ())
 }
 
+/// Run `f` on the account view of `db` while csm holds the database's
+/// write lock (`BEGIN IMMEDIATE`, after every check [`write_settings`]
+/// makes), then roll back: nothing in the database changes, and no other
+/// writer (an Orca starting) can change the `settings` row between the
+/// view `f` decides on and what `f` does about it. For a change outside the
+/// database that is safe only while the row says what it said (a stash no
+/// record names). `f` runs inside the transaction, so it must be short.
+pub fn with_locked_view<T>(
+    db: &Path,
+    profile_id: &str,
+    json: Option<&[u8]>,
+    f: &mut dyn FnMut(&StoreView) -> Result<T, OrcaError>,
+) -> Result<T, OrcaError> {
+    let mut conn = open_for_write(db)?;
+    let tx = conn
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(|_| refuse("busy (another writer holds it); nothing was done"))?;
+    let Inspected { view, .. } = inspect(&tx, profile_id, json)?;
+    let out = f(&view);
+    // Dropping `tx` rolls back; nothing was written.
+    drop(tx);
+    out
+}
+
 /// Patch the account keys of the `settings` row of `db` in one
 /// `BEGIN IMMEDIATE` transaction (see the module doc). `json` is the
 /// retained `orca-data.json` beside the database, when one exists.
