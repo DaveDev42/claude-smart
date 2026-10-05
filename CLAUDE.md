@@ -246,24 +246,35 @@ is needed.
   bound the damage if the assumption is wrong, but a test with a
   throwaway account (two sessions, a switch, a forced expiry) has not been
   run.
-- **Windows Orca detection is inferred.** Windows has no `SingletonLock`;
-  the named-pipe framing, the plain-file stash and telling `Orca.exe` from
-  its helpers follow Orca's source and have not been exercised on a real
-  machine. The e2e harness runs on macOS and Linux only.
+- **Windows with Orca stopped is unexercised.** With Orca running, the
+  named pipe, telling `Orca.exe` from its helpers (every helper carries
+  `--type=` or a `.js` entry, the `daemon-host` copy included) and the
+  version from the executable's `VS_VERSIONINFO` were checked on a real
+  machine (a raw scan for `0xFEEF04BD` used to hit Chromium code and read a
+  garbage version, refusing every offline write). Orca stopped (no
+  `SingletonLock`, the plain-file stash, the offline SQLite write) has not
+  been run there, so the automatic migration keeps A1, A2, A3 and the
+  cutover's offline `D` write on RPC on Windows. The e2e harness runs on
+  macOS and Linux only.
 - **Orca format drift.** csm ports Orca's private store format and account
   logic. The port follows Orca v1.4.209 to v1.4.220 (the 1.4.214 to
   1.4.220 drift touches none of the mirrored account, store or SQLite
   files), and offline writes are allowed only for `TESTED` (`1.4`). Linux
   reads the version from `resources/app.asar`'s `package.json`. The
-  SQLite write was verified once against a real Orca 1.4.218 on Linux
-  (stop, offline switch and back, start: Orca loaded the rows and answered
-  RPC with csm's active account); macOS and Windows SQLite profiles run the
-  same code but were not exercised live. A new Orca release needs a
-  `tools/orca-drift.sh` pass before `TESTED` grows.
-- **The automatic migration still defers SQLite store writes.**
-  `migrate/adopt.rs` keeps deferring an import or a first select on a
-  SQLite profile (and on Linux and Windows altogether) to a running Orca;
-  the manual `csm accounts import`/`use` work offline.
+  SQLite write was verified against a real Orca 1.4.218 on Linux and
+  1.4.220 on macOS (stop, offline switch and back, on macOS also a
+  `doctor --fix` orphan removal, start: Orca loaded the rows and answered
+  RPC with the original active account); Windows SQLite profiles run the
+  same code but were not exercised with Orca stopped. A new Orca release
+  needs a `tools/orca-drift.sh` pass before `TESTED` grows.
+- **The automatic migration's offline SQLite path is unit-tested only.**
+  `migrate/adopt.rs` imports and selects offline on a SQLite profile (macOS
+  and Linux) when the database passes `store::preflight`
+  (`OrcaView::db_write_error`), and defers to a running Orca otherwise;
+  the e2e `auto_sqlite` scenario covers only the refused case (its
+  database is a bare header, and the fake Orca does not read SQLite). Every
+  fleet host had finished the migration before this path existed, so it
+  has not run on a real machine.
 - **Minimal-store creation is unverified against real Orca.** With Orca
   stopped and no store at all, `accounts add`/`import` write
   `store::MINIMAL_STORE` plus the account keys (`write_protocol` with

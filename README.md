@@ -875,15 +875,18 @@ and Linux, and `%LOCALAPPDATA%\csm` on Windows.
 - macOS: everything, with stashed grants in the login Keychain. csm calls
   `/usr/bin/security`, as Orca and Claude Code do, so items keep the same
   owner and no prompt appears.
-- Linux and WSL: stashed grants are files. csm has no way yet to read the
-  installed Orca version on Linux, so with Orca stopped it will not write
-  Orca's store: switch with Orca running. Under WSL, a Windows Orca's
-  userData is never written.
+- Linux and WSL: stashed grants are files. With Orca stopped csm writes
+  Orca's store once it has read a tested version from `app.asar` (see
+  *Verified Orca versions*). Under WSL, a Windows Orca's userData is never
+  written.
 - Windows: idle-compact's relay runs claude in a ConPTY (see *The
-  relay*), and its end-to-end tests pass on a Windows machine. Orca detection
-  (no `SingletonLock` there, the named pipe, telling `Orca.exe` from its
-  helpers) follows Orca's source and has not been checked on a real
-  machine. The relaunch loop is off until two checks pass on a real
+  relay*), and its end-to-end tests pass on a Windows machine. With Orca
+  running, csm finds it on a real machine (the named pipe, `Orca.exe` told
+  from its helpers, the version from the executable's version resource) and
+  switches over RPC. Orca stopped has not been exercised on a real Windows
+  machine, so the automatic migration leaves store writes there to a
+  running Orca; the manual `csm accounts` verbs write offline under the same
+  checks as elsewhere. The relaunch loop is off until two checks pass on a real
   console (Ctrl-C handling, and a complete transcript after a limit stop),
   so a limit switch there switches and notifies instead of resuming.
 
@@ -912,9 +915,14 @@ profile, and a retained `orca-data.json` still matches the database's
 acceptance marker. A last liveness check runs inside the transaction, so
 Orca starting at that moment rolls the write back and csm hands the change
 to Orca's RPC. `csm hook` and `csm statusline` read the same database
-read-only. `csm accounts doctor` lists an orphan stash on a SQLite profile
-but removes it only after Orca has checked it; start Orca and check
-again first. csm never creates a missing store while Orca's backups
+read-only. `csm accounts doctor --fix` removes an orphan stash on a SQLite
+profile with Orca stopped only while the database passes the same checks,
+reading the account list from it again under its write lock (with a
+liveness check inside) right before the removal; a stash the database
+names is never touched. The SQLite write path was checked against real
+Orca on Linux (1.4.218) and macOS (1.4.220): an offline switch and back,
+an orphan removal, then Orca started on the result and answered RPC with
+the expected active account. csm never creates a missing store while Orca's backups
 (`.bak.N`, retained exports or database backups) are still there, since
 Orca restores from them on its next start. It also refuses every offline
 store write while `orca-profile-index.json` (or its `.bak`) exists but does
