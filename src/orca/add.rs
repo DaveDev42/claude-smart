@@ -521,10 +521,7 @@ fn persist(
     let key = identity_key(&cap.identity)?;
     let email = cap.identity.email.clone();
     let dup = || OrcaError::Refused("This Claude account is already added.".into());
-    if let Some(v) = store::load_choice(env.data_file)?
-        .map(|f| StoreView::from_bytes(&f.bytes))
-        .transpose()
-        .map_err(|e| OrcaError::Refused(e.to_string()))?
+    if let Some((v, _)) = store::load_view_choice(env.data_file)?
         && find_by_identity(&v.accounts, &key).is_some()
     {
         return Err(dup());
@@ -1187,10 +1184,8 @@ pub fn remove(env: &AccountsEnv<'_>, id: &str) -> Result<AccountChange, OrcaErro
         });
     }
     offline_gate(env)?;
-    let view = store::load_choice(env.data_file)?
-        .map(|f| StoreView::from_bytes(&f.bytes))
-        .transpose()
-        .map_err(|e| OrcaError::Refused(e.to_string()))?
+    let view = store::load_view_choice(env.data_file)?
+        .map(|(v, _)| v)
         .ok_or_else(|| OrcaError::Refused("no Orca store".into()))?;
     let rec = view
         .account(id)
@@ -1277,10 +1272,7 @@ pub fn remove(env: &AccountsEnv<'_>, id: &str) -> Result<AccountChange, OrcaErro
 
 /// Load the store's account view, `None` when there is no store.
 fn load_view(env: &AccountsEnv<'_>) -> Result<Option<StoreView>, OrcaError> {
-    store::load_choice(env.data_file)?
-        .map(|f| StoreView::from_bytes(&f.bytes))
-        .transpose()
-        .map_err(|e| OrcaError::Refused(e.to_string()))
+    Ok(store::load_view_choice(env.data_file)?.map(|(v, _)| v))
 }
 
 /// Remove an orphan stash for `accounts doctor --fix`: its grant goes to

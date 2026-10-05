@@ -126,16 +126,12 @@ pub fn snapshot_with(env: &HostEnv, opts: &SnapshotOptions, facts: &dyn ProcFact
     let live = live::check(env.os, &user_data.dir, facts);
     let running = live.running;
 
-    let (store, store_error) = match store::load_choice(&data_file) {
+    let (store, store_error) = match store::load_view_choice(&data_file) {
         Ok(None) => (None, None),
-        Ok(Some(f)) => match StoreView::from_bytes(&f.bytes) {
-            Ok(v) => (
-                Some(v),
-                f.legacy
-                    .then(|| "the store is Orca's legacy root file".to_owned()),
-            ),
-            Err(e) => (None, Some(e.to_string())),
-        },
+        Ok(Some((v, legacy))) => (
+            Some(v),
+            legacy.then(|| "the store is Orca's legacy root file".to_owned()),
+        ),
         Err(e) => (None, Some(e.to_string())),
     };
 

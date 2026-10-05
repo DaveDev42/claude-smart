@@ -781,3 +781,36 @@ mod tests {
         assert_eq!(executables_under(fake.root()), Vec::<PathBuf>::new());
     }
 }
+
+/// Write a SQLite-backed Orca profile (Orca 1.4.214+ layout: WAL mode,
+/// `profile_state_documents` with a `settings` document) under `user_data`.
+/// Returns the database path. The connection is dropped without a
+/// checkpoint-on-close so the rows may sit in the `-wal` file, as with a
+/// stopped Orca that was killed.
+pub(crate) fn write_state_db(user_data: &Path, profile: &str, settings: &str) -> PathBuf {
+    let dir = user_data.join("profiles").join(profile);
+    std::fs::create_dir_all(&dir).unwrap();
+    let db = dir.join(super::userdata::STATE_DB);
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    conn.pragma_update(None, "journal_mode", "WAL").unwrap();
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS profile_state_meta (key TEXT PRIMARY KEY, value TEXT);
+         CREATE TABLE IF NOT EXISTS profile_state_documents (
+             domain TEXT PRIMARY KEY, payload TEXT NOT NULL, updated_at INTEGER);",
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT OR REPLACE INTO profile_state_documents (domain, payload, updated_at) VALUES ('settings', ?1, 0)",
+        [settings],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT OR REPLACE INTO profile_state_documents (domain, payload, updated_at) VALUES ('repos', '[]', 0)",
+        [],
+    )
+    .unwrap();
+    // Leave the WAL in place by keeping the connection's checkpoint from running on drop.
+    let _ = conn.pragma_update(None, "wal_autocheckpoint", 0);
+    std::mem::forget(conn);
+    db
+}

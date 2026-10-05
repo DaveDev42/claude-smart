@@ -135,6 +135,7 @@ mimalloc = "0.1"
 # Crypto provider for reqwest's rustls stack: ring, installed once in
 # usage::local::api::http_client.
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rusqlite = { version = "0.40.2", features = ["bundled"] }
 
 # ─── HTTP transport (local usage collection: Anthropic's OAuth usage API) ────
 # rustls (not native-tls): native-tls drags in system OpenSSL on Linux, which

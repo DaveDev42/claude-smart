@@ -153,7 +153,7 @@ pub(crate) fn render_status(v: &OrcaView) -> String {
     if v.sqlite_state {
         line(
             "store",
-            "SQLite (profile-state.db); orca-data.json is Orca's export and may be stale"
+            "SQLite (profile-state.db, read-only); orca-data.json is Orca's export and may be stale"
                 .to_owned(),
         );
     }
@@ -328,8 +328,14 @@ fn override_warning_now(v: &OrcaView) -> Option<String> {
         .ok()?
     } else {
         let choice = crate::orca::userdata::data_file(&v.user_data.dir);
-        let f = crate::orca::store::load_choice(&choice).ok()??;
-        serde_json::from_slice(&f.bytes).ok()?
+        let db = choice.state_db_files().into_iter().next()?;
+        match crate::orca::store::load_state_db_settings(&db) {
+            Ok(Some(settings)) => serde_json::json!({ "settings": settings }),
+            _ => {
+                let f = crate::orca::store::load_choice(&choice).ok()??;
+                serde_json::from_slice(&f.bytes).ok()?
+            }
+        }
     };
     let cmd = claude_override(&value);
     let home = HostEnv::current().ok().map(|e| e.home);

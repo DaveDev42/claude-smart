@@ -529,12 +529,7 @@ fn named_active(view: &StoreView) -> Option<String> {
 }
 
 fn load_view(choice: &DataFileChoice) -> Result<Option<StoreView>, OrcaError> {
-    match store::load_choice(choice)? {
-        None => Ok(None),
-        Some(f) => StoreView::from_bytes(&f.bytes)
-            .map(Some)
-            .map_err(|e| OrcaError::Refused(e.to_string())),
-    }
+    Ok(store::load_view_choice(choice)?.map(|(v, _)| v))
 }
 
 // ─── switch ───────────────────────────────────────────────────────────────────
