@@ -8,15 +8,17 @@
 //! Sources: macOS `CFBundleShortVersionString` in `<bundle>/Contents/Info.plist`
 //! (XML; a binary plist reads as unknown); Windows the fixed file version of
 //! `Orca.exe`, read from its `VS_FIXEDFILEINFO` resource without any Win32
-//! call; Linux has no reliable source yet (INFERRED package metadata), so
-//! it is unknown and counts as out of range.
+//! call; Linux the `version` of the `package.json` packed in
+//! `resources/app.asar` (the Electron archive every Linux package of Orca
+//! ships: `.deb`, AppImage, tarball), read from the archive's JSON header
+//! without unpacking it.
 //!
 //! The gate is `major.minor` (binding operator decision). Orca 1.4.214
 //! changed the store inside that range: a profile may keep its state in
 //! SQLite, with `orca-data.json` reduced to a hash-pinned export. That
-//! change is gated by what is on disk, not by the version: every offline
-//! store write refuses a profile whose `profile-state.db` family exists
-//! ([`super::store::sqlite_gate`]).
+//! change is handled by what is on disk, not by the version: an offline
+//! write to such a profile goes to `profile-state.db`
+//! ([`super::statedb`]).
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -29,6 +31,12 @@ pub const TESTED: &[&str] = &["1.4"];
 
 /// Cap on `Info.plist`.
 const PLIST_CAP: u64 = 1024 * 1024;
+
+/// Cap on an `app.asar` header (Orca 1.4.218's is 1.3 MiB).
+const ASAR_HEADER_CAP: u64 = 64 * 1024 * 1024;
+
+/// Cap on the packed `package.json`.
+const ASAR_PACKAGE_CAP: u64 = 1024 * 1024;
 
 /// What csm knows about the installed Orca.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -114,6 +122,85 @@ pub fn fixed_file_version(bytes: &[u8]) -> Option<String> {
     None
 }
 
+/// Where the archive's header JSON lies and where file data starts, from
+/// the archive's first 16 bytes (Chromium pickles: `u32 4`, `u32 header
+/// pickle size`, `u32 payload size`, `u32 string length`). Pure.
+fn asar_layout(head: &[u8; 16]) -> Option<(u64, u64)> {
+    let word = |o: usize| {
+        u64::from(u32::from_le_bytes([
+            head[o],
+            head[o + 1],
+            head[o + 2],
+            head[o + 3],
+        ]))
+    };
+    if word(0) != 4 {
+        return None;
+    }
+    let header_size = word(4);
+    let json_len = word(12);
+    if json_len == 0 || json_len + 8 > header_size {
+        return None;
+    }
+    // (json length, data base offset)
+    Some((json_len, 8 + header_size))
+}
+
+/// The offset and size of `package.json` at the archive root, from the
+/// header JSON. Pure.
+fn asar_package_entry(header: &[u8]) -> Option<(u64, u64)> {
+    let v: serde_json::Value = serde_json::from_slice(header).ok()?;
+    let e = v.get("files")?.get("package.json")?;
+    let size = e.get("size")?.as_u64()?;
+    let offset = match e.get("offset")? {
+        serde_json::Value::String(s) => s.parse().ok()?,
+        n => n.as_u64()?,
+    };
+    Some((offset, size))
+}
+
+/// The `version` of a `package.json`. Pure.
+fn package_version(bytes: &[u8]) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_slice(bytes).ok()?;
+    let ver = v.get("version")?.as_str()?.trim();
+    (!ver.is_empty()).then(|| ver.to_owned())
+}
+
+/// Read the version packed in an Electron `app.asar`.
+pub fn read_asar_version(asar: &Path) -> Option<String> {
+    use std::io::{Seek, SeekFrom};
+    let mut f = std::fs::File::open(asar).ok()?;
+    let mut head = [0u8; 16];
+    f.read_exact(&mut head).ok()?;
+    let (json_len, base) = asar_layout(&head)?;
+    if json_len > ASAR_HEADER_CAP {
+        return None;
+    }
+    let mut header = vec![0u8; usize::try_from(json_len).ok()?];
+    f.read_exact(&mut header).ok()?;
+    let (offset, size) = asar_package_entry(&header)?;
+    if size > ASAR_PACKAGE_CAP {
+        return None;
+    }
+    f.seek(SeekFrom::Start(base.checked_add(offset)?)).ok()?;
+    let mut pkg = vec![0u8; usize::try_from(size).ok()?];
+    f.read_exact(&mut pkg).ok()?;
+    package_version(&pkg)
+}
+
+/// `resources/app.asar` beside a Linux Orca executable. Pure.
+fn asar_beside(exe: &Path) -> Option<PathBuf> {
+    let dir = exe.parent()?;
+    // The `.deb`'s `/usr/bin/orca-ide` resolves to `<app>/resources/bin/orca-ide`.
+    if dir.file_name().is_some_and(|n| n == "bin")
+        && let Some(res) = dir.parent()
+        && res.file_name().is_some_and(|n| n == "resources")
+    {
+        return Some(res.join("app.asar"));
+    }
+    Some(dir.join("resources").join("app.asar"))
+}
+
 /// Read the version from a macOS `.app` bundle.
 pub fn read_bundle_version(bundle: &Path) -> Option<String> {
     let plist = bundle.join("Contents").join("Info.plist");
@@ -167,9 +254,34 @@ pub fn install_candidates(env: &HostEnv, main_exe: Option<&Path>) -> Vec<PathBuf
                 );
             }
         }
-        HostOs::Linux => {}
+        HostOs::Linux => {
+            out.extend(main_exe.and_then(asar_beside));
+            out.extend(system_linux_installs().iter().filter_map(|e| {
+                let resolved = std::fs::canonicalize(e).unwrap_or_else(|_| e.clone());
+                asar_beside(&resolved)
+            }));
+        }
     }
     out
+}
+
+/// Conventional Linux install locations (the `.deb` puts Orca in
+/// `/opt/Orca` and links `/usr/bin/orca-ide`). None under test or e2e, so
+/// neither reads the machine's real install.
+#[cfg(not(test))]
+fn system_linux_installs() -> Vec<PathBuf> {
+    if crate::e2e::ENABLED {
+        return Vec::new();
+    }
+    vec![
+        PathBuf::from("/opt/Orca/orca-ide"),
+        PathBuf::from("/usr/bin/orca-ide"),
+    ]
+}
+
+#[cfg(test)]
+fn system_linux_installs() -> Vec<PathBuf> {
+    Vec::new()
 }
 
 /// System-wide app dirs. None under test, so a test never reads the
@@ -200,7 +312,7 @@ pub fn detect(env: &HostEnv, main_exe: Option<&Path>) -> OrcaVersion {
         let v = match env.os {
             HostOs::MacOs => read_bundle_version(&c),
             HostOs::Windows => read_exe_version(&c),
-            HostOs::Linux => None,
+            HostOs::Linux => read_asar_version(&c),
         };
         if let Some(version) = v {
             return OrcaVersion {
@@ -306,5 +418,74 @@ mod tests {
         );
         let env = HostEnv::for_test(dir.path(), HostOs::Linux);
         assert_eq!(detect(&env, None), OrcaVersion::unknown());
+    }
+
+    /// An `app.asar` laid out the way Electron's packer writes it.
+    fn asar(files: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut entries = serde_json::Map::new();
+        let mut data = Vec::new();
+        for (name, body) in files {
+            entries.insert(
+                (*name).to_owned(),
+                serde_json::json!({"size": body.len(), "offset": data.len().to_string()}),
+            );
+            data.extend_from_slice(body);
+        }
+        let json = serde_json::to_vec(&serde_json::json!({"files": entries})).unwrap();
+        let padded = json.len().div_ceil(4) * 4;
+        let mut out = Vec::new();
+        out.extend(4u32.to_le_bytes());
+        out.extend(((padded + 8) as u32).to_le_bytes());
+        out.extend(((padded + 4) as u32).to_le_bytes());
+        out.extend((json.len() as u32).to_le_bytes());
+        out.extend(&json);
+        out.resize(16 + padded, 0);
+        out.extend(data);
+        out
+    }
+
+    #[test]
+    fn linux_reads_the_version_packed_in_app_asar() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = dir.path().join("opt/Orca");
+        std::fs::create_dir_all(app.join("resources/bin")).unwrap();
+        std::fs::write(
+            app.join("resources/app.asar"),
+            asar(&[
+                ("index.js", b"console.log(1)"),
+                ("package.json", br#"{"name":"orca","version":"1.4.218"}"#),
+            ]),
+        )
+        .unwrap();
+        let env = HostEnv::for_test(dir.path(), HostOs::Linux);
+        // The running main's executable, and the `/usr/bin` link's target.
+        for exe in [app.join("orca-ide"), app.join("resources/bin/orca-ide")] {
+            let v = detect(&env, Some(&exe));
+            assert_eq!(v.version.as_deref(), Some("1.4.218"), "{}", exe.display());
+            assert_eq!(
+                v.source.as_deref(),
+                Some(app.join("resources/app.asar").as_path())
+            );
+            assert!(v.in_tested_range());
+        }
+        // No candidate when Orca is stopped under test (system paths are off).
+        assert_eq!(detect(&env, None), OrcaVersion::unknown());
+    }
+
+    #[test]
+    fn a_malformed_asar_reads_as_unknown() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("app.asar");
+        for bytes in [
+            b"".to_vec(),
+            b"not an asar archive at all".to_vec(),
+            asar(&[("index.js", b"x")]),
+            asar(&[("package.json", b"{\"name\":\"orca\"}")]),
+            asar(&[("package.json", b"{not json")]),
+        ] {
+            std::fs::write(&p, bytes).unwrap();
+            assert_eq!(read_asar_version(&p), None);
+        }
+        assert_eq!(read_asar_version(&dir.path().join("missing")), None);
     }
 }

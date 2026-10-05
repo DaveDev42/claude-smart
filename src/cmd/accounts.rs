@@ -693,9 +693,11 @@ pub(crate) struct DoctorFacts {
     /// The account list came from the store (Orca stopped) — the only case an
     /// orphan stash may be removed offline.
     pub from_store: bool,
-    /// The profile keeps its state in SQLite (Orca 1.4.214+): a store read
-    /// is Orca's export, which lags accounts added since Orca's last clean
-    /// quit, so an orphan found through it is not proof.
+    /// The profile keeps its state in SQLite (Orca 1.4.214+). csm reads the
+    /// database, but falls back to Orca's export (which lags accounts added
+    /// since Orca's last clean quit) when the database has no readable
+    /// settings, so an orphan found offline is not proof enough to delete a
+    /// stash; the removal waits for Orca.
     pub sqlite_state: bool,
     /// `switch.json` names an unfinished switch.
     pub pending_journal: bool,
@@ -820,7 +822,7 @@ pub(crate) fn findings(f: &DoctorFacts) -> Vec<Finding> {
         let why = if fix.is_some() {
             ""
         } else if stale {
-            " (read from Orca's SQLite export, which may lag; start Orca to check)"
+            " (Orca keeps its state in SQLite; start Orca to check and remove it)"
         } else {
             " (repair only with Orca stopped)"
         };
@@ -1701,7 +1703,7 @@ mod tests {
         let got = findings(&f);
         assert_eq!(got.len(), 1);
         assert!(got[0].fix.is_none());
-        assert!(got[0].text.contains("may lag"), "{}", got[0].text);
+        assert!(got[0].text.contains("start Orca"), "{}", got[0].text);
     }
 
     #[test]

@@ -89,6 +89,7 @@ pub mod refresh;
 pub mod rpc;
 pub mod runtime;
 pub mod stash;
+pub mod statedb;
 pub mod store;
 pub mod switch;
 pub mod sysdefault;

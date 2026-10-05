@@ -153,9 +153,11 @@ pub(crate) fn render_status(v: &OrcaView) -> String {
     if v.sqlite_state {
         line(
             "store",
-            "SQLite (profile-state.db, read-only); orca-data.json is Orca's export and may be stale"
-                .to_owned(),
+            "SQLite (profile-state.db; orca-data.json is only Orca's export)".to_owned(),
         );
+    }
+    if let Some(e) = &v.db_write_error {
+        line("store", format!("not writable offline: {e}"));
     }
     line(
         "offline",

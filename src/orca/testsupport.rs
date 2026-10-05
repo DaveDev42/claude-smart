@@ -814,3 +814,173 @@ pub(crate) fn write_state_db(user_data: &Path, profile: &str, settings: &str) ->
     std::mem::forget(conn);
     db
 }
+
+/// A profile database with Orca 1.4.214..1.4.220's real shape
+/// (`createProfileStateTablesSql`, `user_version` 3, WAL, the `profile_id`
+/// and `revision` meta rows, hashed rows with per-row revisions that lag
+/// the profile's). See [`write_orca_db`].
+pub(crate) struct OrcaDb {
+    pub db: PathBuf,
+}
+
+impl OrcaDb {
+    fn conn(&self) -> rusqlite::Connection {
+        rusqlite::Connection::open(&self.db).unwrap()
+    }
+
+    /// Every document row, in rowid order.
+    pub fn rows(&self) -> Vec<(String, super::statedb::DocRow)> {
+        let c = self.conn();
+        let mut s = c
+            .prepare(
+                "SELECT domain, payload, domain_version, revision, updated_at, content_hash
+                 FROM profile_state_documents ORDER BY rowid",
+            )
+            .unwrap();
+        s.query_map([], |r| {
+            Ok((
+                r.get(0)?,
+                super::statedb::DocRow {
+                    payload: r.get(1)?,
+                    domain_version: r.get(2)?,
+                    revision: r.get(3)?,
+                    updated_at: r.get(4)?,
+                    content_hash: r.get(5)?,
+                },
+            ))
+        })
+        .unwrap()
+        .map(Result::unwrap)
+        .collect()
+    }
+
+    pub fn meta(&self, key: &str) -> Option<String> {
+        use rusqlite::OptionalExtension;
+        self.conn()
+            .query_row(
+                "SELECT value FROM profile_state_meta WHERE key = ?1",
+                [key],
+                |r| r.get(0),
+            )
+            .optional()
+            .unwrap()
+    }
+
+    pub fn set_meta(&self, key: &str, value: &str) {
+        self.conn()
+            .execute(
+                "INSERT INTO profile_state_meta (key, value) VALUES (?1, ?2)
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                [key, value],
+            )
+            .unwrap();
+    }
+
+    pub fn exec(&self, sql: &str) {
+        self.conn().execute_batch(sql).unwrap();
+    }
+}
+
+/// Write `<user_data>/profiles/<profile>/profile-state.db` the way Orca
+/// 1.4.214+ leaves it: its exact DDL, `user_version` 3, WAL, a
+/// `schemaVersion`, a `repos` and a `settings` row, and the profile at
+/// `revision` (the rows at lower revisions, as Orca's are).
+pub(crate) fn write_orca_db(
+    user_data: &Path,
+    profile: &str,
+    settings: &str,
+    revision: i64,
+) -> OrcaDb {
+    let dir = user_data.join("profiles").join(profile);
+    std::fs::create_dir_all(&dir).unwrap();
+    let db = dir.join(super::userdata::STATE_DB);
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    conn.pragma_update(None, "journal_mode", "WAL").unwrap();
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS profile_state_meta (
+    key TEXT PRIMARY KEY NOT NULL, value TEXT NOT NULL
+  );
+  CREATE TABLE IF NOT EXISTS profile_state_documents (
+    domain TEXT PRIMARY KEY NOT NULL, payload TEXT NOT NULL,
+    domain_version INTEGER NOT NULL, revision INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL, content_hash TEXT NOT NULL
+  );
+  CREATE TABLE IF NOT EXISTS profile_state_automation_runs_meta (
+    domain TEXT PRIMARY KEY NOT NULL,
+    presence TEXT NOT NULL,
+    domain_version INTEGER NOT NULL,
+    revision INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    content_hash TEXT NOT NULL
+  );
+  CREATE TABLE IF NOT EXISTS profile_state_automation_runs (
+    run_id TEXT PRIMARY KEY NOT NULL,
+    ordinal INTEGER NOT NULL,
+    payload TEXT NOT NULL,
+    content_hash TEXT NOT NULL,
+    revision INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL
+  );
+  PRAGMA user_version = 3;",
+    )
+    .unwrap();
+    let ins = |domain: &str, payload: &str, rev: i64| {
+        conn.execute(
+            "INSERT INTO profile_state_documents
+             (domain, payload, domain_version, revision, updated_at, content_hash)
+             VALUES (?1, ?2, 1, ?3, 1790759243257, ?4)",
+            rusqlite::params![
+                domain,
+                payload,
+                rev,
+                super::statedb::sha256_hex(payload.as_bytes())
+            ],
+        )
+        .unwrap();
+    };
+    ins("schemaVersion", "1", 1);
+    ins(
+        "repos",
+        r#"[{"id":"r1","path":"/Users/example/src/app"}]"#,
+        revision.min(2),
+    );
+    ins("settings", settings, revision);
+    conn.execute(
+        "INSERT INTO profile_state_meta (key, value) VALUES ('profile_id', ?1), ('revision', ?2)",
+        rusqlite::params![profile, revision.to_string()],
+    )
+    .unwrap();
+    drop(conn);
+    OrcaDb { db }
+}
+
+/// Move the profile of `choice` to SQLite the way Orca 1.4.214's first
+/// start does: its `orca-data.json` settings become the `settings` row of a
+/// real-shape database, and the JSON either stays as the accepted export
+/// (`keep_json`, with a matching acceptance marker) or is removed.
+pub(crate) fn sqlite_profile(choice: &super::userdata::DataFileChoice, keep_json: bool) -> OrcaDb {
+    let bytes = std::fs::read(&choice.path).unwrap();
+    let v: Value = serde_json::from_slice(&bytes).unwrap();
+    let settings = serde_json::to_string(&v["settings"]).unwrap();
+    let user_data = choice
+        .path
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap();
+    let db = write_orca_db(user_data, &choice.profile_id, &settings, 5);
+    if keep_json {
+        db.set_meta(
+            "legacy_json_acceptance",
+            &format!(
+                r#"{{"jsonHash":"{}","acceptedRevision":1}}"#,
+                super::statedb::sha256_hex(&bytes)
+            ),
+        );
+    } else {
+        std::fs::remove_file(&choice.path).unwrap();
+    }
+    db
+}

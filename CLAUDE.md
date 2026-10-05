@@ -30,7 +30,7 @@ The module tree is discoverable from `src/`; this lists only what is not obvious
 - `src/migrate/`: the automatic migration off the legacy per-profile layout (`~/.config/claude-as/profiles.json`, `~/.claude.<name>`, `~/.claude.shared`, the machine-wide `CLAUDE_CONFIG_DIR` floor). Phases `adopt|carry|cutover|retire|done` are persisted in `<state>/migration.json`; the 3 s `PRESPAWN_BUDGET` bounds the pre-spawn run. Credentials are never deleted (quarantine files them), legacy dirs are renamed `<dir>.retired`, unregistered `~/.claude.*` dirs are only listed.
 - `src/cli/`: `parser.rs` is a hand-rolled `csm run` flag loop, NOT clap, so claude flags forward verbatim (it stops at the first positional, using `carry::arity`). `completions.rs` holds a clap tree used ONLY for `csm completions`, never to parse real argv. `reserved.rs` owns the reserved subcommand consts and `dispatch_subcommand`.
 - `src/account/`: `accounts.rs` reads Orca's host accounts read-only. `load` (store) is the only load the hook and statusline use; `load_live` asks Orca over RPC (3 s timeout) because its store lags its memory. `scoring.rs` has `LIMIT_PCT=99`, `SATURATION_PCT=95` and `is_viable_pcts`, the one viability predicate over session and week_all. `pick_best_at` and the hook's target pick route through it; never add a second inline threshold check. `week_fable` does not feed viability.
-- `src/orca/`: csm as a second client of Orca's account service. `HostEnv::current()` refuses the real home under `cfg(test)`; tests use `HostEnv::for_test`. `store.rs` holds the store-write protocol (L0/L1/L2 liveness checks, `patch_settings` round-trip gate, `sqlite_gate`). `keychain.rs` refuses the real `/usr/bin/security` under `cfg(test)`. `switch.rs` is a pure `plan_switch` plus executor and journal.
+- `src/orca/`: csm as a second client of Orca's account service. `HostEnv::current()` refuses the real home under `cfg(test)`; tests use `HostEnv::for_test`. `store.rs` holds the store-write protocol (L0/L1/L2 liveness checks, `patch_settings` round-trip gate, `preflight`); for a SQLite profile it delegates to `statedb.rs`, the port of Orca's offline settings writer (`profile-state.db` `settings` row, revision fence, acceptance marker). `keychain.rs` refuses the real `/usr/bin/security` under `cfg(test)`. `switch.rs` is a pure `plan_switch` plus executor and journal.
 - `src/usage/`: `transport.rs` `fetch()` order is positive TTL cache, `CSM_USAGE_CMD`, negative cooldown, `local::collect`. `local/api.rs` owns the one `http_client` builder.
 - `src/hook/`: two live tiers. Tier-0 `StopFailure` with `error: "rate_limit"` fires when a 429 ends the turn; tier-2 usage-% catches caps crossed during a successful turn. A subscription cap fires no hook (Claude Code parks the turn in an auto-retry wait), so `hook::run_from_statusline` runs the same classification off the statusLine tick; that is the operative path for weekly and model-scoped caps. A `week_fable`-only cap does not switch accounts: `detect::classify_with` relaunches the same session with a `--model` override (`fable_fallback_model`, gated by `CLAUDE_FABLE_FALLBACK` and a one-shot `<sid>.model-fallback` marker).
 - `src/platform/child.rs` holds every bounded run-with-timeout helper. State dir is `$XDG_STATE_HOME/csm` or `~/.local/state/csm` (`%LOCALAPPDATA%\csm` on Windows).
@@ -125,10 +125,14 @@ dependency/MSRV checks).
    - Offline writes go through the store-write protocol in `orca::store`
      (liveness at L0, L1 and L2; temp file, then rename; Orca appearing
      mid-write is handled, not ignored) and only when `schemaVersion` is 1,
-     the round-trip gate passes, the Orca version is in `TESTED`, and the
-     profile has no `profile-state.db` (`store::sqlite_gate`: from Orca
-     1.4.214 `orca-data.json` is then only an export, so those changes go
-     over RPC only).
+     the round-trip gate passes and the Orca version is in `TESTED`. A
+     profile with a `profile-state.db` (Orca 1.4.214+) is written in that
+     database only (`orca::statedb`: one `BEGIN IMMEDIATE` transaction on
+     the `settings` row, L1 inside it before `COMMIT`), never in its
+     `orca-data.json` export, and only when the database passes Orca's own
+     checks (schema 3, WAL, `quick_check`, row hashes, profile id, the
+     acceptance marker of a retained export). `store::preflight` runs
+     those checks read-only before a switch touches `D`.
    - Byte fidelity: a patch changes only the keys it names; stashes and
      Keychain items keep exact bytes; new records follow Orca's key order.
    - Never select "no account", never delete a credential csm cannot
@@ -247,10 +251,19 @@ is needed.
   its helpers follow Orca's source and have not been exercised on a real
   machine. The e2e harness runs on macOS and Linux only.
 - **Orca format drift.** csm ports Orca's private store format and account
-  logic. The port follows Orca v1.4.209 to v1.4.214, and offline writes are
-  allowed only for `TESTED` (`1.4`). Linux has no version source yet, so
-  Linux never writes the store offline (RPC only). A new Orca release needs
-  a `tools/orca-drift.sh` pass before `TESTED` grows.
+  logic. The port follows Orca v1.4.209 to v1.4.220 (the 1.4.214 to
+  1.4.220 drift touches none of the mirrored account, store or SQLite
+  files), and offline writes are allowed only for `TESTED` (`1.4`). Linux
+  reads the version from `resources/app.asar`'s `package.json`. The
+  SQLite write was verified once against a real Orca 1.4.218 on Linux
+  (stop, offline switch and back, start: Orca loaded the rows and answered
+  RPC with csm's active account); macOS and Windows SQLite profiles run the
+  same code but were not exercised live. A new Orca release needs a
+  `tools/orca-drift.sh` pass before `TESTED` grows.
+- **The automatic migration still defers SQLite store writes.**
+  `migrate/adopt.rs` keeps deferring an import or a first select on a
+  SQLite profile (and on Linux and Windows altogether) to a running Orca;
+  the manual `csm accounts import`/`use` work offline.
 - **Minimal-store creation is unverified against real Orca.** With Orca
   stopped and no store at all, `accounts add`/`import` write
   `store::MINIMAL_STORE` plus the account keys (`write_protocol` with

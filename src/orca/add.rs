@@ -425,7 +425,7 @@ fn offline_gate(env: &AccountsEnv<'_>) -> Result<(), OrcaError> {
             "this userData is not csm's to write".into(),
         ));
     }
-    store::sqlite_gate(env.data_file)
+    store::preflight(env.data_file)
 }
 
 fn lock(env: &AccountsEnv<'_>) -> Result<SwitchLock, OrcaError> {
@@ -1648,7 +1648,7 @@ mod tests {
     }
 
     #[test]
-    fn offline_adds_refuse_a_sqlite_backed_profile() {
+    fn offline_adds_refuse_an_unwritable_sqlite_profile_before_anything_runs() {
         let w = world();
         let store_before = std::fs::read(&w.choice.path).unwrap();
         std::fs::write(
@@ -1672,7 +1672,7 @@ mod tests {
             login_add(&w.env(&live), &cli).unwrap_err(),
             remove(&w.env(&live), "id-b").unwrap_err(),
         ] {
-            assert!(e.to_string().contains("SQLite"), "{e}");
+            assert!(e.to_string().contains("profile-state.db"), "{e}");
         }
         // Nothing ran, nothing was created.
         assert!(cli.calls.lock().unwrap().is_empty());
@@ -1683,6 +1683,40 @@ mod tests {
                 .count(),
             2
         );
+    }
+
+    #[test]
+    fn offline_import_and_remove_change_a_sqlite_profile_in_its_database() {
+        let w = world();
+        let export = std::fs::read(&w.choice.path).unwrap();
+        let db = crate::orca::testsupport::sqlite_profile(&w.choice, true);
+        let view = || store::load_view_choice(&w.choice).unwrap().unwrap().0;
+        let src = w.tmp.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join(".credentials.json"), creds_json("at-c", "rt-c", 5)).unwrap();
+        std::fs::write(
+            src.join(".claude.json"),
+            json!({"oauthAccount": oauth_json("u-c", "carol@example.com", None)}).to_string(),
+        )
+        .unwrap();
+        let cli = FakeClaude {
+            creds: String::new(),
+            status: "{}".into(),
+            calls: Mutex::new(Vec::new()),
+        };
+        let live = ScriptedLiveness::stopped();
+        let c = import(&w.env(&live), &cli, &src, None).unwrap();
+        let id = c.id.unwrap();
+        assert_eq!(view().accounts.len(), 3);
+        assert_eq!(view().accounts[2].id, id);
+        let c = remove(&w.env(&live), "id-b").unwrap();
+        assert_eq!(c.route, Route::Offline);
+        let ids: Vec<_> = view().accounts.iter().map(|a| a.id.clone()).collect();
+        assert_eq!(ids, vec!["id-a".to_owned(), id]);
+        assert_eq!(view().active_host_id(), Some("id-a"));
+        assert_eq!(db.meta("revision").as_deref(), Some("7"));
+        // The accepted export is never touched.
+        assert_eq!(std::fs::read(&w.choice.path).unwrap(), export);
     }
 
     /// Orca comes up during the login and does not confirm the import (no

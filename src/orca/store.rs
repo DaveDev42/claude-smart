@@ -36,9 +36,13 @@
 //!
 //! From Orca 1.4.214 on, a profile's store of record may be SQLite
 //! (`profile-state.db` beside `orca-data.json`, which is then an export
-//! pinned by a hash marker). The protocol refuses such a profile before it
-//! reads and again before the rename ([`sqlite_gate`]); those writes go
-//! through Orca's RPC only.
+//! pinned by a hash marker). For such a profile the protocol keeps the same
+//! L0/L1/L2 shape but the write is one SQLite transaction on the `settings`
+//! row ([`super::statedb::write_settings`]): L1 runs inside the
+//! transaction just before `COMMIT`, so Orca appearing there rolls it back.
+//! `orca-data.json` is never touched for such a profile (a changed byte
+//! would break Orca's acceptance marker), and a JSON write whose profile
+//! grows a database mid-write aborts ([`sqlite_gate`]).
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
@@ -225,22 +229,15 @@ const STATE_DB_NAME: &str = super::userdata::STATE_DB;
 /// The account view csm READS for `choice`: the SQLite store of record when
 /// the profile has `profile-state.db` (Orca 1.4.214+, where `orca-data.json`
 /// is only an export written at quit and may be stale or absent), else the
-/// JSON file. Read-only; every write path still goes through
-/// [`write_protocol`] and refuses a SQLite profile.
+/// JSON file. Read-only; every write goes through [`write_protocol`].
 pub fn load_view_choice(choice: &DataFileChoice) -> Result<Option<(StoreView, bool)>, OrcaError> {
     if choice.index_unreadable {
         return Err(OrcaError::Refused(INDEX_REFUSAL.into()));
     }
     let mut db_error = None;
     if let Some(db) = choice.state_db_files().first() {
-        match load_state_db_settings(db) {
-            Ok(Some(settings)) => {
-                let mut doc = Map::new();
-                doc.insert("settings".into(), settings);
-                return StoreView::from_value(&Value::Object(doc), false)
-                    .map(|v| Some((v, false)))
-                    .map_err(|e| OrcaError::Refused(e.to_string()));
-            }
+        match super::statedb::load_view(db) {
+            Ok(Some(v)) => return Ok(Some((v, false))),
             Ok(None) => {}
             Err(e) => db_error = Some(e),
         }
@@ -460,6 +457,51 @@ pub fn patch_settings(bytes: &[u8], patch: &Patch) -> Result<Vec<u8>, StoreError
     Ok(out)
 }
 
+/// [`patch_settings`] over a bare `settings` object: the payload of the
+/// `settings` row of `profile-state.db`. Pure. Refuses unless the payload
+/// passes the round-trip gate and is an object; the output differs from the
+/// input only inside the three account keys.
+pub fn patch_settings_payload(payload: &[u8], patch: &Patch) -> Result<Vec<u8>, StoreError> {
+    let original = parse_gated(payload)?;
+    if patch.is_empty() {
+        return Ok(payload.to_vec());
+    }
+    if let Some(a) = &patch.accounts {
+        check_accounts(a)?;
+    }
+    let wrap = |v: Value| {
+        let mut m = Map::new();
+        m.insert("settings".into(), v);
+        Value::Object(m)
+    };
+    let mut v = wrap(original.clone());
+    let settings = v
+        .get_mut("settings")
+        .and_then(Value::as_object_mut)
+        .ok_or(StoreError::NoSettings)?;
+    if let Some(a) = &patch.accounts {
+        settings.insert(KEY_ACCOUNTS.into(), Value::Array(a.clone()));
+    }
+    if let Some(id) = &patch.active_id {
+        settings.insert(
+            KEY_ACTIVE_ID.into(),
+            id.clone().map_or(Value::Null, Value::String),
+        );
+    }
+    if let Some(by) = &patch.active_by_runtime {
+        settings.insert(KEY_ACTIVE_BY_RUNTIME.into(), by.to_value());
+    }
+    let out = serde_json::to_vec(&v["settings"]).map_err(|_| StoreError::NotJson)?;
+    let reparsed = parse_gated(&out)?;
+    if strip_patch_keys(&wrap(reparsed.clone())) != strip_patch_keys(&wrap(original)) {
+        return Err(StoreError::BadPatch(
+            "patch changed a key outside the account keys".into(),
+        ));
+    }
+    StoreView::from_value(&wrap(reparsed), true)?;
+    Ok(out)
+}
+
 // ─── the store-write protocol ─────────────────────────────────────────────────
 
 /// The minimal store csm creates when none exists (design section 2).
@@ -493,10 +535,16 @@ pub fn preimage_dir(state: &Path) -> PathBuf {
 
 /// Save `bytes` as the newest store pre-image (0600) and prune old ones.
 fn save_preimage(state: &Path, bytes: &[u8]) -> Result<PathBuf, OrcaError> {
+    save_preimage_as(state, "orca-data.", bytes)
+}
+
+/// Save `bytes` as the newest pre-image named `<prefix><ms>.<pid>.json`
+/// (0600) and keep the newest [`PREIMAGES_KEPT`] of that prefix.
+fn save_preimage_as(state: &Path, prefix: &str, bytes: &[u8]) -> Result<PathBuf, OrcaError> {
     let dir = preimage_dir(state);
     fsx::create_dir_all(&dir, 0o700).map_err(|e| OrcaError::io("cannot create", &dir, e))?;
     let path = dir.join(format!(
-        "orca-data.{}.{}.json",
+        "{prefix}{}.{}.json",
         super::now_ms(),
         std::process::id()
     ));
@@ -508,7 +556,7 @@ fn save_preimage(state: &Path, bytes: &[u8]) -> Result<PathBuf, OrcaError> {
                 .filter(|p| {
                     p.file_name()
                         .and_then(|n| n.to_str())
-                        .is_some_and(|n| n.starts_with("orca-data.") && n.ends_with(".json"))
+                        .is_some_and(|n| n.starts_with(prefix) && n.ends_with(".json"))
                 })
                 .collect()
         })
@@ -533,12 +581,12 @@ fn stamp_now(path: &Path) -> Result<Option<FileStamp>, OrcaError> {
 pub const INDEX_REFUSAL: &str = "Orca's profile index (orca-profile-index.json) is unreadable; \
      Orca will not start until it is repaired, and csm cannot tell which profile's store is Orca's";
 
-/// The message every offline write refuses with when the profile keeps its
-/// state in SQLite (Orca 1.4.214 and later).
-pub const SQLITE_REFUSAL: &str = "Orca keeps this profile's state in SQLite (profile-state.db); \
-     orca-data.json is only its export, so csm changes it only through Orca: start Orca";
+/// The refusal of a JSON write whose profile gained a SQLite database
+/// (Orca 1.4.214 and later) while csm was writing.
+pub const SQLITE_REFUSAL: &str = "Orca moved this profile's state to SQLite (profile-state.db) \
+     while csm was writing orca-data.json; nothing was written";
 
-/// Refuse an offline write to a profile whose store of record is SQLite
+/// Refuse a JSON write to a profile whose store of record is SQLite
 /// ([`DataFileChoice::has_state_db`]).
 pub fn sqlite_gate(choice: &DataFileChoice) -> Result<(), OrcaError> {
     if choice.has_state_db() {
@@ -568,9 +616,14 @@ pub fn write_protocol(
         return Ok(StoreWrite::OrcaAtL0);
     }
 
-    // 2. load, gate, build. A SQLite-backed profile is never written, and
-    // never created beside its database.
-    sqlite_gate(choice)?;
+    // 2. load, gate, build. A SQLite-backed profile is written in its
+    // database, and no JSON is ever created beside it.
+    if choice.index_unreadable {
+        return Err(OrcaError::Refused(INDEX_REFUSAL.into()));
+    }
+    if choice.has_state_db() {
+        return write_protocol_db(choice, live, &base, state, build);
+    }
     let loaded = load_choice(choice)?;
     let (path, bytes, stamp) = match loaded {
         Some(f) if f.legacy => {
@@ -660,6 +713,84 @@ pub fn write_protocol(
         return Ok(StoreWrite::OrcaAtL2);
     }
     Ok(StoreWrite::Written)
+}
+
+/// Would an offline write to `choice` pass the store checks? For a
+/// SQLite-backed profile, the database checks of [`write_protocol`] made
+/// read-only ([`super::statedb::preflight`]); for a JSON profile, the
+/// loaded view's gate. Callers run it before they change anything outside
+/// the store. Writes nothing.
+pub fn preflight(choice: &DataFileChoice) -> Result<(), OrcaError> {
+    if choice.index_unreadable {
+        return Err(OrcaError::Refused(INDEX_REFUSAL.into()));
+    }
+    if choice.has_state_db() {
+        let db = choice
+            .state_db_files()
+            .into_iter()
+            .next()
+            .ok_or_else(|| OrcaError::Refused("no profile-state.db path".into()))?;
+        let json = load(&choice.path)?.map(|f| f.bytes);
+        return super::statedb::preflight(&db, &choice.profile_id, json.as_deref());
+    }
+    Ok(())
+}
+
+/// Steps 2 to 5 of [`write_protocol`] on a SQLite-backed profile: one
+/// transaction on the `settings` row of `profile-state.db`, with L1 as its
+/// last check before `COMMIT` and L2 after it.
+fn write_protocol_db(
+    choice: &DataFileChoice,
+    live: &dyn Liveness,
+    base: &LiveMark,
+    state: &Path,
+    build: &mut dyn FnMut(&StoreView) -> Result<Patch, OrcaError>,
+) -> Result<StoreWrite, OrcaError> {
+    let db = choice
+        .state_db_files()
+        .into_iter()
+        .next()
+        .ok_or_else(|| OrcaError::Refused("no profile-state.db path".into()))?;
+    // Orca's own offline writer requires a retained export to match the
+    // database's acceptance marker; read it as Orca does (whole file).
+    let json = load(&choice.path)?.map(|f| f.bytes);
+    let mut orca_at_l1 = false;
+    let r = super::statedb::write_settings(
+        &db,
+        &choice.profile_id,
+        json.as_deref(),
+        build,
+        &mut |payload, revision| {
+            save_preimage_as(
+                state,
+                &format!("profile-state-settings.r{revision}."),
+                payload.as_bytes(),
+            )
+            .map(|_| ())
+        },
+        &mut || {
+            // 3. L1, inside the transaction.
+            crate::e2e::point("store-L1");
+            let clear = live.mark().still_clear_of(base);
+            orca_at_l1 = !clear;
+            clear
+        },
+    )?;
+    match r {
+        super::statedb::DbWrite::Unchanged => Ok(StoreWrite::Unchanged),
+        super::statedb::DbWrite::Aborted if orca_at_l1 => Ok(StoreWrite::OrcaAtL1),
+        super::statedb::DbWrite::Aborted => Err(OrcaError::Refused(
+            "the write was rolled back; nothing was written".into(),
+        )),
+        super::statedb::DbWrite::Committed { .. } => {
+            // 5. L2
+            crate::e2e::point("store-L2");
+            if !live.mark().still_clear_of(base) {
+                return Ok(StoreWrite::OrcaAtL2);
+            }
+            Ok(StoreWrite::Written)
+        }
+    }
 }
 
 // ─── redo over RPC ────────────────────────────────────────────────────────────
@@ -1375,9 +1506,10 @@ mod tests {
     }
 
     #[test]
-    fn a_sqlite_backed_profile_is_never_written_or_created() {
+    fn a_broken_sqlite_family_is_refused_and_no_json_is_written() {
         // Orca 1.4.214's "both" state: any change to the JSON breaks its
-        // acceptance marker, so the store stays byte-identical.
+        // acceptance marker, so the JSON stays byte-identical even when the
+        // database cannot be written.
         for sfx in ["", "-wal", "-shm", "-journal"] {
             let f = fx();
             let before = std::fs::read(&f.choice.path).unwrap();
@@ -1388,9 +1520,10 @@ mod tests {
             std::fs::write(&db, b"").unwrap();
             assert!(f.choice.has_state_db());
             let live = ScriptedLiveness::stopped();
+            assert!(preflight(&f.choice).is_err());
             let e =
                 write_protocol(&f.choice, false, &live, None, &f.state, &mut select_b).unwrap_err();
-            assert!(e.to_string().contains("SQLite"), "{e}");
+            assert!(e.to_string().contains("profile-state.db"), "{e}");
             assert_eq!(std::fs::read(&f.choice.path).unwrap(), before);
             assert!(!preimage_dir(&f.state).exists());
         }
@@ -1414,8 +1547,115 @@ mod tests {
             &mut select_b,
         )
         .unwrap_err();
-        assert!(e.to_string().contains("SQLite"), "{e}");
+        assert!(e.to_string().contains("profile-state.db"), "{e}");
         assert!(!choice.path.exists());
+    }
+
+    #[test]
+    fn a_sqlite_backed_profile_is_written_in_its_database() {
+        use crate::orca::testsupport::sqlite_profile;
+        for keep_json in [true, false] {
+            let f = fx();
+            let json_before = std::fs::read(&f.choice.path).unwrap();
+            let db = sqlite_profile(&f.choice, keep_json);
+            assert!(preflight(&f.choice).is_ok());
+            let live = ScriptedLiveness::stopped();
+            let r = write_protocol(&f.choice, false, &live, None, &f.state, &mut select_b).unwrap();
+            assert_eq!(r, StoreWrite::Written);
+            assert_eq!(live.checks(), 3, "L0, L1, L2");
+            let (v, _) = load_view_choice(&f.choice).unwrap().unwrap();
+            assert_eq!(v.active_host_id(), Some("id-b"));
+            assert_eq!(v.accounts.len(), 2);
+            assert_eq!(db.meta("revision").as_deref(), Some("6"));
+            // The export is never touched, and never created.
+            if keep_json {
+                assert_eq!(std::fs::read(&f.choice.path).unwrap(), json_before);
+            } else {
+                assert!(!f.choice.path.exists());
+            }
+            // The pre-image is the old settings payload.
+            let names = dir_names(&preimage_dir(&f.state));
+            assert_eq!(names.len(), 1);
+            assert!(
+                names[0].starts_with("profile-state-settings.r5."),
+                "{names:?}"
+            );
+            let pre = std::fs::read(preimage_dir(&f.state).join(&names[0])).unwrap();
+            let pre: Value = serde_json::from_slice(&pre).unwrap();
+            assert_eq!(pre[KEY_ACTIVE_ID], "id-a");
+            // Again: unchanged, no revision spent.
+            let r = write_protocol(&f.choice, false, &live, None, &f.state, &mut select_b).unwrap();
+            assert_eq!(r, StoreWrite::Unchanged);
+            assert_eq!(db.meta("revision").as_deref(), Some("6"));
+        }
+    }
+
+    #[test]
+    fn orca_appearing_around_a_database_write() {
+        use crate::orca::testsupport::sqlite_profile;
+        let active = |f: &Fx| {
+            load_view_choice(&f.choice)
+                .unwrap()
+                .unwrap()
+                .0
+                .active_host_id()
+                .map(str::to_owned)
+        };
+        // L0: nothing read, nothing written.
+        let f = fx();
+        let db = sqlite_profile(&f.choice, true);
+        let rows = db.rows();
+        let r = write_protocol(
+            &f.choice,
+            false,
+            &ScriptedLiveness::appears_at(0),
+            None,
+            &f.state,
+            &mut select_b,
+        )
+        .unwrap();
+        assert_eq!(r, StoreWrite::OrcaAtL0);
+        assert_eq!(db.rows(), rows);
+        // L1 (inside the transaction, before COMMIT): rolled back.
+        let r = write_protocol(
+            &f.choice,
+            false,
+            &ScriptedLiveness::appears_at(1),
+            None,
+            &f.state,
+            &mut select_b,
+        )
+        .unwrap();
+        assert_eq!(r, StoreWrite::OrcaAtL1);
+        assert_eq!(db.rows(), rows);
+        assert_eq!(db.meta("revision").as_deref(), Some("5"));
+        assert_eq!(active(&f).as_deref(), Some("id-a"));
+        // L2: committed; the caller redoes over RPC.
+        let r = write_protocol(
+            &f.choice,
+            false,
+            &ScriptedLiveness::appears_at(2),
+            None,
+            &f.state,
+            &mut select_b,
+        )
+        .unwrap();
+        assert_eq!(r, StoreWrite::OrcaAtL2);
+        assert_eq!(active(&f).as_deref(), Some("id-b"));
+    }
+
+    #[test]
+    fn a_database_whose_export_diverged_is_refused() {
+        use crate::orca::testsupport::sqlite_profile;
+        let f = fx();
+        let db = sqlite_profile(&f.choice, true);
+        std::fs::write(&f.choice.path, br#"{"schemaVersion":1,"settings":{}}"#).unwrap();
+        let rows = db.rows();
+        assert!(preflight(&f.choice).is_err());
+        let live = ScriptedLiveness::stopped();
+        let e = write_protocol(&f.choice, false, &live, None, &f.state, &mut select_b).unwrap_err();
+        assert!(e.to_string().contains("acceptance"), "{e}");
+        assert_eq!(db.rows(), rows);
     }
 
     #[test]

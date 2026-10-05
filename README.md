@@ -53,9 +53,11 @@ the way Orca would:
 - With Orca stopped, csm runs a port of Orca's switch. It writes the same
   files and Keychain items Orca would, so the next Orca start finds a state
   Orca itself could have produced. Once Orca 1.4.214 or later has run, it
-  keeps its state in SQLite (`profile-state.db`), and every change
-  (`accounts use`, `add`, `import`, `rm`, and the limit switch) needs Orca
-  running. `csm orca status` shows which case applies.
+  keeps its state in SQLite (`profile-state.db`); csm then reads and writes
+  the `settings` document in that database the way Orca's own offline
+  writer does, and leaves `orca-data.json` (only Orca's export) alone.
+  `csm orca status` shows which case applies and whether an offline write
+  would be accepted.
 
 One account is active per machine at a time. Every claude csm starts runs
 in `D`, so all sessions on a machine share the active account.
@@ -887,20 +889,31 @@ and Linux, and `%LOCALAPPDATA%\csm` on Windows.
 
 ## Verified Orca versions
 
-csm's port follows Orca's source at v1.4.209 through v1.4.214. It writes
-Orca's store offline only for Orca 1.4.x (read from the app bundle on
-macOS and from `Orca.exe` on Windows), and only while the profile has no
-`profile-state.db`; otherwise it uses RPC only. The end-to-end harness
-models Orca 1.4.214.
+csm's port follows Orca's source at v1.4.209 through v1.4.220
+(`tools/orca-drift.sh v1.4.214 v1.4.220` shows no change to the account,
+store or SQLite code csm mirrors). It writes Orca's store offline only for
+Orca 1.4.x, read from the app bundle on macOS, from `Orca.exe` on Windows,
+and from the `package.json` packed in `resources/app.asar` on Linux
+(`/opt/Orca` for the `.deb`, or beside the running `orca-ide`); an
+unknown or other version means RPC only. The end-to-end harness models
+Orca 1.4.214.
 
 From 1.4.214 Orca keeps its state in SQLite and writes `orca-data.json`
-only as an export when it quits cleanly. csm never writes such an export,
-so with Orca stopped a switch, add, import or rm is refused with a line
-saying to start Orca. While Orca runs, csm reads the
-account list over RPC (`csm usage`, and the supervisor's limit switch);
-`csm hook` and `csm statusline` never make RPC calls, so they read the
-export, which can lag until Orca next quits. `csm accounts doctor` lists
-what it finds in an export but does not repair it; start Orca and check
+only as an export. With Orca stopped, csm reads the account list from
+`profile-state.db` (read-only, so a stopped Orca's `-wal` is honoured), and
+a switch, add, import or rm changes the `settings` row there in one
+`BEGIN IMMEDIATE` transaction: the profile revision is bumped and the row's
+revision, `updated_at` and sha-256 `content_hash` are set as Orca's
+`writeProfileStateDomains` sets them, and only the three account keys of
+the payload change. csm refuses the database (and changes nothing) unless
+its schema is the one Orca 1.4.214 to 1.4.220 writes (`user_version` 3,
+WAL), its integrity check passes, its rows validate, it belongs to the
+profile, and a retained `orca-data.json` still matches the database's
+acceptance marker. A last liveness check runs inside the transaction, so
+Orca starting at that moment rolls the write back and csm hands the change
+to Orca's RPC. `csm hook` and `csm statusline` read the same database
+read-only. `csm accounts doctor` lists an orphan stash on a SQLite profile
+but removes it only after Orca has checked it; start Orca and check
 again first. csm never creates a missing store while Orca's backups
 (`.bak.N`, retained exports or database backups) are still there, since
 Orca restores from them on its next start. It also refuses every offline

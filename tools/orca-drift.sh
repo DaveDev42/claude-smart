@@ -59,6 +59,24 @@ PATHS=(
   src/main/persistence/loading-store/store.ts
   src/main/persistence/loading-store/user-data-path.ts
   src/main/persistence/profile-state/profile-state-active-location.ts
+  # The SQLite store of record (1.4.214+): schema, row validation, the
+  # revision fence, the write transaction, the legacy-JSON acceptance
+  # marker, and Orca's own offline settings writer that csm's
+  # statedb::write_settings mirrors.
+  src/main/persistence/profile-state/profile-state-database.ts
+  src/main/persistence/profile-state/profile-state-database-schema.ts
+  src/main/persistence/profile-state/profile-state-database-validation.ts
+  src/main/persistence/profile-state/profile-state-documents.ts
+  src/main/persistence/profile-state/profile-state-document-validation.ts
+  src/main/persistence/profile-state/profile-state-domain-reader.ts
+  src/main/persistence/profile-state/profile-state-domain-writes.ts
+  src/main/persistence/profile-state/profile-state-domain-write-validation.ts
+  src/main/persistence/profile-state/profile-state-revision.ts
+  src/main/persistence/profile-state/profile-state-write-transaction.ts
+  src/main/persistence/profile-state/profile-state-storage-classification.ts
+  src/main/persistence/profile-state/profile-state-offline-settings.ts
+  src/main/persistence/profile-state/legacy-json/profile-state-json-acceptance.ts
+  src/shared/profile-state-storage-paths.ts
   src/main/orca-profiles/profile-index-store.ts
   src/main/orca-profiles/profile-storage-paths.ts
   src/shared/orca-profiles.ts

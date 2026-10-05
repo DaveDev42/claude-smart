@@ -590,12 +590,13 @@ fn switch_locked_if(
         Err("the installed Orca version is not one csm was tested with".to_owned())
     } else if !env.store_access_allowed {
         Err("this userData is not csm's to write".to_owned())
-    } else if env.data_file.has_state_db() {
-        Err(store::SQLITE_REFUSAL.to_owned())
     } else {
         match &view {
             None => Err("no Orca store".to_owned()),
-            Some(v) => v.writable().map_err(|e| e.to_string()),
+            Some(v) => v
+                .writable()
+                .map_err(|e| e.to_string())
+                .and_then(|()| store::preflight(env.data_file).map_err(|e| e.to_string())),
         }
     };
     let rec = view.as_ref().and_then(|v| v.account(target)).cloned();
@@ -2152,7 +2153,7 @@ mod tests {
     }
 
     #[test]
-    fn a_sqlite_backed_store_refuses_the_offline_switch_before_touching_d() {
+    fn an_unwritable_sqlite_store_refuses_the_offline_switch_before_touching_d() {
         let w = World::new(None);
         let store_before = std::fs::read(&w.choice.path).unwrap();
         std::fs::write(
@@ -2165,10 +2166,32 @@ mod tests {
         let live = ScriptedLiveness::stopped();
         let http = FakeHttp::default();
         let e = switch(&w.env(&live, &http), "id-b").unwrap_err();
-        assert!(e.to_string().contains("SQLite"), "{e}");
+        assert!(e.to_string().contains("profile-state.db"), "{e}");
         assert_eq!(std::fs::read(&w.choice.path).unwrap(), store_before);
         assert_eq!(w.d_creds(), a_creds());
         assert!(read_journal(&w.state).is_none());
+    }
+
+    #[test]
+    fn an_offline_switch_on_a_sqlite_store_writes_the_database() {
+        let w = World::new(None);
+        let export = std::fs::read(&w.choice.path).unwrap();
+        let db = crate::orca::testsupport::sqlite_profile(&w.choice, true);
+        let live = ScriptedLiveness::stopped();
+        let http = FakeHttp::default();
+        let r = switch(&w.env(&live, &http), "id-b").unwrap();
+        assert_eq!(r.outcome, Outcome::Switched);
+        assert_eq!(w.d_creds(), b_creds());
+        let v = store::load_view_choice(&w.choice).unwrap().unwrap().0;
+        assert_eq!(v.active_host_id(), Some("id-b"));
+        assert_eq!(db.meta("revision").as_deref(), Some("6"));
+        assert_eq!(std::fs::read(&w.choice.path).unwrap(), export);
+        // And back.
+        let r = switch(&w.env(&live, &http), "id-a").unwrap();
+        assert_eq!(r.outcome, Outcome::Switched);
+        assert_eq!(w.d_creds(), a_creds());
+        let v = store::load_view_choice(&w.choice).unwrap().unwrap().0;
+        assert_eq!(v.active_host_id(), Some("id-a"));
     }
 
     #[test]

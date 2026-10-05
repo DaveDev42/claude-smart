@@ -84,9 +84,12 @@ pub struct OrcaView {
     pub version_ok: bool,
     pub schema_version: Option<String>,
     /// The profile keeps its state in SQLite (Orca 1.4.214+): the store
-    /// read above is Orca's export and may lag the database; csm never
-    /// writes it offline.
+    /// above was read from `profile-state.db`, and an offline write goes
+    /// there (`orca-data.json` is only Orca's export).
     pub sqlite_state: bool,
+    /// Orca stopped and the profile is SQLite-backed: why csm's offline
+    /// write would refuse its database (`store::preflight`), if it would.
+    pub db_write_error: Option<String>,
 }
 
 impl OrcaView {
@@ -102,7 +105,7 @@ impl OrcaView {
         !self.running
             && self.user_data.store_access_allowed()
             && self.version_ok
-            && !self.sqlite_state
+            && self.db_write_error.is_none()
             && self.store.as_ref().is_some_and(|s| s.writable().is_ok())
             && self.store_error.is_none()
     }
@@ -197,6 +200,9 @@ pub fn snapshot_with(env: &HostEnv, opts: &SnapshotOptions, facts: &dyn ProcFact
     OrcaView {
         schema_version: store.as_ref().and_then(|s| s.schema_version.clone()),
         sqlite_state: data_file.has_state_db(),
+        db_write_error: (!running && data_file.has_state_db())
+            .then(|| store::preflight(&data_file).err().map(|e| e.to_string()))
+            .flatten(),
         user_data,
         store,
         store_error,
@@ -296,7 +302,8 @@ mod tests {
             Some(UuidMatch::Unique("id-b".into()))
         );
         assert!(v.store.as_ref().unwrap().writable().is_ok());
-        // Linux has no version source yet: offline writes stay off.
+        // No Orca install under test: the version is unknown, so offline
+        // writes stay off.
         assert!(!v.version_ok && !v.offline_write_allowed());
     }
 
