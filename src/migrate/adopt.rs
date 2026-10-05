@@ -38,17 +38,18 @@ pub(crate) enum RowAction {
     Import,
     /// Offline read-back into the account's stash (no store write).
     ReadBack(String),
-    /// The import patches a SQLite-backed store, which csm changes only
-    /// through a running Orca: left for `csm accounts import <dir>` then.
+    /// The import patches a SQLite-backed store whose database fails
+    /// csm's offline checks: left for a running Orca.
     Defer,
     Skip,
 }
 
-/// Step 4's action for a row; `sqlite`: the profile keeps its state in
-/// SQLite. Pure.
-pub(crate) fn row_action(status: &Status, sqlite: bool) -> RowAction {
+/// Step 4's action for a row; `sqlite_blocked`: the profile keeps its
+/// state in SQLite and its database fails the offline write's checks
+/// (`OrcaView::db_write_error`). Pure.
+pub(crate) fn row_action(status: &Status, sqlite_blocked: bool) -> RowAction {
     match status {
-        Status::ToImport if sqlite => RowAction::Defer,
+        Status::ToImport if sqlite_blocked => RowAction::Defer,
         Status::ToImport => RowAction::Import,
         Status::InOrca {
             id,
@@ -170,28 +171,31 @@ pub(crate) enum ImportAction {
 
 /// A1's route. A running Orca takes the import over RPC whatever its
 /// store; a stopped one is written only through the offline protocol's
-/// gates (the tested version, a JSON store, store access), never on Linux,
-/// which has no Orca version source yet, and never on Windows, whose Orca
-/// detection is inferred. The offline import re-checks each
-/// gate under its lock; this is the decision the report shows. Pure.
+/// gates (the tested version, store access, and for a SQLite profile a
+/// database that passes the offline write's checks), on macOS and Linux
+/// (which reads the Orca version from `app.asar`), never on Windows, whose
+/// Orca detection has not been exercised with Orca stopped. The offline
+/// import re-checks each gate under its lock (the SQLite one inside its
+/// transaction); this is the decision the report shows. `sqlite_blocked`:
+/// as for [`row_action`]. Pure.
 pub(crate) fn import_action(
     orca_running: bool,
     os: HostOs,
-    sqlite: bool,
+    sqlite_blocked: bool,
     version_ok: bool,
     store_access_allowed: bool,
 ) -> ImportAction {
     if orca_running {
         ImportAction::Rpc
-    } else if os == HostOs::Linux {
-        ImportAction::Defer("Orca is stopped and csm changes its store on Linux only through it")
     } else if os == HostOs::Windows {
-        // Orca detection on Windows is inferred (design section 6): an
-        // automatic store write behind an Orca csm failed to see would
-        // break Invariant 6.
+        // An automatic store write behind an Orca csm failed to see would
+        // break Invariant 6; the manual `accounts` verbs write offline.
         ImportAction::Defer("Orca is stopped and csm changes its store on Windows only through it")
-    } else if sqlite {
-        ImportAction::Defer("Orca keeps its state in SQLite, so the import waits for Orca to run")
+    } else if sqlite_blocked {
+        ImportAction::Defer(
+            "Orca keeps its state in SQLite and its database does not pass csm's offline checks \
+             now (`csm orca status` says why), so the import waits for Orca to run",
+        )
     } else if !version_ok {
         ImportAction::Defer(
             "the installed Orca version is not one csm was tested with; the import waits for Orca to run",
@@ -230,7 +234,8 @@ pub(crate) struct ActiveFacts<'a> {
     pub floor: Option<&'a Status>,
     pub orca_running: bool,
     pub os: HostOs,
-    pub sqlite: bool,
+    /// As for [`row_action`].
+    pub sqlite_blocked: bool,
     pub version_ok: bool,
     pub store_access_allowed: bool,
     /// csm's `D` is the floor profile's dir, where Orca runs once started
@@ -278,17 +283,14 @@ pub(crate) fn active_action(f: &ActiveFacts<'_>) -> ActiveAction {
     }
     if f.orca_running {
         ActiveAction::Select(id)
-    } else if f.os == HostOs::Linux {
-        ActiveAction::Defer(
-            "Orca has no active account; csm selects one on Linux only through a running Orca",
-        )
     } else if f.os == HostOs::Windows {
         ActiveAction::Defer(
             "Orca has no active account; csm selects one on Windows only through a running Orca",
         )
-    } else if f.sqlite {
+    } else if f.sqlite_blocked {
         ActiveAction::Defer(
-            "Orca has no active account and keeps its state in SQLite; csm selects one once Orca runs",
+            "Orca has no active account and its SQLite database does not pass csm's offline \
+             checks now; csm selects one once Orca runs",
         )
     } else if !f.version_ok || !f.store_access_allowed {
         ActiveAction::Defer(
@@ -414,6 +416,12 @@ fn same_dir(a: &Path, b: &Path) -> bool {
     let trim = |p: &Path| PathBuf::from(p.to_string_lossy().trim_end_matches(['/', '\\']));
     let canon = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| trim(p));
     trim(a) == trim(b) || canon(a) == canon(b)
+}
+
+/// A stopped Orca's SQLite database fails the offline write's checks
+/// (`store::preflight`): the store-writing steps wait for Orca.
+fn sqlite_blocked(view: &OrcaView) -> bool {
+    view.sqlite_state && view.db_write_error.is_some()
 }
 
 fn snapshot() -> anyhow::Result<OrcaView> {
@@ -551,7 +559,7 @@ pub(crate) fn adopt(
                 let action = import_action(
                     view.running,
                     ctx.os(),
-                    view.sqlite_state,
+                    sqlite_blocked(&view),
                     view.version_ok,
                     store_access,
                 );
@@ -703,7 +711,7 @@ pub(crate) fn adopt(
         floor: floor_status.as_ref(),
         orca_running: view.running,
         os: ctx.os(),
-        sqlite: view.sqlite_state,
+        sqlite_blocked: sqlite_blocked(&view),
         version_ok: view.version_ok,
         store_access_allowed: store_access,
         d_is_floor,
@@ -807,26 +815,22 @@ mod tests {
             assert_eq!(import_action(true, os, true, false, false), Rpc);
             assert_eq!(import_action(true, os, false, true, true), Rpc);
         }
-        // Orca down, JSON store, tested version: offline on macOS only.
-        // Linux has no version source; Windows Orca detection is inferred,
-        // so an automatic store write there waits for a running Orca.
-        assert_eq!(
-            import_action(false, HostOs::MacOs, false, true, true),
-            Offline
-        );
+        // Orca down, a writable store (JSON or a SQLite database that
+        // passes the checks), tested version: offline on macOS and Linux.
+        for os in [HostOs::MacOs, HostOs::Linux] {
+            assert_eq!(import_action(false, os, false, true, true), Offline);
+        }
+        // Windows waits for a running Orca.
         assert!(
             matches!(import_action(false, HostOs::Windows, false, true, true), Defer(w) if w.contains("Windows"))
         );
-        assert!(matches!(
-            import_action(false, HostOs::Linux, false, true, true),
-            Defer(_)
-        ));
-        // SQLite, untested version, no store access: deferred.
+        // A SQLite database the offline write refuses, an untested
+        // version, no store access: deferred.
         assert!(
             matches!(import_action(false, HostOs::MacOs, true, true, true), Defer(w) if w.contains("SQLite"))
         );
         assert!(
-            matches!(import_action(false, HostOs::MacOs, false, false, true), Defer(w) if w.contains("version"))
+            matches!(import_action(false, HostOs::Linux, false, false, true), Defer(w) if w.contains("version"))
         );
         assert!(matches!(
             import_action(false, HostOs::MacOs, false, true, false),
@@ -840,7 +844,7 @@ mod tests {
             floor,
             orca_running: false,
             os: HostOs::MacOs,
-            sqlite: false,
+            sqlite_blocked: false,
             version_ok: true,
             store_access_allowed: true,
             d_is_floor: true,
@@ -873,22 +877,30 @@ mod tests {
             active_action(&facts(None, Some(&Status::NoCredentials))),
             ActiveAction::NoFloorAccount
         );
-        // Orca up: RPC, even on SQLite.
+        // Orca up: RPC, even on a SQLite database csm would not write.
         let up = ActiveFacts {
             orca_running: true,
-            sqlite: true,
+            sqlite_blocked: true,
             d_is_floor: false,
             ..facts(None, Some(&in_orca))
         };
         assert_eq!(active_action(&up), ActiveAction::Select("acct-work".into()));
-        // Orca down: SQLite, Linux, untested, or a D the floor does not name defer.
+        // Orca down on Linux, or on a SQLite database that passes the
+        // checks: selected offline.
         for f in [
             ActiveFacts {
-                sqlite: true,
+                os: HostOs::Linux,
                 ..facts(None, Some(&in_orca))
             },
+            facts(None, Some(&in_orca)),
+        ] {
+            assert_eq!(active_action(&f), ActiveAction::Select("acct-work".into()));
+        }
+        // Orca down: a refused SQLite database, untested, or a D the floor
+        // does not name defer.
+        for f in [
             ActiveFacts {
-                os: HostOs::Linux,
+                sqlite_blocked: true,
                 ..facts(None, Some(&in_orca))
             },
             ActiveFacts {

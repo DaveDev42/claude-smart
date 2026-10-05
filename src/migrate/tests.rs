@@ -1003,12 +1003,12 @@ fn session_floor_is_inert_under_test() {
     assert_eq!(session_floor().unwrap(), None);
 }
 
-/// A SQLite-backed Orca profile used to deadlock `migrate import`: the
-/// write gate needs Orca stopped and the SQLite gate needed it running.
-/// Now only the store-patching steps (the import, the floor switch) are
-/// deferred to a running Orca; read-backs still run offline.
+/// A SQLite-backed Orca profile whose database fails the offline write's
+/// checks defers only the store-patching steps (the import, the floor
+/// switch) to a running Orca; read-backs still run offline. A database
+/// that passes them is written offline like a JSON store.
 #[test]
-fn a_sqlite_profile_defers_only_the_store_writes() {
+fn a_blocked_sqlite_profile_defers_only_the_store_writes() {
     let fresher = Status::InOrca {
         id: "acct-a".into(),
         fresher: Some(true),

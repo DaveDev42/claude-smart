@@ -1019,8 +1019,10 @@ sc_auto_crash() {
   done
 }
 
-# Orca stopped with a SQLite-backed profile and no active account: csm
-# cannot import or select offline, so it exits 75; with Orca up, 0.
+# Orca stopped with a SQLite-backed profile whose database fails csm's
+# offline checks (here a bare header) and no active account: csm cannot
+# import or select offline, so it exits 75; with Orca up, 0. A database
+# that passes them is written offline (unit tests in orca::add/switch).
 sc_auto_sqlite() {
   legacy_world
   set_dirs
