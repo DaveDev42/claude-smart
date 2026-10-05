@@ -246,15 +246,18 @@ is needed.
   bound the damage if the assumption is wrong, but a test with a
   throwaway account (two sessions, a switch, a forced expiry) has not been
   run.
-- **Windows with Orca stopped is unexercised.** With Orca running, the
+- **Windows with Orca stopped is only partly exercised.** With Orca running, the
   named pipe, telling `Orca.exe` from its helpers (every helper carries
   `--type=` or a `.js` entry, the `daemon-host` copy included) and the
   version from the executable's `VS_VERSIONINFO` were checked on a real
   machine (a raw scan for `0xFEEF04BD` used to hit Chromium code and read a
-  garbage version, refusing every offline write). Orca stopped (no
-  `SingletonLock`, the plain-file stash, the offline SQLite write) has not
-  been run there, so the automatic migration keeps A1, A2, A3 and the
-  cutover's offline `D` write on RPC on Windows. The e2e harness runs on
+  garbage version, refusing every offline write). With Orca stopped,
+  0.4.8 on a real Windows Orca 1.4.220 (2026-10-05) read the store
+  (`accounts 2 (store)`, `offline writes allowed`), switched the active
+  account offline and back, and served `usage --json` for both accounts;
+  the restarted Orca answered RPC with the original active account. The
+  automatic migration still keeps A1, A2, A3 and the cutover's offline `D`
+  write on RPC on Windows, since no Windows host has run it offline. The e2e harness runs on
   macOS and Linux only.
 - **Orca format drift.** csm ports Orca's private store format and account
   logic. The port follows Orca v1.4.209 to v1.4.220 (the 1.4.214 to
@@ -264,8 +267,8 @@ is needed.
   SQLite write was verified against a real Orca 1.4.218 on Linux and
   1.4.220 on macOS (stop, offline switch and back, on macOS also a
   `doctor --fix` orphan removal, start: Orca loaded the rows and answered
-  RPC with the original active account); Windows SQLite profiles run the
-  same code but were not exercised with Orca stopped. A new Orca release
+  RPC with the original active account), and the offline switch and back
+  on 1.4.220 on Windows (no `doctor --fix` run there). A new Orca release
   needs a `tools/orca-drift.sh` pass before `TESTED` grows.
 - **The automatic migration's offline SQLite path is unit-tested only.**
   `migrate/adopt.rs` imports and selects offline on a SQLite profile (macOS
