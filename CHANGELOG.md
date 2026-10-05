@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.4.7](https://github.com/DaveDev42/claude-smart/compare/v0.4.6...v0.4.7) (2026-10-05)
+
+
+### Features
+
+* **orca:** write SQLite profiles offline and read the Linux Orca version ([9d23531](https://github.com/DaveDev42/claude-smart/commit/9d235312134e822101ab9495df0549b10668c5bd))
+
+
+### Bug Fixes
+
+* **orca:** read the offline account list from profile-state.db ([e06b651](https://github.com/DaveDev42/claude-smart/commit/e06b651696b2ae1b93c97aca0386f2514c2fa28c))
+
 ## [0.4.6](https://github.com/DaveDev42/claude-smart/compare/v0.4.5...v0.4.6) (2026-10-02)
 
 
