@@ -143,10 +143,10 @@ impl AccountSet {
         let ud = userdata::resolve(env, live_pid);
         let paths =
             runtime::runtime_paths(env.claude_config_dir.as_deref(), &env.home, |p| p.exists());
-        let view = store::load_choice(&userdata::data_file(&ud.dir))
+        let view = store::load_view_choice(&userdata::data_file(&ud.dir))
             .ok()
             .flatten()
-            .and_then(|f| StoreView::from_bytes(&f.bytes).ok());
+            .map(|(v, _)| v);
         let live = rpc_timeout
             .filter(|_| ud.store_access_allowed() && live_pid(&ud.dir))
             .and_then(|t| rpc::accounts_list(&ud.dir, false, t).ok());
@@ -545,6 +545,27 @@ mod tests {
         assert_eq!(set.current_uuid.as_deref(), Some("u-new"));
         assert_eq!(set.label("id-new"), "carol");
         assert_eq!(set.active.as_deref(), Some("id-a"));
+    }
+
+    /// Orca stopped, SQLite profile, no `orca-data.json` at all (a headless
+    /// Orca never writes the export): the account list and the active id
+    /// come from `profile-state.db`.
+    #[test]
+    fn a_sqlite_profile_without_an_export_lists_its_accounts() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        let mut env = HostEnv::for_test(home, HostOs::Linux);
+        env.claude_config_dir = Some(home.join("claude-d").to_string_lossy().into_owned());
+        let ud = home.join(".config/orca");
+        crate::orca::testsupport::write_state_db(
+            &ud,
+            "local-default",
+            r#"{"claudeManagedAccounts":[{"id":"id-a","email":"alice@example.com","managedAuthRuntime":"host"},{"id":"id-b","email":"bob@example.com","managedAuthRuntime":"host"},{"id":"id-w","email":"w@example.com","managedAuthRuntime":"wsl"}],"activeClaudeManagedAccountId":"id-b","activeClaudeManagedAccountIdsByRuntime":{"host":"id-b","wsl":null}}"#,
+        );
+        assert!(!ud.join("profiles/local-default/orca-data.json").exists());
+        let set = AccountSet::load_with(&env);
+        assert_eq!(set.ids_sorted(), vec!["id-a", "id-b"]);
+        assert_eq!(set.active.as_deref(), Some("id-b"));
     }
 
     /// Orca's live list: every record it names, with the store's

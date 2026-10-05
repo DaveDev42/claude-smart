@@ -168,6 +168,91 @@ pub fn load_choice(choice: &DataFileChoice) -> Result<Option<StoreFile>, OrcaErr
     }
 }
 
+// ─── SQLite store of record (Orca 1.4.214+) ─────────────────────────────────
+
+/// Table and domain of the `settings` document inside `profile-state.db`.
+const STATE_TABLE_QUERY: &str =
+    "SELECT payload FROM profile_state_documents WHERE domain = 'settings'";
+
+/// Read the `settings` document of `profile-state.db` read-only.
+///
+/// The connection is `SQLITE_OPEN_READ_ONLY` (the `mode=ro` of a URI open),
+/// never `immutable`: a stopped Orca leaves its newest rows in the `-wal`
+/// file and only a normal read-only connection replays them. csm never
+/// writes the database. `None` when the file is absent or has no `settings`
+/// document; an unreadable or malformed database is an error.
+pub fn load_state_db_settings(db: &Path) -> Result<Option<Value>, OrcaError> {
+    use rusqlite::{Connection, OpenFlags, types::ValueRef};
+    match std::fs::symlink_metadata(db) {
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(OrcaError::io("cannot stat", db, e)),
+    }
+    let bad = |what: &str| OrcaError::Refused(format!("{}: {what}", STATE_DB_NAME));
+    let conn = Connection::open_with_flags(
+        db,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(|_| bad("cannot open read-only"))?;
+    let _ = conn.busy_timeout(Duration::from_secs(2));
+    let mut stmt = match conn.prepare(STATE_TABLE_QUERY) {
+        Ok(s) => s,
+        // No such table (an empty file): nothing to read. Anything else
+        // (not a database, I/O error) is an error.
+        Err(e) if e.to_string().contains("no such table") => return Ok(None),
+        Err(_) => return Err(bad("cannot read settings")),
+    };
+    let mut rows = stmt.query([]).map_err(|_| bad("cannot read settings"))?;
+    let Some(row) = rows.next().map_err(|_| bad("cannot read settings"))? else {
+        return Ok(None);
+    };
+    let payload: Vec<u8> = match row.get_ref(0).map_err(|_| bad("cannot read settings"))? {
+        ValueRef::Text(b) | ValueRef::Blob(b) => b.to_vec(),
+        _ => return Err(bad("settings payload is not text")),
+    };
+    if payload.len() as u64 > STORE_CAP {
+        return Err(bad("settings payload too large"));
+    }
+    let v: Value = serde_json::from_slice(&payload).map_err(|_| bad("settings is not JSON"))?;
+    if !v.is_object() {
+        return Err(bad("settings is not a JSON object"));
+    }
+    Ok(Some(v))
+}
+
+const STATE_DB_NAME: &str = super::userdata::STATE_DB;
+
+/// The account view csm READS for `choice`: the SQLite store of record when
+/// the profile has `profile-state.db` (Orca 1.4.214+, where `orca-data.json`
+/// is only an export written at quit and may be stale or absent), else the
+/// JSON file. Read-only; every write path still goes through
+/// [`write_protocol`] and refuses a SQLite profile.
+pub fn load_view_choice(choice: &DataFileChoice) -> Result<Option<(StoreView, bool)>, OrcaError> {
+    if choice.index_unreadable {
+        return Err(OrcaError::Refused(INDEX_REFUSAL.into()));
+    }
+    let mut db_error = None;
+    if let Some(db) = choice.state_db_files().first() {
+        match load_state_db_settings(db) {
+            Ok(Some(settings)) => {
+                let mut doc = Map::new();
+                doc.insert("settings".into(), settings);
+                return StoreView::from_value(&Value::Object(doc), false)
+                    .map(|v| Some((v, false)))
+                    .map_err(|e| OrcaError::Refused(e.to_string()));
+            }
+            Ok(None) => {}
+            Err(e) => db_error = Some(e),
+        }
+    }
+    match load_choice(choice)? {
+        Some(f) => StoreView::from_bytes(&f.bytes)
+            .map(|v| Some((v, f.legacy)))
+            .map_err(|e| OrcaError::Refused(e.to_string())),
+        None => db_error.map_or(Ok(None), Err),
+    }
+}
+
 // ─── parse + gate ─────────────────────────────────────────────────────────────
 
 /// Parse `bytes` as a JSON object with order and number text preserved.
@@ -913,6 +998,79 @@ mod tests {
             !format!("{f:?}").contains("schemaVersion"),
             "Debug prints no content"
         );
+    }
+
+    // ─── SQLite store of record ───────────────────────────────────────────
+
+    const DB_SETTINGS: &str = r#"{"claudeManagedAccounts":[{"id":"id-a","email":"alice@example.com","managedAuthRuntime":"host"},{"id":"id-b","email":"bob@example.com","managedAuthRuntime":"host"}],"activeClaudeManagedAccountId":"id-b","activeClaudeManagedAccountIdsByRuntime":{"host":"id-b","wsl":null},"localAccountRuntime":"host"}"#;
+
+    #[test]
+    fn a_sqlite_profile_reads_accounts_with_no_export_present() {
+        let dir = tempfile::tempdir().unwrap();
+        let ud = dir.path();
+        crate::orca::testsupport::write_state_db(ud, "local-default", DB_SETTINGS);
+        let choice = crate::orca::userdata::data_file(ud);
+        assert!(!choice.path.exists(), "no orca-data.json");
+        assert!(choice.has_state_db());
+        let (v, legacy) = load_view_choice(&choice).unwrap().unwrap();
+        assert!(!legacy);
+        let ids: Vec<_> = v.accounts.iter().map(|a| a.id.as_str()).collect();
+        assert_eq!(ids, ["id-a", "id-b"]);
+        assert_eq!(v.active_host_id(), Some("id-b"));
+        assert_eq!(v.active_id_raw.as_deref(), Some("id-b"));
+    }
+
+    #[test]
+    fn the_database_wins_over_a_stale_export() {
+        let dir = tempfile::tempdir().unwrap();
+        let ud = dir.path();
+        crate::orca::testsupport::write_state_db(ud, "local-default", DB_SETTINGS);
+        let choice = crate::orca::userdata::data_file(ud);
+        std::fs::write(
+            &choice.path,
+            br#"{"schemaVersion":1,"settings":{"claudeManagedAccounts":[{"id":"id-old","email":"old@example.com","managedAuthRuntime":"host"}],"activeClaudeManagedAccountId":"id-old"}}"#,
+        )
+        .unwrap();
+        let (v, _) = load_view_choice(&choice).unwrap().unwrap();
+        assert_eq!(v.accounts.len(), 2);
+        assert!(v.account("id-old").is_none());
+        assert_eq!(v.active_host_id(), Some("id-b"));
+    }
+
+    #[test]
+    fn an_empty_or_settingless_database_falls_back_to_the_export() {
+        let dir = tempfile::tempdir().unwrap();
+        let ud = dir.path();
+        let choice = crate::orca::userdata::data_file(ud);
+        std::fs::create_dir_all(choice.path.parent().unwrap()).unwrap();
+        std::fs::write(choice.path.with_file_name("profile-state.db"), b"").unwrap();
+        assert!(load_view_choice(&choice).unwrap().is_none());
+        std::fs::write(&choice.path, store()).unwrap();
+        assert!(load_view_choice(&choice).unwrap().is_some());
+    }
+
+    #[test]
+    fn a_garbage_database_without_an_export_is_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let choice = crate::orca::userdata::data_file(dir.path());
+        std::fs::create_dir_all(choice.path.parent().unwrap()).unwrap();
+        std::fs::write(
+            choice.path.with_file_name("profile-state.db"),
+            b"this is not a sqlite database at all, just text padding.....",
+        )
+        .unwrap();
+        assert!(load_view_choice(&choice).is_err());
+    }
+
+    #[test]
+    fn reading_the_database_never_writes_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let ud = dir.path();
+        let db = crate::orca::testsupport::write_state_db(ud, "local-default", DB_SETTINGS);
+        let before = std::fs::read(&db).unwrap();
+        let choice = crate::orca::userdata::data_file(ud);
+        load_view_choice(&choice).unwrap().unwrap();
+        assert_eq!(std::fs::read(&db).unwrap(), before);
     }
 
     // ─── the write protocol ───────────────────────────────────────────────
