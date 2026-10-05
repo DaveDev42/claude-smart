@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.4.8](https://github.com/DaveDev42/claude-smart/compare/v0.4.7...v0.4.8) (2026-10-05)
+
+
+### Features
+
+* **accounts:** remove an orphan stash on a SQLite profile with Orca stopped ([69c9fdc](https://github.com/DaveDev42/claude-smart/commit/69c9fdcdd1afbee6d52b2eb7dae87ef1e5b4e610))
+* **migrate:** import and select offline on SQLite profiles and on Linux ([13d3c0c](https://github.com/DaveDev42/claude-smart/commit/13d3c0c4f82d3f5dc35bd18a77ac89b3ad2da9ea))
+
+
+### Bug Fixes
+
+* **orca:** read the Windows Orca version from the executable's version resource ([cfbe06a](https://github.com/DaveDev42/claude-smart/commit/cfbe06ae473ae28ea6a8d72180f2c1ac54a34513))
+
 ## [0.4.7](https://github.com/DaveDev42/claude-smart/compare/v0.4.6...v0.4.7) (2026-10-05)
 
 
