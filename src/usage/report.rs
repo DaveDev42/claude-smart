@@ -149,6 +149,9 @@ pub struct Report {
     /// record predates the field or carried no label; the column then falls
     /// back to its baked-in name.
     pub week_model_label: Option<String>,
+    /// Orca's active host account id, when it names one. Set by the caller
+    /// from the account set (`build_report` leaves it `None`).
+    pub active: Option<String>,
 }
 
 // ─── pure core: join ─────────────────────────────────────────────────────────
@@ -213,6 +216,7 @@ pub fn build_report(
         no_usage,
         captured_at: usage.and_then(|u| u.captured_at.clone()),
         week_model_label: tier_label(usage),
+        active: None,
     }
 }
 
@@ -633,12 +637,16 @@ struct JsonReport<'a> {
     /// Which tier every row's `week_fable_pct` measures, as reported by the
     /// local collector.
     week_model_label: Option<&'a str>,
+    /// Orca's active host account id, or `null` when Orca names none.
+    active: Option<&'a str>,
     profiles: std::collections::BTreeMap<&'a str, JsonRow<'a>>,
 }
 
 #[derive(Debug, Serialize)]
 struct JsonRow<'a> {
     registered: bool,
+    /// This row is Orca's active account (the `*` in `csm accounts list`).
+    active: bool,
     session_pct: Option<i64>,
     week_all_pct: Option<i64>,
     week_fable_pct: Option<i64>,
@@ -677,6 +685,7 @@ pub fn render_json(report: &Report) -> Result<String, serde_json::Error> {
                 r.name.as_str(),
                 JsonRow {
                     registered: r.registered,
+                    active: report.active.as_deref() == Some(r.name.as_str()),
                     session_pct: r.session_pct,
                     week_all_pct: r.week_all_pct,
                     week_fable_pct: r.week_fable_pct,
@@ -699,6 +708,7 @@ pub fn render_json(report: &Report) -> Result<String, serde_json::Error> {
         stale_secs: report.stale_secs,
         configured: report.configured,
         week_model_label: report.week_model_label.as_deref(),
+        active: report.active.as_deref(),
         profiles,
     };
     serde_json::to_string_pretty(&wire)
@@ -915,6 +925,22 @@ mod tests {
             json.contains("\"stale_secs\": null"),
             "stale_secs: None must serialize as JSON null: {json}"
         );
+    }
+
+    #[test]
+    fn json_names_the_active_account_top_level_and_per_row() {
+        let reg = registry(&["home", "work"]);
+        let u = sample_usage();
+        let mut report = build_report(&reg, Some(&u), true, None);
+        let v: serde_json::Value = serde_json::from_str(&render_json(&report).unwrap()).unwrap();
+        assert!(v["active"].is_null(), "{v}");
+        assert_eq!(v["profiles"]["home"]["active"], false);
+
+        report.active = Some("work".into());
+        let v: serde_json::Value = serde_json::from_str(&render_json(&report).unwrap()).unwrap();
+        assert_eq!(v["active"], "work");
+        assert_eq!(v["profiles"]["work"]["active"], true);
+        assert_eq!(v["profiles"]["home"]["active"], false);
     }
 
     /// A single-profile blob carrying an explicit tier label, as the local

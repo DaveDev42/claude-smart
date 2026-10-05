@@ -139,6 +139,7 @@ pub(crate) fn build_usage_report(
 
     let mut rpt = report::build_report(&ids, data.as_ref(), configured, stale_secs);
     report::label_rows(&mut rpt, &accounts.accounts);
+    rpt.active = accounts.active.clone();
     rpt
 }
 
