@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.4.9](https://github.com/DaveDev42/claude-smart/compare/v0.4.8...v0.4.9) (2026-10-06)
+
+
+### Features
+
+* **usage:** name Orca's active account in usage --json — top-level active id plus a per-row active flag ([6c93b65](https://github.com/DaveDev42/claude-smart/commit/6c93b65ff438219701c753ffaba4bb25f3eef429))
+
 ## [0.4.8](https://github.com/DaveDev42/claude-smart/compare/v0.4.7...v0.4.8) (2026-10-05)
 
 
