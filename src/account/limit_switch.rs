@@ -285,10 +285,16 @@ pub fn run_hop(
     // The terminal line is gone with the terminal (an Orca pane, a closed
     // window): the log keeps why the hop switched or stayed.
     let _ = crate::hook::notify::append_log(own_sid, &hop_log_message(own_sid, &outcome));
-    if let HopOutcome::Switched { from, to, .. } = &outcome {
-        crate::hook::hops::record_switch(own_sid, &sentinel.reason, from.as_deref(), to);
-    }
+    record_outcome(own_sid, &sentinel.reason, &outcome);
     outcome
+}
+
+/// Append the hop log's `switch` line for a hop that switched; every other
+/// outcome leaves the log alone.
+fn record_outcome(own_sid: &str, reason: &str, outcome: &HopOutcome) {
+    if let HopOutcome::Switched { from, to, .. } = outcome {
+        crate::hook::hops::record_switch(own_sid, reason, from.as_deref(), to);
+    }
 }
 
 /// The `limit-switch.log` message for a hop's decision, in the hook's
@@ -936,5 +942,52 @@ mod tests {
         );
         assert_eq!(notices, 1);
         drop(held);
+    }
+
+    #[test]
+    fn only_a_switched_hop_appends_a_hop_log_line() {
+        let home = tempfile::tempdir().unwrap();
+        let log = || {
+            let path = crate::paths::smart_dir_no_create().join("hops.jsonl");
+            std::fs::read_to_string(path).unwrap_or_default()
+        };
+        crate::testenv::with_test_home(home.path(), || {
+            let reason = "limit:week_all";
+            record_outcome(
+                "sid-1",
+                reason,
+                &HopOutcome::Followed {
+                    to: "acct-b".into(),
+                },
+            );
+            record_outcome(
+                "sid-1",
+                reason,
+                &HopOutcome::Stay {
+                    reason: "no viable account".into(),
+                },
+            );
+            record_outcome("sid-1", reason, &HopOutcome::LockBusy);
+            assert_eq!(log(), "");
+
+            record_outcome(
+                "sid-1",
+                reason,
+                &HopOutcome::Switched {
+                    from: Some("acct-a".into()),
+                    to: "acct-b".into(),
+                    generation: 3,
+                },
+            );
+            let text = log();
+            let lines: Vec<&str> = text.lines().collect();
+            assert_eq!(lines.len(), 1);
+            let v: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+            assert_eq!(v["kind"], "switch");
+            assert_eq!(v["sid"], "sid-1");
+            assert_eq!(v["reason"], "week_all");
+            assert_eq!(v["from_account"], "acct-a");
+            assert_eq!(v["to_account"], "acct-b");
+        });
     }
 }
