@@ -245,7 +245,17 @@ is needed.
   gate, the follow-at-turn-boundary rule and the read-back profile veto
   bound the damage if the assumption is wrong, but a test with a
   throwaway account (two sessions, a switch, a forced expiry) has not been
-  run.
+  run. A static read of Claude Code 2.1.293 (issue #42) supports the
+  assumption: each request re-checks `.credentials.json`'s mtime and drops
+  its cache on a change, a refresh runs under `<D>/.oauth_refresh.lock`
+  and returns early when the stored access token differs from its own,
+  and the write-back is a compare-and-swap on the refresh token, so a
+  stale session leaves another account's grant alone. The same read
+  suggests a turn parked in a 429 auto-retry keeps its old client and
+  bearer, since only auth-type errors rebuild the client. If that holds,
+  an in-place switch has to interrupt the parked turn and submit a new
+  prompt. Until a throwaway-account run confirms both, the limit switch
+  keeps relaunching (#42).
 - **Windows with Orca stopped is only partly exercised.** With Orca running, the
   named pipe, telling `Orca.exe` from its helpers (every helper carries
   `--type=` or a `.js` entry, the `daemon-host` copy included) and the
