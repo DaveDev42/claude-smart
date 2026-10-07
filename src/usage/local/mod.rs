@@ -217,6 +217,12 @@ enum Resolution {
     },
 }
 
+/// Epoch seconds for an expiry given in ms; `None` for zero or negative,
+/// which is a placeholder rather than an instant.
+fn expiry_epoch(expired_at_ms: i64) -> Option<i64> {
+    (expired_at_ms > 0).then_some(expired_at_ms / 1000)
+}
+
 /// The pure branch table. `has_stale` = the account already has a stored
 /// `usage` to fall back on (read by `apply_resolution`, not here). `label`
 /// names the account in the `NeedsRefresh` action (`csm accounts use
@@ -230,12 +236,6 @@ enum Resolution {
 /// unconditionally (design spec "맛이 간 프로필은 로그인하라고 경고" §자격증명
 /// 상태 3분류); `apply_resolution` is what decides, from `has_stale`, whether
 /// the row it builds carries real numbers or is bare.
-/// Epoch seconds for an expiry given in ms; `None` for zero or negative,
-/// which is a placeholder rather than an instant.
-fn expiry_epoch(expired_at_ms: i64) -> Option<i64> {
-    (expired_at_ms > 0).then_some(expired_at_ms / 1000)
-}
-
 fn resolve(has_stale: bool, event: Event, label: &str) -> (Resolution, bool) {
     match event {
         Event::InCooldown { until } => {
