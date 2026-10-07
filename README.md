@@ -325,6 +325,18 @@ The session resumes on the same account with `--model` set to
 spends no switch. `CLAUDE_FABLE_FALLBACK=0` turns it off, and the cap is
 then handled like any other.
 
+### The hop log
+
+Every switch and every model fallback also appends one JSON line to
+`hops.jsonl` in csm's state directory, for scripts that count or chart hops.
+The fields are `at` (RFC3339 UTC), `sid`, `kind` (`switch` or
+`model-fallback`), `reason` (`session`, `week_all`, `week_fable` or
+`rate_limit`), `from_account` and `to_account` (Orca account ids, or null
+when unknown) and, for a fallback, `model`. A switch is logged by the
+supervisor once it has switched Orca's account, not when the hook proposes a
+target. The file moves to `hops.jsonl.1` past 1 MiB, one generation. Logging
+is best effort and never fails a hop.
+
 ## Usage metering
 
 `csm usage` prints one row per Orca account: email, organization, the three

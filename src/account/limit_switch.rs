@@ -285,6 +285,9 @@ pub fn run_hop(
     // The terminal line is gone with the terminal (an Orca pane, a closed
     // window): the log keeps why the hop switched or stayed.
     let _ = crate::hook::notify::append_log(own_sid, &hop_log_message(own_sid, &outcome));
+    if let HopOutcome::Switched { from, to, .. } = &outcome {
+        crate::hook::hops::record_switch(own_sid, &sentinel.reason, from.as_deref(), to);
+    }
     outcome
 }
 

@@ -56,6 +56,7 @@
 //! user-visible signal.
 
 pub mod detect;
+pub mod hops;
 pub mod notify;
 pub mod stop;
 
@@ -797,6 +798,14 @@ mod tests {
             smart_dir.join(format!("{sid}.model-fallback")).exists(),
             "the one-shot model-fallback marker must be claimed"
         );
+        let hops = std::fs::read_to_string(smart_dir.join("hops.jsonl"))
+            .expect("a model fallback appends a hops.jsonl line");
+        let hop: serde_json::Value = serde_json::from_str(hops.trim_end()).unwrap();
+        assert_eq!(hop["sid"], sid);
+        assert_eq!(hop["kind"], "model-fallback");
+        assert_eq!(hop["reason"], "week_fable");
+        assert_eq!(hop["model"], "opus");
+        assert_eq!(hop["from_account"], "limited");
         assert!(
             !smart_dir.join(format!("{sid}.switched")).exists(),
             "a model fallback must never touch .switched — it would burn the \
@@ -1408,6 +1417,10 @@ mod tests {
         assert!(
             !smart_dir.join(format!("{sid}.model-fallback")).exists(),
             "an account switch must never claim the model-fallback marker"
+        );
+        assert!(
+            !smart_dir.join("hops.jsonl").exists(),
+            "the hook only proposes a switch target; run_hop records the switch"
         );
     }
 

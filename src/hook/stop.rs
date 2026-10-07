@@ -114,6 +114,12 @@ pub fn commit_and_stop(c: &Commit<'_>) -> anyhow::Result<()> {
     };
     crate::platform::relaunch::write_relaunch(&paths::sentinel(sid), &sentinel)?;
 
+    // A model fallback is fully known here; an account switch is recorded by
+    // `limit_switch::run_hop`, where the target is final.
+    if let Some(model) = c.model_override {
+        crate::hook::hops::record_model_fallback(sid, c.reason, c.target_account, model);
+    }
+
     if c.model_override.is_some() {
         // Marker: this session fell back to the fallback model on a Fable
         // cap, current as of now, on THIS account. Both entry points (the
