@@ -409,7 +409,11 @@ pub fn classify_session(
         return match facts.start_ticks(rec.pid) {
             None => SessionLiveness::Unverifiable,
             Some(got) if got == ticks => SessionLiveness::Live,
-            Some(_) => SessionLiveness::Dead,
+            // Dead only when the value is plausibly ticks since boot: one
+            // past the uptime (epoch seconds or ms from another writer) says
+            // nothing about this pid.
+            Some(_) if facts.uptime_ticks().is_some_and(|up| ticks <= up) => SessionLiveness::Dead,
+            Some(_) => SessionLiveness::Unverifiable,
         };
     }
     let want = match (&rec.proc_start, &rec.proc_start_ft) {
@@ -1168,7 +1172,10 @@ mod tests {
     fn a_linux_record_in_clock_ticks_is_compared_with_the_proc_start_ticks() {
         let d = "linux:m:pid:[1]";
         let p = proc_info(500, "claude", None, &[]);
-        let facts = FakeProcs::default().with(p).with_ticks(500, 1453);
+        let facts = FakeProcs::default()
+            .with(p)
+            .with_ticks(500, 1453)
+            .with_uptime_ticks(500_000);
         assert_eq!(
             classify_session(&rec(500, Some("1453"), Some(d)), d, &facts),
             SessionLiveness::Live
@@ -1201,6 +1208,54 @@ mod tests {
                 .unwrap()
                 .may_have_live()
         );
+    }
+
+    #[test]
+    fn a_ticks_mismatch_is_dead_only_when_the_value_fits_the_uptime() {
+        let d = "linux:m:pid:[1]";
+        let p = proc_info(500, "claude", None, &[]);
+        let facts = FakeProcs::default()
+            .with(p)
+            .with_ticks(500, 1453)
+            .with_uptime_ticks(500_000);
+        // The epoch start time of the process (seconds) is not ticks.
+        assert_eq!(
+            classify_session(&rec(500, Some("1760000000"), Some(d)), d, &facts),
+            SessionLiveness::Unverifiable
+        );
+        // Larger than the uptime (ms epoch too): unverifiable.
+        assert_eq!(
+            classify_session(&rec(500, Some("500001"), Some(d)), d, &facts),
+            SessionLiveness::Unverifiable
+        );
+        assert_eq!(
+            classify_session(&rec(500, Some("1760000000000"), Some(d)), d, &facts),
+            SessionLiveness::Unverifiable
+        );
+        // A plausible tick count that differs: dead.
+        assert_eq!(
+            classify_session(&rec(500, Some("98765"), Some(d)), d, &facts),
+            SessionLiveness::Dead
+        );
+        assert_eq!(
+            classify_session(&rec(500, Some("500000"), Some(d)), d, &facts),
+            SessionLiveness::Dead
+        );
+        // Unknown uptime: fail safe.
+        let no_uptime = FakeProcs::default()
+            .with(proc_info(500, "claude", None, &[]))
+            .with_ticks(500, 1453);
+        assert_eq!(
+            classify_session(&rec(500, Some("98765"), Some(d)), d, &no_uptime),
+            SessionLiveness::Unverifiable
+        );
+        // Another pid domain never reaches the ticks comparison.
+        for other in ["darwin", "win32:abc"] {
+            assert_eq!(
+                classify_session(&rec(500, Some("98765"), Some(other)), d, &facts),
+                SessionLiveness::Unverifiable
+            );
+        }
     }
 
     #[test]

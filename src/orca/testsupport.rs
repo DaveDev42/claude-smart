@@ -354,6 +354,7 @@ pub(crate) struct FakeProcs {
     unreadable: bool,
     environs: HashMap<u32, Vec<std::ffi::OsString>>,
     ticks: HashMap<u32, u64>,
+    uptime: Option<u64>,
 }
 
 impl FakeProcs {
@@ -386,6 +387,12 @@ impl FakeProcs {
         self
     }
 
+    /// The machine's uptime in clock ticks (Linux).
+    pub(crate) fn with_uptime_ticks(mut self, ticks: u64) -> Self {
+        self.uptime = Some(ticks);
+        self
+    }
+
     /// Give `pid` a readable environment of `KEY=value` entries. A listed
     /// process without one reads as unreadable.
     pub(crate) fn with_env(mut self, pid: u32, vars: &[&str]) -> Self {
@@ -414,6 +421,10 @@ impl super::live::ProcFacts for FakeProcs {
 
     fn start_ticks(&self, pid: u32) -> Option<u64> {
         self.ticks.get(&pid).copied()
+    }
+
+    fn uptime_ticks(&self) -> Option<u64> {
+        self.uptime
     }
 
     fn environ(&self, pid: u32) -> Option<Vec<std::ffi::OsString>> {

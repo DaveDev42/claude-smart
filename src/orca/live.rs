@@ -65,6 +65,12 @@ pub trait ProcFacts {
         let _ = pid;
         None
     }
+    /// The machine's uptime in clock ticks (`/proc/uptime` seconds times
+    /// `CLK_TCK`), the bound a Linux `procStart` must fit under. `None` off
+    /// Linux or when it cannot be read.
+    fn uptime_ticks(&self) -> Option<u64> {
+        None
+    }
     /// A process's environment block, `None` when it cannot be read (the
     /// default: a source that cannot read environments reads none).
     fn environ(&self, pid: u32) -> Option<Vec<OsString>> {
@@ -96,6 +102,15 @@ impl ProcFacts for SystemProcs {
         }
         let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
         stat_start_ticks(&stat)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn uptime_ticks(&self) -> Option<u64> {
+        let text = std::fs::read_to_string("/proc/uptime").ok()?;
+        let secs: f64 = text.split_whitespace().next()?.parse().ok()?;
+        // SAFETY: sysconf has no preconditions.
+        let hz = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+        (hz > 0 && secs.is_finite() && secs >= 0.0).then_some((secs * hz as f64) as u64)
     }
 
     #[cfg(not(test))]
