@@ -27,7 +27,11 @@
 //! `linux:<machine-id>:<pid-ns link>` and the Windows form
 //! `win32:<hostname lowercased>` are INFERRED from the bundle. A record is
 //! live when its domain is this host's, its pid is alive, and the process
-//! start time equals `procStart` (the pid-reuse guard). A record csm cannot
+//! start time equals `procStart` (the pid-reuse guard). On Linux Claude Code
+//! writes `procStart` as the process start time in clock ticks since boot
+//! (all digits, `/proc/<pid>/stat` field 22; seen on a live Linux
+//! registry), so an all-digit `procStart` is compared with that field
+//! ([`ProcFacts::start_ticks`]) and needs no `ps` string. A record csm cannot
 //! verify is [`SessionLiveness::Unverifiable`], which callers treat as
 //! possibly live (fail safe: Orca defers its refresh when a session lives).
 
@@ -322,6 +326,16 @@ pub fn lstart_epoch(s: &str) -> Option<i64> {
         .map(|t| t.and_utc().timestamp())
 }
 
+/// `procStart` in Linux's form: all ASCII digits (clock ticks since boot).
+/// Pure.
+fn ticks_text(s: &str) -> Option<u64> {
+    let t = s.trim();
+    if t.is_empty() || !t.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    t.parse().ok()
+}
+
 /// A Windows FILETIME (100 ns ticks since 1601) as epoch seconds. Pure.
 pub fn filetime_epoch(s: &str) -> Option<i64> {
     let ticks: u64 = s.trim().parse().ok()?;
@@ -389,6 +403,14 @@ pub fn classify_session(
     }
     if rec.pid <= 1 || !facts.alive(rec.pid) {
         return SessionLiveness::Dead;
+    }
+    // Linux: ticks since boot, compared exactly with `/proc/<pid>/stat`.
+    if let Some(ticks) = rec.proc_start.as_deref().and_then(ticks_text) {
+        return match facts.start_ticks(rec.pid) {
+            None => SessionLiveness::Unverifiable,
+            Some(got) if got == ticks => SessionLiveness::Live,
+            Some(_) => SessionLiveness::Dead,
+        };
     }
     let want = match (&rec.proc_start, &rec.proc_start_ft) {
         (Some(s), _) => lstart_epoch(s),
@@ -1139,6 +1161,45 @@ mod tests {
         assert_eq!(
             classify_session(&rec(500, Some(start), Some(d)), d, &blind),
             SessionLiveness::Unverifiable
+        );
+    }
+
+    #[test]
+    fn a_linux_record_in_clock_ticks_is_compared_with_the_proc_start_ticks() {
+        let d = "linux:m:pid:[1]";
+        let p = proc_info(500, "claude", None, &[]);
+        let facts = FakeProcs::default().with(p).with_ticks(500, 1453);
+        assert_eq!(
+            classify_session(&rec(500, Some("1453"), Some(d)), d, &facts),
+            SessionLiveness::Live
+        );
+        // The pid was reused after a reboot: a different start tick.
+        assert_eq!(
+            classify_session(&rec(500, Some("98765"), Some(d)), d, &facts),
+            SessionLiveness::Dead
+        );
+        // A dead pid stays dead.
+        assert_eq!(
+            classify_session(&rec(501, Some("1453"), Some(d)), d, &facts),
+            SessionLiveness::Dead
+        );
+        // No ticks source (not Linux, or /proc unreadable): fail safe.
+        let blind = FakeProcs::default().with(proc_info(500, "claude", None, &[]));
+        assert_eq!(
+            classify_session(&rec(500, Some("1453"), Some(d)), d, &blind),
+            SessionLiveness::Unverifiable
+        );
+        // A stale record behind a reused pid no longer blocks retire.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("500.json"),
+            r#"{"pid":500,"procStart":"98765","pidDomain":"linux:m:pid:[1]"}"#,
+        )
+        .unwrap();
+        assert!(
+            !scan_sessions(dir.path(), d, &facts)
+                .unwrap()
+                .may_have_live()
         );
     }
 

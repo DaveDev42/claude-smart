@@ -353,6 +353,7 @@ pub(crate) struct FakeProcs {
     alive_only: Vec<u32>,
     unreadable: bool,
     environs: HashMap<u32, Vec<std::ffi::OsString>>,
+    ticks: HashMap<u32, u64>,
 }
 
 impl FakeProcs {
@@ -376,6 +377,12 @@ impl FakeProcs {
 
     pub(crate) fn unreadable_table(mut self) -> Self {
         self.unreadable = true;
+        self
+    }
+
+    /// Give `pid` a start time in clock ticks since boot (Linux).
+    pub(crate) fn with_ticks(mut self, pid: u32, ticks: u64) -> Self {
+        self.ticks.insert(pid, ticks);
         self
     }
 
@@ -403,6 +410,10 @@ impl super::live::ProcFacts for FakeProcs {
 
     fn table(&self) -> Option<Vec<ProcInfo>> {
         (!self.unreadable).then(|| self.listed.clone())
+    }
+
+    fn start_ticks(&self, pid: u32) -> Option<u64> {
+        self.ticks.get(&pid).copied()
     }
 
     fn environ(&self, pid: u32) -> Option<Vec<std::ffi::OsString>> {

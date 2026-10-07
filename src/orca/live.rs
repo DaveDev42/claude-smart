@@ -58,6 +58,13 @@ pub trait ProcFacts {
     fn start_time(&self, pid: u32) -> Option<u64> {
         self.probe(pid).map(|p| p.start_time)
     }
+    /// A process's start time in clock ticks since boot (`/proc/<pid>/stat`
+    /// field 22), the unit Claude Code writes to a Linux session record's
+    /// `procStart`. `None` off Linux or when it cannot be read.
+    fn start_ticks(&self, pid: u32) -> Option<u64> {
+        let _ = pid;
+        None
+    }
     /// A process's environment block, `None` when it cannot be read (the
     /// default: a source that cannot read environments reads none).
     fn environ(&self, pid: u32) -> Option<Vec<OsString>> {
@@ -80,6 +87,15 @@ impl ProcFacts for SystemProcs {
             return None;
         }
         crate::platform::proc::probe(pid)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn start_ticks(&self, pid: u32) -> Option<u64> {
+        if pid == 0 {
+            return None;
+        }
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+        stat_start_ticks(&stat)
     }
 
     #[cfg(not(test))]
@@ -122,6 +138,17 @@ impl ProcFacts for SystemProcs {
     fn environ(&self, _pid: u32) -> Option<Vec<OsString>> {
         None
     }
+}
+
+/// Field 22 (`starttime`, clock ticks since boot) of a `/proc/<pid>/stat`
+/// line. `comm` (field 2) is parenthesised and may hold spaces and
+/// parentheses, so the fields are counted after the LAST `)`. Pure.
+#[cfg(any(target_os = "linux", test))]
+pub fn stat_start_ticks(stat: &str) -> Option<u64> {
+    let rest = &stat[stat.rfind(')')? + 1..];
+    // After the `)`: field 3 (state) is the first token, so field 22 is the
+    // 20th.
+    rest.split_whitespace().nth(19)?.parse().ok()
 }
 
 // ─── main-executable match ────────────────────────────────────────────────────
@@ -849,6 +876,17 @@ mod tests {
     use crate::orca::testsupport::{FakeProcs, proc_info};
 
     const MAC_MAIN: &str = "/Applications/Orca.app/Contents/MacOS/Orca";
+
+    #[test]
+    fn stat_start_ticks_counts_fields_after_the_last_paren() {
+        let line = "463492 (claude) S 1 463492 463492 0 -1 4194560 100 0 0 0 5 3 0 0 20 0 11 0 1945239 1000 200 18446744073709551615 0 0";
+        assert_eq!(stat_start_ticks(line), Some(1_945_239));
+        // `comm` with spaces and parentheses.
+        let odd = "42 (a) b (c)) R 1 42 42 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 777 1 1 0";
+        assert_eq!(stat_start_ticks(odd), Some(777));
+        assert_eq!(stat_start_ticks("42 (short) S 1 2"), None);
+        assert_eq!(stat_start_ticks("no parens"), None);
+    }
 
     fn inputs(singleton: SingletonProbe, runtime: RuntimeProbe) -> LiveInputs {
         LiveInputs {
