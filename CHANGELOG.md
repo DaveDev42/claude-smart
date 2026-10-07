@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.4.10](https://github.com/DaveDev42/claude-smart/compare/v0.4.9...v0.4.10) (2026-10-07)
+
+
+### Features
+
+* **hook:** hops.jsonl, a structured event per limit switch and model fallback ([17df3ad](https://github.com/DaveDev42/claude-smart/commit/17df3adc9500c0f6dc48bed84dcee3f12b349aa9)), closes [#34](https://github.com/DaveDev42/claude-smart/issues/34)
+
+
+### Bug Fixes
+
+* **migrate:** make the dry run apply the real run's Orca CLAUDE_CONFIG_DIR refusal ([e662637](https://github.com/DaveDev42/claude-smart/commit/e66263787026e341978e4b7ee728b1688551a83f)), closes [#41](https://github.com/DaveDev42/claude-smart/issues/41)
+* **orca:** call a ticks procStart mismatch dead only when the value fits the uptime ([2d690f1](https://github.com/DaveDev42/claude-smart/commit/2d690f1d88ec38427de897df7fc1b0093de72052)), closes [#41](https://github.com/DaveDev42/claude-smart/issues/41)
+* **orca:** verify a Linux session record's procStart in clock ticks — a reused pid no longer blocks retire ([7fa7703](https://github.com/DaveDev42/claude-smart/commit/7fa7703966f0224f4939ffae1867631647cc9d00)), closes [#41](https://github.com/DaveDev42/claude-smart/issues/41)
+* **usage:** no age for an expiry at or before the epoch — expiresAt 0 reads as expired without "20726d ago" ([31d920c](https://github.com/DaveDev42/claude-smart/commit/31d920c76749bc2c0f91e76fc18157ade947e443))
+
 ## [0.4.9](https://github.com/DaveDev42/claude-smart/compare/v0.4.8...v0.4.9) (2026-10-06)
 
 
