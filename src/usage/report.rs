@@ -520,28 +520,30 @@ fn display_name(r: &Row) -> String {
 /// `CLAUDE_CONFIG_DIR=<dir> claude auth login` is far too long for a column.
 pub(crate) fn status_cell(r: &Row, now: DateTime<Utc>) -> String {
     match (&r.status, &r.error, &r.attention) {
-        (Status::RefreshNeeded, _, Some(att)) => {
-            format!(
+        (Status::RefreshNeeded, _, Some(att)) => match attention_age(att, now) {
+            Some(age) => format!(
                 "{} (stale {})",
                 Status::RefreshNeeded.label(),
-                humanize_age(attention_age_secs(att, now))
-            )
-        }
+                humanize_age(age)
+            ),
+            None => Status::RefreshNeeded.label().to_owned(),
+        },
         (Status::Errored, Some(msg), _) => format!("{}: {}", Status::Errored.label(), msg),
         (s, _, _) => s.label().to_owned(),
     }
 }
 
-/// Seconds elapsed since `attention.since_epoch`, clamped at 0. `0` when
-/// `since_epoch` is absent (an API 401/403 or `NotFound` carries no local
-/// expiry instant — see `model::Attention::since_epoch`'s doc) rather than
-/// panicking or fabricating an age; callers needing to distinguish "no known
-/// age" should check `attention.since_epoch` directly.
-fn attention_age_secs(attention: &Attention, now: DateTime<Utc>) -> u64 {
+/// Earliest `since_epoch` treated as a real instant (2020-01-01 UTC). Older
+/// values (an `expiresAt` of 0 cached by earlier versions) render no age.
+const MIN_PLAUSIBLE_EPOCH: i64 = 1_577_836_800;
+
+/// The age in seconds since `attention.since_epoch`, clamped at 0, or `None`
+/// when the epoch is absent (API 401/403, `NotFound`) or implausibly old.
+fn attention_age(attention: &Attention, now: DateTime<Utc>) -> Option<u64> {
     attention
         .since_epoch
+        .filter(|e| *e >= MIN_PLAUSIBLE_EPOCH)
         .map(|epoch| (now.timestamp() - epoch).max(0) as u64)
-        .unwrap_or(0)
 }
 
 /// The two-line footer block for one profile's `attention`:
@@ -559,9 +561,8 @@ fn attention_age_secs(attention: &Attention, now: DateTime<Utc>) -> u64 {
 /// the identical block straight from a cached `UsageData`'s per-profile
 /// `attention`, without needing a full `Row`/`Report` join.
 pub fn attention_block_lines(name: &str, attention: &Attention, now: DateTime<Utc>) -> [String; 2] {
-    let age_part = attention
-        .since_epoch
-        .map(|_| format!(" {} ago", humanize_age(attention_age_secs(attention, now))))
+    let age_part = attention_age(attention, now)
+        .map(|age| format!(" {} ago", humanize_age(age)))
         .unwrap_or_default();
     let action_word = match attention.kind {
         AttentionKind::NeedsLogin => "login required",
@@ -1216,6 +1217,29 @@ mod tests {
         let report = build_report(&reg, Some(&u), true, None);
         let row = report.rows.iter().find(|r| r.name == "work").unwrap();
         assert_eq!(status_cell(row, now()), "LOGIN REQUIRED");
+    }
+
+    #[test]
+    fn cached_epoch_zero_renders_no_age() {
+        let mk = |kind, epoch| Attention {
+            kind,
+            message: "credentials expired".to_string(),
+            action: "csm accounts use home".to_string(),
+            since_epoch: Some(epoch),
+        };
+        let a = mk(AttentionKind::NeedsLogin, 0);
+        let lines = attention_block_lines("work", &a, now());
+        assert!(!lines[0].contains("ago"), "{}", lines[0]);
+        let b = mk(AttentionKind::NeedsRefresh, 0);
+        let lines = attention_block_lines("work", &b, now());
+        assert!(!lines[0].contains("ago"), "{}", lines[0]);
+        let reg = registry(&["home"]);
+        let mut u = attention_usage();
+        u.profiles.remove("work");
+        u.profiles.get_mut("home").unwrap().attention = Some(b);
+        let report = build_report(&reg, Some(&u), true, None);
+        let row = report.rows.iter().find(|r| r.name == "home").unwrap();
+        assert_eq!(status_cell(row, now()), "REFRESH NEEDED");
     }
 
     #[test]

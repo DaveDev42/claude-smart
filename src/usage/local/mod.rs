@@ -230,6 +230,12 @@ enum Resolution {
 /// unconditionally (design spec "맛이 간 프로필은 로그인하라고 경고" §자격증명
 /// 상태 3분류); `apply_resolution` is what decides, from `has_stale`, whether
 /// the row it builds carries real numbers or is bare.
+/// Epoch seconds for an expiry given in ms; `None` for zero or negative,
+/// which is a placeholder rather than an instant.
+fn expiry_epoch(expired_at_ms: i64) -> Option<i64> {
+    (expired_at_ms > 0).then_some(expired_at_ms / 1000)
+}
+
 fn resolve(has_stale: bool, event: Event, label: &str) -> (Resolution, bool) {
     match event {
         Event::InCooldown { until } => {
@@ -265,7 +271,7 @@ fn resolve(has_stale: bool, event: Event, label: &str) -> (Resolution, bool) {
                     kind: AttentionKind::NeedsRefresh,
                     message: "access token expired".to_string(),
                     action: refresh_action(label),
-                    since_epoch: Some(expired_at_ms / 1000),
+                    since_epoch: expiry_epoch(expired_at_ms),
                 },
             },
             false,
@@ -280,7 +286,7 @@ fn resolve(has_stale: bool, event: Event, label: &str) -> (Resolution, bool) {
                     kind: AttentionKind::NeedsLogin,
                     message: "credentials expired".to_string(),
                     action: login_action(),
-                    since_epoch: Some(expired_at_ms / 1000),
+                    since_epoch: expiry_epoch(expired_at_ms),
                 },
             },
             false,
@@ -1446,6 +1452,29 @@ mod tests {
     }
 
     // ── resolve ──────────────────────────────────────────────────────────────
+
+    #[test]
+    fn resolve_creds_expired_at_epoch_zero_has_no_since_epoch() {
+        for refresh_alive in [true, false] {
+            let (res, _) = resolve(
+                true,
+                Event::CredsExpired {
+                    refresh_alive,
+                    expired_at_ms: 0,
+                },
+                "home",
+            );
+            let attention = match res {
+                Resolution::NeedsRefresh { attention } => attention,
+                Resolution::NeedsLogin { attention, .. } => attention,
+                other => panic!("unexpected {other:?}"),
+            };
+            assert_eq!(attention.since_epoch, None);
+            let lines =
+                crate::usage::report::attention_block_lines("home", &attention, chrono::Utc::now());
+            assert!(!lines[0].contains("ago"), "{}", lines[0]);
+        }
+    }
 
     #[test]
     fn resolve_in_cooldown_with_stale_serves_stale() {

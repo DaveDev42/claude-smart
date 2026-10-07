@@ -279,6 +279,15 @@ mod tests {
     }
 
     #[test]
+    fn parse_blob_expires_at_zero_is_expired() {
+        let json = r#"{"claudeAiOauth":{"accessToken":"tok_example","expiresAt":0}}"#;
+        match parse_blob(json, now()) {
+            Err(CredError::Expired { expired_at_ms, .. }) => assert_eq!(expired_at_ms, 0),
+            other => panic!("expected Expired, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn parse_blob_expired_token_is_expired_error() {
         let json = r#"{"claudeAiOauth":{"accessToken":"tok_example","expiresAt":1}}"#;
         let result = parse_blob(json, now());
