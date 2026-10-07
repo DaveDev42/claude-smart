@@ -131,6 +131,21 @@ pub enum Plan {
     Refuse(String),
 }
 
+/// Why a switch through a running Orca is refused over `D`, `None` when
+/// Orca and csm share it. The one rule `plan_switch` and the migration's
+/// dry run both apply. Pure.
+pub fn running_dir_refusal(orca_dir_agrees: Option<bool>) -> Option<&'static str> {
+    match orca_dir_agrees {
+        Some(true) => None,
+        Some(false) => {
+            Some("Orca runs with a different CLAUDE_CONFIG_DIR than csm; switch in Orca")
+        }
+        None => Some(
+            "cannot read Orca's CLAUDE_CONFIG_DIR, so csm cannot tell that Orca and csm share D",
+        ),
+    }
+}
+
 /// Decide the route. Pure.
 pub fn plan_switch(s: &SwitchState) -> Plan {
     match &s.target {
@@ -146,15 +161,9 @@ pub fn plan_switch(s: &SwitchState) -> Plan {
         }
     }
     if s.orca_running {
-        return match s.orca_dir_agrees {
-            Some(true) => Plan::Rpc,
-            Some(false) => Plan::Refuse(
-                "Orca runs with a different CLAUDE_CONFIG_DIR than csm; switch in Orca".into(),
-            ),
-            None => Plan::Refuse(
-                "cannot read Orca's CLAUDE_CONFIG_DIR, so csm cannot tell that Orca and csm share D"
-                    .into(),
-            ),
+        return match running_dir_refusal(s.orca_dir_agrees) {
+            None => Plan::Rpc,
+            Some(why) => Plan::Refuse(why.into()),
         };
     }
     if let Err(why) = &s.offline_allowed {

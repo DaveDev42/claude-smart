@@ -241,6 +241,10 @@ pub(crate) struct ActiveFacts<'a> {
     /// csm's `D` is the floor profile's dir, where Orca runs once started
     /// with the floor set: an offline switch materializes there.
     pub d_is_floor: bool,
+    /// While Orca runs: does Orca main's `D` equal csm's? `None`: cannot be
+    /// read. The select goes over RPC only when they agree
+    /// (`switch::plan_switch`), so a dry run applies the same refusal.
+    pub orca_dir_agrees: Option<bool>,
     /// A dry run: the floor's grant was probed for presence only, so its
     /// freshness is unknown and not held against the select.
     pub dry_run: bool,
@@ -282,7 +286,10 @@ pub(crate) fn active_action(f: &ActiveFacts<'_>) -> ActiveAction {
         _ => {}
     }
     if f.orca_running {
-        ActiveAction::Select(id)
+        match crate::orca::switch::running_dir_refusal(f.orca_dir_agrees) {
+            None => ActiveAction::Select(id),
+            Some(why) => ActiveAction::Defer(why),
+        }
     } else if f.os == HostOs::Windows {
         ActiveAction::Defer(
             "Orca has no active account; csm selects one on Windows only through a running Orca",
@@ -706,6 +713,13 @@ pub(crate) fn adopt(
         None => Status::NoCredentials,
     });
     let d_is_floor = floor.is_some_and(|p| same_dir(&ctx.paths.config_dir, &p.dir));
+    // Read only when the select would go over RPC; the real run's switch
+    // reads it again through the same context.
+    let orca_dir_agrees = if view.running && view.active_id.is_none() && floor.is_some() {
+        ctx.orca_dir_agrees(&procs)
+    } else {
+        None
+    };
     let facts = ActiveFacts {
         active_id: view.active_id.as_deref(),
         floor: floor_status.as_ref(),
@@ -715,6 +729,7 @@ pub(crate) fn adopt(
         version_ok: view.version_ok,
         store_access_allowed: store_access,
         d_is_floor,
+        orca_dir_agrees,
         dry_run: opts.dry_run,
     };
     match (active_action(&facts), floor) {
@@ -848,8 +863,48 @@ mod tests {
             version_ok: true,
             store_access_allowed: true,
             d_is_floor: true,
+            orca_dir_agrees: Some(true),
             dry_run: false,
         }
+    }
+
+    /// Issue #41: the dry run said "would select" while the real run was
+    /// refused because Orca's `CLAUDE_CONFIG_DIR` could not be read (or
+    /// differs). Both go through `running_dir_refusal` now.
+    #[test]
+    fn a_running_orca_whose_dir_csm_cannot_confirm_defers_the_select_in_a_dry_run_too() {
+        let in_orca = Status::InOrca {
+            id: "acct-work".into(),
+            fresher: Some(false),
+        };
+        for dry_run in [false, true] {
+            let up = |agrees| ActiveFacts {
+                orca_running: true,
+                orca_dir_agrees: agrees,
+                dry_run,
+                ..facts(None, Some(&in_orca))
+            };
+            assert_eq!(
+                active_action(&up(Some(true))),
+                ActiveAction::Select("acct-work".into())
+            );
+            for agrees in [None, Some(false)] {
+                let ActiveAction::Defer(why) = active_action(&up(agrees)) else {
+                    panic!("{agrees:?} dry_run={dry_run}");
+                };
+                assert_eq!(Some(why), crate::orca::switch::running_dir_refusal(agrees));
+            }
+        }
+        // Orca stopped: no dir to compare, the offline route stays.
+        let down = ActiveFacts {
+            orca_dir_agrees: None,
+            dry_run: true,
+            ..facts(None, Some(&in_orca))
+        };
+        assert_eq!(
+            active_action(&down),
+            ActiveAction::Select("acct-work".into())
+        );
     }
 
     #[test]
