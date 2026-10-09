@@ -280,23 +280,28 @@ is needed.
   RPC with the original active account), and the offline switch and back
   on 1.4.220 on Windows (no `doctor --fix` run there). A new Orca release
   needs a `tools/orca-drift.sh` pass before `TESTED` grows.
-- **The automatic migration's offline SQLite path is unit-tested only.**
+- **The automatic migration's offline SQLite path is verified on Linux only.**
   `migrate/adopt.rs` imports and selects offline on a SQLite profile (macOS
   and Linux) when the database passes `store::preflight`
   (`OrcaView::db_write_error`), and defers to a running Orca otherwise;
   the e2e `auto_sqlite` scenario covers only the refused case (its
-  database is a bare header, and the fake Orca does not read SQLite). Every
-  fleet host had finished the migration before this path existed, so it
-  has not run on a real machine.
-- **Minimal-store creation is unverified against real Orca.** With Orca
+  database is a bare header, and the fake Orca does not read SQLite). On
+  2026-10-09 it ran against a real Orca 1.4.218 on Linux in a sandbox HOME
+  with fake credentials: with Orca stopped, `csm migrate` imported both
+  profiles, selected the floor profile's account in the `settings` row and
+  cut over, and the restarted Orca served both accounts and the active id
+  over RPC and read the stash csm wrote. macOS (Keychain stashes) and the
+  retire phase on a real machine are still unexercised.
+- **Minimal-store creation is verified against real Orca on Linux only.** With Orca
   stopped and no store at all, `accounts add`/`import` write
   `store::MINIMAL_STORE` plus the account keys (`write_protocol` with
   `allow_create`). Orca 1.4.214's source spreads its defaults under the
   parsed document (`normalizeLoadedProfileState`) and, on first start,
   migrates the JSON into SQLite through the same loader, so the file should
-  load. Design section 2 gates this on starting a real Orca (1.4.212 and
-  1.4.214) against a sandbox userData, which has not been done; the e2e
-  harness uses the fake Orca only. Known from the source: a store that
+  load. A real Orca 1.4.218 on Linux, started on a sandbox userData after
+  an offline `csm accounts import` into an empty one (2026-10-09), migrated
+  the minimal JSON into SQLite and served the account over RPC. Not yet
+  run against a real Orca on macOS or Windows. Known from the source: a store that
   exists without an `onboarding` block makes Orca skip its first-run wizard
   (`normalizeLoadedOnboardingState`).
 
