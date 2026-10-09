@@ -24,10 +24,11 @@ use serde::Deserialize;
 /// never turns "unrelated field changed" into "must be a veto".
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 pub struct SessionStatus {
-    /// `"idle"`/`"busy"`/`"waiting"`/`"shell"` (Claude Code's own words;
-    /// an unrecognised value is treated the same as any other non-`"idle"`
-    /// value by [`veto_reason`] — a future word claude adds must veto, not
-    /// be silently ignored).
+    /// `"idle"`/`"busy"`/`"waiting"`/`"shell"` (Claude Code's own words).
+    /// `"shell"` is `"idle"` with a background `local_bash` task still
+    /// running, not a turn state, so [`veto_reason`] treats it as idle. An
+    /// unrecognised value is treated as any other non-idle word — a future
+    /// word claude adds must veto, not be silently ignored.
     #[serde(default)]
     pub status: Option<String>,
     #[serde(default, rename = "waitingFor")]
@@ -56,7 +57,8 @@ pub fn read_status(path: &Path) -> Option<SessionStatus> {
 
 /// The pure veto decision: `Some(reason)` when typing must not proceed,
 /// `None` when this check has nothing against it. `reason` is `status`'s
-/// own value when it is present, non-blank and not `"idle"` (safe to log —
+/// own value when it is present, non-blank and neither `"idle"` nor `"shell"`
+/// (`"shell"` is idle with a background bash task running; safe to log —
 /// these are Claude Code's own short status words, never free text);
 /// otherwise `"waiting"` when `status` is `"idle"`/absent but `waitingFor`
 /// is a non-blank string (never logging `waitingFor`'s own text, which is
@@ -65,6 +67,7 @@ pub fn veto_reason(status: &SessionStatus) -> Option<String> {
     if let Some(s) = status.status.as_deref().map(str::trim)
         && !s.is_empty()
         && s != "idle"
+        && s != "shell"
     {
         return Some(s.to_owned());
     }
@@ -105,13 +108,27 @@ mod tests {
 
     #[test]
     fn veto_reason_is_the_status_word_when_not_idle() {
-        for status in ["busy", "waiting", "shell"] {
+        for status in ["busy", "waiting", "future-word"] {
             let s = SessionStatus {
                 status: Some(status.to_owned()),
                 waiting_for: None,
             };
             assert_eq!(veto_reason(&s), Some(status.to_owned()), "status={status}");
         }
+    }
+
+    #[test]
+    fn veto_reason_none_for_shell_idle_with_a_background_bash_task() {
+        let s = SessionStatus {
+            status: Some("shell".to_owned()),
+            waiting_for: None,
+        };
+        assert_eq!(veto_reason(&s), None);
+        let s = SessionStatus {
+            status: Some("shell".to_owned()),
+            waiting_for: Some("permission".to_owned()),
+        };
+        assert_eq!(veto_reason(&s), Some("waiting".to_owned()));
     }
 
     #[test]

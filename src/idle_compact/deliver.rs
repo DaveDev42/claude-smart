@@ -863,7 +863,7 @@ mod tests {
             status_veto: if rng.bool() {
                 None
             } else {
-                Some(rng.choose(&["busy", "waiting", "shell"]).to_owned())
+                Some(rng.choose(&["busy", "waiting", "screen-busy"]).to_owned())
             },
             last_keystroke_ms: if rng.bool() {
                 None
