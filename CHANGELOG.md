@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.4.11](https://github.com/DaveDev42/claude-smart/compare/v0.4.10...v0.4.11) (2026-10-09)
+
+
+### Bug Fixes
+
+* **idle-compact:** a background shell no longer vetoes the compact — Claude Code's "shell" status is idle with a bash task running ([bd19c72](https://github.com/DaveDev42/claude-smart/commit/bd19c725f5a46e2a9a355c38cb000e87b338bab3))
+
 ## [0.4.10](https://github.com/DaveDev42/claude-smart/compare/v0.4.9...v0.4.10) (2026-10-07)
 
 
