@@ -715,7 +715,7 @@ pub(crate) fn floor_gate_line(g: &FloorGate) -> Option<String> {
         FloorGate::Pass => None,
         FloorGate::NoCutover => Some("the cutover has not run yet".into()),
         FloorGate::SameBoot => Some(
-            "waits for a reboot after the cutover (apps started before it may still use the dir)"
+            "a reboot after the cutover comes first (apps started before it may still use the dir)"
                 .into(),
         ),
         FloorGate::BootUnknown => Some(

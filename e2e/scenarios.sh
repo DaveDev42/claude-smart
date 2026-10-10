@@ -824,7 +824,7 @@ sc_migrate() {
   check "Orca put carol into ~/.claude" eq "$(d_refresh)" rt-carol-1
   csm migrate
   check "without a reboot work still waits" test -d "$WORK"
-  check "and the report says for what" has_fixed "$LOGS/out" "waits for a reboot"
+  check "and the report says for what" has_fixed "$LOGS/out" "waits: a reboot after the cutover"
   BOOT_ID=boot-2 csm migrate
   check "after the reboot: exit 0" eq "$RC" 0
   check "work is retired" retired "$WORK"
