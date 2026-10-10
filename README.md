@@ -495,7 +495,8 @@ box content at verify time, whitespace collapsed, at most 80 characters) and
 the rollback.
 
 The screen checks were written against real captures of Claude Code
-2.1.283 (`tests/fixtures/screens/`, see its README); a Claude Code release
+2.1.283 and 2.1.296, the latter in all six themes (`tests/fixtures/screens/`,
+see its README); a Claude Code release
 that redraws the box, the mode line or the window title differently would
 make the supervisor refuse (it never types on a screen it does not
 recognise), not misfire.

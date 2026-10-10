@@ -290,8 +290,16 @@ is needed.
   with fake credentials: with Orca stopped, `csm migrate` imported both
   profiles, selected the floor profile's account in the `settings` row and
   cut over, and the restarted Orca served both accounts and the active id
-  over RPC and read the stash csm wrote. macOS (Keychain stashes) and the
-  retire phase on a real machine are still unexercised.
+  over RPC and read the stash csm wrote. On 2026-10-10 a second sandbox
+  run (csm 0.4.11, Orca 1.4.218, loopback-only network namespace) drove
+  `csm migrate` on through retire to `done`: the non-floor profile retired
+  once the profile endpoint (a loopback fake) answered, the floor profile
+  after Orca restarted in `~/.claude` and a later boot id was seen (the
+  reboot was simulated by bind-mounting another `boot_id`), quarantined
+  grants and stashes were byte-identical to the dirs' credentials, and the
+  restarted Orca served both accounts and the active id. macOS (Keychain
+  stashes), Windows, a real reboot and the pre-spawn path are still
+  unexercised.
 - **Minimal-store creation is verified against real Orca on Linux only.** With Orca
   stopped and no store at all, `accounts add`/`import` write
   `store::MINIMAL_STORE` plus the account keys (`write_protocol` with
@@ -305,7 +313,8 @@ is needed.
   exists without an `onboarding` block makes Orca skip its first-run wizard
   (`normalizeLoadedOnboardingState`).
 
-- **The automatic migration is tested on fakes only.** The e2e harness
+- **The automatic migration is mostly tested on fakes.** Apart from the
+  Linux sandbox runs above, the e2e harness
   drives every phase against the fake Orca, with the floor in a file
   (`CSM_E2E_SESSION_FLOOR_FILE`) and the boot id from `CSM_E2E_BOOT_ID`.
   Not yet run on a real machine: `launchctl unsetenv` clearing the floor
