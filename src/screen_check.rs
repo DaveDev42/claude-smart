@@ -371,7 +371,9 @@ pub enum Menu {
 /// Inspect the slash-command menu Claude Code draws directly above the box's
 /// top rule while a `/` command is being typed. Entries are rows whose first
 /// visible cell is `/` at column 2; the highlighted one is drawn in the accent
-/// colour, the others grey (see `compact-menu-typed-120x40`).
+/// colour, the others grey (see `compact-menu-typed-120x40`). In Claude Code
+/// 2.1.296 the selected row also carries a `❯` pointer and every `/` sits at
+/// column 4 (see `theme-*-compact-menu-typed-120x40`); the pointer decides.
 /// Menu rows are the contiguous non-blank rows above the top rule.
 pub fn command_menu(screen: &vt100::Screen) -> Menu {
     let Some((start, _)) = locate(screen) else {
@@ -379,6 +381,12 @@ pub fn command_menu(screen: &vt100::Screen) -> Menu {
     };
     let (_, cols) = screen.size();
     let mut entries: Vec<(String, Option<vt100::Color>)> = Vec::new(); // (command, colour)
+    // Claude Code 2.1.296 draws the selected row as `  ❯ /name` and the
+    // others as `    /name` (`/` at column 4); 2.1.287 and older draw every
+    // row with `/` at column 2 and mark the selection by colour only.
+    let mut pointers: Vec<usize> = Vec::new(); // indexes of rows with the `❯` pointer
+    let mut pointer_layout = false; // any row with `/` at column 4
+    let mut legacy_layout = false; // any row with `/` at column 2
     let mut row = start.saturating_sub(1); // the top rule
     while row > 0 {
         row -= 1;
@@ -386,19 +394,33 @@ pub fn command_menu(screen: &vt100::Screen) -> Menu {
         if text.trim().is_empty() {
             break;
         }
-        let Some(col) = (0..cols).find(|&c| {
+        let visible = |c: u16| {
             screen
                 .cell(row, c)
-                .is_some_and(|cell| cell.has_contents() && cell.contents() != " ")
-        }) else {
+                .filter(|cell| cell.has_contents() && cell.contents() != " ")
+        };
+        let Some(col) = (0..cols).find(|&c| visible(c).is_some()) else {
             continue;
         };
-        if col != 2 || screen.cell(row, col).map(|c| c.contents()) != Some("/") {
-            continue;
-        }
-        // The command word: the run of written, non-space cells from `col`
+        let first = screen.cell(row, col).map(|c| c.contents());
+        let (slash, pointer) = match (col, first) {
+            (2, Some("/")) => {
+                legacy_layout = true;
+                (2, false)
+            }
+            (4, Some("/")) => {
+                pointer_layout = true;
+                (4, false)
+            }
+            (2, Some("\u{276f}")) if visible(4).is_some_and(|c| c.contents() == "/") => {
+                pointer_layout = true;
+                (4, true)
+            }
+            _ => continue,
+        };
+        // The command word: the run of written, non-space cells from `slash`
         // (unwritten cells separate it from the description).
-        let name: String = (col..cols)
+        let name: String = (slash..cols)
             .map_while(|c| {
                 screen
                     .cell(row, c)
@@ -406,7 +428,10 @@ pub fn command_menu(screen: &vt100::Screen) -> Menu {
                     .filter(|t| !t.is_empty() && *t != " ")
             })
             .collect();
-        let fg = screen.cell(row, col).map(|cell| cell.fgcolor());
+        let fg = screen.cell(row, slash).map(|cell| cell.fgcolor());
+        if pointer {
+            pointers.push(entries.len());
+        }
         entries.push((name, fg));
     }
     if entries.is_empty() {
@@ -423,7 +448,15 @@ pub fn command_menu(screen: &vt100::Screen) -> Menu {
     // the selected entry is the one drawn in that colour while the other is
     // not. Anything unclear (no box command, default colour, both or neither
     // row in the accent) stays `None`, so the caller rolls back.
-    let highlighted = if let [(name, _)] = entries.as_slice() {
+    let highlighted = if pointer_layout {
+        // The pointer glyph is the selection in every theme (captures of all
+        // six themes); the colours differ per theme and are not consulted.
+        // No pointer, several pointers, or rows of both layouts: unclear.
+        match pointers.as_slice() {
+            [i] if !legacy_layout => Some(entries[*i].0.clone()),
+            _ => None,
+        }
+    } else if let [(name, _)] = entries.as_slice() {
         Some(name.clone())
     } else if entries.len() >= 3 {
         let odd: Vec<&(String, Option<vt100::Color>)> = entries
@@ -459,12 +492,13 @@ pub fn command_menu(screen: &vt100::Screen) -> Menu {
     }
 }
 
-/// `true` when pressing Enter would run exactly `command`: either no menu is
-/// drawn (Enter submits the typed text) or the menu's highlighted entry is
-/// `command`.
+/// `true` when pressing Enter would run exactly `command`: the slash menu is
+/// drawn and its highlighted entry is `command`. A typed slash command always
+/// opens the menu, so a screen where none is recognised (a layout this module
+/// does not know yet) refuses rather than guessing what Enter would run.
 pub fn enter_runs(screen: &vt100::Screen, command: &str) -> bool {
     match command_menu(screen) {
-        Menu::Absent => true,
+        Menu::Absent => false,
         Menu::Open { highlighted, .. } => highlighted.as_deref() == Some(command),
     }
 }
@@ -486,6 +520,13 @@ mod tests {
         compaction_started: bool,
         #[serde(default)]
         busy: bool,
+        /// Slash-menu rows `command_menu` must find (absent: no menu is drawn).
+        #[serde(default)]
+        menu_entries: Option<usize>,
+        /// The entry Enter would run; `None` with `menu_entries` set means
+        /// the menu is open but not decidable.
+        #[serde(default)]
+        menu_highlight: Option<String>,
         description: String,
     }
 
@@ -755,14 +796,128 @@ mod tests {
         assert!(!check(b"\x1b[45;3H\x1b[38;2;153;153;153m/compact"));
     }
 
+    /// Every capture with a menu recorded in the index: Claude Code 2.1.296
+    /// across all six themes, with a background shell, and with vim keys.
+    #[test]
+    fn menu_matches_the_index_for_every_capture() {
+        let fixtures = load_index();
+        let mut with_menu = 0;
+        for fx in &fixtures {
+            let Some(entries) = fx.menu_entries else {
+                continue;
+            };
+            with_menu += 1;
+            let screen = replay(fx);
+            assert_eq!(
+                command_menu(&screen),
+                Menu::Open {
+                    highlighted: fx.menu_highlight.clone(),
+                    entries
+                },
+                "{}: {}",
+                fx.name,
+                fx.description
+            );
+            // Enter runs `/compact` exactly when it is the selected row.
+            assert_eq!(
+                enter_runs(&screen, "/compact"),
+                fx.menu_highlight.as_deref() == Some("/compact"),
+                "{}",
+                fx.name
+            );
+            assert!(!busy(&screen, ""), "{}: a menu is not busy", fx.name);
+        }
+        assert!(with_menu >= 27, "only {with_menu} captures carry a menu");
+    }
+
+    #[test]
+    fn every_theme_has_the_menu_captures() {
+        let fixtures = load_index();
+        for theme in [
+            "dark",
+            "light",
+            "dark-daltonized",
+            "light-daltonized",
+            "dark-ansi",
+            "light-ansi",
+        ] {
+            for kind in [
+                "fresh-idle",
+                "comp-menu-typed",
+                "comp-menu-down",
+                "compact-menu-typed",
+                "compact-menu-down",
+            ] {
+                let name = format!("theme-{theme}-{kind}-120x40");
+                assert!(fixtures.iter().any(|f| f.name == name), "missing {name}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_pointer_menu_without_exactly_one_pointer_is_refused() {
+        let name = "theme-dark-compact-menu-typed-120x40";
+        let fx = load_index().into_iter().find(|f| f.name == name).unwrap();
+        let base = std::fs::read(fixtures_dir().join(format!("{name}.bin"))).unwrap();
+        let run = |extra: &[u8]| {
+            let mut raw = base.clone();
+            raw.extend_from_slice(extra);
+            let mut parser = vt100::Parser::new(fx.rows, fx.cols, 0);
+            parser.process(&raw);
+            command_menu(parser.screen())
+        };
+        // The capture: `/compact` carries the pointer on row 35 (1-based).
+        assert_eq!(
+            run(b""),
+            Menu::Open {
+                highlighted: Some("/compact".to_owned()),
+                entries: 2
+            }
+        );
+        // Pointer erased from the selected row: nothing is selected.
+        assert_eq!(
+            run(b"\x1b[35;3H  \x1b[41;3H"),
+            Menu::Open {
+                highlighted: None,
+                entries: 2
+            }
+        );
+        // Pointer on both rows: ambiguous.
+        assert_eq!(
+            run(b"\x1b[36;3H\xe2\x9d\xaf\x1b[41;3H"),
+            Menu::Open {
+                highlighted: None,
+                entries: 2
+            }
+        );
+        // Pointer moved to `/autocompact` (and off `/compact`): that row.
+        assert_eq!(
+            run(b"\x1b[35;3H  \x1b[36;3H\xe2\x9d\xaf\x1b[41;3H"),
+            Menu::Open {
+                highlighted: Some("/autocompact".to_owned()),
+                entries: 2
+            }
+        );
+        // A row in the old layout (`/` at column 2) next to pointer rows.
+        assert_eq!(
+            run(b"\x1b[36;1H\x1b[2K  /autocompact\x1b[41;3H"),
+            Menu::Open {
+                highlighted: None,
+                entries: 2
+            }
+        );
+    }
+
     #[test]
     fn no_menu_on_screens_without_one() {
         for fx in &load_index() {
-            if fx.name.starts_with("compact-menu-") {
+            if fx.name.starts_with("compact-menu-") || fx.menu_entries.is_some() {
                 continue;
             }
             let screen = replay(fx);
             assert_eq!(command_menu(&screen), Menu::Absent, "{}", fx.name);
+            // No recognised menu: Enter's effect is unknown, so it is refused.
+            assert!(!enter_runs(&screen, "/compact"), "{}", fx.name);
         }
     }
 

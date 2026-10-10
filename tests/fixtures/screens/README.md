@@ -152,3 +152,55 @@ same-width substitutions. `index.json` gained a `busy` field.
   drawn entirely in the accent colour (`38;2;177;185;249`), the others grey.
   Bold is not the selection: it marks the substring typed so far in every
   entry that contains it (`/autocompact` has `compact` in bold).
+
+## Claude Code 2.1.296: all themes, sandbox API-key capture (2026-10-10)
+
+38 captures (`theme-*`, 120x40) from Claude Code **2.1.296**, taken without the
+operator's account or config. The real `claude` binary ran in a Python
+`pty.fork()` harness with a stripped environment: `HOME` a sandbox dir,
+`CLAUDE_CONFIG_DIR` unset, `ANTHROPIC_API_KEY=sk-ant-dummy-not-real`,
+`ANTHROPIC_BASE_URL=http://127.0.0.1:9`, telemetry/error-reporting/autoupdater
+off, `TERM=xterm-256color`, `COLORTERM=truecolor`. A pre-seeded sandbox
+`.claude.json` (`hasCompletedOnboarding`, `theme`, the last 20 characters of the
+dummy key under `customApiKeyResponses.approved`, the cwd's
+`hasTrustDialogAccepted`) skipped every dialog, so nothing talked to a model
+or the network. The harness answered the device-attributes query, never pressed
+Enter on `/compact`, and exited with Ctrl-C twice and then its own pid.
+Sanitization is the same-width substitution above (`dave`, the host name, the
+session uuid in the cwd shown by the header).
+
+Themes offered by the picker: `dark`, `light`, `dark-daltonized`,
+`light-daltonized`, `dark-ansi`, `light-ansi` (plus `auto`, which follows the
+terminal and was not captured). Per theme: `fresh-idle`, `comp-menu-typed`
+(`/comp`, four entries), `comp-menu-down` (Down from there),
+`compact-menu-typed` (two entries) and `compact-menu-down`. Also, dark theme
+only: `background-shell-*` (`!sleep 300` run from bash mode, then Ctrl+B twice;
+a single Ctrl+B only shows the hint; the footer reads `1 shell · ← for agents ·
+↓ to manage`; idle, `/compact` typed, and Down) and `vim-*` (`editorMode: vim`:
+insert, normal, `/compact` typed, and Esc, which only closes the menu and
+leaves the draft in insert mode). `index.json` rows with a menu carry
+`menu_entries` and `menu_highlight`.
+
+What the captures showed:
+
+- **The slash menu layout changed.** 2.1.296 draws the selected row as
+  `  ❯ /compact` and the others as `    /autocompact`, so every `/` is at
+  column 4. 2.1.287 drew `/` at column 2 with no pointer. The old rule only
+  recognised column 2, found no entry, and reported `Menu::Absent`, which
+  `enter_runs` reads as "Enter submits the typed text": it answered `true`
+  even with `/autocompact` selected. `command_menu` now accepts both layouts;
+  in the pointer layout the single row with the `❯` pointer is the selection
+  and zero, several, or mixed-layout pointers leave it undecided (refuse).
+- **The colour rule is theme specific and is not used for 2.1.296.** The
+  selected row's accent is `177,185,249` (dark), `87,105,247` (light),
+  `153,204,255` (dark-daltonized), `51,102,255` (light-daltonized), ANSI 12
+  (dark-ansi) and ANSI 4 (light-ansi); the others are grey (`153,153,153`,
+  `102,102,102`, ANSI 7, ANSI 8). The command typed in the box is now drawn in
+  the default colour, so the old two-entry rule (take the accent from the box)
+  could not decide either. The legacy colour rules stay for column-2 menus.
+- With vim keys off, the footer row still has content without `-- INSERT --`,
+  so those captures read as vim `Normal` (as the vim section above explains).
+- A running foreground shell (`theme-dark-foreground-shell-running-120x40`)
+  shows `esc to interrupt` in the footer (busy by the activity-line rule); a
+  backgrounded one does not, and the idle box and the menu are classified as
+  usual.
