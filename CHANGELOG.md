@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.4.12](https://github.com/DaveDev42/claude-smart/compare/v0.4.11...v0.4.12) (2026-10-10)
+
+
+### Bug Fixes
+
+* **idle-compact:** read Claude Code 2.1.296's pointer-style slash menu and refuse Enter when no menu is recognised — the old column-2 rule saw no menu on 2.1.296 and let Enter through ([1df9c5d](https://github.com/DaveDev42/claude-smart/commit/1df9c5d3094884cd20a457ab040f88ec27848761))
+* **migrate:** drop the doubled 'waits' from the floor dir's reboot line ([8fdb0c1](https://github.com/DaveDev42/claude-smart/commit/8fdb0c1c56632ec9e0631f20fbd05ac5866eafe7))
+
 ## [0.4.11](https://github.com/DaveDev42/claude-smart/compare/v0.4.10...v0.4.11) (2026-10-09)
 
 
