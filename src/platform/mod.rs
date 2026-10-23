@@ -8,8 +8,6 @@ pub mod relaunch;
 #[cfg(unix)]
 pub mod posix;
 
-pub mod relay;
-
 #[cfg(windows)]
 pub mod windows;
 
@@ -19,37 +17,20 @@ pub mod windows;
 // on every platform. sysinfo gives a targeted single-process refresh + the
 // name/exe/argv[0] on all targets, so there is no external `ps` spawn (and no
 // separate POSIX vs Windows code path to keep in sync). The launcher (which IS
-// OS-specific, and on unix picked between direct/relay) is chosen through
+// OS-specific) is chosen through
 // `pick_launcher` below rather than a bare type alias.
 
 pub use proc_check::SysinfoProcCheck as PlatformProcCheck;
 
-/// Pick the launcher for this `csm` process: the pty relay if idle-compact's
-/// activation predicate says so (see `relay::should_activate`), the direct
-/// (today's-behaviour) launcher otherwise. Chosen once per process start —
-/// a later, per-hop *setup* failure inside the relay falls back to the
-/// direct launcher for that hop only, without needing to re-run this pick.
+/// The launcher for this `csm` process: csm hands the real terminal (or
+/// console) straight to claude.
 #[cfg(unix)]
-pub fn pick_launcher(mode: crate::config::IdleCompactMode) -> Box<dyn launcher::Launcher> {
-    if relay::platform_should_activate(mode) {
-        Box::new(relay::RelayLauncher::with_observer(std::sync::Arc::new(
-            crate::idle_compact::supervisor::Supervisor::new(),
-        )))
-    } else {
-        Box::new(posix::PosixLauncher)
-    }
+pub fn pick_launcher() -> Box<dyn launcher::Launcher> {
+    Box::new(posix::PosixLauncher)
 }
 
-/// Windows: the ConPTY relay under the same activation rule (consoles
-/// instead of terminals, no foreground-group check), the direct launcher
-/// otherwise. See `relay::conpty`.
+/// Windows: the direct launcher, sharing the console with claude.
 #[cfg(windows)]
-pub fn pick_launcher(mode: crate::config::IdleCompactMode) -> Box<dyn launcher::Launcher> {
-    if relay::platform_should_activate(mode) {
-        Box::new(relay::ConptyLauncher::with_observer(std::sync::Arc::new(
-            crate::idle_compact::supervisor::Supervisor::new(),
-        )))
-    } else {
-        Box::new(windows::WindowsLauncher)
-    }
+pub fn pick_launcher() -> Box<dyn launcher::Launcher> {
+    Box::new(windows::WindowsLauncher)
 }

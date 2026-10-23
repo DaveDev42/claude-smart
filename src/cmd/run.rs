@@ -261,21 +261,14 @@ pub(crate) fn run(args: &[OsString]) -> anyhow::Result<()> {
         cli,
     };
 
-    // `pick_launcher` picks the relay (a pty on unix, a ConPTY on Windows)
-    // or the direct (PosixLauncher / WindowsLauncher) launcher once, per
-    // idle-compact's activation predicate (`platform::relay::should_activate`
-    // through each platform's `platform_should_activate`). The migration's
-    // run after the spawn
+    // The migration's run after the spawn
     // counts this child as a live claude in its D: it starts before it
     // registers in D/sessions.
     crate::migrate::note_child(
         dir.as_ref().map(|d| d.d.clone()),
         Some(spec.session_id.clone()),
     );
-    let mode = crate::config::Config::load()
-        .unwrap_or_default()
-        .idle_compact_mode();
-    let launcher = platform::pick_launcher(mode);
+    let launcher = platform::pick_launcher();
     platform::relaunch::run_relaunch_loop(launcher.as_ref(), &spec)
 }
 

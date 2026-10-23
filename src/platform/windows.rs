@@ -110,9 +110,6 @@ impl Launcher for WindowsLauncher {
         cmd.args(prefix);
         cmd.args(cli);
         env.apply(&mut cmd);
-        // Direct mode is never a relay supervisor: strip any CSM_SUPERVISOR_PID
-        // this process inherited, as the POSIX direct launcher does.
-        cmd.env_remove(crate::idle_compact::SUPERVISOR_PID_ENV);
         // Own process group so GenerateConsoleCtrlEvent can target claude alone.
         cmd.creation_flags(CREATE_NEW_PROCESS_GROUP);
         // stdio inherited by default (shares the console) — never piped.
@@ -139,8 +136,7 @@ impl Launcher for WindowsLauncher {
 
 /// Publish claude's group id, then install the forwarding console control
 /// handler. With `CREATE_NEW_PROCESS_GROUP` the OS would otherwise drop
-/// keyboard Ctrl-C. Also used by the ConPTY relay's `__conpty-leader` helper,
-/// which shares the pseudoconsole with claude.
+/// keyboard Ctrl-C.
 pub(crate) fn forward_console_ctrl(pid: u32) {
     CHILD_PGID.store(pid, Ordering::SeqCst);
     // SAFETY: registering a process-wide console control handler.

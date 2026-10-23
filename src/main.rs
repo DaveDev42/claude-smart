@@ -6,7 +6,6 @@ mod e2e;
 mod envvar;
 mod epoch;
 mod hook;
-mod idle_compact;
 mod launch_context;
 mod migrate;
 mod orca;
@@ -14,7 +13,6 @@ mod paths;
 mod picker;
 mod platform;
 mod reaper;
-mod screen_check;
 mod session;
 mod sidecar;
 mod statusline;
@@ -35,22 +33,6 @@ fn main() -> anyhow::Result<()> {
 
     e2e::guard();
     let args: Vec<OsString> = std::env::args_os().collect();
-
-    // Hidden pty-relay leader entry point (`csm __pty-leader <slave-path> --
-    // <argv...>`), intercepted before any other argv handling — csm can be
-    // invoked under a `claude`-named symlink (Orca's alias), and this word
-    // must never depend on that name-based dispatch below. Never reached
-    // except via `RelayLauncher`'s own re-exec of `current_exe()`.
-    #[cfg(unix)]
-    if args.len() >= 2 && args[1] == "__pty-leader" {
-        std::process::exit(platform::relay::leader::main(&args[2..]));
-    }
-    // Windows counterpart: the helper `ConptyLauncher` starts inside its
-    // pseudoconsole to run claude there.
-    #[cfg(windows)]
-    if args.len() >= 2 && args[1] == platform::relay::conpty_logic::LEADER_WORD {
-        std::process::exit(platform::relay::conpty::leader_main(&args[2..]));
-    }
 
     // Top-level `--version`/`-V` and `--help`/`-h` belong to csm itself, not to
     // claude — but only under the name `csm`. `csm-hook --version` must reach

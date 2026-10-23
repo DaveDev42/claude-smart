@@ -1655,19 +1655,12 @@ fn write_noclobber_epoch(path: &Path) -> anyhow::Result<()> {
 }
 
 /// Suffixes [`prune_detected_markers`] sweeps: the one-shot notify dedup
-/// marker, plus `idle_compact`'s two per-session markers (`<sid>.idle`, the
-/// last-Stop stamp, and `<sid>.idle-compacted`, the one-shot fire marker) —
-/// the same per-session state files this sweep already prunes by age, so a
-/// session that stops running is not left with stale idle-compact markers
-/// any more than it is with a stale `.detected` one.
+/// marker, plus the `.idle` / `.idle-compacted` markers the removed
+/// idle-compact feature left behind, so an upgraded machine still sheds them.
 const PRUNED_MARKER_SUFFIXES: [&str; 3] = [".detected", ".idle", ".idle-compacted"];
 
 /// Prune `.detected`/`.idle`/`.idle-compacted` markers older than 7 days
-/// across the smart dir, then [`idle_compact::request::prune_stale_requests`]
-/// over the same dir's `idle-compact-requests/` subdirectory (a supervisor
-/// that never claimed a hand-off request — crashed, or was never actually
-/// alive despite a live-looking pid check at write time — must not leave it
-/// behind forever either). Best-effort: any error is silently ignored.
+/// across the smart dir. Best-effort: any error is silently ignored.
 /// Shell (the `.detected` case this ported from):
 /// `find "$SMART_DIR" -maxdepth 1 -name '*.detected' -mtime +7 -delete`
 fn prune_detected_markers() {
@@ -1695,10 +1688,6 @@ fn prune_detected_markers() {
             let _ = std::fs::remove_file(entry.path());
         }
     }
-    crate::idle_compact::request::prune_stale_requests(
-        &paths::idle_compact_requests_dir(),
-        crate::epoch::now_secs() as i64,
-    );
 }
 
 /// Check the machine-wide cooldown and atomically claim the slot.
@@ -3071,13 +3060,13 @@ mod tests {
         assert!(resolve_target_from_pick(result).is_none());
     }
 
-    // ── prune_detected_markers (also sweeps idle_compact's two markers) ──────
+    // ── prune_detected_markers (also sweeps the removed idle-compact's markers) ──────
 
     /// A marker older than 7 days is pruned for all three suffixes
     /// (`.detected`, `.idle`, `.idle-compacted`); one still within the
     /// window is left alone, for every suffix.
     #[test]
-    fn prune_detected_markers_sweeps_idle_compact_markers_too() {
+    fn prune_detected_markers_sweeps_legacy_idle_markers_too() {
         let home = tempfile::TempDir::new().unwrap();
         crate::testenv::with_test_home(home.path(), || {
             let dir = crate::paths::smart_dir().unwrap();
@@ -3086,14 +3075,14 @@ mod tests {
             let stale_sid = "sid-stale-0001";
             for sid in [fresh_sid, stale_sid] {
                 std::fs::write(crate::paths::detected(sid), "1").unwrap();
-                std::fs::write(crate::paths::idle(sid), "1").unwrap();
-                std::fs::write(crate::paths::idle_compacted(sid), "1").unwrap();
+                std::fs::write(dir.join(format!("{sid}.idle")), "1").unwrap();
+                std::fs::write(dir.join(format!("{sid}.idle-compacted")), "1").unwrap();
             }
             for sid in [stale_sid] {
                 for p in [
                     crate::paths::detected(sid),
-                    crate::paths::idle(sid),
-                    crate::paths::idle_compacted(sid),
+                    dir.join(format!("{sid}.idle")),
+                    dir.join(format!("{sid}.idle-compacted")),
                 ] {
                     // Write access: Windows refuses set_modified on a read-only handle.
                     let f = std::fs::OpenOptions::new().write(true).open(&p).unwrap();
@@ -3112,45 +3101,15 @@ mod tests {
             prune_detected_markers();
 
             assert!(crate::paths::detected(fresh_sid).exists());
-            assert!(crate::paths::idle(fresh_sid).exists());
-            assert!(crate::paths::idle_compacted(fresh_sid).exists());
+            assert!(dir.join(format!("{fresh_sid}.idle")).exists());
+            assert!(dir.join(format!("{fresh_sid}.idle-compacted")).exists());
             assert!(!crate::paths::detected(stale_sid).exists());
-            assert!(!crate::paths::idle(stale_sid).exists());
-            assert!(!crate::paths::idle_compacted(stale_sid).exists());
+            assert!(!dir.join(format!("{stale_sid}.idle")).exists());
+            assert!(!dir.join(format!("{stale_sid}.idle-compacted")).exists());
             assert!(
                 dir.join("sidecar-unrelated.json").exists(),
                 "the sweep must only touch the tracked marker suffixes"
             );
-        });
-    }
-
-    /// [`prune_detected_markers`] also sweeps
-    /// `idle-compact-requests/<pid>.json` hand-off files: an expired one
-    /// (past its own `deadline`, regardless of the 7-day marker-age window
-    /// above) is pruned, a live one is left alone.
-    #[test]
-    fn prune_detected_markers_sweeps_stale_idle_compact_requests_too() {
-        let home = tempfile::TempDir::new().unwrap();
-        crate::testenv::with_test_home(home.path(), || {
-            let dir = crate::paths::idle_compact_requests_dir();
-            let now = crate::epoch::now_secs() as i64;
-            let sample = |deadline: i64| crate::idle_compact::request::Request {
-                v: crate::idle_compact::request::REQUEST_V,
-                mode: "on".to_owned(),
-                sid: "sid-1".to_owned(),
-                written_at: now,
-                deadline,
-                recache_tokens: 150_000,
-                remaining_secs: 200,
-                vim_mode: None,
-            };
-            crate::idle_compact::request::write_request(&dir, 111, &sample(now - 1_000)).unwrap(); // expired
-            crate::idle_compact::request::write_request(&dir, 222, &sample(now + 1_000)).unwrap(); // live
-
-            prune_detected_markers();
-
-            assert!(!crate::paths::idle_compact_request(111).exists());
-            assert!(crate::paths::idle_compact_request(222).exists());
         });
     }
 }
