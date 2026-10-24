@@ -125,50 +125,20 @@ pub(crate) fn run(args: &[OsString]) -> anyhow::Result<()> {
     }
     let quiet = launch.context.is_orca();
 
-    // ── 1b. The automatic migration ────────────────────────────────────────────
-    // A terminal launch runs the probe and stage A before the spawn, within
-    // a 3 s budget, so this launch already has managed accounts; a pane
-    // does nothing before the spawn unless Orca already runs in ~/.claude
-    // (then B1 and B2 run first, so a resumed pane finds its transcripts).
-    // Either way the rest runs after the spawn, on a thread the recovery
-    // thread starts (`migrate::start_post_spawn`).
-    // Every return below, a cancelled picker or a failed step included,
-    // ends the launch through this guard: a migration run still going gets
-    // a short grace and a pre-spawn run's report reaches the terminal.
-    let _migration = crate::migrate::LaunchGuard::new();
-    match crate::migrate::probe::trigger_class("run", args, Some(launch.context)) {
-        crate::migrate::probe::TriggerClass::Full => crate::migrate::prespawn(),
-        crate::migrate::probe::TriggerClass::Pane => {
-            crate::migrate::pane_prespawn();
-            crate::migrate::arm_pane();
-        }
-        _ => {}
-    }
-
     // ── 2. Resolve the working directory, D and the child env ─────────────────
     let cwd = std::env::current_dir().context("csm: cannot determine current directory")?;
     let dir = launch_context::launch_dir(quiet);
     let pin = dir
         .as_ref()
         .map_or(launch_context::ConfigDirPin::Leave, |d| d.pin.clone());
-    // A pre-spawn migration run that outlived its budget may hold
-    // switch.lock: the repair and the switch below would wait up to 30 s
-    // for it, so they are left to the recovery after the spawn.
-    let migrating = crate::migrate::prespawn_still_running();
     if !quiet {
-        if dir.as_ref().is_some_and(|d| d.stale) {
-            crate::migrate::stale_pin_hint();
-        }
         // Interactive: an unfinished switch is repaired before the account
         // decision; inside Orca it waits until after the spawn (relaunch loop).
-        if !migrating {
-            prelaunch_recovery(&pin);
-        }
+        prelaunch_recovery(&pin);
     }
     // Reads files only (store, stashes' oauth-account.json, D's .claude.json).
     let mut accounts = launch_accounts(dir.as_ref());
     if launch.context == LaunchContext::Interactive
-        && !migrating
         && let Some(line) = prelaunch_switch(&accounts, &pin)
     {
         eprintln!("{line}");
@@ -261,13 +231,6 @@ pub(crate) fn run(args: &[OsString]) -> anyhow::Result<()> {
         cli,
     };
 
-    // The migration's run after the spawn
-    // counts this child as a live claude in its D: it starts before it
-    // registers in D/sessions.
-    crate::migrate::note_child(
-        dir.as_ref().map(|d| d.d.clone()),
-        Some(spec.session_id.clone()),
-    );
     let launcher = platform::pick_launcher();
     platform::relaunch::run_relaunch_loop(launcher.as_ref(), &spec)
 }
@@ -663,7 +626,6 @@ mod tests {
         let dir = launch_context::LaunchDir {
             d: d.clone(),
             pin: launch_context::ConfigDirPin::Set(d.clone()),
-            stale: false,
         };
         crate::testenv::with_test_home(home.path(), || {
             std::fs::create_dir_all(crate::paths::smart_dir_no_create()).unwrap();

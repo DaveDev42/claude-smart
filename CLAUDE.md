@@ -24,10 +24,9 @@ multi-machine fleet), but the crate itself ships **zero** private identifiers
 The module tree is discoverable from `src/`; this lists only what is not obvious from it.
 
 - `src/main.rs`: `e2e::guard()` is the first call in `main()`, then argv[0]/`args[1]` dispatch. Every `cmd_*` handler lives under `src/cmd/`. Three reserved words dispatch outside it: `reap` (`src/reaper/`), `statusline` (`src/statusline.rs`), `newuuid` (inline in `main()`).
-- `src/e2e.rs`: seams for `e2e/run.sh`, compiled in only with the `e2e` cargo feature (inert otherwise). `guard()` exits 97 unless `HOME` (and any `XDG_*_HOME`) lies inside `CSM_E2E_SANDBOX`. The feature also fakes the Keychain runner, Orca process scan, Orca version, session floor, boot id, and named `point(name)` hooks. Never enable the feature in a release build.
-- `src/cmd/`: one module per subcommand. `cas.rs` is a compat stub, `claude.rs` is the `csm claude <args…>` passthrough. `accounts.rs` and `migrate.rs` keep a pure parser/decision core over `orca::` / `migrate::Report`.
-- `src/launch_context.rs`: how a launch started (`Print`, `OrcaPane`, `OrcaStructured`, `Interactive`, `CSM_ORCA` override), the `CLAUDE_CONFIG_DIR` pin rule (while Orca runs every launch uses Orca's live `D`; `stale_pin` drops an inherited value naming a recorded legacy dir or `~/.claude`), and the managed-account auth-env strip list.
-- `src/migrate/`: the automatic migration off the legacy per-profile layout (`~/.config/claude-as/profiles.json`, `~/.claude.<name>`, `~/.claude.shared`, the machine-wide `CLAUDE_CONFIG_DIR` floor). Phases `adopt|carry|cutover|retire|done` are persisted in `<state>/migration.json`; the 3 s `PRESPAWN_BUDGET` bounds the pre-spawn run. Credentials are never deleted (quarantine files them), legacy dirs are renamed `<dir>.retired`, unregistered `~/.claude.*` dirs are only listed.
+- `src/e2e.rs`: seams for `e2e/run.sh`, compiled in only with the `e2e` cargo feature (inert otherwise). `guard()` exits 97 unless `HOME` (and any `XDG_*_HOME`) lies inside `CSM_E2E_SANDBOX`. The feature also fakes the Keychain runner, Orca process scan, Orca version, and named `point(name)` hooks. Never enable the feature in a release build.
+- `src/cmd/`: one module per subcommand. `claude.rs` is the `csm claude <args…>` passthrough. `accounts.rs` keeps a pure parser/decision core over `orca::`.
+- `src/launch_context.rs`: how a launch started (`Print`, `OrcaPane`, `OrcaStructured`, `Interactive`, `CSM_ORCA` override), the `CLAUDE_CONFIG_DIR` pin rule (while Orca runs every launch uses Orca's live `D`), and the managed-account auth-env strip list.
 - `src/cli/`: `parser.rs` is a hand-rolled `csm run` flag loop, NOT clap, so claude flags forward verbatim (it stops at the first positional, using `carry::arity`). `completions.rs` holds a clap tree used ONLY for `csm completions`, never to parse real argv. `reserved.rs` owns the reserved subcommand consts and `dispatch_subcommand`.
 - `src/account/`: `accounts.rs` reads Orca's host accounts read-only. `load` (store) is the only load the hook and statusline use; `load_live` asks Orca over RPC (3 s timeout) because its store lags its memory. `scoring.rs` has `LIMIT_PCT=99`, `SATURATION_PCT=95` and `is_viable_pcts`, the one viability predicate over session and week_all. `pick_best_at` and the hook's target pick route through it; never add a second inline threshold check. `week_fable` does not feed viability.
 - `src/orca/`: csm as a second client of Orca's account service. `HostEnv::current()` refuses the real home under `cfg(test)`; tests use `HostEnv::for_test`. `store.rs` holds the store-write protocol (L0/L1/L2 liveness checks, `patch_settings` round-trip gate, `preflight`); for a SQLite profile it delegates to `statedb.rs`, the port of Orca's offline settings writer (`profile-state.db` `settings` row, revision fence, acceptance marker). `keychain.rs` refuses the real `/usr/bin/security` under `cfg(test)`. `switch.rs` is a pure `plan_switch` plus executor and journal.
@@ -109,17 +108,9 @@ dependency/MSRV checks).
    names. One runtime dir `D` per machine and one active account per
    machine.
 4. **Pure core + thin I/O shell** for testable features (`report.rs`,
-   `cmd/accounts.rs`, `cmd/migrate.rs`, `migrate/`): the join/decision logic is a pure fn unit-tested against
+   `cmd/accounts.rs`): the join/decision logic is a pure fn unit-tested against
    fixtures; network/stdin/stdout/clock live in `main`/the I/O shell only.
-5. **Deprecated `cas` compat stays quiet.** `csm cas --print-default-dir`
-   prints Orca's live `D` while that is a legacy profile dir (before the
-   cutover, csm's own `D` when that is one), else nothing plus one stderr
-   note, since exporting `~/.claude` would make Orca read
-   `~/.claude/.claude.json`; `csm cas --eval …` prints nothing on stdout, one note on
-   stderr, and exits 0, so a leftover shell shim does not break a shell.
-   Every other `cas` verb is retired and fails with a pointer to
-   `csm accounts`. Do not grow it back.
-6. **Orca store rules.** Orca's files are another app's private state.
+5. **Orca store rules.** Orca's files are another app's private state.
    - With Orca running, every change goes through its RPC. csm never writes
      the store, a stash or `D`'s credentials behind a running Orca.
    - Offline writes go through the store-write protocol in `orca::store`
@@ -143,7 +134,7 @@ dependency/MSRV checks).
      contents.
    - `csm hook` (every event) does no network I/O, no RPC and no Keychain
      access; an Orca-pane launch touches neither before claude starts.
-7. **Test hygiene (machine safety).** Tests must never reach the real
+6. **Test hygiene (machine safety).** Tests must never reach the real
    machine's accounts or starve it of processes.
    - Tests never resolve the real home, the real Orca userData, the login
      Keychain, `~/.claude*`, `~/.config/claude-as`, `~/.config/claude-smart`
@@ -170,11 +161,10 @@ dependency/MSRV checks).
 ## CLI surface (collision-safe)
 
 `run, hook, accounts {list [--no-usage]|use|add|import|rm|doctor [--fix] [--offline]},
-orca {status|setup}, migrate [--dry-run],
+orca {status|setup},
 config {show|get|set|unset launch-command|min-claude-version},
 usage [--json] [--no-fetch] [--refresh] | usage capture,
-scan, sidecar, statusline, completions, reap, newuuid, claude <args…>` + the
-hidden compat `cas`. There is no csm-global flag. The collision analysis
+scan, sidecar, statusline, completions, reap, newuuid, claude <args…>`. There is no csm-global flag. The collision analysis
 against claude's own subcommands is Invariant 2 above.
 
 ## Git workflow
@@ -231,9 +221,7 @@ is needed.
   0.4.8 on a real Windows Orca 1.4.220 (2026-10-05) read the store
   (`accounts 2 (store)`, `offline writes allowed`), switched the active
   account offline and back, and served `usage --json` for both accounts;
-  the restarted Orca answered RPC with the original active account. The
-  automatic migration still keeps A1, A2, A3 and the cutover's offline `D`
-  write on RPC on Windows, since no Windows host has run it offline. The e2e harness runs on
+  the restarted Orca answered RPC with the original active account. The e2e harness runs on
   macOS and Linux only.
 - **Orca format drift.** csm ports Orca's private store format and account
   logic. The port follows Orca v1.4.209 to v1.4.220 (the 1.4.214 to
@@ -246,26 +234,6 @@ is needed.
   RPC with the original active account), and the offline switch and back
   on 1.4.220 on Windows (no `doctor --fix` run there). A new Orca release
   needs a `tools/orca-drift.sh` pass before `TESTED` grows.
-- **The automatic migration's offline SQLite path is verified on Linux only.**
-  `migrate/adopt.rs` imports and selects offline on a SQLite profile (macOS
-  and Linux) when the database passes `store::preflight`
-  (`OrcaView::db_write_error`), and defers to a running Orca otherwise;
-  the e2e `auto_sqlite` scenario covers only the refused case (its
-  database is a bare header, and the fake Orca does not read SQLite). On
-  2026-10-09 it ran against a real Orca 1.4.218 on Linux in a sandbox HOME
-  with fake credentials: with Orca stopped, `csm migrate` imported both
-  profiles, selected the floor profile's account in the `settings` row and
-  cut over, and the restarted Orca served both accounts and the active id
-  over RPC and read the stash csm wrote. On 2026-10-10 a second sandbox
-  run (csm 0.4.11, Orca 1.4.218, loopback-only network namespace) drove
-  `csm migrate` on through retire to `done`: the non-floor profile retired
-  once the profile endpoint (a loopback fake) answered, the floor profile
-  after Orca restarted in `~/.claude` and a later boot id was seen (the
-  reboot was simulated by bind-mounting another `boot_id`), quarantined
-  grants and stashes were byte-identical to the dirs' credentials, and the
-  restarted Orca served both accounts and the active id. macOS (Keychain
-  stashes), Windows, a real reboot and the pre-spawn path are still
-  unexercised.
 - **Minimal-store creation is verified against real Orca on Linux only.** With Orca
   stopped and no store at all, `accounts add`/`import` write
   `store::MINIMAL_STORE` plus the account keys (`write_protocol` with
@@ -278,22 +246,6 @@ is needed.
   run against a real Orca on macOS or Windows. Known from the source: a store that
   exists without an `onboarding` block makes Orca skip its first-run wizard
   (`normalizeLoadedOnboardingState`).
-
-- **The automatic migration is mostly tested on fakes.** Apart from the
-  Linux sandbox runs above, the e2e harness
-  drives every phase against the fake Orca, with the floor in a file
-  (`CSM_E2E_SESSION_FLOOR_FILE`) and the boot id from `CSM_E2E_BOOT_ID`.
-  Not yet run on a real machine: `launchctl unsetenv` clearing the floor
-  for an Orca started from the Dock, the `HKCU\Environment` delete plus
-  `WM_SETTINGCHANGE` on Windows, Windows junctions and hard links as
-  compat links, real Orca taking `~/.claude` at its next start after a
-  cutover done while it ran, and Claude Code honouring csm's hold of its
-  `<config>.lock`. On Windows, A1, A2 and A3 act only through a running
-  Orca's RPC (A3 not at all) and defer while Orca is stopped, and a dir
-  whose grant is newer than its stash stays until the account is logged
-  in again in Orca (settle never writes a stash there). The window between a cutover under a
-  running Orca and Orca's restart (a plain `claude` in a new shell holds
-  the same refresh token as Orca's `<floor>`) is accepted, not closed.
 - **Windows console-stop is unverified.** Two empirical checks gate the Windows
   relaunch loop and neither runs headlessly: (1) interactive Ctrl-C cancels
   claude's prompt rather than killing the supervisor; (2) after a limit-triggered

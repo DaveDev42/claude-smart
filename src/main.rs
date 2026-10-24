@@ -7,7 +7,6 @@ mod envvar;
 mod epoch;
 mod hook;
 mod launch_context;
-mod migrate;
 mod orca;
 mod paths;
 mod picker;
@@ -59,21 +58,14 @@ fn main() -> anyhow::Result<()> {
     let dispatch = cli::reserved::dispatch_subcommand(&args);
     let rest: &[OsString] = &args[args.len() - dispatch.rest_len..];
 
-    // The automatic migration's FULL and NOTE triggers (design section 1);
-    // every NONE word returns before its probe, and `run`/`migrate` decide
-    // for themselves.
-    migrate::at_dispatch(dispatch.subcommand, rest);
-
     match dispatch.subcommand {
         "run" => cmd::run::run(rest),
         "claude" => cmd::claude::cmd_claude(rest),
         "hook" => cmd::hook::cmd_hook(rest),
         "accounts" => cmd::accounts::cmd_accounts(rest),
         "orca" => cmd::orca::cmd_orca(rest),
-        "migrate" => cmd::migrate::cmd_migrate(rest),
         "config" => cmd::config::cmd_config(rest),
         "usage" => cmd::usage::cmd_usage(rest),
-        "cas" => cmd::cas::cmd_cas(rest),
         "scan" => cmd::scan::cmd_scan(rest),
         "reap" => reaper::cmd(rest),
         "sidecar" => cmd::sidecar::cmd_sidecar(rest),
@@ -121,8 +113,6 @@ fn print_help() {
     println!("ORCA");
     println!("  csm orca [status]                    Orca as csm sees it (never prints secrets)");
     println!("  csm orca setup                       create the `claude` alias for Orca\n");
-    println!("MIGRATION (from the profile-based setup; also runs on its own)");
-    println!("  csm migrate [--dry-run]              move this machine onto Orca's accounts now\n");
     println!("CONFIG (csm's own — ~/.config/claude-smart/config.json)");
     println!("  csm config [show]                    print the config JSON");
     println!("  csm config get launch-command        print the resolved launch command");

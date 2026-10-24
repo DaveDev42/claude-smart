@@ -80,9 +80,9 @@ pub(crate) fn is_running(pid: u32) -> bool {
 /// `None` when the process is gone or its environment could not be read. An
 /// empty block counts as unreadable: every real process carries at least
 /// `PATH`, and sysinfo returns an empty list on a permission failure.
-/// Off the hot path: only the Orca runtime-dir check calls this.
-// Linux tests stub the one other caller (orca::live), so it is unused there.
-#[cfg_attr(all(test, target_os = "linux"), allow(dead_code))]
+/// Off the hot path: only [`environ_read`] calls this.
+// Linux reads `/proc/<pid>/environ` itself ([`environ_read`]).
+#[cfg(not(target_os = "linux"))]
 pub(crate) fn environ(pid: u32) -> Option<Vec<OsString>> {
     use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
 
@@ -181,9 +181,8 @@ pub(crate) fn snapshot() -> Vec<ProcInfo> {
 
 #[cfg(test)]
 mod tests {
-    /// Round 8: this process's own threads are not processes in the table
-    /// (Linux, where sysinfo lists them), so the migrate gate's
-    /// `other_csm` never counts csm's own reader thread.
+    /// This process's own threads are not processes in the table (Linux,
+    /// where sysinfo lists them).
     #[cfg(target_os = "linux")]
     #[test]
     fn the_snapshot_leaves_out_threads() {
@@ -201,20 +200,6 @@ mod tests {
         assert_ne!(tid, me);
         assert!(table.iter().any(|p| p.pid == me), "this process is listed");
         assert!(!table.iter().any(|p| p.pid == tid), "thread {tid} listed");
-        // Only this process and its thread's pid, each given csm's exe name:
-        // a thread row would read as "another csm". The rest of the host's
-        // table is left out, so a csm running elsewhere on the machine (an
-        // e2e run, the operator's own sessions) cannot fail this test.
-        let ours: Vec<super::ProcInfo> = table
-            .iter()
-            .filter(|p| p.pid == me || p.pid == tid)
-            .cloned()
-            .map(|mut p| {
-                p.exe = Some(std::path::PathBuf::from("/usr/local/bin/csm"));
-                p
-            })
-            .collect();
-        assert_eq!(crate::migrate::other_csm(&ours, me, None), None);
     }
 
     #[cfg(unix)]

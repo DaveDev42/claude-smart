@@ -1,5 +1,5 @@
 //! One read-only view over Orca's account state, shared by the commands
-//! that read it (`csm accounts`, `csm orca status`, `csm migrate`).
+//! that read it (`csm accounts`, `csm orca status`).
 //!
 //! [`snapshot`] resolves userData, checks whether Orca runs (fail closed),
 //! loads the store, and, when asked and Orca runs, reads `accounts.list

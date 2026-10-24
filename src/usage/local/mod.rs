@@ -27,8 +27,7 @@
 //! - **Inactive, Orca stopped**: the stash token. With
 //!   [`CollectOpts::refresh_stash`] a grant that expires within 5 min is
 //!   refreshed first exactly as Orca does, under `switch.lock`, into the
-//!   stash only — and never while an unretired legacy `~/.claude.<name>`
-//!   still holds the account (design section 10 item 5), nor for the store's
+//!   stash only — and never for the store's
 //!   active account or a grant `D` also holds ([`stash_refresh_guard`]).
 //!   This replaces the former `CSM_OAUTH_REFRESH` opt-in, which is gone.
 //!
@@ -797,9 +796,8 @@ fn probe_stash(
 }
 
 /// Refresh `id`'s stash grant under `switch.lock`: re-read it there (the
-/// compare half of the compare-and-swap), refuse while Orca runs, while an
-/// unretired legacy profile dir still holds this account, or when the grant
-/// may be the one `D` holds ([`stash_refresh_guard`]), then run Orca's
+/// compare half of the compare-and-swap), refuse while Orca runs or when the
+/// grant may be the one `D` holds ([`stash_refresh_guard`]), then run Orca's
 /// refresh into the stash only. `Ok(None)` = nothing new. With
 /// `lock_held` the caller already holds `switch.lock`.
 fn refresh_stash(
@@ -813,15 +811,6 @@ fn refresh_stash(
     use crate::orca::refresh::{StashRefresh, refresh_stash_if_needed};
     use crate::orca::{live, quarantine::Quarantine};
 
-    let email = accounts.get(id).and_then(|a| a.email.as_deref());
-    let uuid = stash
-        .oauth_account()
-        .ok()
-        .flatten()
-        .and_then(|v| crate::orca::runtime::OauthIdentity::from_value(&v).account_uuid);
-    if legacy_dir_holds(&h.home, uuid.as_deref(), email) {
-        return Err("an unretired legacy profile dir still holds this account".into());
-    }
     let state = crate::paths::smart_dir().map_err(|e| format!("state dir: {}", e.kind()))?;
     let _lock = lock_for_refresh(&state, lock_held, std::time::Duration::from_secs(10))?;
     if live::check(h.os, &h.user_data, &live::SystemProcs).running {
@@ -921,33 +910,6 @@ fn runtime_refresh_tokens(h: &crate::account::accounts::HostCtx) -> Result<Vec<S
         Err(e) => return Err(format!("{}: {}", p.display(), e.kind())),
     }
     Ok(out)
-}
-
-/// Does an unretired `~/.claude.<name>` from the legacy registry still hold
-/// this account (design section 10 item 5)? Matched by `accountUuid`, else
-/// by email. A listed dir whose identity cannot be read counts as holding
-/// it (fail safe: no offline refresh).
-fn legacy_dir_holds(home: &Path, uuid: Option<&str>, email: Option<&str>) -> bool {
-    let Ok(legacy) = crate::migrate::load_legacy(home) else {
-        return true;
-    };
-    legacy.profiles.iter().any(|p| {
-        if std::fs::symlink_metadata(&p.dir).is_err() {
-            return false;
-        }
-        let paths = crate::orca::runtime::runtime_paths(Some(&p.dir.to_string_lossy()), home, |x| {
-            x.exists()
-        });
-        match crate::orca::runtime::read_runtime_identity(&paths) {
-            crate::orca::runtime::RuntimeIdentity::Present(i) => {
-                let by_uuid = matches!((uuid, i.account_uuid.as_deref()), (Some(a), Some(b)) if a == b);
-                let by_email = matches!((email, i.email.as_deref()), (Some(a), Some(b)) if a.trim().eq_ignore_ascii_case(b.trim()));
-                by_uuid || by_email
-            }
-            crate::orca::runtime::RuntimeIdentity::None => false,
-            crate::orca::runtime::RuntimeIdentity::Unreadable => true,
-        }
-    })
 }
 
 /// One line to csm's log (never a secret).

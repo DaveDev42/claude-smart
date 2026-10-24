@@ -75,7 +75,7 @@ pub fn set_cooldown(profile: &str, until_epoch: i64) -> std::io::Result<()> {
     set_cooldown_at(&paths::usage_store(profile), profile, until_epoch)
 }
 
-// ─── path-injected cores (the testable seam — see `cas::edit`'s pattern) ───
+// ─── path-injected cores (the testable seam) ───
 
 fn load_from(path: &Path) -> Option<StoreRecord> {
     let text = std::fs::read_to_string(path).ok()?;

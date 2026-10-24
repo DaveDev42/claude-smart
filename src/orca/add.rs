@@ -621,42 +621,7 @@ pub fn import(
     config_dir: &Path,
     previous_legacy_sha256: Option<&str>,
 ) -> Result<AccountChange, OrcaError> {
-    import_with(
-        env,
-        cli,
-        config_dir,
-        LegacyDigest::Given(previous_legacy_sha256),
-    )
-}
-
-/// [`import`] with `previousLegacyCredentialsSha256` = the sha256 of the
-/// unscoped runtime item as it is once `switch.lock` is held (migration
-/// step 4). Read under the lock, a concurrent csm switch cannot change the
-/// item between the digest and the capture and make the capture take the
-/// switched-in grant for the imported dir's.
-pub fn import_current_legacy(
-    env: &AccountsEnv<'_>,
-    cli: &dyn ClaudeCli,
-    config_dir: &Path,
-) -> Result<AccountChange, OrcaError> {
-    import_with(env, cli, config_dir, LegacyDigest::Current)
-}
-
-/// Where an import's legacy digest comes from.
-enum LegacyDigest<'a> {
-    /// The caller's (`None` = not given).
-    Given(Option<&'a str>),
-    /// The unscoped item's, read under `switch.lock` (macOS; none elsewhere).
-    Current,
-}
-
-fn import_with(
-    env: &AccountsEnv<'_>,
-    cli: &dyn ClaudeCli,
-    config_dir: &Path,
-    digest: LegacyDigest<'_>,
-) -> Result<AccountChange, OrcaError> {
-    if let LegacyDigest::Given(Some(sha)) = digest
+    if let Some(sha) = previous_legacy_sha256
         && !(sha.len() == 64
             && sha
                 .bytes()
@@ -671,19 +636,6 @@ fn import_with(
         .map_err(|e| OrcaError::io("cannot resolve", &config_dir, e))?;
     let dir_s = dir.to_string_lossy().into_owned();
     let _lock = lock(env)?;
-    let current;
-    let previous_legacy_sha256 = match digest {
-        LegacyDigest::Given(d) => d,
-        LegacyDigest::Current => {
-            current = if env.os == HostOs::MacOs {
-                keychain::read_runtime_scoped(None, env.keychain_user)?
-                    .map(|s| sha256_hex(s.expose().as_bytes()))
-            } else {
-                None
-            };
-            current.as_deref()
-        }
-    };
     if env.live.mark().running {
         rpc::add_claude_from_config_dir(
             env.user_data,
@@ -2055,45 +2007,6 @@ mod tests {
                 stdout: r#"{"email":"carol@example.com"}"#.into(),
             })
         }
-    }
-
-    /// Migration's import digests the unscoped item under `switch.lock`: a
-    /// legacy dir with no scoped item then keeps its own file grant, and
-    /// the unchanged unscoped item (another account's) is not captured.
-    #[cfg(unix)]
-    #[test]
-    fn import_current_legacy_digests_the_unscoped_item_under_the_lock() {
-        let _fake = crate::orca::testsupport::FakeSecurity::install();
-        let w = world();
-        let user = w.user.clone();
-        let other = creds_json("at-b", "rt-b", 5);
-        keychain::write_runtime_scoped(&other, None, &user).unwrap();
-        let src = w.tmp.path().join("legacy");
-        std::fs::create_dir_all(&src).unwrap();
-        let grant = creds_json("at-c", "rt-c", 5);
-        std::fs::write(src.join(".credentials.json"), &grant).unwrap();
-        std::fs::write(
-            src.join(".claude.json"),
-            json!({"oauthAccount": oauth_json("u-c", "carol@example.com", None)}).to_string(),
-        )
-        .unwrap();
-        let cli = FakeClaude {
-            creds: String::new(),
-            status: "{}".into(),
-            calls: Mutex::new(Vec::new()),
-        };
-        let live = ScriptedLiveness::stopped();
-        let mut env = w.env(&live);
-        env.os = HostOs::MacOs;
-        let c = import_current_legacy(&env, &cli, &src).unwrap();
-        let id = c.id.unwrap();
-        let v = w.view();
-        let rec = v.accounts.iter().find(|a| a.id == id).unwrap();
-        let s = Stash::open(&w.ud, &id, rec.managed_auth_path.as_deref()).unwrap();
-        assert_eq!(
-            s.credentials(HostOs::MacOs).unwrap().unwrap().expose(),
-            grant
-        );
     }
 
     #[cfg(unix)]

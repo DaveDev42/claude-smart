@@ -673,7 +673,7 @@ pub fn snapshot_values(
 /// File the system-default snapshot's grants in the quarantine without
 /// touching `D` or anything of Orca's. This is what csm does about a
 /// crashed switch from no account while Orca runs: csm never writes `D`
-/// behind a running Orca (Invariant 6), and Orca's next select would
+/// behind a running Orca (Invariant 5), and Orca's next select would
 /// force-capture the half-written `D` over the snapshot, which may hold the
 /// only copy of the user's own login. Returns the fingerprints filed (or
 /// already there); nothing when there is no valid snapshot.

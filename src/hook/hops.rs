@@ -18,7 +18,7 @@
 //! The formatter is pure; [`append`] is the thin shell. It is best effort and
 //! returns nothing: a full disk or a read-only state dir must never fail a
 //! hop. The hook-side call does no network, RPC or Keychain access
-//! (Invariant 6), only a local append.
+//! (Invariant 5), only a local append.
 
 use std::io::Write as _;
 

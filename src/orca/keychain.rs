@@ -217,15 +217,6 @@ pub fn find_argv(svc: &str, acct: &str) -> Vec<String> {
         .collect()
 }
 
-/// `find-generic-password -s <svc> -a <acct>` without `-w`: the item's
-/// attributes only, never its secret. A presence probe.
-pub fn presence_argv(svc: &str, acct: &str) -> Vec<String> {
-    ["find-generic-password", "-s", svc, "-a", acct]
-        .iter()
-        .map(|s| (*s).to_owned())
-        .collect()
-}
-
 /// `delete-generic-password -s <svc> -a <acct>` (Orca's D()).
 pub fn delete_argv(svc: &str, acct: &str) -> Vec<String> {
     ["delete-generic-password", "-s", svc, "-a", acct]
@@ -475,21 +466,6 @@ pub fn find_password(svc: &str, acct: &str) -> Result<Option<SecretString>, Keyc
     Ok(Some(SecretString::new(trimmed.to_owned())))
 }
 
-/// Does the item exist? Runs [`presence_argv`], which never reads the
-/// secret (so it cannot raise an access prompt either); stdout, the item's
-/// attributes, is dropped unread.
-pub fn has_password(svc: &str, acct: &str) -> Result<bool, KeychainError> {
-    let out = run_security(&presence_argv(svc, acct), None)?;
-    match out.code {
-        Some(0) => Ok(true),
-        _ if out.is_not_found() => Ok(false),
-        code => Err(KeychainError::Failed {
-            code,
-            reason: out.reason(),
-        }),
-    }
-}
-
 /// The stash credential of account `id` (macOS).
 pub fn find_stash(id: &str) -> Result<Option<SecretString>, KeychainError> {
     find_password(STASH_SERVICE, id)
@@ -608,29 +584,6 @@ pub fn read_runtime_scoped(
         }
     }
     Ok(None)
-}
-
-/// Every spelling of `dir` a claude process may have hashed into its
-/// Keychain service name: as given, with and without one trailing
-/// separator, and each form's [`dir_aliases`] walk. Deduped, in order.
-pub fn dir_spellings(dir: &str) -> Vec<String> {
-    let trimmed = dir.trim_end_matches(['/', '\\']);
-    let base = if trimmed.is_empty() { dir } else { trimmed };
-    let sep = if base.contains('\\') && !base.contains('/') {
-        '\\'
-    } else {
-        '/'
-    };
-    let forms = [dir.to_owned(), base.to_owned(), format!("{base}{sep}")];
-    let mut out: Vec<String> = Vec::new();
-    for f in forms {
-        for a in dir_aliases(&f) {
-            if !out.contains(&a) {
-                out.push(a);
-            }
-        }
-    }
-    out
 }
 
 /// Orca's l() (`De.a`): the first item over w(dir).
@@ -869,28 +822,6 @@ mod tests {
     }
 
     #[cfg(unix)]
-    /// The presence probe never passes `-w`, so it never reads a secret.
-    #[test]
-    fn has_password_probes_without_reading_the_secret() {
-        let fake = crate::orca::testsupport::FakeSecurity::install();
-        fake.put(
-            "svc-a",
-            "alice",
-            br#"{"claudeAiOauth":{"accessToken":"at-a"}}"#,
-        );
-        assert!(has_password("svc-a", "alice").unwrap());
-        assert!(!has_password("svc-b", "alice").unwrap());
-        let argv = fake.argv();
-        assert_eq!(argv.len(), 2, "{argv:?}");
-        assert!(
-            argv.iter().all(|a| !a.split(' ').any(|t| t == "-w")),
-            "{argv:?}"
-        );
-        fake.fail_find("svc-a", true);
-        assert!(has_password("svc-a", "alice").is_err());
-    }
-
-    #[cfg(unix)]
     #[test]
     fn find_reads_trimmed_bytes_and_absent_items() {
         let fake = crate::orca::testsupport::FakeSecurity::install();
@@ -1122,26 +1053,5 @@ mod tests {
         let u = KeychainUser::from_env(&env);
         assert_eq!(u.acct, ACCOUNT_FALLBACK);
         assert_eq!(u.delete_accts, vec![ACCOUNT_FALLBACK, "has space"]);
-    }
-    #[cfg(unix)]
-    #[test]
-    fn dir_spellings_cover_the_trailing_slash_and_the_realpath() {
-        let tmp = tempfile::tempdir().unwrap();
-        let real = tmp.path().join("real");
-        std::fs::create_dir_all(&real).unwrap();
-        let d = real.to_string_lossy().into_owned();
-        let got = dir_spellings(&d);
-        assert_eq!(got[0], d);
-        assert!(got.contains(&format!("{d}/")));
-        let canon = std::fs::canonicalize(&real)
-            .unwrap()
-            .to_string_lossy()
-            .into_owned();
-        assert!(got.contains(&canon));
-        let slashed = dir_spellings(&format!("{d}/"));
-        assert!(slashed.contains(&d));
-        let mut dedup = got.clone();
-        dedup.dedup();
-        assert_eq!(dedup.len(), got.len());
     }
 }

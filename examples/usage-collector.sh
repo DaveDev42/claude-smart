@@ -79,8 +79,8 @@ set -eu
 # Fill in `read_profile_usage` with however YOU can obtain a profile's numbers
 # (an API call, parsing a billing export, etc.). The loop assembles valid JSON.
 #
-# Profiles come from the csm registry so this stays in sync with `csm profiles`.
-REGISTRY="$HOME/.config/claude-as/profiles.json"
+# Profiles come from a JSON file you maintain: {"<name>": "<config dir>", ...}.
+REGISTRY="${PROFILES_JSON:-$HOME/.config/example/profiles.json}"
 
 # Echo "<session_pct> <week_pct> <session_reset> <week_reset>" for a profile,
 # or print nothing + return non-zero if it cannot be read (→ goes to "errors").
@@ -91,7 +91,7 @@ read_profile_usage() {
     return 1   # stub: "no data" → every profile lands in errors{} until implemented
 }
 
-# Extract "name<TAB>dir" pairs from profiles.json without needing jq.
+# Extract "name<TAB>dir" pairs from that file without needing jq.
 profile_pairs() {
     python3 - "$REGISTRY" <<'PY'
 import json, sys

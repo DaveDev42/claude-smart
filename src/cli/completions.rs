@@ -76,24 +76,6 @@ pub enum CompletionsSubcmd {
         owner: Option<String>,
     },
 
-    /// Deprecated. `--print-default-dir` prints csm's runtime dir; `--eval`
-    /// prints nothing (the profile switcher is gone).
-    #[command(name = "cas", hide = true)]
-    Cas {
-        /// Deprecated no-op (prints nothing on stdout).
-        #[arg(long)]
-        eval: bool,
-        /// Ignored.
-        #[arg(long, value_name = "SHELL")]
-        shell: Option<String>,
-        /// Print csm's runtime dir `D` and exit.
-        #[arg(long)]
-        print_default_dir: bool,
-        /// Ignored.
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
-        op_args: Vec<String>,
-    },
-
     /// Orca's Claude accounts: list, switch, add, import, remove, check.
     #[command(name = "accounts")]
     Accounts {
@@ -106,13 +88,6 @@ pub enum CompletionsSubcmd {
     Orca {
         #[command(subcommand)]
         verb: Option<OrcaVerb>,
-    },
-
-    /// Move a profile-based install onto Orca's account model.
-    #[command(name = "migrate")]
-    Migrate {
-        #[command(subcommand)]
-        verb: Option<MigrateVerb>,
     },
 
     /// csm's own global config (~/.config/claude-smart/config.json).
@@ -265,28 +240,6 @@ pub enum OrcaVerb {
     Setup,
 }
 
-/// `csm migrate <verb>`.
-#[derive(clap::Subcommand)]
-pub enum MigrateVerb {
-    /// Read-only: what `import` and `retire` would do.
-    #[command(name = "plan")]
-    Plan,
-    /// Import profile logins into Orca and carry config over to ~/.claude.
-    #[command(name = "import")]
-    Import {
-        /// Print what would be done and change nothing.
-        #[arg(long)]
-        dry_run: bool,
-    },
-    /// Retire migrated profile dirs and the old profile registry.
-    #[command(name = "retire")]
-    Retire {
-        /// Print what would be done and change nothing.
-        #[arg(long)]
-        dry_run: bool,
-    },
-}
-
 /// `csm config <verb>` — global config verbs.
 #[derive(clap::Subcommand)]
 pub enum ConfigVerb {
@@ -423,7 +376,6 @@ mod tests {
             "usage",
             "accounts",
             "orca",
-            "migrate",
             "scan",
             "reap",
             "sidecar",
@@ -469,8 +421,6 @@ mod tests {
         use crate::cli::reserved::CSM_RESERVED_SUBCOMMANDS;
 
         let cmd = CsmCompletionsApp::command();
-        // Hidden subcommands (the deprecated `cas`) still count: dispatch
-        // still reserves the word.
         let mut names: Vec<&str> = cmd
             .get_subcommands()
             .map(|c| c.get_name())

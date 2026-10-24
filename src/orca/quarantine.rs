@@ -119,7 +119,8 @@ pub enum Reason {
     StashChanged,
     /// A refreshed grant csm could not persist to its stash.
     PersistFailed,
-    /// Moved out of a retired config dir.
+    /// Moved out of a retired config dir (filed by the removed migration;
+    /// existing entries still read).
     Retired,
     /// Moved out of a stash no Orca record names (`accounts doctor --fix`).
     Orphaned,
@@ -145,9 +146,10 @@ pub enum Reason {
     /// side state (MCP servers' OAuth logins) the account's stash lacks.
     /// `accounts doctor --fix` keeps it until the stash holds that too.
     ExtraLogins,
-    /// An orphan `~/.claude/.credentials.json` the migration's cutover moved
-    /// out of `~/.claude` before Orca's `D` moves there: it is not the
-    /// active account's stashed grant, so no account is claimed for it.
+    /// An orphan `~/.claude/.credentials.json` the removed migration's
+    /// cutover moved out of `~/.claude`: it is not the active account's
+    /// stashed grant, so no account is claimed for it. Existing entries
+    /// still read.
     Cutover,
 }
 
@@ -401,29 +403,6 @@ impl Quarantine {
             return Ok(false);
         };
         meta.reason = reason;
-        self.write_meta(&meta)?;
-        Ok(true)
-    }
-
-    /// Rewrite entry `fp` as not provably any account's: `reason`, no
-    /// matched account, and the profile endpoint's answer when there was
-    /// one. For a grant filed under an account that then profiled as
-    /// another. `Ok(false)` when there is no such entry.
-    pub fn unattribute(
-        &self,
-        fp: &str,
-        reason: Reason,
-        profile: Option<(u16, Option<&str>)>,
-    ) -> Result<bool, OrcaError> {
-        let Some(mut meta) = self.meta_of(fp) else {
-            return Ok(false);
-        };
-        meta.reason = reason;
-        meta.matched_account = None;
-        if let Some((status, uuid)) = profile {
-            meta.profile_status = Some(status);
-            meta.profile_account_uuid = uuid.map(str::to_owned);
-        }
         self.write_meta(&meta)?;
         Ok(true)
     }

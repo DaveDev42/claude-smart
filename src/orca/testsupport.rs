@@ -105,9 +105,6 @@ sub run {
 open(my $log, '>>', "$root/calls") or die;
 print $log (defined $ARGV[0] ? $ARGV[0] : ''), "\n";
 close $log;
-open(my $alog, '>>', "$root/argv") or die;
-print $alog join(' ', @ARGV), "\n";
-close $alog;
 if (@ARGV && $ARGV[0] eq '-i') {
     my $rc = 0;
     while (my $line = <STDIN>) {
@@ -229,16 +226,6 @@ impl FakeSecurity {
             .map(str::to_owned)
             .collect()
     }
-
-    /// Every call's full argument list, one space-joined line per call
-    /// (`-i` batches log only `-i`).
-    pub(crate) fn argv(&self) -> Vec<String> {
-        std::fs::read_to_string(self.dir.path().join("argv"))
-            .unwrap_or_default()
-            .lines()
-            .map(str::to_owned)
-            .collect()
-    }
 }
 
 impl Drop for FakeSecurity {
@@ -352,7 +339,6 @@ pub(crate) struct FakeProcs {
     hidden: HashMap<u32, ProcInfo>,
     alive_only: Vec<u32>,
     unreadable: bool,
-    environs: HashMap<u32, Vec<std::ffi::OsString>>,
     ticks: HashMap<u32, u64>,
     uptime: Option<u64>,
 }
@@ -392,14 +378,6 @@ impl FakeProcs {
         self.uptime = Some(ticks);
         self
     }
-
-    /// Give `pid` a readable environment of `KEY=value` entries. A listed
-    /// process without one reads as unreadable.
-    pub(crate) fn with_env(mut self, pid: u32, vars: &[&str]) -> Self {
-        self.environs
-            .insert(pid, vars.iter().map(std::ffi::OsString::from).collect());
-        self
-    }
 }
 
 impl super::live::ProcFacts for FakeProcs {
@@ -425,10 +403,6 @@ impl super::live::ProcFacts for FakeProcs {
 
     fn uptime_ticks(&self) -> Option<u64> {
         self.uptime
-    }
-
-    fn environ(&self, pid: u32) -> Option<Vec<std::ffi::OsString>> {
-        self.environs.get(&pid).cloned()
     }
 }
 

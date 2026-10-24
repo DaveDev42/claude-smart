@@ -27,8 +27,6 @@ pub(crate) const CSM_RESERVED_SUBCOMMANDS: &[&str] = &[
     "hook",
     "config",
     "usage",
-    // Deprecated compat only: `--print-default-dir` and a no-op `--eval`.
-    "cas",
     "scan",
     "sidecar",
     "statusline",
@@ -37,7 +35,6 @@ pub(crate) const CSM_RESERVED_SUBCOMMANDS: &[&str] = &[
     "reap",
     "accounts",
     "orca",
-    "migrate",
     // The documented passthrough verb. `claude` is NOT one of claude's own
     // subcommands (`claude claude` is not a thing), so reserving the word
     // costs nothing and gives `csm claude <args…>` — claude in csm's runtime
@@ -252,15 +249,7 @@ mod tests {
     }
 
     #[test]
-    fn dispatch_explicit_cas() {
-        let a = argv(&["csm", "cas", "--eval", "--shell", "zsh", "--", "home"]);
-        let d = dispatch_subcommand(&a);
-        assert_eq!(d.subcommand, "cas");
-        assert_eq!(d.rest_len, 5);
-    }
-
-    #[test]
-    fn dispatch_explicit_accounts_orca_migrate() {
+    fn dispatch_explicit_accounts_orca() {
         assert_eq!(
             routed(&["csm", "accounts", "use", "alice@example.com"]),
             ("accounts", strings(&["use", "alice@example.com"]))
@@ -269,16 +258,18 @@ mod tests {
             routed(&["csm", "orca", "status"]),
             ("orca", strings(&["status"]))
         );
-        assert_eq!(
-            routed(&["csm", "migrate", "plan"]),
-            ("migrate", strings(&["plan"]))
-        );
     }
 
     /// The retired words are no longer csm's: they reach claude as prompts.
     #[test]
     fn dispatch_retired_words_fall_through_to_run() {
-        for w in ["profiles", "pick-account", "current-usage"] {
+        for w in [
+            "profiles",
+            "pick-account",
+            "current-usage",
+            "cas",
+            "migrate",
+        ] {
             assert_eq!(routed(&["csm", w]).0, "run", "{w}");
         }
     }

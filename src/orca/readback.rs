@@ -534,11 +534,6 @@ pub struct ReadBack<'a> {
     pub http: &'a dyn OauthHttp,
     pub quarantine: &'a Quarantine,
     pub now_ms: i64,
-    /// Migration read-back of a retired config dir (design §9 step 4):
-    /// every Keychain spelling of the dir is a candidate
-    /// ([`keychain::dir_spellings`]) and the shared unscoped item is not,
-    /// since it may belong to any profile.
-    pub migration: bool,
 }
 
 /// What [`read_back`] did.
@@ -555,18 +550,7 @@ pub struct ReadBackReport {
 /// Gather the runtime grants in Orca's order.
 pub fn gather(rb: &ReadBack<'_>) -> Result<Vec<Candidate>, OrcaError> {
     let mut raw = Vec::new();
-    if rb.os == HostOs::MacOs && rb.migration {
-        let dir = rb.paths.config_dir.to_string_lossy().into_owned();
-        for spelling in keychain::dir_spellings(&dir) {
-            let svc = keychain::runtime_service(Some(&spelling));
-            if let Some(v) = keychain::find_password(&svc, &rb.keychain_user.acct)? {
-                raw.push(Candidate {
-                    source: Source::ScopedKeychain,
-                    json: v,
-                });
-            }
-        }
-    } else if rb.os == HostOs::MacOs {
+    if rb.os == HostOs::MacOs {
         let dir = rb.paths.config_dir.to_string_lossy().into_owned();
         if let Some(v) = keychain::read_runtime_scoped(Some(&dir), rb.keychain_user)? {
             raw.push(Candidate {
@@ -1321,7 +1305,6 @@ mod tests {
                 http,
                 quarantine: &self.q,
                 now_ms: 1_700_000_000_000,
-                migration: false,
             })
         }
 
@@ -1537,7 +1520,6 @@ mod tests {
             http: &http,
             quarantine: &w.q,
             now_ms: 0,
-            migration: false,
         })
         .unwrap();
         assert_eq!(rep.persisted, None);
@@ -1568,7 +1550,6 @@ mod tests {
             http: &FakeHttp::default(),
             quarantine: &w.q,
             now_ms: 0,
-            migration: false,
         })
         .unwrap();
         assert_eq!(
