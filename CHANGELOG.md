@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.5.0](https://github.com/DaveDev42/claude-smart/compare/v0.4.12...v0.5.0) (2026-10-24)
+
+
+### ⚠ BREAKING CHANGES
+
+* csm scan, csm sidecar and csm newuuid are removed and no longer reserved, so they reach claude as a prompt.
+* csm migrate and csm cas (--eval, --print-default-dir) are removed and no longer reserved, so they reach claude as a prompt. The automatic migration is gone: upgrade through 0.4.12 first. csm no longer reads ~/.config/claude-as, ~/.claude.<name>, ~/.claude.shared or migration.json.
+* `csm config get|set|unset idle-compact` is gone and now fails like any unknown key (exit 1). Use Claude Code's `idleCompaction` setting instead. `CSM_RELAY` and `CSM_SUPERVISOR_PID` are no longer read.
+
+### Code Refactoring
+
+* remove idle-compact and the terminal relay — Claude Code compacts idle sessions itself ([876a6c0](https://github.com/DaveDev42/claude-smart/commit/876a6c08f52f678efa0d9ea114d7b6f1dfbdbe40))
+* remove the automatic migration and the cas compat ([c95c44f](https://github.com/DaveDev42/claude-smart/commit/c95c44fc924ad53d706bb5cd8036b3e20fe4d4ce))
+* remove the shell-era csm scan, csm sidecar and csm newuuid ([4387b1e](https://github.com/DaveDev42/claude-smart/commit/4387b1e58670178bc7edae954d3ef473b3a32837))
+
 ## [0.4.12](https://github.com/DaveDev42/claude-smart/compare/v0.4.11...v0.4.12) (2026-10-10)
 
 
