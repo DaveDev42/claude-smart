@@ -25,8 +25,6 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 use std::ffi::OsString;
 
-use cmd::support::newuuid;
-
 fn main() -> anyhow::Result<()> {
     use cli::reserved::Invocation;
 
@@ -66,15 +64,9 @@ fn main() -> anyhow::Result<()> {
         "orca" => cmd::orca::cmd_orca(rest),
         "config" => cmd::config::cmd_config(rest),
         "usage" => cmd::usage::cmd_usage(rest),
-        "scan" => cmd::scan::cmd_scan(rest),
         "reap" => reaper::cmd(rest),
-        "sidecar" => cmd::sidecar::cmd_sidecar(rest),
         "statusline" => statusline::run(rest),
         "completions" => cmd::completions::cmd_completions(rest),
-        "newuuid" => {
-            println!("{}", newuuid());
-            Ok(())
-        }
         other => {
             eprintln!("csm: unknown subcommand: {other}");
             eprintln!("run `csm --help` for the full surface");
@@ -131,14 +123,11 @@ fn print_help() {
         "  csm usage capture                    read statusLine stdin, merge into the store\n"
     );
     println!("OTHER");
-    println!("  csm scan [<cwd>]                     session TSV for the picker");
     println!(
         "  csm reap [--dry-run] [--term] [--all|--session <sid>]   kill orphan processes left by claude"
     );
-    println!("  csm sidecar {{read|write|merge|flags}} <sid> [k=v...]");
     println!("  csm statusline                       Claude Code statusLine segment");
     println!("  csm completions {{zsh|bash|pwsh}}      shell completions");
-    println!("  csm newuuid                          fresh lowercase UUID v4");
     println!(
         "  csm claude <args...>                 run claude in csm's runtime dir, args verbatim\n"
     );

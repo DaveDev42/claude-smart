@@ -524,8 +524,6 @@ sc_passthrough() {
   FAKE_LOG="$LOGS/claude.log" csm claude -p "hello there"
   check "csm claude -p runs claude once" eq "$(count_calls "$LOGS/claude.log")" 1
   check "with the arguments verbatim" eq "$(call_argv "$LOGS/claude.log" 1 | tail -n +2 | tr '\n' ' ')" "-p hello there "
-  csm newuuid
-  check "csm newuuid prints a uuid" grep -qE '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$' "$LOGS/out"
   csm run --help
   check "csm run --help prints run's usage" has_fixed "$LOGS/out" "csm run [csm-flags]"
   check "nothing was launched" eq "$(count_inv "$LOGS/claude.log")" 0

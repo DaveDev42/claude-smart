@@ -23,7 +23,7 @@ multi-machine fleet), but the crate itself ships **zero** private identifiers
 
 The module tree is discoverable from `src/`; this lists only what is not obvious from it.
 
-- `src/main.rs`: `e2e::guard()` is the first call in `main()`, then argv[0]/`args[1]` dispatch. Every `cmd_*` handler lives under `src/cmd/`. Three reserved words dispatch outside it: `reap` (`src/reaper/`), `statusline` (`src/statusline.rs`), `newuuid` (inline in `main()`).
+- `src/main.rs`: `e2e::guard()` is the first call in `main()`, then argv[0]/`args[1]` dispatch. Every `cmd_*` handler lives under `src/cmd/`. Two reserved words dispatch outside it: `reap` (`src/reaper/`) and `statusline` (`src/statusline.rs`).
 - `src/e2e.rs`: seams for `e2e/run.sh`, compiled in only with the `e2e` cargo feature (inert otherwise). `guard()` exits 97 unless `HOME` (and any `XDG_*_HOME`) lies inside `CSM_E2E_SANDBOX`. The feature also fakes the Keychain runner, Orca process scan, Orca version, and named `point(name)` hooks. Never enable the feature in a release build.
 - `src/cmd/`: one module per subcommand. `claude.rs` is the `csm claude <args…>` passthrough. `accounts.rs` keeps a pure parser/decision core over `orca::`.
 - `src/launch_context.rs`: how a launch started (`Print`, `OrcaPane`, `OrcaStructured`, `Interactive`, `CSM_ORCA` override), the `CLAUDE_CONFIG_DIR` pin rule (while Orca runs every launch uses Orca's live `D`), and the managed-account auth-env strip list.
@@ -164,7 +164,7 @@ dependency/MSRV checks).
 orca {status|setup},
 config {show|get|set|unset launch-command|min-claude-version},
 usage [--json] [--no-fetch] [--refresh] | usage capture,
-scan, sidecar, statusline, completions, reap, newuuid, claude <args…>`. There is no csm-global flag. The collision analysis
+statusline, completions, reap, claude <args…>`. There is no csm-global flag. The collision analysis
 against claude's own subcommands is Invariant 2 above.
 
 ## Git workflow

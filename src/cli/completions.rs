@@ -113,14 +113,6 @@ pub enum CompletionsSubcmd {
         verb: Option<UsageVerb>,
     },
 
-    /// Scan a directory for Claude Code sessions and print TSV rows.
-    #[command(name = "scan")]
-    Scan {
-        /// Working directory to scan (defaults to current directory).
-        #[arg(value_name = "CWD")]
-        cwd: Option<String>,
-    },
-
     /// Discover and kill orphan processes left behind by a csm-managed claude session.
     #[command(name = "reap")]
     Reap {
@@ -138,20 +130,6 @@ pub enum CompletionsSubcmd {
         session: Option<String>,
     },
 
-    /// Read/write/merge session sidecar state.
-    #[command(name = "sidecar")]
-    Sidecar {
-        /// Operation: read | write | merge | flags
-        #[arg(value_name = "OP")]
-        op: String,
-        /// Session UUID.
-        #[arg(value_name = "SID")]
-        sid: String,
-        /// Key=value pairs to write/merge (for write/merge operations).
-        #[arg(value_name = "KEY=VALUE")]
-        kv_args: Vec<String>,
-    },
-
     /// Render the Claude Code statusLine segment.
     #[command(name = "statusline")]
     Statusline,
@@ -162,10 +140,6 @@ pub enum CompletionsSubcmd {
         /// Target shell.
         shell: Shell,
     },
-
-    /// Print a fresh lowercase UUID v4 (used as --session-id on cold launch).
-    #[command(name = "newuuid")]
-    Newuuid,
 
     /// Run claude in csm's runtime dir, arguments forwarded verbatim.
     #[command(name = "claude")]
@@ -376,12 +350,9 @@ mod tests {
             "usage",
             "accounts",
             "orca",
-            "scan",
             "reap",
-            "sidecar",
             "statusline",
             "completions",
-            "newuuid",
             "claude",
         ] {
             assert!(

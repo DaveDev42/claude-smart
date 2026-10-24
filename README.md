@@ -105,11 +105,8 @@ csm config get|set|unset min-claude-version   lowest claude a limit switch accep
 
 csm hook                                 the Claude Code hook (Stop, StopFailure, SubagentStop, SessionEnd)
 csm statusline                           Claude Code statusLine segment: <account>@<host>
-csm scan [<cwd>]                         session list (TSV)
-csm sidecar {read|write|merge|flags} <sid> [k=v...]   per-session state
 csm reap [--dry-run] [--term] [--all|--session <sid>] kill processes orphaned by claude
 csm completions {zsh|bash|pwsh}          shell completions
-csm newuuid                              a fresh UUID v4
 ```
 
 Accounts are named by Orca's account id, a unique prefix of it, or the full
@@ -569,6 +566,7 @@ and Linux, and `%LOCALAPPDATA%\csm` on Windows.
 | `csm config … idle-compact`, `CSM_RELAY`, `CSM_SUPERVISOR_PID` | Gone with the idle compact feature and its terminal relay. Claude Code compacts idle sessions itself (the `idleCompaction` setting). `csm config get idle-compact` is an unknown key (exit 1); an old `idleCompact` value in `config.json` is ignored. |
 | `csm migrate`, `csm migrate --dry-run`, the automatic migration off the profile layout | Gone. csm no longer reads `~/.config/claude-as`, `~/.claude.<name>`, `~/.claude.shared` or `<state>/migration.json`, and no longer clears the machine-wide `CLAUDE_CONFIG_DIR`. Upgrade through 0.4.12 (the last release that migrates) first and let it reach `phase: done`; `csm orca status` showed the `migration` row there. `csm accounts import <dir>` still imports a login from any config dir. |
 | `csm cas` (`--eval`, `--print-default-dir`) | Gone. The word is no longer reserved, so `csm cas` reaches claude as a prompt. Remove any leftover shell shim or guard that calls it. |
+| `csm scan`, `csm sidecar`, `csm newuuid` | Gone. They were entry points for the old shell implementation; nothing in csm calls them. The words are no longer reserved, so they reach claude as a prompt. The session scan, the sidecar files and `reap` are unchanged. |
 | `csm hook --owner <dir>` | Still accepted and ignored, so settings written by older versions keep working. |
 
 ## Platforms

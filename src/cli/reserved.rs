@@ -27,11 +27,8 @@ pub(crate) const CSM_RESERVED_SUBCOMMANDS: &[&str] = &[
     "hook",
     "config",
     "usage",
-    "scan",
-    "sidecar",
     "statusline",
     "completions",
-    "newuuid",
     "reap",
     "accounts",
     "orca",
@@ -269,6 +266,9 @@ mod tests {
             "current-usage",
             "cas",
             "migrate",
+            "scan",
+            "sidecar",
+            "newuuid",
         ] {
             assert_eq!(routed(&["csm", w]).0, "run", "{w}");
         }
@@ -322,22 +322,6 @@ mod tests {
     }
 
     #[test]
-    fn dispatch_explicit_scan() {
-        let a = argv(&["csm", "scan", "/tmp/project"]);
-        let d = dispatch_subcommand(&a);
-        assert_eq!(d.subcommand, "scan");
-        assert_eq!(d.rest_len, 1);
-    }
-
-    #[test]
-    fn dispatch_explicit_sidecar() {
-        let a = argv(&["csm", "sidecar", "read", "abc-sid"]);
-        let d = dispatch_subcommand(&a);
-        assert_eq!(d.subcommand, "sidecar");
-        assert_eq!(d.rest_len, 2);
-    }
-
-    #[test]
     fn dispatch_explicit_statusline() {
         let a = argv(&["csm", "statusline"]);
         assert_eq!(dispatch_subcommand(&a).subcommand, "statusline");
@@ -349,12 +333,6 @@ mod tests {
         let d = dispatch_subcommand(&a);
         assert_eq!(d.subcommand, "completions");
         assert_eq!(d.rest_len, 1);
-    }
-
-    #[test]
-    fn dispatch_explicit_newuuid() {
-        let a = argv(&["csm", "newuuid"]);
-        assert_eq!(dispatch_subcommand(&a).subcommand, "newuuid");
     }
 
     // ── implicit `run` fallthrough ────────────────────────────────────────────

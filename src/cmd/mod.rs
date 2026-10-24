@@ -12,7 +12,5 @@ pub mod config;
 pub mod hook;
 pub mod orca;
 pub mod run;
-pub mod scan;
-pub mod sidecar;
 pub mod support;
 pub mod usage;
